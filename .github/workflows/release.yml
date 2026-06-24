@@ -25,6 +25,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             asset: recalld-aarch64-linux.tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            asset: recalld-x86_64-darwin.tar.gz
           - target: aarch64-apple-darwin
             runner: macos-latest
             asset: recalld-aarch64-darwin.tar.gz
@@ -41,6 +44,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -55,38 +61,9 @@ jobs:
         with:
           files: ${{ matrix.asset }}
 
-  build-macos-x86:
-    name: Build (x86_64-apple-darwin)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.87"
-          targets: x86_64-apple-darwin
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: x86_64-apple-darwin
-
-      - name: Build
-        run: cargo build --release --target x86_64-apple-darwin
-
-      - name: Package
-        run: |
-          cd target/x86_64-apple-darwin/release
-          tar czf ../../../recalld-x86_64-darwin.tar.gz recalld recalld-cli
-          cd ../../..
-
-      - name: Upload
-        uses: softprops/action-gh-release@v2
-        with:
-          files: recalld-x86_64-darwin.tar.gz
-
   checksums:
     name: Checksums
-    needs: [build, build-macos-x86]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Download release assets
