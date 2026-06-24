@@ -15,13 +15,18 @@ use crate::model::{AccessEvent, AccessKind, DecayPhase, MemoryId};
 /// FSRS v4.5 power-law decay exponent.
 ///
 /// The forgetting curve follows R(t, S) = (1 + FACTOR * t / S) ^ DECAY.
-/// The value -0.5 is the population-average exponent from the original
-/// FSRS training on 700M+ Anki reviews. FSRS-6 makes this trainable
-/// (w20), but Recalld uses the fixed v4.5 value since there is no
-/// per-user data to personalize against.
+/// Fixed constant chosen for FSRS-4.5 based on empirical benchmarking
+/// against Anki review datasets, yielding ~22% RMSE improvement over the
+/// prior value of -1 used in FSRS v4. FSRS-6 makes this trainable (w20),
+/// but recalld uses the fixed v4.5 value since there is no per-user data
+/// to personalize against.
 ///
 /// Changing this constant invalidates all retrievability calculations
 /// in the system. It is intentionally not configurable.
+///
+/// Reference: Ye, J. (2022). "A Stochastic Shortest Path Algorithm for
+/// Optimizing Spaced Repetition Scheduling." Proc. 28th ACM SIGKDD.
+/// Algorithm wiki: https://github.com/open-spaced-repetition/fsrs4anki/wiki/The-Algorithm
 const DECAY: f32 = -0.5;
 
 /// FSRS v4.5 scaling factor for the forgetting curve.
@@ -198,8 +203,14 @@ pub(super) const DEFAULT_PHASE_3_THRESHOLD: f32 = 0.05;
 /// that 5 well-timed accesses produce stability of ~1,479 days
 /// (Spec 02, Section 3.5). Rounded to 1,500 for a clean threshold.
 ///
-/// Based on Bahrick (1984) permastore research: some memories, once
-/// sufficiently overlearned, resist forgetting for 25+ years.
+/// Inspired by Bahrick's (1984) permastore concept: sufficiently
+/// overlearned memories resist forgetting for 25+ years. The specific
+/// threshold is derived from FSRS stability arithmetic, not directly
+/// from Bahrick's empirical data.
+///
+/// Reference: Bahrick, H. P. (1984). "Semantic memory content in
+/// permastore: Fifty years of memory for Spanish learned in school."
+/// Journal of Experimental Psychology: General, 113(1), 1-29.
 pub(super) const DEFAULT_PERMASTORE_THRESHOLD: f32 = 1500.0;
 
 /// Maximum connection bonus from spreading activation.
@@ -208,7 +219,13 @@ pub(super) const DEFAULT_PERMASTORE_THRESHOLD: f32 = 1500.0;
 /// effective retrievability. This prevents highly-connected memories
 /// from becoming immune to decay.
 ///
-/// Derived from ACT-R spreading activation theory (Anderson 1993).
+/// Derived from ACT-R spreading activation theory.
+///
+/// Reference: Anderson, J. R. (1993). "Rules of the Mind."
+/// Lawrence Erlbaum Associates.
+/// Fan effect: Anderson, J. R. & Reder, L. M. (1999). "The fan
+/// effect: New results and new theories." Journal of Experimental
+/// Psychology: General, 128, 186-197.
 pub(super) const DEFAULT_MAX_CONNECTION_BONUS: f32 = 0.15;
 
 /// Maximum associative strength between two memories.

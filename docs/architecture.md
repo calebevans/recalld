@@ -217,9 +217,9 @@ graph LR
 
 ### Permastore
 
-When a memory's FSRS stability exceeds 1500 days (~4.1 years), it is marked as permastore and permanently exempted from decay sweeps. This models Bahrick's (1984) finding that sufficiently overlearned memories resist forgetting for 25+ years.
+When a memory's FSRS stability exceeds 1500 days (~4.1 years), it is marked as permastore and permanently exempted from decay sweeps. Inspired by Bahrick's (1984) permastore concept -- sufficiently overlearned memories resist forgetting for 25+ years. The specific 1500-day threshold is derived from FSRS stability arithmetic (5 well-timed accesses yield ~1,479 days of stability), not directly from Bahrick's empirical data.
 
-Approximately 5 well-timed retrievals can push stability past the permastore threshold.
+Reference: Bahrick, H. P. (1984). "Semantic memory content in permastore: Fifty years of memory for Spanish learned in school." *Journal of Experimental Psychology: General*, 113(1), 1-29.
 
 ### Decay sweep processing order
 
@@ -512,7 +512,12 @@ The pipeline fetches `min(limit * 8, max(100, limit * 8))` candidates internally
 
 ## 8. Retrieval-Induced Forgetting (RIF)
 
-RIF models the empirical finding that retrieving a memory weakens similar but non-retrieved competitors (Anderson, Bjork, & Bjork, 1994). recalld implements this via the Nonmonotonic Plasticity Hypothesis (Ritvo et al., 2019).
+RIF models the empirical finding that retrieving a memory weakens similar but non-retrieved competitors. recalld implements this via the Nonmonotonic Plasticity Hypothesis, with distance decay from the SAMPL model.
+
+**References:**
+- Anderson, M. C., Bjork, R. A., & Bjork, E. L. (1994). "Remembering can cause forgetting: Retrieval dynamics in long-term memory." *J. Exp. Psychol: Learning, Memory, and Cognition*, 20, 1063-1087.
+- Ritvo, V. J. H., Turk-Browne, N. B., & Norman, K. A. (2019). "Nonmonotonic Plasticity: How Memory Retrieval Drives Learning." *Trends in Cognitive Sciences*, 23(9), 726-742.
+- Murayama, K., Miyatsu, T., Buchli, D., & Storm, B. C. (2014). "Forgetting as a consequence of retrieval: A meta-analytic review of retrieval-induced forgetting." *Psychological Bulletin*, 140(5), 1383-1409.
 
 ### Mechanism
 

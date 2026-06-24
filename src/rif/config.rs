@@ -1,16 +1,17 @@
 //! Configuration for Retrieval-Induced Forgetting.
 //!
 //! [`RifConfig`] holds all tunable parameters for the RIF subsystem.
-//! Defaults are calibrated to match the meta-analytic RIF effect size
-//! of ~8.7% recall reduction (Murayama et al., 2014).
+//! Defaults are calibrated to approximate the meta-analytic RIF effect
+//! size of Hedges' g = 0.35 (~8.7 percentage-point recall reduction)
+//! reported by Murayama et al. (2014).
 
 use serde::{Deserialize, Serialize};
 
 /// Configuration for Retrieval-Induced Forgetting.
 ///
 /// All thresholds and magnitudes are tunable per namespace.
-/// Defaults are calibrated to match the meta-analytic RIF
-/// effect size of ~8.7% recall reduction (Murayama et al., 2014).
+/// Defaults are calibrated to approximate the meta-analytic RIF
+/// effect size of Hedges' g = 0.35 (Murayama et al., 2014).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RifConfig {
     /// Master switch. When `false`, `RifEngine::compute_effects` returns

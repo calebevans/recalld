@@ -1,8 +1,13 @@
 //! Spreading activation (connection bonus) and edge factors.
 //!
-//! Implements ACT-R spreading activation adapted for Recalld: fan-effect
+//! Implements ACT-R spreading activation adapted for recalld: fan-effect
 //! attenuation, 2-hop propagation with decay, and the connection bonus
 //! formula. Also provides batch recomputation for decay sweeps.
+//!
+//! References:
+//! - Anderson, J. R. (1993). "Rules of the Mind." Lawrence Erlbaum.
+//! - Anderson, J. R. & Reder, L. M. (1999). "The fan effect: New results
+//!   and new theories." J. Exp. Psychol: General, 128, 186-197.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
