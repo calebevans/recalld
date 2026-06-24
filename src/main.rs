@@ -148,9 +148,13 @@ enum BenchTarget {
         #[arg(long, default_value = "30")]
         top_k: usize,
 
-        /// Model name for answer generation and enrichment
+        /// Model name for answer generation and query construction
         #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
+
+        /// Model name for conversation ingestion (memory extraction)
+        #[arg(long, default_value = "claude-haiku-4-5")]
+        ingest_model: String,
 
         /// Model name for answer judging (uses a separate model to avoid self-grading bias)
         #[arg(long, default_value = "claude-haiku-4-5")]
@@ -281,6 +285,7 @@ async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> 
             data,
             top_k,
             model,
+            ingest_model,
             judge_model,
             llm_url,
             skip_adversarial,
@@ -325,6 +330,7 @@ async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> 
                 &data,
                 top_k,
                 &model,
+                &ingest_model,
                 &judge_model,
                 llm_url.as_deref(),
                 format,

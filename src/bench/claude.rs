@@ -393,126 +393,39 @@ impl LlmClient {
             When a memory contains a direct quote or specific detail, prefer that detail \
             over your general knowledge.";
 
-        let instructions = match category {
-            "open-domain" => {
-                "\n\nInstructions:\n\
-                - These questions ARE answerable from the evidence -- you MUST provide a \
-                definitive answer.\n\
+        let instructions = "\n\nInstructions:\n\
+                - Base your answer ONLY on the provided memories.\n\
                 - Reason step by step:\n\
                   1. Identify which memories contain relevant evidence.\n\
-                  2. State what each relevant memory tells you.\n\
-                  3. Combine the evidence into a clear conclusion.\n\
-                - For hypothetical questions (\"would they...\", \"is it likely...\"), \
-                commit to a clear yes/no with brief reasoning from evidence.\n\
-                - For trait or preference questions (political views, personality, interests), \
-                synthesize a conclusion from behavioral patterns. Name the trait directly \
-                (e.g., \"liberal\", \"introverted\", \"athletic\").\n\
-                - State your conclusion assertively. Do not hedge or add qualifiers like \
-                \"possibly\" or \"it seems.\"\n\
-                - Never say \"I don't know\" or \"there is not enough information.\"\n\
-                - Keep your final answer concise (one or two sentences after your reasoning)."
-            }
-            "temporal" => {
-                "\n\nInstructions:\n\
-                - Base your answer ONLY on the provided memories.\n\
-                - Reason about time step by step:\n\
-                  1. Extract all dates and time references from the relevant memories.\n\
-                  2. If the question asks WHEN something happened, find the memory that \
-                  describes the event and report its date.\n\
-                  3. If the question asks about ordering (first, last, before, after), \
-                  arrange the relevant events chronologically using their dates.\n\
-                  4. If the question asks about duration or intervals, calculate from \
-                  the dates.\n\
-                - Pay close attention to the dates shown in parentheses for each memory -- \
-                these are the dates the information was recorded.\n\
-                - Relative time references in memories (\"last week\", \"a few months ago\") \
-                should be interpreted relative to that memory's date.\n\
-                - If the memories do not contain enough information to answer the question, \
-                say \"I don't know\".\n\
-                - Keep your final answer concise -- state the date, time period, or ordering \
-                directly."
-            }
-            "multi-hop" => {
-                "\n\nInstructions:\n\
-                - Base your answer ONLY on the provided memories.\n\
-                - This question requires combining information from multiple memories. \
-                Reason step by step:\n\
-                  1. Break the question into sub-parts. What pieces of information do \
-                  you need?\n\
-                  2. Find the memory (or memories) that address each sub-part.\n\
-                  3. Chain the pieces together to form your answer.\n\
-                - For \"would they\" hypothetical questions, find evidence of relevant \
-                preferences or behaviors, then apply common-sense reasoning to answer \
-                yes or no.\n\
+                  2. If the question requires combining information from multiple memories, \
+                  chain the pieces together.\n\
+                  3. If the question involves time, pay attention to dates shown in \
+                  parentheses for each memory.\n\
+                - Verify person references: if the question names a specific person, \
+                confirm the memory is about THAT person before using it as evidence. \
+                A memory about one person does NOT answer a question about a different \
+                person.\n\
                 - Memories may use different words for the same concept (e.g., \"plays \
-                violin\" relates to \"classical music\"; \"collects classic children's \
-                books\" relates to specific book titles).\n\
-                - Check the related memories [R1], [R2], etc. -- they may contain the \
-                connecting information between the directly retrieved memories.\n\
-                - If the memories do not contain enough information to answer the question, \
-                say \"I don't know\".\n\
-                - Keep your final answer concise (one or two sentences after your reasoning)."
-            }
-            "adversarial" => {
-                "\n\nInstructions:\n\
-                - These questions may ask about something that was NOT discussed in the \
-                conversation, or may attribute an event to the WRONG person.\n\
-                - Before answering, carefully verify:\n\
-                  1. Does any memory ACTUALLY describe the event or fact asked about?\n\
-                  2. If a memory describes something similar, does it name the SAME person \
-                  the question asks about? (e.g., if the question asks about Melanie but \
-                  the memory says Caroline did it, that is NOT a match.)\n\
-                - Common trap: The question swaps person names. A memory about Caroline's \
-                camping trip does NOT answer a question about Melanie's camping trip.\n\
-                - If no memory matches BOTH the event AND the person in the question, \
-                say \"I don't know\" or \"This was not discussed.\"\n\
-                - Only answer if you find a memory that specifically matches the person \
-                AND the event asked about.\n\
-                - Keep your answer concise."
-            }
-            _ => {
-                "\n\nInstructions:\n\
-                - Base your answer ONLY on the provided memories.\n\
-                - These are direct fact-lookup questions. The answer should be stated or \
-                closely paraphrased in one of the memories.\n\
-                - If the question names a person, verify the memory is about THAT specific \
-                person before answering.\n\
-                - Prefer the highest-scoring memory when multiple memories seem relevant.\n\
-                - Memories may describe the answer using different words than the question \
-                (e.g., \"plays violin\" answers \"what instrument\"). Use the information \
-                available even when the phrasing differs.\n\
-                - If the memories do not contain enough information to answer the question, \
-                say \"I don't know\".\n\
-                - Keep your final answer concise (one or two sentences)."
-            }
-        };
+                guitar\" relates to \"rock music\"). Use the information available even \
+                when the phrasing differs.\n\
+                - For hypothetical questions (\"would they...\", \"is it likely...\"), \
+                find evidence of relevant preferences or behaviors and commit to a \
+                clear answer with brief reasoning.\n\
+                - If the memories do not contain enough information to answer the \
+                question, say \"I don't know.\"\n\
+                - Keep your final answer concise (one or two sentences after your \
+                reasoning).";
 
         let system = format!("{base}{instructions}");
 
-        let reasoning_hint = match category {
-            "temporal" => "First extract the relevant dates from the memories, then answer.",
-            "multi-hop" => "First identify the pieces of information needed, then combine them.",
-            "adversarial" => {
-                "Check: does any memory match BOTH the person and the event in the question?"
-            }
-            "open-domain" => "Identify the relevant evidence, then state your conclusion.",
-            _ => "",
-        };
+        let reasoning_hint = "Identify the relevant evidence from the memories, then answer.";
 
-        let user = if reasoning_hint.is_empty() {
-            format!(
-                "Retrieved memories:\n{context}{neighbor_context}\n\n\
-                 Question: {question}\n\n\
-                 Answer:"
-            )
-        } else {
-            format!(
-                "Retrieved memories:\n{context}{neighbor_context}\n\n\
-                 Question: {question}\n\n\
-                 {reasoning_hint}\n\n\
-                 Answer:"
-            )
-        };
+        let user = format!(
+            "Retrieved memories:\n{context}{neighbor_context}\n\n\
+             Question: {question}\n\n\
+             {reasoning_hint}\n\n\
+             Answer:"
+        );
 
         self.call(&system, &user).await
     }
@@ -619,8 +532,8 @@ impl LlmClient {
             Store any new factual information revealed in the latest turn.\n\n\
             Guidelines:\n\
             - NEVER generalize specific nouns. Store the EXACT name, title, or object: \
-            \"Charlotte's Web\" NOT \"a book\", \"hoodies\" NOT \"clothing\", \"Sweden\" NOT \
-            \"her home country\", \"golden retriever\" NOT \"dog\", \"cup with a dog face\" \
+            \"To Kill a Mockingbird\" NOT \"a book\", \"sneakers\" NOT \"shoes\", \"Portugal\" NOT \
+            \"his home country\", \"labrador\" NOT \"dog\", \"hand-painted vase\" \
             NOT \"pottery\".\n\
             - Always name specific items, places, brands, species, colors, and quantities.\n\
             - Store EVERY distinct fact: names, places, events, activities, preferences, \
@@ -634,10 +547,10 @@ impl LlmClient {
             vague like \"we've been married a while\" but context gives a specific duration, \
             store the specific duration.\n\
             - Cross-speaker opinions: When person A expresses an opinion about person B \
-            (e.g., \"I think she'd be an awesome mom\"), store it as its own separate memory \
+            (e.g., \"I think he'd make a great teacher\"), store it as its own separate memory \
             with both speakers as entities. These are distinct from factual statements.\n\
             - Inferrable conclusions: When facts in the conversation strongly imply a conclusion \
-            (e.g., a bad experience on a trip implies they wouldn't want to repeat it), store \
+            (e.g., a stressful experience at a job implies they might want to change careers), store \
             the inference as a separate memory with appropriate context. Tag it with the \
             relevant entities and topics so it can be found later.\n\
             - Multiple memories per turn is fine if the turn contains multiple distinct facts.\n\
@@ -670,8 +583,8 @@ impl LlmClient {
             surrounding context verbatim — this is critical for recall accuracy.\n\
             - \"entities\" (required, array of strings): ALL people, pets, places, organizations, \
             book/movie/song titles, and proper nouns mentioned in this memory. You MUST always \
-            provide this field. Use their canonical name (e.g., \"Caroline\", \"Oliver\", \"Sweden\", \
-            \"Charlotte's Web\", \"LGBTQ\"). These are used for search indexing and graph linking.\n\
+            provide this field. Use their canonical name (e.g., \"Alice\", \"Marcus\", \"Portugal\", \
+            \"To Kill a Mockingbird\", \"NASA\"). These are used for search indexing and graph linking.\n\
             - \"topics\" (required, array of strings): 1-5 topic keywords describing what the \
             memory is about. You MUST always provide this field. Examples: \"adoption\", \"career\", \
             \"cooking\", \"music\", \"camping\", \"self-care\", \"family\", \"art\", \"pets\", \
@@ -748,10 +661,10 @@ impl LlmClient {
               specific proper noun (book title, place name, event name), ALWAYS include it in the \
               fts_query even if it appears in the semantic query too — FTS excels at exact name matching.\n\
             Use multiple queries when the question has multiple angles. For example:\n\
-              - \"What books has Melanie read?\" -> one query about Melanie reading habits, another about \
-              specific book titles Melanie mentioned.\n\
-              - \"Would Caroline enjoy hiking?\" -> one query about Caroline's outdoor activities, another \
-              about Caroline's exercise or fitness preferences.\n\
+              - \"What movies has Alice watched?\" -> one query about Alice's movie-watching habits, another about \
+              specific film titles Alice mentioned.\n\
+              - \"Would Marcus enjoy cooking?\" -> one query about Marcus's food-related activities, another \
+              about Marcus's hobbies or kitchen interests.\n\
             For simple factual questions, one query is fine.\n\
             Each query in the set should come from a genuinely different angle — not paraphrases of \
             each other. Think about how the ANSWER might be phrased in a stored memory, not just how \
@@ -762,7 +675,7 @@ impl LlmClient {
             memory system stores what happened, not what it means.\n\
             - \"entities\" (optional, array of strings): Filter to memories mentioning specific \
             people, places, or proper nouns. Use the canonical name as it would appear in a memory \
-            (e.g., \"Caroline\", \"Sweden\", \"Oliver\"). When the question asks about a specific person, \
+            (e.g., \"Alice\", \"Tokyo\", \"Marcus\"). When the question asks about a specific person, \
             include their name here to prioritize memories about them. Provide at most 1-2 entities.\n\
             - \"topics\" (optional, array of strings): Filter to memories about specific topics. \
             Use lowercase single words or short phrases. Examples: \"adoption\", \"cooking\", \"career\", \

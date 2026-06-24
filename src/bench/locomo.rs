@@ -362,12 +362,15 @@ pub async fn run(
     data_path: &Path,
     top_k: usize,
     model: &str,
+    ingest_model: &str,
     judge_model: &str,
     llm_url: Option<&str>,
     format: &str,
     skip_adversarial: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = LlmClient::new(model.to_string(), llm_url)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let ingest_llm = LlmClient::new(ingest_model.to_string(), llm_url)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let judge_llm = LlmClient::new(judge_model.to_string(), llm_url)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -398,9 +401,10 @@ pub async fn run(
         total_turns,
     );
     eprintln!(
-        "  Backend: {}    Model: {}    Judge: {}    Top-k: {}",
+        "  Backend: {}    Model: {}    Ingest: {}    Judge: {}    Top-k: {}",
         llm.backend_label(),
         model,
+        ingest_model,
         judge_model,
         top_k,
     );
@@ -436,7 +440,7 @@ pub async fn run(
 
         eprint!("    Ingesting turns...");
         let ingest_start = Instant::now();
-        let stored = ingest_conversation(&harness, conv, &llm).await?;
+        let stored = ingest_conversation(&harness, conv, &ingest_llm).await?;
         eprintln!(
             " done ({} memories, {:.1}s)",
             stored,
@@ -485,7 +489,7 @@ pub async fn run(
                 .collect();
             let answer_start = Instant::now();
             let generated = llm
-                .generate_answer(&qa.question, &mem_contexts, &cat_name, &graph_context)
+                .generate_answer(&qa.question, &mem_contexts, "unknown", &graph_context)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             let answer_ms = answer_start.elapsed().as_secs_f64() * 1000.0;
