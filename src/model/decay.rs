@@ -40,11 +40,6 @@ impl DecayPhase {
         }
     }
 
-    /// Determine the correct phase using the default thresholds.
-    pub fn from_strength_default(strength: f32) -> Self {
-        Self::from_strength(strength, &PhaseThresholds::default())
-    }
-
     /// Convert from the on-disk `u8` discriminant.
     /// Returns `None` for unrecognized values (including sentinel 0).
     pub fn from_u8(value: u8) -> Option<Self> {
@@ -61,15 +56,6 @@ impl DecayPhase {
         self as u8
     }
 
-    /// True if full text should be retained in this phase.
-    pub fn retains_full_text(self) -> bool {
-        matches!(self, DecayPhase::Full)
-    }
-
-    /// True if the summary should be retained in this phase.
-    pub fn retains_summary(self) -> bool {
-        matches!(self, DecayPhase::Full | DecayPhase::Summary)
-    }
 }
 
 impl Default for DecayPhase {

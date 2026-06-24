@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::constants::*;
-use crate::model::error::ValidationError;
 use crate::model::id::NamespaceId;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -43,10 +42,6 @@ impl PhaseThresholds {
         Ok(())
     }
 
-    /// True if the given strength indicates the memory should be deleted.
-    pub fn is_below_deletion(&self, strength: f32) -> bool {
-        strength <= self.ghost_threshold
-    }
 }
 
 impl Default for PhaseThresholds {
@@ -124,71 +119,5 @@ impl NamespaceConfig {
             desired_retention: DEFAULT_DESIRED_RETENTION,
             decay_rate_multiplier: None,
         }
-    }
-
-    /// Validate namespace configuration.
-    pub fn validate(&self) -> Result<(), ValidationError> {
-        // Name: 1-64 chars, alphanumeric + hyphens + underscores
-        if self.name.is_empty()
-            || self.name.len() > NAMESPACE_NAME_MAX_BYTES
-            || !self
-                .name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(ValidationError::InvalidNamespaceName {
-                max: NAMESPACE_NAME_MAX_BYTES,
-            });
-        }
-
-        // Embedding dim > 0
-        if self.embedding_dim == 0 {
-            return Err(ValidationError::DimensionMismatch {
-                expected: 1,
-                actual: 0,
-                namespace: self.name.clone(),
-            });
-        }
-
-        // Stability range
-        if !(STABILITY_FLOOR..=STABILITY_CEILING).contains(&self.initial_stability) {
-            return Err(ValidationError::InvalidStability {
-                value: self.initial_stability,
-                min: STABILITY_FLOOR,
-                max: STABILITY_CEILING,
-            });
-        }
-
-        // Difficulty range
-        if !(DIFFICULTY_MIN..=DIFFICULTY_MAX).contains(&self.default_difficulty) {
-            return Err(ValidationError::DifficultyOutOfRange {
-                value: self.default_difficulty,
-                min: DIFFICULTY_MIN,
-                max: DIFFICULTY_MAX,
-            });
-        }
-
-        // Phase thresholds
-        self.phase_thresholds
-            .validate()
-            .map_err(|_| ValidationError::InvalidStability {
-                value: 0.0,
-                min: 0.0,
-                max: 1.0,
-            })?;
-
-        // Desired retention in (0.0, 1.0)
-        if self.desired_retention <= 0.0 || self.desired_retention >= 1.0 {
-            return Err(ValidationError::StrengthOutOfRange(self.desired_retention));
-        }
-
-        // Decay rate multiplier must be >= 0.0 if set
-        if let Some(mult) = self.decay_rate_multiplier {
-            if mult < 0.0 {
-                return Err(ValidationError::InvalidDecayMultiplier { value: mult });
-            }
-        }
-
-        Ok(())
     }
 }

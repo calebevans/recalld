@@ -115,47 +115,6 @@ pub enum ValidationError {
     InvalidDecayMultiplier { value: f32 },
 }
 
-impl ValidationError {
-    /// Machine-readable error code for JSON API responses.
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::SummaryEmpty => "INVALID_SUMMARY",
-            Self::SummaryTooLong { .. } => "SUMMARY_TOO_LONG",
-            Self::FullTextTooLong { .. } => "FULL_TEXT_TOO_LONG",
-            Self::TooManyTags { .. } => "TOO_MANY_TAGS",
-            Self::InvalidTag { .. } => "INVALID_TAG",
-            Self::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
-            Self::NonFiniteEmbedding { .. } => "INVALID_EMBEDDING",
-            Self::NamespaceNotFound { .. } => "NAMESPACE_NOT_FOUND",
-            Self::InvalidStability { .. } => "INVALID_STABILITY",
-            Self::StrengthOutOfRange(_) => "INVALID_STRENGTH",
-            Self::DecayStrengthOutOfRange(_) => "INVALID_DECAY_STRENGTH",
-            Self::StabilityOutOfRange { .. } => "INVALID_STABILITY",
-            Self::DifficultyOutOfRange { .. } => "INVALID_DIFFICULTY",
-            Self::TimestampOrdering { .. } => "INVALID_TIMESTAMPS",
-            Self::InvalidNamespaceName { .. } => "INVALID_NAMESPACE_NAME",
-            Self::InvalidDecayMultiplier { .. } => "INVALID_DECAY_MULTIPLIER",
-        }
-    }
-
-    /// The field name this error pertains to, for JSON `"field"` key.
-    pub fn field(&self) -> &'static str {
-        match self {
-            Self::SummaryEmpty | Self::SummaryTooLong { .. } => "summary",
-            Self::FullTextTooLong { .. } => "full_text",
-            Self::TooManyTags { .. } | Self::InvalidTag { .. } => "tags",
-            Self::DimensionMismatch { .. } | Self::NonFiniteEmbedding { .. } => "embedding",
-            Self::NamespaceNotFound { .. } | Self::InvalidNamespaceName { .. } => "namespace",
-            Self::InvalidStability { .. } => "initial_stability",
-            Self::StrengthOutOfRange(_) => "strength",
-            Self::DecayStrengthOutOfRange(_) => "decay_strength",
-            Self::StabilityOutOfRange { .. } => "stability",
-            Self::DifficultyOutOfRange { .. } => "difficulty",
-            Self::TimestampOrdering { .. } => "timestamps",
-            Self::InvalidDecayMultiplier { .. } => "decay_rate_multiplier",
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════
 // DecodeError

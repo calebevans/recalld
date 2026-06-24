@@ -32,18 +32,6 @@ pub enum AccessKind {
     ManualReinforcement,
 }
 
-impl AccessKind {
-    /// Fraction of the FSRS SInc multiplier to apply for this access kind.
-    /// Returns 0.0 for kinds that should not update stability.
-    pub fn sinc_weight(self) -> f64 {
-        match self {
-            AccessKind::DirectRetrieval => 1.0,
-            AccessKind::ManualReinforcement => 1.0,
-            AccessKind::AssociativeRetrieval => 0.5,
-            AccessKind::DecaySweep => 0.0,
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════
 // AccessEvent
@@ -203,71 +191,6 @@ impl Memory {
         Ok(())
     }
 
-    /// Validate all invariants, collecting every violation instead of
-    /// short-circuiting on the first.
-    pub fn validate_all(&self) -> Vec<ValidationError> {
-        let mut errors = Vec::new();
-
-        if self.summary.is_empty() {
-            errors.push(ValidationError::SummaryEmpty);
-        } else if self.summary.len() > SUMMARY_MAX_BYTES {
-            errors.push(ValidationError::SummaryTooLong {
-                len: self.summary.len(),
-                max: SUMMARY_MAX_BYTES,
-            });
-        }
-
-        if let Some(ref ft) = self.full_text {
-            if ft.len() > FULL_TEXT_MAX_BYTES {
-                errors.push(ValidationError::FullTextTooLong {
-                    len: ft.len(),
-                    max: FULL_TEXT_MAX_BYTES,
-                });
-            }
-        }
-
-        if self.tags.len() > MAX_TAGS {
-            errors.push(ValidationError::TooManyTags {
-                count: self.tags.len(),
-                max: MAX_TAGS,
-            });
-        }
-
-        if !(0.0..=1.0).contains(&self.strength) {
-            errors.push(ValidationError::StrengthOutOfRange(self.strength));
-        }
-
-        if !(0.0..=1.0).contains(&self.decay_strength) {
-            errors.push(ValidationError::DecayStrengthOutOfRange(
-                self.decay_strength,
-            ));
-        }
-
-        if !(STABILITY_FLOOR..=STABILITY_CEILING).contains(&self.stability) {
-            errors.push(ValidationError::StabilityOutOfRange {
-                value: self.stability,
-                min: STABILITY_FLOOR,
-                max: STABILITY_CEILING,
-            });
-        }
-
-        if !(DIFFICULTY_MIN..=DIFFICULTY_MAX).contains(&self.difficulty) {
-            errors.push(ValidationError::DifficultyOutOfRange {
-                value: self.difficulty,
-                min: DIFFICULTY_MIN,
-                max: DIFFICULTY_MAX,
-            });
-        }
-
-        if self.created_at > self.last_accessed_at {
-            errors.push(ValidationError::TimestampOrdering {
-                created: self.created_at,
-                accessed: self.last_accessed_at,
-            });
-        }
-
-        errors
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -373,12 +296,4 @@ impl CreateMemory {
         Ok(())
     }
 
-    /// Convert raw tag strings into validated `Tag` values.
-    /// Returns an error on the first invalid tag.
-    pub fn validated_tags(&self) -> Result<Vec<Tag>, ValidationError> {
-        self.tags
-            .iter()
-            .map(|s| Tag::new(s.as_str()).map_err(ValidationError::from))
-            .collect()
-    }
 }

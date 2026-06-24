@@ -8,7 +8,7 @@
 use super::fsrs::{
     DEFAULT_DIFFICULTY, DEFAULT_INITIAL_STABILITY, DEFAULT_MAX_CONNECTION_BONUS,
     DEFAULT_PARTIAL_ACCESS_WEIGHT, DEFAULT_PERMASTORE_THRESHOLD, DEFAULT_PHASE_1_THRESHOLD,
-    DEFAULT_PHASE_2_THRESHOLD, DEFAULT_PHASE_3_THRESHOLD, STABILITY_CEILING, STABILITY_FLOOR,
+    DEFAULT_PHASE_2_THRESHOLD, DEFAULT_PHASE_3_THRESHOLD,
 };
 
 /// All tunable parameters for the FSRS decay engine.
@@ -110,61 +110,3 @@ impl Default for DecayConfig {
     }
 }
 
-impl DecayConfig {
-    /// Validate that all config values are within legal ranges.
-    ///
-    /// Returns `Err` with a descriptive message if any value is invalid.
-    /// Called at namespace creation and config update time.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.initial_stability < STABILITY_FLOOR || self.initial_stability > STABILITY_CEILING {
-            return Err(format!(
-                "initial_stability must be in [{STABILITY_FLOOR}, {STABILITY_CEILING}], \
-                 got {}",
-                self.initial_stability
-            ));
-        }
-        if self.difficulty < 1.0 || self.difficulty > 10.0 {
-            return Err(format!(
-                "difficulty must be in [1.0, 10.0], got {}",
-                self.difficulty
-            ));
-        }
-        if self.phase_1_threshold <= self.phase_2_threshold {
-            return Err(format!(
-                "phase_1_threshold ({}) must be > phase_2_threshold ({})",
-                self.phase_1_threshold, self.phase_2_threshold
-            ));
-        }
-        if self.phase_2_threshold <= self.phase_3_threshold {
-            return Err(format!(
-                "phase_2_threshold ({}) must be > phase_3_threshold ({})",
-                self.phase_2_threshold, self.phase_3_threshold
-            ));
-        }
-        if self.phase_3_threshold < 0.0 || self.phase_3_threshold >= 1.0 {
-            return Err(format!(
-                "phase_3_threshold must be in [0.0, 1.0), got {}",
-                self.phase_3_threshold
-            ));
-        }
-        if self.permastore_threshold < 1.0 {
-            return Err(format!(
-                "permastore_threshold must be >= 1.0 day, got {}",
-                self.permastore_threshold
-            ));
-        }
-        if self.max_connection_bonus < 0.0 || self.max_connection_bonus > 1.0 {
-            return Err(format!(
-                "max_connection_bonus must be in [0.0, 1.0], got {}",
-                self.max_connection_bonus
-            ));
-        }
-        if self.partial_access_weight < 0.0 || self.partial_access_weight > 1.0 {
-            return Err(format!(
-                "partial_access_weight must be in [0.0, 1.0], got {}",
-                self.partial_access_weight
-            ));
-        }
-        Ok(())
-    }
-}

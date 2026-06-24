@@ -79,23 +79,6 @@ impl DecayState {
     /// Maximum number of access events retained in the history ring buffer.
     pub const MAX_ACCESS_HISTORY: usize = 32;
 
-    /// Create a new DecayState for a freshly created memory.
-    ///
-    /// Uses the provided config for initial stability and difficulty.
-    /// All retrievability fields start at 1.0 (just created = fully retrievable).
-    pub fn new(config: &DecayConfig, now_millis: i64) -> Self {
-        Self {
-            stability: config.initial_stability,
-            strength: 1.0,
-            decay_strength: 1.0,
-            difficulty: config.difficulty,
-            phase: DecayPhase::Full,
-            is_permastore: false,
-            last_accessed_at: now_millis,
-            access_history: Vec::new(),
-        }
-    }
-
     /// Push an access event into the bounded history ring buffer.
     ///
     /// If the buffer is full (>= MAX_ACCESS_HISTORY), the oldest entry

@@ -21,7 +21,7 @@ name = "recalld"
 path = "src/lib.rs"
 
 [features]
-default = ["bench"]
+default = []
 bench = []
 
 [dependencies]

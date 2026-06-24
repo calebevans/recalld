@@ -145,7 +145,7 @@ enum BenchTarget {
         data: std::path::PathBuf,
 
         /// Number of retrieved memories per question
-        #[arg(long, default_value = "20")]
+        #[arg(long, default_value = "30")]
         top_k: usize,
 
         /// Model name for answer generation and enrichment
