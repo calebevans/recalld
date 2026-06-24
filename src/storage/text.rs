@@ -206,8 +206,11 @@ impl TextStore {
             // Read and validate header.
             let mut header_buf = [0u8; TextLogHeader::SIZE];
             file.read_exact(&mut header_buf)?;
-            let header = TextLogHeader::read_from_bytes(&header_buf)
-                .map_err(|_| StorageError::HeaderParseError { file: "fulltext.dat" })?;
+            let header = TextLogHeader::read_from_bytes(&header_buf).map_err(|_| {
+                StorageError::HeaderParseError {
+                    file: "fulltext.dat",
+                }
+            })?;
             header.validate()?;
 
             // Set write position to end of file.
@@ -335,8 +338,11 @@ impl TextStore {
         self.file.seek(SeekFrom::Start(0))?;
         let mut header_buf = [0u8; TextLogHeader::SIZE];
         self.file.read_exact(&mut header_buf)?;
-        let header = TextLogHeader::read_from_bytes(&header_buf)
-            .map_err(|_| StorageError::HeaderParseError { file: "fulltext.dat" })?;
+        let header = TextLogHeader::read_from_bytes(&header_buf).map_err(|_| {
+            StorageError::HeaderParseError {
+                file: "fulltext.dat",
+            }
+        })?;
         header.validate()
     }
 
