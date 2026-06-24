@@ -19,12 +19,12 @@ use serde::{Deserialize, Serialize};
 use crate::config::RecalldConfig;
 use crate::model::record::DiskRecord;
 use crate::model::{CachedRecord, DecayPhase, MemoryId};
-use crate::search::{QueryMode, SearchQuery, VectorIndex, VectorMetadata};
 use crate::search::PipelineSearchFilter;
+use crate::search::{QueryMode, SearchQuery, VectorIndex, VectorMetadata};
 use crate::storage::StorageEngine as _;
 use crate::system::Recalld;
 
-use super::claude::{LlmClient, MemoryContext, MemoryRelation, GraphContext};
+use super::claude::{GraphContext, LlmClient, MemoryContext, MemoryRelation};
 
 // ── Category mapping ──────────────────────────────────────────────
 
@@ -138,19 +138,25 @@ fn parse_session_date(s: &str) -> Option<i64> {
     let year: i32 = date_parts.next()?.parse().ok()?;
 
     let month: u32 = match month_str {
-        "January" => 1, "February" => 2, "March" => 3, "April" => 4,
-        "May" => 5, "June" => 6, "July" => 7, "August" => 8,
-        "September" => 9, "October" => 10, "November" => 11, "December" => 12,
+        "January" => 1,
+        "February" => 2,
+        "March" => 3,
+        "April" => 4,
+        "May" => 5,
+        "June" => 6,
+        "July" => 7,
+        "August" => 8,
+        "September" => 9,
+        "October" => 10,
+        "November" => 11,
+        "December" => 12,
         _ => return None,
     };
 
-    let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)?
-        .and_hms_opt(hour, minute, 0)?;
+    let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, 0)?;
     let utc = dt.and_utc();
     Some(utc.timestamp_millis())
 }
-
-
 
 fn parse_dataset(path: &Path) -> Result<Vec<Conversation>, Box<dyn std::error::Error>> {
     let data = std::fs::read_to_string(path)?;
@@ -161,14 +167,13 @@ fn parse_dataset(path: &Path) -> Result<Vec<Conversation>, Box<dyn std::error::E
     let mut conversations = Vec::with_capacity(raw.len());
 
     for (idx, raw_conv) in raw.into_iter().enumerate() {
-        let id = raw_conv
-            .sample_id
-            .unwrap_or_else(|| format!("conv_{idx}"));
+        let id = raw_conv.sample_id.unwrap_or_else(|| format!("conv_{idx}"));
 
         // Build session number -> timestamp map from conversation dates.
         let mut session_dates: HashMap<u32, i64> = HashMap::new();
         for (key, value) in &raw_conv.conversation {
-            if let Some(num) = key.strip_prefix("session_")
+            if let Some(num) = key
+                .strip_prefix("session_")
                 .and_then(|s| s.strip_suffix("_date_time"))
                 .and_then(|s| s.parse::<u32>().ok())
             {
@@ -193,7 +198,8 @@ fn parse_dataset(path: &Path) -> Result<Vec<Conversation>, Box<dyn std::error::E
             if key.ends_with("_date_time") {
                 continue;
             }
-            if let Some(num) = key.strip_prefix("session_")
+            if let Some(num) = key
+                .strip_prefix("session_")
                 .and_then(|s| s.parse::<u32>().ok())
             {
                 session_keys.push((num, key.as_str()));
@@ -206,17 +212,26 @@ fn parse_dataset(path: &Path) -> Result<Vec<Conversation>, Box<dyn std::error::E
             let base_ts = session_dates.get(session_num).copied().unwrap_or(now_ms);
             let shifted_ts = base_ts + time_shift;
 
-            let Some(turn_list) = raw_conv.conversation.get(*session_key)
-                .and_then(|v| v.as_array()) else { continue };
+            let Some(turn_list) = raw_conv
+                .conversation
+                .get(*session_key)
+                .and_then(|v| v.as_array())
+            else {
+                continue;
+            };
 
             for (turn_idx, turn_val) in turn_list.iter().enumerate() {
-                let Some(turn_obj) = turn_val.as_object() else { continue };
+                let Some(turn_obj) = turn_val.as_object() else {
+                    continue;
+                };
 
-                let speaker = turn_obj.get("speaker")
+                let speaker = turn_obj
+                    .get("speaker")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let text = turn_obj.get("text")
+                let text = turn_obj
+                    .get("text")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
@@ -234,10 +249,12 @@ fn parse_dataset(path: &Path) -> Result<Vec<Conversation>, Box<dyn std::error::E
                     }
                 }
 
-                let blip_caption = turn_obj.get("blip_caption")
+                let blip_caption = turn_obj
+                    .get("blip_caption")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let image_query = turn_obj.get("query")
+                let image_query = turn_obj
+                    .get("query")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
@@ -295,9 +312,7 @@ struct BenchHarness {
 }
 
 impl BenchHarness {
-    async fn new(
-        base_config: &RecalldConfig,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(base_config: &RecalldConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = tempfile::TempDir::new()?;
 
         let mut config = base_config.clone();
@@ -357,25 +372,29 @@ pub async fn run(
     let judge_llm = LlmClient::new(judge_model.to_string(), llm_url)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    eprintln!(
-        "  Loading dataset from {}...",
-        data_path.display()
-    );
+    eprintln!("  Loading dataset from {}...", data_path.display());
     let conversations = parse_dataset(data_path)?;
 
-    let total_qa: usize = conversations.iter().map(|c| {
-        if skip_adversarial {
-            c.qa_pairs.iter().filter(|q| !q.is_adversarial).count()
-        } else {
-            c.qa_pairs.len()
-        }
-    }).sum();
+    let total_qa: usize = conversations
+        .iter()
+        .map(|c| {
+            if skip_adversarial {
+                c.qa_pairs.iter().filter(|q| !q.is_adversarial).count()
+            } else {
+                c.qa_pairs.len()
+            }
+        })
+        .sum();
     let total_turns: usize = conversations.iter().map(|c| c.turns.len()).sum();
     eprintln!(
         "  {} conversations, {} QA pairs{}, {} turns",
         conversations.len(),
         total_qa,
-        if skip_adversarial { " (adversarial skipped)" } else { "" },
+        if skip_adversarial {
+            " (adversarial skipped)"
+        } else {
+            ""
+        },
         total_turns,
     );
     eprintln!(
@@ -418,7 +437,11 @@ pub async fn run(
         eprint!("    Ingesting turns...");
         let ingest_start = Instant::now();
         let stored = ingest_conversation(&harness, conv, &llm).await?;
-        eprintln!(" done ({} memories, {:.1}s)", stored, ingest_start.elapsed().as_secs_f64());
+        eprintln!(
+            " done ({} memories, {:.1}s)",
+            stored,
+            ingest_start.elapsed().as_secs_f64()
+        );
 
         // Evaluate QA pairs.
         let active_qa: Vec<_> = if skip_adversarial {
@@ -432,7 +455,8 @@ pub async fn run(
 
             // Search.
             let search_start = Instant::now();
-            let memories = search_memories(&harness, &qa.question, top_k, Some(&llm), &mut debug_log).await?;
+            let memories =
+                search_memories(&harness, &qa.question, top_k, Some(&llm), &mut debug_log).await?;
             let retrieval_ms = search_start.elapsed().as_secs_f64() * 1000.0;
             retrieval_times.push(retrieval_ms);
 
@@ -460,7 +484,9 @@ pub async fn run(
                 })
                 .collect();
             let answer_start = Instant::now();
-            let generated = llm.generate_answer(&qa.question, &mem_contexts, &cat_name, &graph_context).await
+            let generated = llm
+                .generate_answer(&qa.question, &mem_contexts, &cat_name, &graph_context)
+                .await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             let answer_ms = answer_start.elapsed().as_secs_f64() * 1000.0;
             answer_times.push(answer_ms);
@@ -468,12 +494,7 @@ pub async fn run(
             // Judge (separate model to avoid self-grading bias).
             let judge_start = Instant::now();
             let result = judge_llm
-                .judge_answer(
-                    &qa.question,
-                    &qa.gold_answer,
-                    &generated,
-                    qa.is_adversarial,
-                )
+                .judge_answer(&qa.question, &qa.gold_answer, &generated, qa.is_adversarial)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             let judge_ms = judge_start.elapsed().as_secs_f64() * 1000.0;
@@ -482,15 +503,16 @@ pub async fn run(
             let verdict = if result.correct { "CORRECT" } else { "WRONG" };
             let _ = writeln!(debug_log, "  Q: {}", qa.question);
             let _ = writeln!(debug_log, "  Gold: {}", qa.gold_answer);
-            let _ = writeln!(debug_log, "  Gen:  {}", generated.chars().take(300).collect::<String>());
+            let _ = writeln!(
+                debug_log,
+                "  Gen:  {}",
+                generated.chars().take(300).collect::<String>()
+            );
             let _ = writeln!(debug_log, "  → {} ({})", verdict, cat_name);
             let _ = writeln!(debug_log);
             let _ = debug_log.flush();
 
-            let stats = report
-                .categories
-                .entry(cat_name.clone())
-                .or_default();
+            let stats = report.categories.entry(cat_name.clone()).or_default();
             stats.total += 1;
             if result.correct {
                 stats.correct += 1;
@@ -578,9 +600,12 @@ async fn store_single_memory(
     if !tag_strings.is_empty() {
         embed_text = format!("{} {}", embed_text, tag_strings.join(" "));
     }
-    let embedding = harness.system.embedding().embed(&embed_text).await.map_err(|e| {
-        format!("embedding failed: {e}")
-    })?;
+    let embedding = harness
+        .system
+        .embedding()
+        .embed(&embed_text)
+        .await
+        .map_err(|e| format!("embedding failed: {e}"))?;
 
     let memory_id = MemoryId::new();
 
@@ -611,13 +636,7 @@ async fn store_single_memory(
             .storage()
             .write()
             .map_err(|e| format!("storage lock poisoned: {e}"))?;
-        storage_w.insert_memory(
-            memory_id,
-            ns_config.id,
-            &mut record,
-            &embedding,
-            full_text,
-        )?;
+        storage_w.insert_memory(memory_id, ns_config.id, &mut record, &embedding, full_text)?;
     }
 
     let cached = CachedRecord::from(&record);
@@ -757,13 +776,18 @@ async fn ingest_conversation(
             stored_memories.clone()
         };
 
-        let memories = match llm.process_turn(&context, &turn_text, &recent_mems, turn.timestamp_ms).await {
+        let memories = match llm
+            .process_turn(&context, &turn_text, &recent_mems, turn.timestamp_ms)
+            .await
+        {
             Ok(mems) => mems,
             Err(_) => Vec::new(),
         };
 
         for mem in &memories {
-            let supersedes_id = mem.supersedes.as_ref()
+            let supersedes_id = mem
+                .supersedes
+                .as_ref()
                 .and_then(|s| uuid::Uuid::parse_str(s).ok())
                 .map(MemoryId::from_uuid);
 
@@ -787,7 +811,8 @@ async fn ingest_conversation(
                 turn.timestamp_ms,
                 &ingested_memories,
                 supersedes_id,
-            ).await?;
+            )
+            .await?;
             ingested_memories.push((mid, turn.timestamp_ms));
             stored_memories.push((mid.to_string(), mem.summary.clone()));
             total_stored += 1;
@@ -863,37 +888,71 @@ async fn search_memories(
 ) -> Result<Vec<ScoredMemory>, Box<dyn std::error::Error>> {
     use crate::bench::claude::SearchQuery as BenchSearchQuery;
 
-    let (queries, search_entities, require_tags, graph_depth, time_range_start, time_range_end) = if let Some(llm) = search_llm {
-        match llm.construct_search_query(question).await {
-            Ok(params) => {
-                let mut tags: Vec<crate::model::Tag> = Vec::new();
-                for entity in &params.entities {
-                    if let Ok(tag) = crate::model::Tag::new(format!("entity/{}", entity.to_lowercase())) {
-                        tags.push(tag);
+    let (queries, search_entities, require_tags, graph_depth, time_range_start, time_range_end) =
+        if let Some(llm) = search_llm {
+            match llm.construct_search_query(question).await {
+                Ok(params) => {
+                    let mut tags: Vec<crate::model::Tag> = Vec::new();
+                    for entity in &params.entities {
+                        if let Ok(tag) =
+                            crate::model::Tag::new(format!("entity/{}", entity.to_lowercase()))
+                        {
+                            tags.push(tag);
+                        }
                     }
-                }
-                for topic in &params.topics {
-                    if let Ok(tag) = crate::model::Tag::new(format!("topic/{}", topic)) {
-                        tags.push(tag);
+                    for topic in &params.topics {
+                        if let Ok(tag) = crate::model::Tag::new(format!("topic/{}", topic)) {
+                            tags.push(tag);
+                        }
                     }
-                }
-                for emotion in &params.emotions {
-                    if let Ok(tag) = crate::model::Tag::new(format!("emotion/{}", emotion)) {
-                        tags.push(tag);
+                    for emotion in &params.emotions {
+                        if let Ok(tag) = crate::model::Tag::new(format!("emotion/{}", emotion)) {
+                            tags.push(tag);
+                        }
                     }
+                    (
+                        params.queries,
+                        params.entities,
+                        tags,
+                        params.depth.min(3) as u8,
+                        params.time_range_start,
+                        params.time_range_end,
+                    )
                 }
-                (params.queries, params.entities, tags, params.depth.min(3) as u8, params.time_range_start, params.time_range_end)
+                Err(e) => {
+                    eprintln!("      Warning: search query construction failed: {e}");
+                    (
+                        vec![BenchSearchQuery {
+                            query: question.to_string(),
+                            fts_query: None,
+                        }],
+                        Vec::new(),
+                        Vec::new(),
+                        1u8,
+                        None,
+                        None,
+                    )
+                }
             }
-            Err(e) => {
-                eprintln!("      Warning: search query construction failed: {e}");
-                (vec![BenchSearchQuery { query: question.to_string(), fts_query: None }], Vec::new(), Vec::new(), 1u8, None, None)
-            }
-        }
-    } else {
-        (vec![BenchSearchQuery { query: question.to_string(), fts_query: None }], Vec::new(), Vec::new(), 1u8, None, None)
-    };
+        } else {
+            (
+                vec![BenchSearchQuery {
+                    query: question.to_string(),
+                    fts_query: None,
+                }],
+                Vec::new(),
+                Vec::new(),
+                1u8,
+                None,
+                None,
+            )
+        };
 
-    let _ = writeln!(debug_log, "  Depth: {graph_depth}, TimeRange: {:?}..{:?}", time_range_start, time_range_end);
+    let _ = writeln!(
+        debug_log,
+        "  Depth: {graph_depth}, TimeRange: {:?}..{:?}",
+        time_range_start, time_range_end
+    );
     if !require_tags.is_empty() {
         let tag_strs: Vec<&str> = require_tags.iter().map(|t| t.as_str()).collect();
         let _ = writeln!(debug_log, "  Filters: {:?}", tag_strs);
@@ -907,7 +966,11 @@ async fn search_memories(
             let _ = writeln!(debug_log, "  FTS[{}]:   {:?}", qi + 1, fq);
         }
 
-        let per_query_limit = if queries.len() > 1 { top_k / 2 + 5 } else { top_k };
+        let per_query_limit = if queries.len() > 1 {
+            top_k / 2 + 5
+        } else {
+            top_k
+        };
         let filter = PipelineSearchFilter {
             require_tags: require_tags.clone(),
             ..PipelineSearchFilter::default()
@@ -931,7 +994,8 @@ async fn search_memories(
         let results = load_full_texts(harness, response.results)?;
 
         for r in results {
-            merged.entry(r.memory_id)
+            merged
+                .entry(r.memory_id)
                 .and_modify(|existing| {
                     if r.score > existing.score {
                         *existing = r.clone();
@@ -942,12 +1006,22 @@ async fn search_memories(
     }
 
     let mut results: Vec<ScoredMemory> = merged.into_values().collect();
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(top_k);
 
     for (i, r) in results.iter().enumerate().take(5) {
         let snippet: String = r.text.chars().take(120).collect();
-        let _ = writeln!(debug_log, "  [{}] score={:.3} | {}", i + 1, r.score, snippet);
+        let _ = writeln!(
+            debug_log,
+            "  [{}] score={:.3} | {}",
+            i + 1,
+            r.score,
+            snippet
+        );
     }
 
     Ok(results)
@@ -955,10 +1029,7 @@ async fn search_memories(
 
 /// Collect graph context: 1-hop neighbor summaries + edge relationships
 /// between all memories (results and neighbors).
-async fn collect_graph_context(
-    harness: &BenchHarness,
-    results: &[ScoredMemory],
-) -> GraphContext {
+async fn collect_graph_context(harness: &BenchHarness, results: &[ScoredMemory]) -> GraphContext {
     let result_ids: HashSet<MemoryId> = results.iter().map(|m| m.memory_id).collect();
 
     // Build label map for results.
@@ -1000,13 +1071,11 @@ async fn collect_graph_context(
         }
 
         // Sort by weight descending and cap at MAX_NEIGHBORS.
-        let mut sorted: Vec<(MemoryId, f32)> =
-            neighbor_weights.into_iter().collect();
+        let mut sorted: Vec<(MemoryId, f32)> = neighbor_weights.into_iter().collect();
         sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         sorted.truncate(MAX_NEIGHBORS);
 
-        let neighbor_ids: Vec<MemoryId> =
-            sorted.iter().map(|(id, _)| *id).collect();
+        let neighbor_ids: Vec<MemoryId> = sorted.iter().map(|(id, _)| *id).collect();
 
         // Assign labels for neighbors.
         for (i, &mid) in neighbor_ids.iter().enumerate() {
@@ -1014,12 +1083,16 @@ async fn collect_graph_context(
         }
 
         // Now collect edges between all known memories (results + neighbors).
-        let all_ids: Vec<MemoryId> = results.iter().map(|m| m.memory_id)
+        let all_ids: Vec<MemoryId> = results
+            .iter()
+            .map(|m| m.memory_id)
             .chain(neighbor_ids.iter().copied())
             .collect();
 
         for &mid in &all_ids {
-            let Some(src_key) = graph_r.resolve(&mid) else { continue };
+            let Some(src_key) = graph_r.resolve(&mid) else {
+                continue;
+            };
             for edge in graph_r.edges_for(&mid) {
                 let other_key = if edge.source == src_key {
                     edge.target
@@ -1053,8 +1126,7 @@ async fn collect_graph_context(
         .map(|(id, _)| *id)
         .collect();
 
-    let neighbor_ids: Vec<MemoryId> =
-        sorted_neighbors.iter().map(|(id, _)| *id).collect();
+    let neighbor_ids: Vec<MemoryId> = sorted_neighbors.iter().map(|(id, _)| *id).collect();
 
     let mut neighbors: Vec<(MemoryId, String, Option<String>, i64)> =
         Vec::with_capacity(neighbor_ids.len());
@@ -1080,8 +1152,7 @@ async fn collect_graph_context(
             for mid in need_storage {
                 if let Ok(Some(disk)) = storage_w.get_record(mid) {
                     if !disk.summary.is_empty() {
-                        let full_text = if top_full_text_ids.contains(&mid)
-                            && disk.text_length > 0
+                        let full_text = if top_full_text_ids.contains(&mid) && disk.text_length > 0
                         {
                             let text_ref = crate::storage::TextRef {
                                 file_offset: disk.text_offset,
@@ -1091,12 +1162,7 @@ async fn collect_graph_context(
                         } else {
                             None
                         };
-                        neighbors.push((
-                            mid,
-                            disk.summary.clone(),
-                            full_text,
-                            disk.created_at,
-                        ));
+                        neighbors.push((mid, disk.summary.clone(), full_text, disk.created_at));
                     }
                 }
             }
@@ -1107,26 +1173,26 @@ async fn collect_graph_context(
     let mut seen_edges: HashSet<(String, String)> = HashSet::new();
     relations.retain(|r| seen_edges.insert((r.from_label.clone(), r.to_label.clone())));
 
-    GraphContext { neighbors, relations }
+    GraphContext {
+        neighbors,
+        relations,
+    }
 }
 
 // ── Retrieval diagnostics ────────────────────────────────────────
 
 fn extract_key_terms(text: &str) -> Vec<String> {
     let stop_words: std::collections::HashSet<&str> = [
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "need", "dare", "ought",
-        "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
-        "as", "into", "through", "during", "before", "after", "above", "below",
-        "between", "out", "off", "over", "under", "again", "further", "then",
-        "once", "here", "there", "when", "where", "why", "how", "all", "both",
-        "each", "few", "more", "most", "other", "some", "such", "no", "nor",
-        "not", "only", "own", "same", "so", "than", "too", "very", "just",
-        "don", "t", "s", "and", "but", "or", "if", "while", "that", "this",
-        "it", "its", "he", "she", "they", "them", "his", "her", "their",
-        "what", "which", "who", "whom", "these", "those", "am", "about",
-        "up", "down", "also", "like", "yes", "no", "because", "any",
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+        "as", "into", "through", "during", "before", "after", "above", "below", "between", "out",
+        "off", "over", "under", "again", "further", "then", "once", "here", "there", "when",
+        "where", "why", "how", "all", "both", "each", "few", "more", "most", "other", "some",
+        "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "just",
+        "don", "t", "s", "and", "but", "or", "if", "while", "that", "this", "it", "its", "he",
+        "she", "they", "them", "his", "her", "their", "what", "which", "who", "whom", "these",
+        "those", "am", "about", "up", "down", "also", "like", "yes", "no", "because", "any",
     ]
     .into_iter()
     .collect();
@@ -1250,22 +1316,28 @@ pub async fn run_diagnose(
     eprintln!("  Writing results to {}", out_path.display());
     let conversations = parse_dataset(data_path)?;
 
-    let total_qa: usize = conversations.iter().map(|c| {
-        if skip_adversarial {
-            c.qa_pairs.iter().filter(|q| !q.is_adversarial).count()
-        } else {
-            c.qa_pairs.len()
-        }
-    }).sum();
+    let total_qa: usize = conversations
+        .iter()
+        .map(|c| {
+            if skip_adversarial {
+                c.qa_pairs.iter().filter(|q| !q.is_adversarial).count()
+            } else {
+                c.qa_pairs.len()
+            }
+        })
+        .sum();
     eprintln!(
         "  {} conversations, {} QA pairs{}, top-k: {}",
-        conversations.len(), total_qa,
-        if skip_adversarial { " (adversarial skipped)" } else { "" },
+        conversations.len(),
+        total_qa,
+        if skip_adversarial {
+            " (adversarial skipped)"
+        } else {
+            ""
+        },
         top_k,
     );
-    eprintln!(
-        "  Mode: retrieval diagnostics (conversation turn ingest)\n",
-    );
+    eprintln!("  Mode: retrieval diagnostics (conversation turn ingest)\n",);
 
     let mut by_category: HashMap<String, DiagStats> = HashMap::new();
     let mut overall = DiagStats::default();
@@ -1273,7 +1345,10 @@ pub async fn run_diagnose(
     for (conv_idx, conv) in conversations.iter().enumerate() {
         eprintln!(
             "  Conversation {}/{} ({}, {} turns)...",
-            conv_idx + 1, conversations.len(), conv.id, conv.turns.len(),
+            conv_idx + 1,
+            conversations.len(),
+            conv.id,
+            conv.turns.len(),
         );
 
         let harness = BenchHarness::new(config).await?;
@@ -1281,7 +1356,11 @@ pub async fn run_diagnose(
         eprint!("    Ingesting...");
         let t0 = Instant::now();
         let stored = ingest_conversation(&harness, conv, llm).await?;
-        eprintln!(" done ({} memories, {:.1}s)", stored, t0.elapsed().as_secs_f64());
+        eprintln!(
+            " done ({} memories, {:.1}s)",
+            stored,
+            t0.elapsed().as_secs_f64()
+        );
 
         let active_qa: Vec<_> = if skip_adversarial {
             conv.qa_pairs.iter().filter(|q| !q.is_adversarial).collect()
@@ -1291,13 +1370,21 @@ pub async fn run_diagnose(
 
         for (qa_idx, qa) in active_qa.iter().enumerate() {
             let cat = category_name(qa.category).to_string();
-            let memories = search_memories(&harness, &qa.question, top_k, Some(llm), &mut std::io::sink()).await?;
-            let combined_texts: Vec<String> = memories.iter().map(|m| {
-                match &m.full_text {
+            let memories = search_memories(
+                &harness,
+                &qa.question,
+                top_k,
+                Some(llm),
+                &mut std::io::sink(),
+            )
+            .await?;
+            let combined_texts: Vec<String> = memories
+                .iter()
+                .map(|m| match &m.full_text {
                     Some(ft) => format!("{} {}", m.text, ft),
                     None => m.text.clone(),
-                }
-            }).collect();
+                })
+                .collect();
             let text_refs: Vec<&str> = combined_texts.iter().map(|s| s.as_str()).collect();
 
             let (hit_rate, found, total_terms) = retrieval_hit_score(&qa.gold_answer, &text_refs);
@@ -1320,12 +1407,20 @@ pub async fn run_diagnose(
                 terms_found: found,
                 terms_total: total_terms,
                 classification: classification.to_string(),
-                top_retrieved: memories.iter().take(20).map(|m| DiagRetrieved {
-                    score: m.score,
-                    text: m.text.clone(),
-                }).collect(),
+                top_retrieved: memories
+                    .iter()
+                    .take(20)
+                    .map(|m| DiagRetrieved {
+                        score: m.score,
+                        text: m.text.clone(),
+                    })
+                    .collect(),
             };
-            let _ = writeln!(out_file, "{}", serde_json::to_string(&record).unwrap_or_default());
+            let _ = writeln!(
+                out_file,
+                "{}",
+                serde_json::to_string(&record).unwrap_or_default()
+            );
             let _ = out_file.flush();
 
             let stats = by_category.entry(cat).or_default();
@@ -1347,8 +1442,12 @@ pub async fn run_diagnose(
                     stats.misses += 1;
                     overall.misses += 1;
                     if stats.examples_miss.len() < 3 {
-                        let top3: Vec<String> = memories.iter().take(3)
-                            .map(|m| format!("  [{:.3}] {}", m.score, &m.text[..m.text.len().min(80)]))
+                        let top3: Vec<String> = memories
+                            .iter()
+                            .take(3)
+                            .map(|m| {
+                                format!("  [{:.3}] {}", m.score, &m.text[..m.text.len().min(80)])
+                            })
                             .collect();
                         stats.examples_miss.push((
                             qa.question.clone(),
@@ -1360,10 +1459,7 @@ pub async fn run_diagnose(
             }
 
             if (qa_idx + 1) % 20 == 0 || qa_idx + 1 == active_qa.len() {
-                eprint!(
-                    "\r    QA {}/{}    ",
-                    qa_idx + 1, active_qa.len(),
-                );
+                eprint!("\r    QA {}/{}    ", qa_idx + 1, active_qa.len(),);
             }
         }
         eprintln!();
@@ -1371,41 +1467,86 @@ pub async fn run_diagnose(
 
     // Build summary report.
     let mut report = String::new();
-    report.push_str(&format!("\n=== Retrieval Diagnostics (top-k: {}) ===\n\n", top_k));
+    report.push_str(&format!(
+        "\n=== Retrieval Diagnostics (top-k: {}) ===\n\n",
+        top_k
+    ));
 
     let category_order = ["single-hop", "multi-hop", "temporal", "open-domain"];
     let mut table = Table::new();
-    table.set_header(vec!["Category", "Count", "Hit (>=80%)", "Partial", "Miss (<30%)", "Avg Term Coverage"]);
+    table.set_header(vec![
+        "Category",
+        "Count",
+        "Hit (>=80%)",
+        "Partial",
+        "Miss (<30%)",
+        "Avg Term Coverage",
+    ]);
 
     for cat_name in &category_order {
         if let Some(stats) = by_category.get(*cat_name) {
-            let avg = if stats.total > 0 { stats.avg_hit_rate / stats.total as f64 * 100.0 } else { 0.0 };
+            let avg = if stats.total > 0 {
+                stats.avg_hit_rate / stats.total as f64 * 100.0
+            } else {
+                0.0
+            };
             table.add_row(vec![
                 Cell::new(cat_name),
                 Cell::new(stats.total),
-                Cell::new(format!("{} ({:.0}%)", stats.retrieval_hits, stats.retrieval_hits as f64 / stats.total as f64 * 100.0)),
-                Cell::new(format!("{} ({:.0}%)", stats.partial_hits, stats.partial_hits as f64 / stats.total as f64 * 100.0)),
-                Cell::new(format!("{} ({:.0}%)", stats.misses, stats.misses as f64 / stats.total as f64 * 100.0)),
+                Cell::new(format!(
+                    "{} ({:.0}%)",
+                    stats.retrieval_hits,
+                    stats.retrieval_hits as f64 / stats.total as f64 * 100.0
+                )),
+                Cell::new(format!(
+                    "{} ({:.0}%)",
+                    stats.partial_hits,
+                    stats.partial_hits as f64 / stats.total as f64 * 100.0
+                )),
+                Cell::new(format!(
+                    "{} ({:.0}%)",
+                    stats.misses,
+                    stats.misses as f64 / stats.total as f64 * 100.0
+                )),
                 Cell::new(format!("{:.1}%", avg)),
             ]);
         }
     }
 
-    let overall_avg = if overall.total > 0 { overall.avg_hit_rate / overall.total as f64 * 100.0 } else { 0.0 };
+    let overall_avg = if overall.total > 0 {
+        overall.avg_hit_rate / overall.total as f64 * 100.0
+    } else {
+        0.0
+    };
     table.add_row(vec![
         Cell::new("OVERALL"),
         Cell::new(overall.total),
-        Cell::new(format!("{} ({:.0}%)", overall.retrieval_hits, overall.retrieval_hits as f64 / overall.total.max(1) as f64 * 100.0)),
-        Cell::new(format!("{} ({:.0}%)", overall.partial_hits, overall.partial_hits as f64 / overall.total.max(1) as f64 * 100.0)),
-        Cell::new(format!("{} ({:.0}%)", overall.misses, overall.misses as f64 / overall.total.max(1) as f64 * 100.0)),
+        Cell::new(format!(
+            "{} ({:.0}%)",
+            overall.retrieval_hits,
+            overall.retrieval_hits as f64 / overall.total.max(1) as f64 * 100.0
+        )),
+        Cell::new(format!(
+            "{} ({:.0}%)",
+            overall.partial_hits,
+            overall.partial_hits as f64 / overall.total.max(1) as f64 * 100.0
+        )),
+        Cell::new(format!(
+            "{} ({:.0}%)",
+            overall.misses,
+            overall.misses as f64 / overall.total.max(1) as f64 * 100.0
+        )),
         Cell::new(format!("{:.1}%", overall_avg)),
     ]);
 
     report.push_str(&format!("{table}\n\n"));
 
     report.push_str("  Note: open-domain hit rates are expected to be low. Gold answers for\n");
-    report.push_str("  open-domain questions are inferred conclusions (e.g., \"Liberal\", \"Likely\n");
-    report.push_str("  no\") that will not appear verbatim in retrieved memories. For open-domain\n");
+    report.push_str(
+        "  open-domain questions are inferred conclusions (e.g., \"Liberal\", \"Likely\n",
+    );
+    report
+        .push_str("  no\") that will not appear verbatim in retrieved memories. For open-domain\n");
     report.push_str("  accuracy, use the full `bench run` pipeline with LLM judging.\n\n");
 
     for cat_name in &category_order {
@@ -1463,7 +1604,13 @@ fn format_report(report: &LocomoReport) -> String {
     ));
 
     // Category breakdown.
-    let category_order = ["single-hop", "multi-hop", "temporal", "open-domain", "adversarial"];
+    let category_order = [
+        "single-hop",
+        "multi-hop",
+        "temporal",
+        "open-domain",
+        "adversarial",
+    ];
     let mut table = Table::new();
     table.set_header(vec!["Category", "Count", "Correct", "Accuracy"]);
 

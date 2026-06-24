@@ -3,19 +3,20 @@
 //! The [`router`] function constructs the complete axum `Router` with
 //! all routes and middleware layers applied.
 
+use std::time::Duration;
+
 use axum::{
+    Router,
     extract::DefaultBodyLimit,
     routing::{delete, get, post},
-    Router,
 };
-use std::time::Duration;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
+use super::ApiConfig;
 use super::handlers;
 use super::middleware::request_id_middleware;
 use super::state::AppState;
-use super::ApiConfig;
 
 /// Constructs the complete axum Router with all routes and middleware.
 ///

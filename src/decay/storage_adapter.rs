@@ -5,9 +5,9 @@
 //! gap between the sweep's needs (e.g. `DecayMetadata`) and the storage
 //! engine's interface (e.g. `get_record` returning a full `DiskRecord`).
 
+use super::sweep::{DecayMetadata, SweepError};
 use crate::model::{DecayPhase, MemoryId};
 use crate::storage::StorageEngine;
-use super::sweep::{DecayMetadata, SweepError};
 
 /// Extract decay-relevant metadata from a `DiskRecord`.
 pub fn get_decay_metadata(
@@ -26,10 +26,7 @@ pub fn get_decay_metadata(
 }
 
 /// Check whether a memory has a non-empty summary.
-pub fn has_summary(
-    storage: &dyn StorageEngine,
-    id: MemoryId,
-) -> Result<bool, SweepError> {
+pub fn has_summary(storage: &dyn StorageEngine, id: MemoryId) -> Result<bool, SweepError> {
     match storage.get_record(id) {
         Ok(Some(record)) => Ok(!record.summary.is_empty()),
         Ok(None) => Err(SweepError::MemoryNotFound(id)),

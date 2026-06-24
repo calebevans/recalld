@@ -88,16 +88,27 @@ pub trait HealthChecker: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchInput {
+    /// Natural language search query.
     pub query: String,
+    /// Namespace to search within.
     pub namespace: String,
+    /// Maximum number of results to return.
     pub limit: usize,
+    /// Tags to filter results by.
     pub tags: Vec<String>,
+    /// Entity names to filter results by.
     pub entities: Vec<String>,
+    /// Topic keywords to filter results by.
     pub topics: Vec<String>,
+    /// Emotional tones to filter results by.
     pub emotions: Vec<String>,
+    /// Minimum memory strength threshold.
     pub min_strength: Option<f32>,
+    /// Number of graph hops for related memories.
     pub depth: u32,
+    /// Lower bound timestamp in milliseconds since epoch.
     pub time_range_start: Option<i64>,
+    /// Upper bound timestamp in milliseconds since epoch.
     pub time_range_end: Option<i64>,
 }
 
@@ -105,8 +116,11 @@ pub struct SearchInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelatedMemory {
+    /// Memory ID of the related memory.
     pub id: String,
+    /// Type of graph edge connecting the memories.
     pub edge_type: String,
+    /// Edge weight indicating relationship strength.
     pub weight: f32,
 }
 
@@ -114,16 +128,24 @@ pub struct RelatedMemory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NeighborMemory {
+    /// Memory ID of the neighbor.
     pub id: String,
+    /// Short summary of the neighbor memory.
     pub summary: String,
+    /// Full text content, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_text: Option<String>,
+    /// Topic keywords associated with this neighbor.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub topics: Vec<String>,
+    /// Emotional tones associated with this neighbor.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emotions: Vec<String>,
+    /// Type of graph edge connecting to the search result.
     pub edge_type: String,
+    /// Edge weight indicating relationship strength.
     pub weight: f32,
+    /// ID of the search result this neighbor is connected to.
     pub connected_to: String,
 }
 
@@ -131,7 +153,9 @@ pub struct NeighborMemory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResponse {
+    /// Direct search result hits.
     pub hits: Vec<SearchHit>,
+    /// Graph neighbors of the search results.
     pub neighbors: Vec<NeighborMemory>,
 }
 
@@ -139,23 +163,37 @@ pub struct SearchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
+    /// Memory ID.
     pub id: String,
+    /// Short summary of the memory.
     pub summary: String,
+    /// Full text content, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_text: Option<String>,
+    /// Combined relevance score.
     pub score: f32,
+    /// Namespace the memory belongs to.
     pub namespace: String,
+    /// Tags associated with this memory.
     pub tags: Vec<String>,
+    /// Named entities mentioned in this memory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<String>,
+    /// Topic keywords for this memory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub topics: Vec<String>,
+    /// Emotional tones for this memory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emotions: Vec<String>,
+    /// Current decay phase (Full, Summary, or Ghost).
     pub phase: String,
+    /// Current memory strength (0.0-1.0).
     pub strength: f32,
+    /// Creation timestamp in milliseconds since epoch.
     pub created_at: i64,
+    /// Last access timestamp in milliseconds since epoch.
     pub last_accessed_at: i64,
+    /// Related memories connected by graph edges.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<RelatedMemory>,
 }
@@ -164,19 +202,30 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreInput {
+    /// Short description of the memory.
     pub summary: String,
+    /// Detailed content, removed when memory decays to ghost phase.
     pub full_text: Option<String>,
+    /// Categorization tags.
     pub tags: Vec<String>,
+    /// Named entities mentioned in the memory.
     #[serde(default)]
     pub entities: Vec<String>,
+    /// Topic keywords.
     #[serde(default)]
     pub topics: Vec<String>,
+    /// Emotional tones.
     #[serde(default)]
     pub emotions: Vec<String>,
+    /// Target namespace.
     pub namespace: String,
+    /// Pre-computed embedding vector, if available.
     pub embedding: Option<Vec<f32>>,
+    /// Initial stability in days for the new memory.
     pub initial_stability: Option<f32>,
+    /// Parent memory ID for hierarchical linking.
     pub parent_id: Option<MemoryId>,
+    /// ID of an older memory this one replaces.
     pub supersedes: Option<MemoryId>,
 }
 
@@ -184,11 +233,17 @@ pub struct StoreInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredMemory {
+    /// Assigned memory ID.
     pub id: String,
+    /// Namespace the memory was stored in.
     pub namespace: String,
+    /// Initial decay phase.
     pub phase: String,
+    /// Initial memory strength.
     pub strength: f32,
+    /// Initial stability in days.
     pub stability: f32,
+    /// Creation timestamp in milliseconds since epoch.
     pub created_at: i64,
 }
 
@@ -196,17 +251,29 @@ pub struct StoredMemory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryRecord {
+    /// Memory ID.
     pub id: String,
+    /// Namespace the memory belongs to.
     pub namespace: String,
+    /// Short summary of the memory.
     pub summary: String,
+    /// Full text content, if available.
     pub full_text: Option<String>,
+    /// Tags associated with this memory.
     pub tags: Vec<String>,
+    /// Current decay phase.
     pub phase: String,
+    /// Current memory strength (0.0-1.0).
     pub strength: f32,
+    /// Current stability in days.
     pub stability: f32,
+    /// Creation timestamp in milliseconds since epoch.
     pub created_at: i64,
+    /// Last access timestamp in milliseconds since epoch.
     pub last_accessed_at: i64,
+    /// Whether this memory is in permastore.
     pub is_permastore: bool,
+    /// Number of graph edges connected to this memory.
     pub edge_count: u16,
 }
 
@@ -214,10 +281,15 @@ pub struct MemoryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReinforceResult {
+    /// Memory ID that was reinforced.
     pub id: String,
+    /// Updated memory strength.
     pub strength: f32,
+    /// Updated stability in days.
     pub stability: f32,
+    /// Current decay phase after reinforcement.
     pub phase: String,
+    /// Whether the memory is in permastore.
     pub is_permastore: bool,
 }
 
@@ -225,9 +297,13 @@ pub struct ReinforceResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateNamespaceInput {
+    /// Namespace name.
     pub name: String,
+    /// Embedding dimensions, fixed after creation.
     pub embedding_dim: Option<u16>,
+    /// Starting stability in days for new memories.
     pub initial_stability: Option<f32>,
+    /// Target retention rate (0.0-1.0).
     pub desired_retention: Option<f32>,
 }
 
@@ -235,10 +311,15 @@ pub struct CreateNamespaceInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NamespaceInfo {
+    /// Namespace numeric ID.
     pub id: u32,
+    /// Namespace name.
     pub name: String,
+    /// Embedding vector dimensions.
     pub embedding_dim: u16,
+    /// Number of memories in this namespace.
     pub memory_count: u64,
+    /// Creation timestamp in milliseconds since epoch.
     pub created_at: i64,
 }
 
@@ -246,12 +327,19 @@ pub struct NamespaceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NamespaceStats {
+    /// Namespace name.
     pub name: String,
+    /// Total number of memories.
     pub memory_count: u64,
+    /// Memory counts broken down by decay phase.
     pub phase_counts: PhaseCounts,
+    /// Number of memories in permastore.
     pub permastore_count: u64,
+    /// Average memory strength across all memories.
     pub avg_strength: f32,
+    /// Total number of graph edges.
     pub edge_count: u64,
+    /// Total bytes used by vector storage.
     pub vector_bytes: u64,
 }
 
@@ -259,8 +347,11 @@ pub struct NamespaceStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhaseCounts {
+    /// Memories in the Full phase.
     pub full: u64,
+    /// Memories in the Summary phase.
     pub summary: u64,
+    /// Memories in the Ghost phase.
     pub ghost: u64,
 }
 
@@ -268,16 +359,22 @@ pub struct PhaseCounts {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthStatus {
+    /// Overall system status (e.g. "ok" or "degraded").
     pub status: String,
+    /// Uptime in seconds since server start.
     pub uptime_secs: u64,
+    /// Health status of individual subsystems.
     pub subsystems: Vec<SubsystemHealth>,
 }
 
 /// Health of a single subsystem.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubsystemHealth {
+    /// Subsystem name.
     pub name: String,
+    /// Subsystem status (e.g. "ok" or "error").
     pub status: String,
+    /// Optional status message with details.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -285,18 +382,23 @@ pub struct SubsystemHealth {
 /// Bridge-level error.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
+    /// The requested entity was not found.
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// The input was invalid or malformed.
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// A storage subsystem error occurred.
     #[error("Storage error: {0}")]
     Storage(String),
 
+    /// A search subsystem error occurred.
     #[error("Search error: {0}")]
     Search(String),
 
+    /// An unexpected internal error occurred.
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -310,9 +412,13 @@ pub enum BridgeError {
 /// Holds `Arc` references to every subsystem. Implements `McpHandler`
 /// by delegating to the tool and resource handler functions.
 pub struct McpBridge {
+    /// Search pipeline for semantic queries and similarity search.
     pub search: Arc<dyn SearchPipeline>,
+    /// Storage engine for CRUD operations on memories.
     pub storage: Arc<dyn StorageEngine>,
+    /// Namespace registry for listing and creating namespaces.
     pub namespaces: Arc<dyn NamespaceRegistry>,
+    /// Health checker for subsystem status.
     pub health: Arc<dyn HealthChecker>,
 }
 

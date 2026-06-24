@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{DecayPhase, Tag};
 use super::error::SearchError;
+use crate::model::{DecayPhase, Tag};
 
 // ---------------------------------------------------------------------------
 // QueryMode

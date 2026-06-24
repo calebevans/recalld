@@ -7,11 +7,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{MemoryId, NamespaceId};
 use super::{
-    SearchFilter, VectorSearchResult, VectorError, VectorIndex, VectorMetadata,
-    dot_product_simd,
+    SearchFilter, VectorError, VectorIndex, VectorMetadata, VectorSearchResult, dot_product_simd,
 };
+use crate::model::{MemoryId, NamespaceId};
 
 // ---------------------------------------------------------------------------
 // TagInterner
@@ -124,18 +123,19 @@ impl FlatVectorIndex {
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
         if &magic != b"CHVI" {
-            return Err(VectorError::CorruptIndex(
-                format!("bad magic: expected CHVI, got {:?}", magic),
-            ));
+            return Err(VectorError::CorruptIndex(format!(
+                "bad magic: expected CHVI, got {:?}",
+                magic
+            )));
         }
 
         let mut buf4 = [0u8; 4];
         file.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         if version != 1 {
-            return Err(VectorError::CorruptIndex(
-                format!("unsupported version: {version}"),
-            ));
+            return Err(VectorError::CorruptIndex(format!(
+                "unsupported version: {version}"
+            )));
         }
 
         file.read_exact(&mut buf4)?;
@@ -149,10 +149,7 @@ impl FlatVectorIndex {
         let total_floats = count * dim;
         let mut vectors = vec![0f32; total_floats];
         let vector_bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(
-                vectors.as_mut_ptr() as *mut u8,
-                total_floats * 4,
-            )
+            std::slice::from_raw_parts_mut(vectors.as_mut_ptr() as *mut u8, total_floats * 4)
         };
         file.read_exact(vector_bytes)?;
 
@@ -198,11 +195,7 @@ impl FlatVectorIndex {
 
     /// Check if a filter entry passes the given search filter.
     #[inline]
-    fn passes_filter(
-        entry: &FilterEntry,
-        filter: &SearchFilter,
-        tags: &TagInterner,
-    ) -> bool {
+    fn passes_filter(entry: &FilterEntry, filter: &SearchFilter, tags: &TagInterner) -> bool {
         // Namespace check.
         if let Some(ns) = filter.namespace_id {
             if entry.namespace_id != ns {
@@ -257,11 +250,7 @@ impl VectorIndex for FlatVectorIndex {
             });
         }
 
-        let tag_indices: Vec<u16> = metadata
-            .tags
-            .iter()
-            .map(|t| self.tags.intern(t))
-            .collect();
+        let tag_indices: Vec<u16> = metadata.tags.iter().map(|t| self.tags.intern(t)).collect();
 
         // If this ID already exists, overwrite in place.
         if let Some(&slot) = self.id_to_slot.get(&id) {
@@ -374,11 +363,7 @@ impl VectorIndex for FlatVectorIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(Ordering::Equal)
-        });
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 
         Ok(results)
     }
@@ -403,10 +388,7 @@ impl VectorIndex for FlatVectorIndex {
 
         // Vectors: dense f32 array.
         let vector_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                self.vectors.as_ptr() as *const u8,
-                self.vectors.len() * 4,
-            )
+            std::slice::from_raw_parts(self.vectors.as_ptr() as *const u8, self.vectors.len() * 4)
         };
         file.write_all(vector_bytes)?;
 
@@ -445,11 +427,7 @@ impl VectorIndex for FlatVectorIndex {
         let Some(&slot) = self.id_to_slot.get(&id) else {
             return Ok(false);
         };
-        let tag_indices: Vec<u16> = metadata
-            .tags
-            .iter()
-            .map(|t| self.tags.intern(t))
-            .collect();
+        let tag_indices: Vec<u16> = metadata.tags.iter().map(|t| self.tags.intern(t)).collect();
         self.entries[slot].namespace_id = metadata.namespace_id;
         self.entries[slot].decay_phase = metadata.decay_phase;
         self.entries[slot].tag_indices = tag_indices;

@@ -222,13 +222,11 @@ fn detect_backend(llm_url: Option<&str>) -> Result<BackendKind, String> {
         return Ok(BackendKind::Anthropic { api_key });
     }
 
-    Err(
-        "No LLM backend configured. Use one of:\n  \
+    Err("No LLM backend configured. Use one of:\n  \
          - --llm-url http://host:port  (OpenAI-compatible server)\n  \
          - CLAUDE_CODE_USE_VERTEX=1 + ANTHROPIC_VERTEX_PROJECT_ID\n  \
          - ANTHROPIC_API_KEY"
-            .to_string(),
-    )
+        .to_string())
 }
 
 fn get_gcloud_token() -> Result<String, String> {
@@ -268,9 +266,7 @@ fn build_relation_map(
             .or_default()
             .push(format!("[{}] ({})", rel.from_label, rel.edge_type));
     }
-    map.into_iter()
-        .map(|(k, v)| (k, v.join(", ")))
-        .collect()
+    map.into_iter().map(|(k, v)| (k, v.join(", "))).collect()
 }
 
 impl LlmClient {
@@ -284,11 +280,18 @@ impl LlmClient {
 
         let backend_label = match &backend {
             BackendKind::OpenAiCompat { base_url } => format!("openai-compat ({base_url})"),
-            BackendKind::Vertex { project_id, region } => format!("vertex ({project_id}, {region})"),
+            BackendKind::Vertex { project_id, region } => {
+                format!("vertex ({project_id}, {region})")
+            }
             BackendKind::Anthropic { .. } => "anthropic".to_string(),
         };
 
-        Ok(Self { client, model, backend, backend_label })
+        Ok(Self {
+            client,
+            model,
+            backend,
+            backend_label,
+        })
     }
 
     pub fn model(&self) -> &str {
@@ -323,7 +326,10 @@ impl LlmClient {
             .map(|(i, mem)| {
                 let label = format!("{}", i + 1);
                 let date = format_timestamp(mem.created_at);
-                let mut line = format!("[{}] (score: {:.2}, {}) {}", label, mem.score, date, mem.text);
+                let mut line = format!(
+                    "[{}] (score: {:.2}, {}) {}",
+                    label, mem.score, date, mem.text
+                );
 
                 let mut meta_parts: Vec<String> = Vec::new();
                 if !mem.entities.is_empty() {
@@ -350,7 +356,8 @@ impl LlmClient {
         let neighbor_context = if graph_context.neighbors.is_empty() {
             String::new()
         } else {
-            let items: Vec<String> = graph_context.neighbors
+            let items: Vec<String> = graph_context
+                .neighbors
                 .iter()
                 .enumerate()
                 .map(|(i, (_mid, summary, full_text, created_at))| {
@@ -390,7 +397,8 @@ impl LlmClient {
             over your general knowledge.";
 
         let instructions = match category {
-            "open-domain" => "\n\nInstructions:\n\
+            "open-domain" => {
+                "\n\nInstructions:\n\
                 - These questions ARE answerable from the evidence -- you MUST provide a \
                 definitive answer.\n\
                 - Reason step by step:\n\
@@ -405,8 +413,10 @@ impl LlmClient {
                 - State your conclusion assertively. Do not hedge or add qualifiers like \
                 \"possibly\" or \"it seems.\"\n\
                 - Never say \"I don't know\" or \"there is not enough information.\"\n\
-                - Keep your final answer concise (one or two sentences after your reasoning).",
-            "temporal" => "\n\nInstructions:\n\
+                - Keep your final answer concise (one or two sentences after your reasoning)."
+            }
+            "temporal" => {
+                "\n\nInstructions:\n\
                 - Base your answer ONLY on the provided memories.\n\
                 - Reason about time step by step:\n\
                   1. Extract all dates and time references from the relevant memories.\n\
@@ -423,8 +433,10 @@ impl LlmClient {
                 - If the memories do not contain enough information to answer the question, \
                 say \"I don't know\".\n\
                 - Keep your final answer concise -- state the date, time period, or ordering \
-                directly.",
-            "multi-hop" => "\n\nInstructions:\n\
+                directly."
+            }
+            "multi-hop" => {
+                "\n\nInstructions:\n\
                 - Base your answer ONLY on the provided memories.\n\
                 - This question requires combining information from multiple memories. \
                 Reason step by step:\n\
@@ -442,8 +454,10 @@ impl LlmClient {
                 connecting information between the directly retrieved memories.\n\
                 - If the memories do not contain enough information to answer the question, \
                 say \"I don't know\".\n\
-                - Keep your final answer concise (one or two sentences after your reasoning).",
-            "adversarial" => "\n\nInstructions:\n\
+                - Keep your final answer concise (one or two sentences after your reasoning)."
+            }
+            "adversarial" => {
+                "\n\nInstructions:\n\
                 - These questions may ask about something that was NOT discussed in the \
                 conversation, or may attribute an event to the WRONG person.\n\
                 - Before answering, carefully verify:\n\
@@ -457,8 +471,10 @@ impl LlmClient {
                 say \"I don't know\" or \"This was not discussed.\"\n\
                 - Only answer if you find a memory that specifically matches the person \
                 AND the event asked about.\n\
-                - Keep your answer concise.",
-            _ => "\n\nInstructions:\n\
+                - Keep your answer concise."
+            }
+            _ => {
+                "\n\nInstructions:\n\
                 - Base your answer ONLY on the provided memories.\n\
                 - These are direct fact-lookup questions. The answer should be stated or \
                 closely paraphrased in one of the memories.\n\
@@ -470,7 +486,8 @@ impl LlmClient {
                 available even when the phrasing differs.\n\
                 - If the memories do not contain enough information to answer the question, \
                 say \"I don't know\".\n\
-                - Keep your final answer concise (one or two sentences).",
+                - Keep your final answer concise (one or two sentences)."
+            }
         };
 
         let system = format!("{base}{instructions}");
@@ -478,7 +495,9 @@ impl LlmClient {
         let reasoning_hint = match category {
             "temporal" => "First extract the relevant dates from the memories, then answer.",
             "multi-hop" => "First identify the pieces of information needed, then combine them.",
-            "adversarial" => "Check: does any memory match BOTH the person and the event in the question?",
+            "adversarial" => {
+                "Check: does any memory match BOTH the person and the event in the question?"
+            }
             "open-domain" => "Identify the relevant evidence, then state your conclusion.",
             _ => "",
         };
@@ -581,14 +600,10 @@ impl LlmClient {
             }),
             Err(_) => {
                 let upper = cleaned.to_uppercase();
-                let correct = upper.contains("\"CORRECT\"")
-                    && !upper.contains("\"WRONG\"");
+                let correct = upper.contains("\"CORRECT\"") && !upper.contains("\"WRONG\"");
                 Ok(JudgeResult {
                     correct,
-                    reason: format!(
-                        "(parse fallback) {}",
-                        &response[..response.len().min(100)]
-                    ),
+                    reason: format!("(parse fallback) {}", &response[..response.len().min(100)]),
                 })
             }
         }
@@ -755,14 +770,22 @@ impl LlmClient {
         match serde_json::from_str::<SearchParamsOutput>(cleaned) {
             Ok(parsed) => {
                 let queries = if let Some(qs) = parsed.queries {
-                    qs.into_iter().map(|q| SearchQuery {
-                        query: q.query,
-                        fts_query: q.fts_query,
-                    }).collect()
+                    qs.into_iter()
+                        .map(|q| SearchQuery {
+                            query: q.query,
+                            fts_query: q.fts_query,
+                        })
+                        .collect()
                 } else if let Some(q) = parsed.query {
-                    vec![SearchQuery { query: q, fts_query: parsed.fts_query }]
+                    vec![SearchQuery {
+                        query: q,
+                        fts_query: parsed.fts_query,
+                    }]
                 } else {
-                    vec![SearchQuery { query: question.to_string(), fts_query: None }]
+                    vec![SearchQuery {
+                        query: question.to_string(),
+                        fts_query: None,
+                    }]
                 };
                 Ok(SearchParams {
                     queries,
@@ -775,7 +798,10 @@ impl LlmClient {
                 })
             }
             Err(_) => Ok(SearchParams {
-                queries: vec![SearchQuery { query: question.to_string(), fts_query: None }],
+                queries: vec![SearchQuery {
+                    query: question.to_string(),
+                    fts_query: None,
+                }],
                 entities: Vec::new(),
                 topics: Vec::new(),
                 emotions: Vec::new(),
@@ -883,17 +909,15 @@ impl LlmClient {
                                     })
                                     .map_err(|e| format!("parse error: {e}"))
                             }
-                            _ => {
-                                serde_json::from_str::<AnthropicResponse>(&text)
-                                    .map(|r| {
-                                        r.content
-                                            .into_iter()
-                                            .filter_map(|b| b.text)
-                                            .collect::<Vec<_>>()
-                                            .join("")
-                                    })
-                                    .map_err(|e| format!("parse error: {e}"))
-                            }
+                            _ => serde_json::from_str::<AnthropicResponse>(&text)
+                                .map(|r| {
+                                    r.content
+                                        .into_iter()
+                                        .filter_map(|b| b.text)
+                                        .collect::<Vec<_>>()
+                                        .join("")
+                                })
+                                .map_err(|e| format!("parse error: {e}")),
                         };
 
                         match extracted {
@@ -906,10 +930,7 @@ impl LlmClient {
                         last_err = format!("HTTP {status}: {}", &text[..text.len().min(200)]);
                         continue;
                     } else {
-                        return Err(format!(
-                            "HTTP {status}: {}",
-                            &text[..text.len().min(500)]
-                        ));
+                        return Err(format!("HTTP {status}: {}", &text[..text.len().min(500)]));
                     }
                 }
                 Err(e) => {
@@ -922,4 +943,3 @@ impl LlmClient {
         Err(format!("failed after 3 attempts: {last_err}"))
     }
 }
-

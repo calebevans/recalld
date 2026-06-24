@@ -20,17 +20,15 @@ pub mod weight;
 
 // ── Re-exports ──────────────────────────────────────────────────────
 
-pub use manager::{
-    CacheConfig, CacheManager, CacheStats, EvictionCause, EvictionEvent,
-};
+pub use manager::{CacheConfig, CacheManager, CacheStats, EvictionCause, EvictionEvent};
 pub use pressure::{
-    create_pressure_monitor, evict_to_target, start_pressure_monitor,
-    NoOpPressureMonitor, PressureLevel, PressureMonitor,
+    NoOpPressureMonitor, PressureLevel, PressureMonitor, create_pressure_monitor, evict_to_target,
+    start_pressure_monitor,
 };
 pub use warming::{
-    compute_priority, enqueue_neighbors_for_prefetch, load_warm_file,
-    prefetch_worker, warm_cache, write_warm_file, PrefetchMetrics,
-    PrefetchRequest, WarmEntry, WarmHeader, WarmLoadResult, WarmSnapshot,
+    PrefetchMetrics, PrefetchRequest, WarmEntry, WarmHeader, WarmLoadResult, WarmSnapshot,
+    compute_priority, enqueue_neighbors_for_prefetch, load_warm_file, prefetch_worker, warm_cache,
+    write_warm_file,
 };
 pub use weight::{calculate_weight, moka_weigher, weigh_cached_record};
 

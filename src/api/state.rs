@@ -7,15 +7,14 @@
 
 use std::sync::Arc;
 
+use crate::embedding::EmbeddingError;
+use crate::graph::GraphError;
 use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
 use crate::model::namespace::NamespaceConfig;
 use crate::model::record::CachedRecord;
-
-use crate::storage::StorageError;
-use crate::embedding::EmbeddingError;
 use crate::search::SearchError;
-use crate::graph::GraphError;
+use crate::storage::StorageError;
 
 // ═══════════════════════════════════════════════════════════════════════
 // API-layer dependency-injection traits
@@ -39,18 +38,10 @@ pub trait SearchPipeline: Send + Sync {
     ) -> Result<Vec<f32>, EmbeddingError>;
 
     /// Execute a search query, returning scored results.
-    async fn search(
-        &self,
-        query: SearchQuery,
-    ) -> Result<Vec<ResolvedSearchResult>, SearchError>;
+    async fn search(&self, query: SearchQuery) -> Result<Vec<ResolvedSearchResult>, SearchError>;
 
     /// Index a memory's embedding in the vector index.
-    async fn index_memory(
-        &self,
-        id: MemoryId,
-        embedding: &[f32],
-        namespace_id: NamespaceId,
-    );
+    async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId);
 
     /// Remove a memory from the vector index.
     async fn remove_from_index(&self, id: MemoryId);
@@ -96,11 +87,7 @@ pub trait StorageEngine: Send + Sync {
 #[async_trait::async_trait]
 pub trait RecordCache: Send + Sync {
     /// Look up a record in the cache, or load from storage on miss.
-    async fn get_or_load(
-        &self,
-        id: MemoryId,
-        storage: &dyn StorageEngine,
-    ) -> Option<CachedRecord>;
+    async fn get_or_load(&self, id: MemoryId, storage: &dyn StorageEngine) -> Option<CachedRecord>;
 
     /// Insert a record into the cache.
     async fn insert(&self, record: &CachedRecord);

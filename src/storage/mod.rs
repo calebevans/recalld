@@ -25,12 +25,10 @@ pub mod vectors;
 
 // ── Re-exports ──────────────────────────────────────────────────────
 
-pub use edges::{cleanup_orphaned_edges, EdgeStore, PersistedEdge};
+pub use edges::{EdgeStore, PersistedEdge, cleanup_orphaned_edges};
 pub use engine::{RedbStorageEngine, StorageEngine};
 pub use error::StorageError;
 pub use indexes::PhaseIndex;
 pub use metadata::MetadataStore;
-pub use text::{
-    recover_text_compaction, CompactionResult, TextRef, TextStore,
-};
+pub use text::{CompactionResult, TextRef, TextStore, recover_text_compaction};
 pub use vectors::{VectorManager, VectorStore};

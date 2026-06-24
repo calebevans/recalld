@@ -5,11 +5,12 @@
 //! output (logging, debug) goes to stderr, never stdout.
 
 use std::sync::Arc;
+
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::mcp::McpError;
 use crate::mcp::protocol::*;
 use crate::mcp::server::McpServer;
-use crate::mcp::McpError;
 
 /// Run the MCP server over stdin/stdout.
 ///

@@ -90,9 +90,7 @@ impl CliConfig {
 }
 
 /// Custom deserializer for [`OutputFormat`] from a TOML string.
-fn deserialize_output_format<'de, D>(
-    deserializer: D,
-) -> std::result::Result<OutputFormat, D::Error>
+fn deserialize_output_format<'de, D>(deserializer: D) -> std::result::Result<OutputFormat, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

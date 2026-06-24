@@ -10,7 +10,7 @@ use crate::model::{EdgeType, MemoryId};
 use crate::rif::activation::calculate_activation;
 use crate::rif::config::RifConfig;
 use crate::rif::metrics::RifMetrics;
-use crate::rif::plasticity::{classify_regime, plasticity_multiplier, ActivationRegime};
+use crate::rif::plasticity::{ActivationRegime, classify_regime, plasticity_multiplier};
 
 /// A pending stability update produced by the RIF engine.
 ///
@@ -156,8 +156,7 @@ impl RifEngine {
 
             let regime = classify_regime(activation, &self.config);
 
-            let new_stability =
-                (neighbor.stability * multiplier).max(self.config.stability_floor);
+            let new_stability = (neighbor.stability * multiplier).max(self.config.stability_floor);
 
             updates.push(StabilityUpdate {
                 memory_id: neighbor.memory_id,
@@ -214,11 +213,7 @@ impl QueryRifContext {
     /// - `effective_multiplier`: the multiplier to actually apply
     ///   (may be closer to 1.0 than `raw_multiplier` if the cap was hit).
     /// - `was_clamped`: `true` if the multiplier was adjusted.
-    pub fn clamp_multiplier(
-        &mut self,
-        memory_id: MemoryId,
-        raw_multiplier: f32,
-    ) -> (f32, bool) {
+    pub fn clamp_multiplier(&mut self, memory_id: MemoryId, raw_multiplier: f32) -> (f32, bool) {
         let cumulative = self.affected.get(&memory_id).copied().unwrap_or(1.0);
         let proposed = cumulative * raw_multiplier;
         let clamped_cumulative = proposed.max(self.max_reduction_per_query);

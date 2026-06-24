@@ -16,8 +16,7 @@ use crate::model::error::TagError;
 ///
 /// Allowed characters: `[a-z0-9/_.::-]` (alphanumeric, hyphens,
 /// underscores, forward slashes, periods, colons).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Tag(String);
 

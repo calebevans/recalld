@@ -4,8 +4,8 @@
 //! decoupled from the wire format, plus the [`OutputFormatter`] trait
 //! with [`JsonFormatter`] and [`HumanFormatter`] implementations.
 
-use comfy_table::{presets, Attribute, Cell, ContentArrangement, Table};
 use colored::Colorize;
+use comfy_table::{Attribute, Cell, ContentArrangement, Table, presets};
 
 use crate::cli::CliError;
 
@@ -510,11 +510,7 @@ impl OutputFormatter for HumanFormatter {
 
     fn reinforce(&self, result: &ReinforceResult) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "{} {}\n",
-            "Reinforced:".green().bold(),
-            result.id
-        ));
+        out.push_str(&format!("{} {}\n", "Reinforced:".green().bold(), result.id));
         out.push_str(&format!(
             "  Stability: {:.1} -> {:.1} days\n",
             result.old_stability, result.new_stability

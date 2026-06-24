@@ -5,12 +5,13 @@
 //! the same pattern: extract, validate, delegate to subsystem, convert
 //! result, respond.
 
+use std::time::Instant;
+
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
-use std::time::Instant;
 use uuid::Uuid;
 
 use super::errors::AppError;
@@ -19,8 +20,8 @@ use super::state::{AppState, QueryInput, SearchQuery};
 use crate::model::id::MemoryId;
 use crate::model::memory::AccessKind;
 use crate::serialization::{
-    ApiResponse, MemoryResponse, NamespaceRequest, NamespaceResponse,
-    SearchHit, SearchRequest, SearchResponse,
+    ApiResponse, MemoryResponse, NamespaceRequest, NamespaceResponse, SearchHit, SearchRequest,
+    SearchResponse,
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -97,12 +98,7 @@ pub async fn create_memory(
             }
             vec.clone()
         }
-        None => {
-            state
-                .search
-                .embed_text(&req.summary, ns.id)
-                .await?
-        }
+        None => state.search.embed_text(&req.summary, ns.id).await?,
     };
 
     // --- Persist ---
@@ -120,10 +116,7 @@ pub async fn create_memory(
 
     // --- Parent edge ---
     if let Some(parent_id) = req.parent_id {
-        state
-            .graph
-            .add_edge(parent_id, memory.id, "parent")
-            .await?;
+        state.graph.add_edge(parent_id, memory.id, "parent").await?;
     }
 
     // --- Cache + vector index ---
@@ -310,8 +303,7 @@ pub async fn search_memories(
     // Validate: need at least one search signal
     if req.query.is_none() && req.embedding.is_none() && req.tags.is_empty() {
         return Err(AppError::BadRequest {
-            message: "at least one of 'query', 'embedding', or 'tags' must be provided"
-                .into(),
+            message: "at least one of 'query', 'embedding', or 'tags' must be provided".into(),
             field: None,
         });
     }
@@ -435,11 +427,12 @@ pub async fn find_similar(
         })?;
 
     let source_embedding =
-        state.search.get_embedding(memory_id).ok_or_else(|| {
-            AppError::Internal {
+        state
+            .search
+            .get_embedding(memory_id)
+            .ok_or_else(|| AppError::Internal {
                 source: "source memory has no indexed embedding".into(),
-            }
-        })?;
+            })?;
 
     let limit = req.limit.min(100) as usize;
 
@@ -547,7 +540,9 @@ pub async fn create_namespace(
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     {
         return Err(AppError::BadRequest {
-            message: "namespace name may only contain alphanumeric characters, hyphens, and underscores".into(),
+            message:
+                "namespace name may only contain alphanumeric characters, hyphens, and underscores"
+                    .into(),
             field: Some("name".into()),
         });
     }
@@ -653,15 +648,10 @@ pub async fn namespace_stats(
 /// Returns 200 with status `"degraded"` if non-critical subsystems are
 /// down (e.g. embedding provider). Returns 503 if critical subsystems
 /// are down (storage, cache).
-pub async fn health_check(
-    State(state): State<AppState>,
-) -> Result<Json<HealthResponse>, AppError> {
+pub async fn health_check(State(state): State<AppState>) -> Result<Json<HealthResponse>, AppError> {
     let uptime = state.started_at.elapsed().as_secs();
 
-    let storage_health = probe_component("storage", || async {
-        state.storage.ping().await
-    })
-    .await;
+    let storage_health = probe_component("storage", || async { state.storage.ping().await }).await;
 
     let cache_health = ComponentHealth {
         status: "up".to_string(),
@@ -675,10 +665,7 @@ pub async fn health_check(
 
     let vector_health = ComponentHealth {
         status: "up".to_string(),
-        message: Some(format!(
-            "indexed: {}",
-            state.search.indexed_count()
-        )),
+        message: Some(format!("indexed: {}", state.search.indexed_count())),
         latency_us: None,
     };
 
@@ -694,9 +681,10 @@ pub async fn health_check(
             "down"
         }
         .to_string(),
-        message: state.decay.last_sweep_time().map(|t| {
-            format!("last sweep: {}s ago", t.elapsed().as_secs())
-        }),
+        message: state
+            .decay
+            .last_sweep_time()
+            .map(|t| format!("last sweep: {}s ago", t.elapsed().as_secs())),
         latency_us: None,
     };
 
@@ -709,13 +697,9 @@ pub async fn health_check(
     };
 
     // Determine overall status
-    let status = if subsystems.storage.status == "down"
-        || subsystems.cache.status == "down"
-    {
+    let status = if subsystems.storage.status == "down" || subsystems.cache.status == "down" {
         HealthStatus::Unhealthy
-    } else if subsystems.embedding.status == "down"
-        || subsystems.decay.status == "down"
-    {
+    } else if subsystems.embedding.status == "down" || subsystems.decay.status == "down" {
         HealthStatus::Degraded
     } else {
         HealthStatus::Healthy
@@ -769,9 +753,7 @@ pub async fn metrics(
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static(
-                "text/plain; charset=utf-8",
-            ),
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
         )],
         output,
     ))

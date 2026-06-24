@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 
 use crate::cli::output::{
     ForgetResult, InspectView, MemoryView, NamespaceStatsView, NamespaceView, ReinforceResult,
-    SearchResult, StoreResult, StatusView, SweepResult,
+    SearchResult, StatusView, StoreResult, SweepResult,
 };
 
 /// HTTP client for the Recalld API server.
@@ -56,12 +56,7 @@ impl RecalldClient {
         path: &str,
         query: &[(&str, &str)],
     ) -> crate::cli::Result<T> {
-        let resp = self
-            .client
-            .get(self.url(path))
-            .query(query)
-            .send()
-            .await?;
+        let resp = self.client.get(self.url(path)).query(query).send().await?;
         self.handle_response(resp).await
     }
 
@@ -71,12 +66,7 @@ impl RecalldClient {
         path: &str,
         body: &B,
     ) -> crate::cli::Result<T> {
-        let resp = self
-            .client
-            .post(self.url(path))
-            .json(body)
-            .send()
-            .await?;
+        let resp = self.client.post(self.url(path)).json(body).send().await?;
         self.handle_response(resp).await
     }
 
@@ -196,11 +186,9 @@ impl RecalldClient {
     }
 
     /// POST /v1/memories/:id/reinforce — manually reinforce a memory.
-    pub async fn reinforce_memory(
-        &self,
-        id: &uuid::Uuid,
-    ) -> crate::cli::Result<ReinforceResult> {
-        self.post(&format!("/v1/memories/{id}/reinforce"), &()).await
+    pub async fn reinforce_memory(&self, id: &uuid::Uuid) -> crate::cli::Result<ReinforceResult> {
+        self.post(&format!("/v1/memories/{id}/reinforce"), &())
+            .await
     }
 
     /// GET /v1/memories/:id/inspect — full debug view.
@@ -245,8 +233,7 @@ impl RecalldClient {
     ) -> crate::cli::Result<Vec<NamespaceStatsView>> {
         match name {
             Some(n) => {
-                let s: NamespaceStatsView =
-                    self.get(&format!("/v1/namespaces/{n}/stats")).await?;
+                let s: NamespaceStatsView = self.get(&format!("/v1/namespaces/{n}/stats")).await?;
                 Ok(vec![s])
             }
             None => self.get("/v1/namespaces/stats").await,
@@ -266,8 +253,7 @@ impl RecalldClient {
             #[serde(skip_serializing_if = "Option::is_none")]
             namespace: Option<&'a str>,
         }
-        self.post("/v1/sweep", &Body { dry_run, namespace })
-            .await
+        self.post("/v1/sweep", &Body { dry_run, namespace }).await
     }
 
     /// GET /v1/status — system health.
@@ -296,8 +282,7 @@ impl RecalldClient {
         if include_embeddings {
             params.push(("includeEmbeddings", "true".to_string()));
         }
-        let query_pairs: Vec<(&str, &str)> =
-            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let query_pairs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         self.get_with_query("/v1/memories/export", &query_pairs)
             .await
     }

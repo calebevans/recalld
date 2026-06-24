@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use crate::cache::CacheManager;
-use crate::graph::structure::RelationshipGraph;
 use crate::graph::SharedGraph;
+use crate::graph::structure::RelationshipGraph;
 use crate::model::{DecayPhase, EdgeType, MemoryId, NamespaceId};
 use crate::search::{EntityIndex, FlatVectorIndex, SearchFilter, VectorIndex};
 use crate::storage::engine::RedbStorageEngine;
@@ -70,7 +70,7 @@ impl AutoLinkThresholds {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// A candidate for auto-linking, returned by the discovery step.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct AutoLinkCandidate {
     /// The candidate memory's ID.
     pub memory_id: MemoryId,
@@ -189,9 +189,7 @@ fn has_typed_edge_between(
 
     for &ek in a_node.outgoing.iter().chain(a_node.incoming.iter()) {
         if let Some(edge) = graph.edges.get(ek) {
-            if (edge.source == b_key || edge.target == b_key)
-                && edge.edge_type == edge_type
-            {
+            if (edge.source == b_key || edge.target == b_key) && edge.edge_type == edge_type {
                 return true;
             }
         }
@@ -206,12 +204,16 @@ fn has_typed_edge_between(
 /// Errors that can occur during the auto-link orchestration.
 #[derive(Debug, thiserror::Error)]
 pub enum AutoLinkError {
+    /// Vector similarity search failed.
     #[error("vector search failed: {0}")]
     VectorSearch(String),
+    /// Graph mutation error (e.g., missing node or duplicate edge).
     #[error("graph error: {0}")]
     Graph(#[from] crate::graph::GraphError),
+    /// Storage persistence error.
     #[error("storage error: {0}")]
     Storage(String),
+    /// A shared lock was poisoned by a panicking thread.
     #[error("lock poisoned: {0}")]
     LockPoisoned(String),
 }
@@ -257,19 +259,13 @@ pub async fn perform_autolink(
         let index = vector_index.read().await;
         let filter = SearchFilter {
             namespace_id: Some(namespace_id),
-            decay_phases: Some(vec![
-                DecayPhase::Full.as_u8(),
-                DecayPhase::Summary.as_u8(),
-            ]),
+            decay_phases: Some(vec![DecayPhase::Full.as_u8(), DecayPhase::Summary.as_u8()]),
             ..SearchFilter::default()
         };
         let results = index
             .search(embedding, search_limit, &filter)
             .map_err(|e| AutoLinkError::VectorSearch(e.to_string()))?;
-        results
-            .into_iter()
-            .map(|r| (r.id, r.score))
-            .collect()
+        results.into_iter().map(|r| (r.id, r.score)).collect()
     };
 
     if candidates.is_empty() {
@@ -284,17 +280,17 @@ pub async fn perform_autolink(
         if let Some(cached) = cache.get(*cid).await {
             candidate_tags_map.insert(
                 *cid,
-                cached.tags.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                cached
+                    .tags
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>(),
             );
         }
     }
 
-    let tag_lookup = |id: &MemoryId| -> Vec<String> {
-        candidate_tags_map
-            .get(id)
-            .cloned()
-            .unwrap_or_default()
-    };
+    let tag_lookup =
+        |id: &MemoryId| -> Vec<String> { candidate_tags_map.get(id).cloned().unwrap_or_default() };
 
     // Step 3: Read-lock graph for auto_link() discovery, then DROP the lock.
     let edges_to_create = {
@@ -338,9 +334,9 @@ pub async fn perform_autolink(
 
     // Step 5: Persist edges to edges.db.
     {
-        let storage_r = storage.read().map_err(|e| {
-            AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = storage
+            .read()
+            .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
         storage_r
             .batch_add_edges(&persisted_edges)
             .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
@@ -351,13 +347,7 @@ pub async fn perform_autolink(
         let mut graph_w = graph.write().await;
         let mut created = 0usize;
         for pe in &persisted_edges {
-            match graph_w.add_edge(
-                pe.source,
-                pe.target,
-                pe.edge_type,
-                pe.weight,
-                true,
-            ) {
+            match graph_w.add_edge(pe.source, pe.target, pe.edge_type, pe.weight, true) {
                 Ok(_) => created += 1,
                 Err(crate::graph::GraphError::EdgeExists(_, _)) => {
                     // Edge already exists (race condition or duplicate) -- skip silently.
@@ -380,9 +370,9 @@ pub async fn perform_autolink(
             .unwrap_or(0);
         let new_count = current_count + edges_created as u16;
         {
-            let storage_r = storage.read().map_err(|e| {
-                AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}"))
-            })?;
+            let storage_r = storage
+                .read()
+                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
             // Best-effort: don't fail the whole autolink if edge_count update fails.
             let _ = storage_r.update_edge_count(new_memory_id, new_count);
         }
@@ -442,16 +432,16 @@ pub async fn perform_entity_link(
         let graph_r = graph.read().await;
         candidates
             .iter()
-            .filter(|(cid, _)| !has_typed_edge_between(&graph_r, &new_memory_id, cid, EdgeType::Entity))
+            .filter(|(cid, _)| {
+                !has_typed_edge_between(&graph_r, &new_memory_id, cid, EdgeType::Entity)
+            })
             .take(max_entity_links)
             .map(|(cid, shared)| {
                 // Jaccard similarity: shared / union for order-independent weight.
                 // Look up candidate's entity count from cache; fall back to
                 // shared count (which gives weight=1.0, a safe overestimate).
-                let candidate_entity_count = candidate_entity_counts
-                    .get(cid)
-                    .copied()
-                    .unwrap_or(*shared);
+                let candidate_entity_count =
+                    candidate_entity_counts.get(cid).copied().unwrap_or(*shared);
                 let union = new_entity_count + candidate_entity_count - *shared;
                 let weight = if union > 0 {
                     (*shared as f32 / union as f32).min(1.0)
@@ -485,9 +475,9 @@ pub async fn perform_entity_link(
         .collect();
 
     {
-        let storage_r = storage.read().map_err(|e| {
-            AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = storage
+            .read()
+            .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
         storage_r
             .batch_add_edges(&persisted_edges)
             .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
@@ -516,9 +506,9 @@ pub async fn perform_entity_link(
             .unwrap_or(0);
         let new_count = current_count + edges_created as u16;
         {
-            let storage_r = storage.read().map_err(|e| {
-                AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}"))
-            })?;
+            let storage_r = storage
+                .read()
+                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
             let _ = storage_r.update_edge_count(new_memory_id, new_count);
         }
         cache.update_edge_count(new_memory_id, new_count).await;
@@ -577,7 +567,9 @@ pub async fn perform_temporal_link(
         let graph_r = graph.read().await;
         candidates
             .iter()
-            .filter(|(cid, _)| !has_typed_edge_between(&graph_r, &new_memory_id, cid, EdgeType::Temporal))
+            .filter(|(cid, _)| {
+                !has_typed_edge_between(&graph_r, &new_memory_id, cid, EdgeType::Temporal)
+            })
             .take(max_temporal_links)
             .cloned()
             .collect()
@@ -605,9 +597,9 @@ pub async fn perform_temporal_link(
         .collect();
 
     {
-        let storage_r = storage.read().map_err(|e| {
-            AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = storage
+            .read()
+            .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
         storage_r
             .batch_add_edges(&persisted_edges)
             .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
@@ -636,9 +628,9 @@ pub async fn perform_temporal_link(
             .unwrap_or(0);
         let new_count = current_count + edges_created as u16;
         {
-            let storage_r = storage.read().map_err(|e| {
-                AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}"))
-            })?;
+            let storage_r = storage
+                .read()
+                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
             let _ = storage_r.update_edge_count(new_memory_id, new_count);
         }
         cache.update_edge_count(new_memory_id, new_count).await;

@@ -5,7 +5,10 @@
 //! dispatches to the appropriate command handler.
 
 use clap::Parser;
-use recalld::cli::{self, Cli, CliConfig, HumanFormatter, JsonFormatter, OutputFormat, OutputFormatter};
+
+use recalld::cli::{
+    self, Cli, CliConfig, HumanFormatter, JsonFormatter, OutputFormat, OutputFormatter,
+};
 
 #[tokio::main]
 async fn main() {

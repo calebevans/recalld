@@ -11,15 +11,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::model::{
-    AccessKind, DecayPhase, DiskRecord, EdgeType, MemoryId, NamespaceConfig,
-    NamespaceId,
+    AccessKind, DecayPhase, DiskRecord, EdgeType, MemoryId, NamespaceConfig, NamespaceId,
 };
-use crate::storage::edges::{cleanup_orphaned_edges, EdgeStore, PersistedEdge};
+use crate::storage::edges::{EdgeStore, PersistedEdge, cleanup_orphaned_edges};
 use crate::storage::error::StorageError;
 use crate::storage::metadata::MetadataStore;
-use crate::storage::text::{
-    recover_text_compaction, CompactionResult, TextRef, TextStore,
-};
+use crate::storage::text::{CompactionResult, TextRef, TextStore, recover_text_compaction};
 use crate::storage::vectors::VectorManager;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -158,25 +155,16 @@ pub trait StorageEngine: Send + Sync {
     // ── Namespaces ──────────────────────────────────────────────────
 
     /// Create a new namespace. Returns the assigned NamespaceId.
-    fn create_namespace(
-        &mut self,
-        config: &NamespaceConfig,
-    ) -> Result<NamespaceId, StorageError>;
+    fn create_namespace(&mut self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError>;
 
     /// List all namespace configurations.
     fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError>;
 
     /// Get a namespace configuration by ID.
-    fn get_namespace(
-        &self,
-        id: NamespaceId,
-    ) -> Result<Option<NamespaceConfig>, StorageError>;
+    fn get_namespace(&self, id: NamespaceId) -> Result<Option<NamespaceConfig>, StorageError>;
 
     /// Get a namespace by name.
-    fn get_namespace_by_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<NamespaceConfig>, StorageError>;
+    fn get_namespace_by_name(&self, name: &str) -> Result<Option<NamespaceConfig>, StorageError>;
 
     // ── Text Compaction ─────────────────────────────────────────────
 
@@ -291,11 +279,7 @@ impl RedbStorageEngine {
         let mut vector_manager = VectorManager::new(db_path.clone());
         let namespaces = meta_store.list_namespaces()?;
         for ns in &namespaces {
-            vector_manager.open_or_create(
-                ns.id,
-                &ns.name,
-                ns.embedding_dim as usize,
-            )?;
+            vector_manager.open_or_create(ns.id, &ns.name, ns.embedding_dim as usize)?;
         }
 
         let mut engine = Self {
@@ -328,10 +312,8 @@ impl RedbStorageEngine {
 
         // 3. Clean up orphaned edges.
         let all_records = self.meta_store.scan_all()?;
-        let known_ids: HashSet<MemoryId> =
-            all_records.iter().map(|(id, _)| *id).collect();
-        let orphans_removed =
-            cleanup_orphaned_edges(&self.edge_store, &known_ids)?;
+        let known_ids: HashSet<MemoryId> = all_records.iter().map(|(id, _)| *id).collect();
+        let orphans_removed = cleanup_orphaned_edges(&self.edge_store, &known_ids)?;
         if orphans_removed > 0 {
             tracing::warn!(
                 removed = orphans_removed,
@@ -407,10 +389,7 @@ impl StorageEngine for RedbStorageEngine {
         Ok(())
     }
 
-    fn get_record(
-        &self,
-        id: MemoryId,
-    ) -> Result<Option<DiskRecord>, StorageError> {
+    fn get_record(&self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
         self.meta_store.get(id)
     }
 
@@ -426,20 +405,14 @@ impl StorageEngine for RedbStorageEngine {
         Ok(vector_store.get_vector(slot).map(|v| v.to_vec()))
     }
 
-    fn get_text(
-        &mut self,
-        text_ref: TextRef,
-    ) -> Result<Option<String>, StorageError> {
+    fn get_text(&mut self, text_ref: TextRef) -> Result<Option<String>, StorageError> {
         if !text_ref.is_some() {
             return Ok(None);
         }
         self.text_store.read(text_ref).map(Some)
     }
 
-    fn delete_memory(
-        &mut self,
-        id: MemoryId,
-    ) -> Result<Option<DiskRecord>, StorageError> {
+    fn delete_memory(&mut self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
         // 1. Delete from meta.db (also removes secondary indexes).
         let record = match self.meta_store.delete(id)? {
             Some(r) => r,
@@ -448,9 +421,7 @@ impl StorageEngine for RedbStorageEngine {
 
         // 2. Free the vector slot.
         let namespace_id = NamespaceId::new(record.namespace_id);
-        if let Some(vector_store) =
-            self.vector_manager.get_mut(namespace_id)
-        {
+        if let Some(vector_store) = self.vector_manager.get_mut(namespace_id) {
             // Ignore errors from freeing slots -- the slot may
             // reference a namespace whose vector file was already
             // removed (e.g., during namespace deletion).
@@ -479,10 +450,7 @@ impl StorageEngine for RedbStorageEngine {
             .update_decay_state(id, phase, strength, stability, is_permastore)
     }
 
-    fn ids_in_phase(
-        &self,
-        phase: DecayPhase,
-    ) -> Result<Vec<MemoryId>, StorageError> {
+    fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError> {
         self.meta_store.ids_in_phase(phase)
     }
 
@@ -526,10 +494,7 @@ impl StorageEngine for RedbStorageEngine {
             .add_edge(source, target, edge_type, weight, auto_created, created_at)
     }
 
-    fn batch_add_edges(
-        &self,
-        edges: &[PersistedEdge],
-    ) -> Result<(), StorageError> {
+    fn batch_add_edges(&self, edges: &[PersistedEdge]) -> Result<(), StorageError> {
         self.edge_store.batch_add_edges(edges)
     }
 
@@ -547,10 +512,7 @@ impl StorageEngine for RedbStorageEngine {
         self.edge_store.get_incoming(target)
     }
 
-    fn remove_all_edges(
-        &self,
-        memory_id: MemoryId,
-    ) -> Result<usize, StorageError> {
+    fn remove_all_edges(&self, memory_id: MemoryId) -> Result<usize, StorageError> {
         self.edge_store.remove_all_edges(memory_id)
     }
 
@@ -560,18 +522,12 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Namespaces ──────────────────────────────────────────────────
 
-    fn create_namespace(
-        &mut self,
-        config: &NamespaceConfig,
-    ) -> Result<NamespaceId, StorageError> {
+    fn create_namespace(&mut self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
         let ns_id = self.meta_store.create_namespace(config)?;
 
         // Open/create the vector file for this namespace.
-        self.vector_manager.open_or_create(
-            ns_id,
-            &config.name,
-            config.embedding_dim as usize,
-        )?;
+        self.vector_manager
+            .open_or_create(ns_id, &config.name, config.embedding_dim as usize)?;
 
         Ok(ns_id)
     }
@@ -580,17 +536,11 @@ impl StorageEngine for RedbStorageEngine {
         self.meta_store.list_namespaces()
     }
 
-    fn get_namespace(
-        &self,
-        id: NamespaceId,
-    ) -> Result<Option<NamespaceConfig>, StorageError> {
+    fn get_namespace(&self, id: NamespaceId) -> Result<Option<NamespaceConfig>, StorageError> {
         self.meta_store.get_namespace(id)
     }
 
-    fn get_namespace_by_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<NamespaceConfig>, StorageError> {
+    fn get_namespace_by_name(&self, name: &str) -> Result<Option<NamespaceConfig>, StorageError> {
         self.meta_store.get_namespace_by_name(name)
     }
 
@@ -643,10 +593,7 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Tags ────────────────────────────────────────────────────────
 
-    fn memories_with_tag(
-        &self,
-        tag: &str,
-    ) -> Result<Vec<MemoryId>, StorageError> {
+    fn memories_with_tag(&self, tag: &str) -> Result<Vec<MemoryId>, StorageError> {
         self.meta_store.memories_with_tag(tag)
     }
 
@@ -662,9 +609,7 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Bulk / Diagnostic ───────────────────────────────────────────
 
-    fn scan_all(
-        &self,
-    ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+    fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
         self.meta_store.scan_all()
     }
 

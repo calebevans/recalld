@@ -8,8 +8,8 @@ use std::sync::Arc;
 use moka::future::Cache;
 use moka::notification::RemovalCause;
 
-use crate::cache::weight;
 use crate::cache::CacheError;
+use crate::cache::weight;
 use crate::model::{CachedRecord, DecayPhase, MemoryId};
 
 /// Type alias for the moka record cache.
@@ -192,7 +192,11 @@ impl CacheManager {
                 std::ptr::null_mut(),
                 0,
             );
-            if size == 0 { 16 * 1024 * 1024 * 1024 } else { size }
+            if size == 0 {
+                16 * 1024 * 1024 * 1024
+            } else {
+                size
+            }
         }
     }
 
@@ -327,9 +331,7 @@ impl CacheManager {
     ) -> super::Result<Option<Arc<CachedRecord>>>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<
-            Output = std::result::Result<Option<CachedRecord>, anyhow::Error>,
-        >,
+        Fut: std::future::Future<Output = std::result::Result<Option<CachedRecord>, anyhow::Error>>,
     {
         // Fast path: direct cache lookup.
         if let Some(record) = self.cache.get(&id).await {
@@ -354,12 +356,7 @@ impl CacheManager {
     /// Update a cached record's stability and strength after RIF processing.
     ///
     /// If the record is not cached, this is a no-op.
-    pub async fn update_rif_state(
-        &self,
-        id: MemoryId,
-        new_stability: f32,
-        new_strength: f32,
-    ) {
+    pub async fn update_rif_state(&self, id: MemoryId, new_stability: f32, new_strength: f32) {
         if let Some(existing) = self.cache.get(&id).await {
             let mut updated = (*existing).clone();
             updated.stability = new_stability;

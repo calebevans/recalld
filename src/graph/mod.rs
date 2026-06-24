@@ -9,9 +9,9 @@
 //! use recalld::graph::{RelationshipGraph, SharedGraph, GraphNode, GraphEdge};
 //! ```
 
-mod structure;
 pub mod activation;
 pub mod autolink;
+mod structure;
 
 // Re-export primary types from CS-10 (structure.rs)
 pub use structure::{
@@ -21,20 +21,21 @@ pub use structure::{
 
 // Re-export CS-11 activation types and functions
 pub use activation::{
-    connection_bonus, effective_retrievability, graph_stats, rebuild_from_storage,
-    recompute_centrality, rif_edge_factor, spreading_activation, spreading_edge_factor,
-    ActivationConfig, SpreadingActivationConfig, MAX_CONNECTION_BONUS,
+    ActivationConfig, MAX_CONNECTION_BONUS, SpreadingActivationConfig, connection_bonus,
+    effective_retrievability, graph_stats, rebuild_from_storage, recompute_centrality,
+    rif_edge_factor, spreading_activation, spreading_edge_factor,
 };
 // Re-export PersistedEdge from storage (the canonical definition)
 pub use crate::storage::PersistedEdge;
 
 // Re-export CS-11 auto-link types and functions
 pub use autolink::{
-    auto_link, AutoLinkCandidate, AutoLinkError, AutoLinkThresholds, DEFAULT_MAX_LINKS,
-    THRESHOLD_HARD_FLOOR, perform_autolink, perform_entity_link, perform_temporal_link,
+    AutoLinkCandidate, AutoLinkError, AutoLinkThresholds, DEFAULT_MAX_LINKS, THRESHOLD_HARD_FLOOR,
+    auto_link, perform_autolink, perform_entity_link, perform_temporal_link,
 };
 
 use std::sync::Arc;
+
 use tokio::sync::RwLock;
 
 /// System-level concurrent handle to the graph.

@@ -16,9 +16,8 @@ use crate::model::{DecayPhase, MemoryId, NamespaceId};
 use crate::search::{EntityIndex, FlatVectorIndex, FtsIndex, QueryEngine};
 use crate::storage::RedbStorageEngine;
 // Import the StorageEngine trait so its methods are in scope.
-use crate::storage::StorageEngine as StorageEngineTrait;
-
 use super::bridge;
+use crate::storage::StorageEngine as StorageEngineTrait;
 
 // ═══════════════════════════════════════════════════════════════════════
 // McpSearchAdapter
@@ -34,6 +33,7 @@ pub struct McpSearchAdapter {
 }
 
 impl McpSearchAdapter {
+    /// Create a new search adapter from the given subsystems.
     pub fn new(
         query_engine: Arc<QueryEngine>,
         embedding: Arc<dyn EmbeddingProvider>,
@@ -212,13 +212,11 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                 };
                 if let Some(neighbor_node) = graph_r.get_node_by_key(other_key) {
                     if !result_ids.contains(&neighbor_node.memory_id) {
-                        let entry = neighbor_weights
-                            .entry(neighbor_node.memory_id)
-                            .or_insert((
-                                0.0,
-                                format!("{:?}", edge.edge_type).to_lowercase(),
-                                mid.to_string(),
-                            ));
+                        let entry = neighbor_weights.entry(neighbor_node.memory_id).or_insert((
+                            0.0,
+                            format!("{:?}", edge.edge_type).to_lowercase(),
+                            mid.to_string(),
+                        ));
                         if edge.weight > entry.0 {
                             *entry = (
                                 edge.weight,
@@ -232,11 +230,10 @@ impl bridge::SearchPipeline for McpSearchAdapter {
         }
         drop(graph_r);
 
-        let mut sorted: Vec<(crate::model::MemoryId, f32, String, String)> =
-            neighbor_weights
-                .into_iter()
-                .map(|(id, (w, et, ct))| (id, w, et, ct))
-                .collect();
+        let mut sorted: Vec<(crate::model::MemoryId, f32, String, String)> = neighbor_weights
+            .into_iter()
+            .map(|(id, (w, et, ct))| (id, w, et, ct))
+            .collect();
         sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         sorted.truncate(MAX_NEIGHBORS);
 
@@ -267,8 +264,7 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                     } else {
                         None
                     };
-                    let metadata =
-                        crate::model::parse_structured_tags(&disk.tags);
+                    let metadata = crate::model::parse_structured_tags(&disk.tags);
 
                     Some(bridge::NeighborMemory {
                         id: mid.to_string(),
@@ -344,6 +340,7 @@ pub struct McpStorageAdapter {
 }
 
 impl McpStorageAdapter {
+    /// Create a new storage adapter from the given subsystems.
     pub fn new(
         storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
         cache: Arc<CacheManager>,
@@ -373,8 +370,8 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         input: bridge::StoreInput,
     ) -> Result<bridge::StoredMemory, bridge::BridgeError> {
-        use crate::model::record::DiskRecord;
         use crate::model::Tag;
+        use crate::model::record::DiskRecord;
 
         // Resolve namespace.
         let ns_config = {
@@ -447,7 +444,9 @@ impl bridge::StorageEngine for McpStorageAdapter {
             phase: DecayPhase::Full.as_u8(),
             strength: 1.0,
             decay_strength: 1.0,
-            stability: input.initial_stability.unwrap_or(ns_config.initial_stability),
+            stability: input
+                .initial_stability
+                .unwrap_or(ns_config.initial_stability),
             difficulty: 5.0,
             is_permastore: 0,
             vector_slot: 0,
@@ -648,9 +647,10 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         id: MemoryId,
     ) -> Result<Option<bridge::MemoryRecord>, bridge::BridgeError> {
-        let mut storage_w = self.storage.write().map_err(|e| {
-            bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-        })?;
+        let mut storage_w = self
+            .storage
+            .write()
+            .map_err(|e| bridge::BridgeError::Internal(format!("storage lock poisoned: {e}")))?;
 
         let disk_record = storage_w
             .get_record(id)
@@ -665,8 +665,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     .map(|ns| ns.name.clone())
                     .unwrap_or_default();
 
-                let phase = DecayPhase::from_u8(record.phase)
-                    .unwrap_or(DecayPhase::Full);
+                let phase = DecayPhase::from_u8(record.phase).unwrap_or(DecayPhase::Full);
 
                 let full_text = if record.text_length > 0 {
                     let text_ref = crate::storage::TextRef {
@@ -697,10 +696,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
         }
     }
 
-    async fn delete_memory(
-        &self,
-        id: MemoryId,
-    ) -> Result<bool, bridge::BridgeError> {
+    async fn delete_memory(&self, id: MemoryId) -> Result<bool, bridge::BridgeError> {
         let deleted = {
             let mut storage_w = self.storage.write().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
@@ -730,18 +726,16 @@ impl bridge::StorageEngine for McpStorageAdapter {
         id: MemoryId,
         _quality: u8,
     ) -> Result<bridge::ReinforceResult, bridge::BridgeError> {
-        let storage_r = self.storage.read().map_err(|e| {
-            bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = self
+            .storage
+            .read()
+            .map_err(|e| bridge::BridgeError::Internal(format!("storage lock poisoned: {e}")))?;
         let record = storage_r
             .get_record(id)
             .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
-            .ok_or_else(|| {
-                bridge::BridgeError::NotFound(format!("memory {id} not found"))
-            })?;
+            .ok_or_else(|| bridge::BridgeError::NotFound(format!("memory {id} not found")))?;
 
-        let phase = DecayPhase::from_u8(record.phase)
-            .unwrap_or(DecayPhase::Full);
+        let phase = DecayPhase::from_u8(record.phase).unwrap_or(DecayPhase::Full);
 
         Ok(bridge::ReinforceResult {
             id: id.to_string(),
@@ -763,21 +757,19 @@ pub struct McpNamespaceAdapter {
 }
 
 impl McpNamespaceAdapter {
-    pub fn new(
-        storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
-    ) -> Self {
+    /// Create a new namespace adapter wrapping the storage engine.
+    pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
         Self { storage }
     }
 }
 
 #[async_trait]
 impl bridge::NamespaceRegistry for McpNamespaceAdapter {
-    async fn list_namespaces(
-        &self,
-    ) -> Result<Vec<bridge::NamespaceInfo>, bridge::BridgeError> {
-        let storage_r = self.storage.read().map_err(|e| {
-            bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-        })?;
+    async fn list_namespaces(&self) -> Result<Vec<bridge::NamespaceInfo>, bridge::BridgeError> {
+        let storage_r = self
+            .storage
+            .read()
+            .map_err(|e| bridge::BridgeError::Internal(format!("storage lock poisoned: {e}")))?;
         let namespaces = storage_r
             .list_namespaces()
             .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
@@ -819,9 +811,10 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             desired_retention: input.desired_retention.unwrap_or(0.9),
         };
 
-        let mut storage_w = self.storage.write().map_err(|e| {
-            bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-        })?;
+        let mut storage_w = self
+            .storage
+            .write()
+            .map_err(|e| bridge::BridgeError::Internal(format!("storage lock poisoned: {e}")))?;
         let assigned_id = storage_w
             .create_namespace(&ns_config)
             .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
@@ -839,16 +832,15 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         &self,
         name: &str,
     ) -> Result<bridge::NamespaceStats, bridge::BridgeError> {
-        let storage_r = self.storage.read().map_err(|e| {
-            bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = self
+            .storage
+            .read()
+            .map_err(|e| bridge::BridgeError::Internal(format!("storage lock poisoned: {e}")))?;
         let _ns = storage_r
             .get_namespace_by_name(name)
             .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
             .ok_or_else(|| {
-                bridge::BridgeError::NotFound(format!(
-                    "namespace '{name}' not found"
-                ))
+                bridge::BridgeError::NotFound(format!("namespace '{name}' not found"))
             })?;
 
         // Full stats would require iterating records. Return basic info.
@@ -879,9 +871,8 @@ pub struct McpHealthAdapter {
 }
 
 impl McpHealthAdapter {
-    pub fn new(
-        storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
-    ) -> Self {
+    /// Create a new health adapter wrapping the storage engine.
+    pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
         Self {
             storage,
             started_at: std::time::Instant::now(),
@@ -893,13 +884,11 @@ impl McpHealthAdapter {
 impl bridge::HealthChecker for McpHealthAdapter {
     async fn check_health(&self) -> bridge::HealthStatus {
         let storage_ok = self.storage.read().is_ok();
-        let subsystems = vec![
-            bridge::SubsystemHealth {
-                name: "storage".to_string(),
-                status: if storage_ok { "ok" } else { "error" }.to_string(),
-                message: None,
-            },
-        ];
+        let subsystems = vec![bridge::SubsystemHealth {
+            name: "storage".to_string(),
+            status: if storage_ok { "ok" } else { "error" }.to_string(),
+            message: None,
+        }];
         let overall = if storage_ok { "ok" } else { "degraded" };
         bridge::HealthStatus {
             status: overall.to_string(),

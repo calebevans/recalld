@@ -4,8 +4,8 @@
 //! implementations (macOS GCD, Linux PSI), and the pressure response loop
 //! that adjusts the cache budget and triggers proactive eviction.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::cache::warming::compute_priority;
 use crate::model::{CachedRecord, MemoryId};
@@ -19,7 +19,7 @@ use crate::model::{CachedRecord, MemoryId};
 ///
 /// Stored as `AtomicU8` for lock-free reads by the prefetch worker
 /// and eviction sweeper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum PressureLevel {
     /// No pressure. Full budget, all prefetch modes active.
@@ -78,10 +78,7 @@ mod macos {
     const QOS_CLASS_DEFAULT: isize = 0x15;
 
     unsafe extern "C" {
-        fn dispatch_get_global_queue(
-            identifier: isize,
-            flags: usize,
-        ) -> *mut c_void;
+        fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
 
         fn dispatch_source_create(
             source_type: *const c_void,
@@ -95,10 +92,7 @@ mod macos {
             handler: extern "C" fn(*mut c_void),
         );
 
-        fn dispatch_set_context(
-            object: *mut c_void,
-            context: *mut c_void,
-        );
+        fn dispatch_set_context(object: *mut c_void, context: *mut c_void);
 
         fn dispatch_source_get_data(source: *const c_void) -> u64;
 
@@ -141,8 +135,7 @@ mod macos {
         /// Calls into libdispatch via raw FFI. The dispatch source and
         /// handler context are leaked intentionally (process-lifetime).
         pub unsafe fn new() -> Self {
-            let level =
-                Arc::new(AtomicU8::new(PressureLevel::Normal as u8));
+            let level = Arc::new(AtomicU8::new(PressureLevel::Normal as u8));
             let notify = Arc::new(Notify::new());
 
             let mask = DISPATCH_MEMORYPRESSURE_NORMAL
@@ -154,8 +147,7 @@ mod macos {
             let queue = unsafe { dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0) };
             let source = unsafe {
                 dispatch_source_create(
-                    &_dispatch_source_type_memorypressure as *const _
-                        as *const c_void,
+                    &_dispatch_source_type_memorypressure as *const _ as *const c_void,
                     0,
                     mask,
                     queue,
@@ -242,8 +234,7 @@ mod linux {
     const CRITICAL_TRIGGER: &str = "full 50000 1000000"; // 5% full-stall in 1s
 
     /// Polling interval for reading PSI avg10 values.
-    const POLL_INTERVAL: std::time::Duration =
-        std::time::Duration::from_secs(5);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Linux memory pressure monitor using PSI triggers.
     pub struct LinuxPressureMonitor {
@@ -261,26 +252,19 @@ mod linux {
         /// polling if trigger registration fails (older kernels,
         /// cgroup-only namespaces, insufficient privileges).
         pub fn new() -> Self {
-            let level =
-                Arc::new(AtomicU8::new(PressureLevel::Normal as u8));
+            let level = Arc::new(AtomicU8::new(PressureLevel::Normal as u8));
             let notify = Arc::new(Notify::new());
 
             let warning_trigger = Self::setup_trigger(WARNING_TRIGGER)
                 .map_err(|e| {
-                    tracing::warn!(
-                        "PSI warning trigger setup failed: {}",
-                        e
-                    );
+                    tracing::warn!("PSI warning trigger setup failed: {}", e);
                     e
                 })
                 .ok();
 
             let critical_trigger = Self::setup_trigger(CRITICAL_TRIGGER)
                 .map_err(|e| {
-                    tracing::warn!(
-                        "PSI critical trigger setup failed: {}",
-                        e
-                    );
+                    tracing::warn!("PSI critical trigger setup failed: {}", e);
                     e
                 })
                 .ok();
@@ -300,9 +284,7 @@ mod linux {
 
         /// Register a PSI trigger by writing the threshold string to
         /// /proc/pressure/memory.
-        fn setup_trigger(
-            trigger: &str,
-        ) -> std::io::Result<std::fs::File> {
+        fn setup_trigger(trigger: &str) -> std::io::Result<std::fs::File> {
             use std::io::Write;
 
             let mut file = std::fs::OpenOptions::new()
@@ -320,8 +302,7 @@ mod linux {
         /// - some avg10 >= 15.0 -> Warning
         /// - otherwise          -> Normal
         fn read_psi_level() -> std::io::Result<PressureLevel> {
-            let content =
-                std::fs::read_to_string("/proc/pressure/memory")?;
+            let content = std::fs::read_to_string("/proc/pressure/memory")?;
             let mut some_avg10: f64 = 0.0;
             let mut full_avg10: f64 = 0.0;
 
@@ -365,9 +346,7 @@ mod linux {
                 tokio::time::sleep(POLL_INTERVAL).await;
 
                 if let Ok(new_level) = Self::read_psi_level() {
-                    let old = self
-                        .level
-                        .swap(new_level as u8, Ordering::Relaxed);
+                    let old = self.level.swap(new_level as u8, Ordering::Relaxed);
                     if old != new_level as u8 {
                         self.notify.notify_one();
                         return new_level;
@@ -423,9 +402,7 @@ pub fn create_pressure_monitor() -> Box<dyn PressureMonitor> {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        tracing::warn!(
-            "no memory pressure monitor for this platform -- using no-op"
-        );
+        tracing::warn!("no memory pressure monitor for this platform -- using no-op");
         Box::new(NoOpPressureMonitor)
     }
 }
@@ -448,9 +425,8 @@ pub async fn start_pressure_monitor(
 ) {
     loop {
         let new_level = monitor.wait_for_change().await;
-        let old_level = PressureLevel::from_u8(
-            pressure_level.swap(new_level as u8, Ordering::Relaxed),
-        );
+        let old_level =
+            PressureLevel::from_u8(pressure_level.swap(new_level as u8, Ordering::Relaxed));
 
         if old_level == new_level {
             continue; // Spurious wake.
@@ -468,8 +444,7 @@ pub async fn start_pressure_monitor(
             PressureLevel::Warning => 0.75,
             PressureLevel::Critical => 0.50,
         };
-        let new_budget =
-            (configured_budget as f64 * budget_fraction) as u64;
+        let new_budget = (configured_budget as f64 * budget_fraction) as u64;
         effective_budget.store(new_budget, Ordering::Relaxed);
 
         // Proactive eviction if budget shrank.
@@ -477,10 +452,8 @@ pub async fn start_pressure_monitor(
             evict_to_target(&cache, new_budget).await;
         }
 
-        metrics::gauge!("cache.pressure_level")
-            .set(new_level as u8 as f64);
-        metrics::gauge!("cache.effective_budget_bytes")
-            .set(new_budget as f64);
+        metrics::gauge!("cache.pressure_level").set(new_level as u8 as f64);
+        metrics::gauge!("cache.effective_budget_bytes").set(new_budget as f64);
     }
 }
 
@@ -513,9 +486,7 @@ pub async fn evict_to_target(
         .iter()
         .map(|(id, record)| (*id, compute_priority(&record)))
         .collect();
-    candidates.sort_unstable_by(|a, b| {
-        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    candidates.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut evicted = 0u64;
     for (id, _priority) in candidates {

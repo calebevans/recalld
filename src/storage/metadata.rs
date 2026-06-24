@@ -9,11 +9,13 @@
 
 use std::path::Path;
 
-use redb::{Database, MultimapTableDefinition, ReadableMultimapTable, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{
+    Database, MultimapTableDefinition, ReadableMultimapTable, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
 
 use crate::model::{
-    AccessEvent, AccessKind, DecayPhase, DiskRecord, MemoryId, NamespaceConfig,
-    NamespaceId,
+    AccessEvent, AccessKind, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId,
 };
 use crate::storage::error::StorageError;
 use crate::storage::indexes::PhaseIndex;
@@ -25,29 +27,24 @@ use crate::storage::indexes::PhaseIndex;
 /// Primary metadata table.
 /// Key: UUID v7 bytes ([u8; 16], big-endian -- chronological sort).
 /// Value: DiskRecord::to_bytes() output (variable-length, version-prefixed).
-const META_TABLE: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("memories");
+const META_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("memories");
 
 /// Namespace configuration table.
 /// Key: NamespaceId as u32.
 /// Value: serde_json::to_vec(&NamespaceConfig) bytes.
-const NAMESPACE_TABLE: TableDefinition<u32, &[u8]> =
-    TableDefinition::new("namespaces");
+const NAMESPACE_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("namespaces");
 
 /// Monotonic counter for namespace ID assignment.
 /// Single row: key = "max_id", value = highest assigned u32.
-const NAMESPACE_COUNTER: TableDefinition<&str, u32> =
-    TableDefinition::new("namespace_counter");
+const NAMESPACE_COUNTER: TableDefinition<&str, u32> = TableDefinition::new("namespace_counter");
 
 /// Serialized secondary index blobs (phase bitmaps).
 /// Key: index name string. Value: serialized bytes.
-const INDEX_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("indexes");
+const INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("indexes");
 
 /// Tag inverted index. One tag -> many memory UUIDs.
 /// Key: lowercased tag string. Value: 16-byte UUID.
-const TAG_INDEX: MultimapTableDefinition<&str, &[u8]> =
-    MultimapTableDefinition::new("tag_index");
+const TAG_INDEX: MultimapTableDefinition<&str, &[u8]> = MultimapTableDefinition::new("tag_index");
 
 /// Namespace inverted index. One namespace_id -> many memory UUIDs.
 /// Key: NamespaceId as u32. Value: 16-byte UUID.
@@ -124,11 +121,7 @@ impl MetadataStore {
     ///
     /// # Errors
     /// - `StorageError::DuplicateId` if a record with this ID already exists.
-    pub fn insert(
-        &self,
-        id: MemoryId,
-        record: &DiskRecord,
-    ) -> Result<(), StorageError> {
+    pub fn insert(&self, id: MemoryId, record: &DiskRecord) -> Result<(), StorageError> {
         let key = id.as_bytes().as_slice();
         let value = record.to_bytes();
 
@@ -148,8 +141,7 @@ impl MetadataStore {
             }
 
             // 3. Update namespace index.
-            let mut ns_idx =
-                write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+            let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             ns_idx.insert(record.namespace_id, key)?;
         }
         write_txn.commit()?;
@@ -273,10 +265,7 @@ impl MetadataStore {
     /// # Returns
     /// The deleted `DiskRecord` (for the caller to know which vector
     /// slot to free, etc.), or `None` if the ID did not exist.
-    pub fn delete(
-        &self,
-        id: MemoryId,
-    ) -> Result<Option<DiskRecord>, StorageError> {
+    pub fn delete(&self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
         let key = id.as_bytes().as_slice();
 
         let write_txn = self.db.begin_write()?;
@@ -286,8 +275,7 @@ impl MetadataStore {
             let mut meta = write_txn.open_table(META_TABLE)?;
             match meta.remove(key)? {
                 Some(value) => {
-                    deleted_record =
-                        DiskRecord::from_bytes(value.value())?;
+                    deleted_record = DiskRecord::from_bytes(value.value())?;
                 }
                 None => {
                     return Ok(None);
@@ -301,8 +289,7 @@ impl MetadataStore {
             }
 
             // 3. Remove from namespace index.
-            let mut ns_idx =
-                write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+            let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             ns_idx.remove(deleted_record.namespace_id, key)?;
         }
         write_txn.commit()?;
@@ -322,10 +309,7 @@ impl MetadataStore {
     ///
     /// Uses the in-memory roaring bitmap index. Requires a META_TABLE
     /// lookup per matching slot to resolve vector_slot -> MemoryId.
-    pub fn ids_in_phase(
-        &self,
-        phase: DecayPhase,
-    ) -> Result<Vec<MemoryId>, StorageError> {
+    pub fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError> {
         let slots: Vec<u32> = {
             let pi = self.phase_index.read().unwrap();
             pi.bitmap(phase).iter().collect()
@@ -335,8 +319,7 @@ impl MetadataStore {
             return Ok(Vec::new());
         }
 
-        let slot_set: std::collections::HashSet<u32> =
-            slots.into_iter().collect();
+        let slot_set: std::collections::HashSet<u32> = slots.into_iter().collect();
         let mut ids = Vec::new();
 
         let read_txn = self.db.begin_read()?;
@@ -346,11 +329,7 @@ impl MetadataStore {
             let record = DiskRecord::from_bytes(value.value())?;
             if slot_set.contains(&record.vector_slot) {
                 let uuid = uuid::Uuid::from_slice(key_bytes.value())
-                    .map_err(|_| {
-                        StorageError::CorruptIndex(
-                            "invalid UUID in meta table".into(),
-                        )
-                    })?;
+                    .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
                 ids.push(MemoryId::from_uuid(uuid));
             }
             if ids.len() == slot_set.len() {
@@ -385,11 +364,7 @@ impl MetadataStore {
             let record = DiskRecord::from_bytes(value.value())?;
             if slots.contains(&record.vector_slot) {
                 let uuid = uuid::Uuid::from_slice(key_bytes.value())
-                    .map_err(|_| {
-                        StorageError::CorruptIndex(
-                            "invalid UUID in meta table".into(),
-                        )
-                    })?;
+                    .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
                 results.push((MemoryId::from_uuid(uuid), record));
             }
             if results.len() == slots.len() {
@@ -408,11 +383,7 @@ impl MetadataStore {
     ///
     /// Performs a read-modify-write in a single redb write transaction.
     /// Does not update any secondary indexes (edge_count is not indexed).
-    pub fn update_edge_count(
-        &self,
-        id: MemoryId,
-        edge_count: u16,
-    ) -> Result<(), StorageError> {
+    pub fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
         let key = id.as_bytes().as_slice();
 
         let write_txn = self.db.begin_write()?;
@@ -439,10 +410,7 @@ impl MetadataStore {
 
 impl MetadataStore {
     /// Find all memory IDs that carry a given tag.
-    pub fn memories_with_tag(
-        &self,
-        tag: &str,
-    ) -> Result<Vec<MemoryId>, StorageError> {
+    pub fn memories_with_tag(&self, tag: &str) -> Result<Vec<MemoryId>, StorageError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_multimap_table(TAG_INDEX)?;
         let mut ids = Vec::new();
@@ -450,12 +418,9 @@ impl MetadataStore {
         let values = table.get(tag)?;
         for result in values {
             let value = result?;
-            let bytes: [u8; 16] =
-                value.value().try_into().map_err(|_| {
-                    StorageError::CorruptIndex(
-                        "invalid UUID length in tag index".into(),
-                    )
-                })?;
+            let bytes: [u8; 16] = value.value().try_into().map_err(|_| {
+                StorageError::CorruptIndex("invalid UUID length in tag index".into())
+            })?;
             ids.push(MemoryId::from_bytes(bytes));
         }
 
@@ -494,12 +459,9 @@ impl MetadataStore {
         let values = table.get(namespace_id.get())?;
         for result in values {
             let value = result?;
-            let bytes: [u8; 16] =
-                value.value().try_into().map_err(|_| {
-                    StorageError::CorruptIndex(
-                        "invalid UUID length in namespace index".into(),
-                    )
-                })?;
+            let bytes: [u8; 16] = value.value().try_into().map_err(|_| {
+                StorageError::CorruptIndex("invalid UUID length in namespace index".into())
+            })?;
             ids.push(MemoryId::from_bytes(bytes));
         }
 
@@ -538,18 +500,10 @@ impl MetadataStore {
                     .ok_or(StorageError::InvalidPhase(record.phase))?;
 
                 if let Some(new_record) = compute_new_state(&record) {
-                    let uuid =
-                        uuid::Uuid::from_slice(key_bytes.value())
-                            .map_err(|_| {
-                                StorageError::CorruptIndex(
-                                    "invalid UUID in meta table".into(),
-                                )
-                            })?;
-                    updates.push((
-                        MemoryId::from_uuid(uuid),
-                        new_record,
-                        old_phase,
-                    ));
+                    let uuid = uuid::Uuid::from_slice(key_bytes.value()).map_err(|_| {
+                        StorageError::CorruptIndex("invalid UUID in meta table".into())
+                    })?;
+                    updates.push((MemoryId::from_uuid(uuid), new_record, old_phase));
                 }
             }
             updates
@@ -566,10 +520,7 @@ impl MetadataStore {
         {
             let mut table = write_txn.open_table(META_TABLE)?;
             for (id, record, _) in &updates {
-                table.insert(
-                    id.as_bytes().as_slice(),
-                    record.to_bytes().as_slice(),
-                )?;
+                table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
             }
         }
 
@@ -580,18 +531,13 @@ impl MetadataStore {
                 let new_phase = DecayPhase::from_u8(record.phase)
                     .ok_or(StorageError::InvalidPhase(record.phase))?;
                 if *old_phase != new_phase {
-                    pi.transition(
-                        record.vector_slot,
-                        *old_phase,
-                        new_phase,
-                    );
+                    pi.transition(record.vector_slot, *old_phase, new_phase);
                 }
             }
 
             // Persist bitmaps inside the same write transaction.
             let mut idx_table = write_txn.open_table(INDEX_TABLE)?;
-            idx_table
-                .insert("phase_bitmaps", pi.to_bytes().as_slice())?;
+            idx_table.insert("phase_bitmaps", pi.to_bytes().as_slice())?;
         }
         write_txn.commit()?;
 
@@ -609,10 +555,7 @@ impl MetadataStore {
         {
             let mut table = write_txn.open_table(META_TABLE)?;
             for (id, record) in records {
-                table.insert(
-                    id.as_bytes().as_slice(),
-                    record.to_bytes().as_slice(),
-                )?;
+                table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
             }
         }
         write_txn.commit()?;
@@ -661,8 +604,7 @@ impl MetadataStore {
         let write_txn = self.db.begin_write()?;
         {
             let mut idx_table = write_txn.open_table(INDEX_TABLE)?;
-            idx_table
-                .insert("phase_bitmaps", bytes.as_slice())?;
+            idx_table.insert("phase_bitmaps", bytes.as_slice())?;
         }
         write_txn.commit()?;
 
@@ -681,10 +623,7 @@ impl MetadataStore {
     /// # Errors
     /// - `StorageError::DuplicateName` if a namespace with this name
     ///   already exists.
-    pub fn create_namespace(
-        &self,
-        config: &NamespaceConfig,
-    ) -> Result<NamespaceId, StorageError> {
+    pub fn create_namespace(&self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
         let write_txn = self.db.begin_write()?;
         let new_id;
         {
@@ -692,25 +631,17 @@ impl MetadataStore {
             let ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
             for result in ns_table.iter()? {
                 let (_, value) = result?;
-                let existing: NamespaceConfig =
-                    serde_json::from_slice(value.value()).map_err(|e| {
-                        StorageError::Deserialize(e.to_string())
-                    })?;
+                let existing: NamespaceConfig = serde_json::from_slice(value.value())
+                    .map_err(|e| StorageError::Deserialize(e.to_string()))?;
                 if existing.name == config.name {
-                    return Err(StorageError::DuplicateName(
-                        config.name.clone(),
-                    ));
+                    return Err(StorageError::DuplicateName(config.name.clone()));
                 }
             }
             drop(ns_table);
 
             // Assign next ID.
-            let mut counter_table =
-                write_txn.open_table(NAMESPACE_COUNTER)?;
-            let current_max = counter_table
-                .get("max_id")?
-                .map(|v| v.value())
-                .unwrap_or(0);
+            let mut counter_table = write_txn.open_table(NAMESPACE_COUNTER)?;
+            let current_max = counter_table.get("max_id")?.map(|v| v.value()).unwrap_or(0);
             new_id = current_max + 1;
             counter_table.insert("max_id", new_id)?;
             drop(counter_table);
@@ -721,8 +652,7 @@ impl MetadataStore {
             let bytes = serde_json::to_vec(&stored_config)
                 .map_err(|e| StorageError::Serialize(e.to_string()))?;
 
-            let mut ns_table =
-                write_txn.open_table(NAMESPACE_TABLE)?;
+            let mut ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
             ns_table.insert(new_id, bytes.as_slice())?;
         }
         write_txn.commit()?;
@@ -731,19 +661,15 @@ impl MetadataStore {
     }
 
     /// List all namespace configurations.
-    pub fn list_namespaces(
-        &self,
-    ) -> Result<Vec<NamespaceConfig>, StorageError> {
+    pub fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(NAMESPACE_TABLE)?;
         let mut configs = Vec::new();
 
         for result in table.iter()? {
             let (_, value) = result?;
-            let config: NamespaceConfig =
-                serde_json::from_slice(value.value()).map_err(|e| {
-                    StorageError::Deserialize(e.to_string())
-                })?;
+            let config: NamespaceConfig = serde_json::from_slice(value.value())
+                .map_err(|e| StorageError::Deserialize(e.to_string()))?;
             configs.push(config);
         }
 
@@ -751,18 +677,13 @@ impl MetadataStore {
     }
 
     /// Get a single namespace configuration by ID.
-    pub fn get_namespace(
-        &self,
-        id: NamespaceId,
-    ) -> Result<Option<NamespaceConfig>, StorageError> {
+    pub fn get_namespace(&self, id: NamespaceId) -> Result<Option<NamespaceConfig>, StorageError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(NAMESPACE_TABLE)?;
         match table.get(id.get())? {
             Some(value) => {
-                let config: NamespaceConfig =
-                    serde_json::from_slice(value.value()).map_err(|e| {
-                        StorageError::Deserialize(e.to_string())
-                    })?;
+                let config: NamespaceConfig = serde_json::from_slice(value.value())
+                    .map_err(|e| StorageError::Deserialize(e.to_string()))?;
                 Ok(Some(config))
             }
             None => Ok(None),
@@ -788,16 +709,13 @@ impl MetadataStore {
     ) -> Result<(), StorageError> {
         let write_txn = self.db.begin_write()?;
         {
-            let mut table =
-                write_txn.open_table(NAMESPACE_TABLE)?;
+            let mut table = write_txn.open_table(NAMESPACE_TABLE)?;
             let existing: NamespaceConfig = {
                 let existing_bytes = table
                     .get(id.get())?
                     .ok_or(StorageError::NamespaceNotFound(id.get()))?;
                 serde_json::from_slice(existing_bytes.value())
-                    .map_err(|e| {
-                        StorageError::Deserialize(e.to_string())
-                    })?
+                    .map_err(|e| StorageError::Deserialize(e.to_string()))?
             };
 
             let mut to_store = updated.clone();
@@ -817,15 +735,11 @@ impl MetadataStore {
     ///
     /// Only removes the config entry. Memory cleanup is the caller's
     /// responsibility. The namespace ID is never recycled.
-    pub fn delete_namespace(
-        &self,
-        id: NamespaceId,
-    ) -> Result<NamespaceConfig, StorageError> {
+    pub fn delete_namespace(&self, id: NamespaceId) -> Result<NamespaceConfig, StorageError> {
         let write_txn = self.db.begin_write()?;
         let config;
         {
-            let mut table =
-                write_txn.open_table(NAMESPACE_TABLE)?;
+            let mut table = write_txn.open_table(NAMESPACE_TABLE)?;
             let value = table
                 .remove(id.get())?
                 .ok_or(StorageError::NamespaceNotFound(id.get()))?;
@@ -870,9 +784,7 @@ impl MetadataStore {
 
 impl MetadataStore {
     /// Iterate all records in creation order (UUID v7 byte order).
-    pub fn scan_all(
-        &self,
-    ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+    pub fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         let mut records = Vec::new();
@@ -880,11 +792,7 @@ impl MetadataStore {
         for result in table.iter()? {
             let (key_bytes, value) = result?;
             let uuid = uuid::Uuid::from_slice(key_bytes.value())
-                .map_err(|_| {
-                    StorageError::CorruptIndex(
-                        "invalid UUID in meta table".into(),
-                    )
-                })?;
+                .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
             let record = DiskRecord::from_bytes(value.value())?;
             records.push((MemoryId::from_uuid(uuid), record));
         }

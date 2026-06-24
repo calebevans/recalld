@@ -5,11 +5,11 @@
 //! the ordered startup sequence. Torn down by [`Recalld::shutdown()`].
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{watch, Notify, RwLock};
+use tokio::sync::{Notify, RwLock, watch};
 use tokio::task::JoinHandle;
 
 use crate::cache::manager::{CacheConfig as CacheMgrConfig, CacheManager};
@@ -17,7 +17,7 @@ use crate::config::RecalldConfig;
 use crate::decay::config::DecayConfig;
 use crate::decay::sweep::{DecaySweepRunner, SweepConfig};
 use crate::embedding::{self, EmbeddingProvider};
-use crate::error::{Result, RecalldError};
+use crate::error::{RecalldError, Result};
 use crate::graph::activation::ActivationConfig;
 use crate::graph::{self, RelationshipGraph, SharedGraph};
 use crate::rif::{RifConfig, RifEngine};
@@ -119,50 +119,41 @@ impl Recalld {
         let storage = {
             let data_dir = &config.storage.data_dir;
             tracing::info!(data_dir = %data_dir, "opening storage engine");
-            let engine = RedbStorageEngine::open(data_dir)
-                .map_err(|e| RecalldError::Init {
-                    step: "open_storage",
-                    message: format!(
-                        "failed to open storage at {}: {}",
-                        data_dir, e
-                    ),
-                    source: Some(Box::new(e)),
-                })?;
+            let engine = RedbStorageEngine::open(data_dir).map_err(|e| RecalldError::Init {
+                step: "open_storage",
+                message: format!("failed to open storage at {}: {}", data_dir, e),
+                source: Some(Box::new(e)),
+            })?;
             tracing::info!("storage engine opened");
             Arc::new(std::sync::RwLock::new(engine))
         };
 
         // -- Step 2: Build relationship graph from storage ------------
         let graph: SharedGraph = {
-            let storage_r = storage.read()
-                .map_err(|e| RecalldError::Init {
-                    step: "lock_storage_for_graph",
-                    message: format!("storage lock poisoned: {}", e),
-                    source: None,
-                })?;
+            let storage_r = storage.read().map_err(|e| RecalldError::Init {
+                step: "lock_storage_for_graph",
+                message: format!("storage lock poisoned: {}", e),
+                source: None,
+            })?;
 
             // Count records for pre-sizing.
-            let record_count = storage_r.count()
-                .map_err(|e| RecalldError::Init {
-                    step: "count_records",
-                    message: "failed to count records in meta.db".into(),
-                    source: Some(Box::new(e)),
-                })? as usize;
+            let record_count = storage_r.count().map_err(|e| RecalldError::Init {
+                step: "count_records",
+                message: "failed to count records in meta.db".into(),
+                source: Some(Box::new(e)),
+            })? as usize;
 
             let mut rel_graph = RelationshipGraph::with_capacity(record_count);
 
             // Load all nodes from meta.db scan.
-            let all_records = storage_r.scan_all()
-                .map_err(|e| RecalldError::Init {
-                    step: "load_graph_nodes",
-                    message: "failed to scan meta.db for graph nodes".into(),
-                    source: Some(Box::new(e)),
-                })?;
+            let all_records = storage_r.scan_all().map_err(|e| RecalldError::Init {
+                step: "load_graph_nodes",
+                message: "failed to scan meta.db for graph nodes".into(),
+                source: Some(Box::new(e)),
+            })?;
 
             for (memory_id, record) in &all_records {
-                let namespace_id = crate::model::NamespaceId::new(
-                    record.namespace_id,
-                );
+                let namespace_id = crate::model::NamespaceId::new(record.namespace_id);
                 let phase = crate::model::DecayPhase::from_u8(record.phase)
                     .unwrap_or(crate::model::DecayPhase::Full);
                 // Silently skip duplicates during startup load.
@@ -176,19 +167,16 @@ impl Recalld {
             }
 
             // Load all edges from edges.db.
-            let persisted_edges = storage_r.load_all_edges()
-                .map_err(|e| RecalldError::Init {
-                    step: "load_graph_edges",
-                    message: "failed to load edges from edges.db".into(),
-                    source: Some(Box::new(e)),
-                })?;
+            let persisted_edges = storage_r.load_all_edges().map_err(|e| RecalldError::Init {
+                step: "load_graph_edges",
+                message: "failed to load edges from edges.db".into(),
+                source: Some(Box::new(e)),
+            })?;
 
             // After CS-23, graph::PersistedEdge == storage::PersistedEdge
             // (with created_at: u64). Pass them directly -- no field mapping needed.
-            let edge_count = graph::rebuild_from_storage(
-                &mut rel_graph,
-                persisted_edges.into_iter(),
-            );
+            let edge_count =
+                graph::rebuild_from_storage(&mut rel_graph, persisted_edges.into_iter());
 
             let stats = rel_graph.stats();
             tracing::info!(
@@ -206,12 +194,8 @@ impl Recalld {
         let cache = {
             let cache_cfg = CacheMgrConfig {
                 max_capacity_bytes: config.cache.max_capacity_bytes,
-                time_to_idle: Some(Duration::from_secs(
-                    config.cache.time_to_idle_secs,
-                )),
-                time_to_live: Some(Duration::from_secs(
-                    config.cache.time_to_live_secs,
-                )),
+                time_to_idle: Some(Duration::from_secs(config.cache.time_to_idle_secs)),
+                time_to_live: Some(Duration::from_secs(config.cache.time_to_live_secs)),
                 embedding_dim: config.embedding.dimensions,
             };
             // No external eviction listener for now.
@@ -224,12 +208,8 @@ impl Recalld {
         let embedding: Arc<dyn EmbeddingProvider> = {
             let emb_config = embedding::EmbeddingConfig {
                 provider: match config.embedding.provider {
-                    crate::config::EmbeddingProvider::OpenAI => {
-                        embedding::ProviderType::OpenAI
-                    }
-                    crate::config::EmbeddingProvider::Ollama => {
-                        embedding::ProviderType::Ollama
-                    }
+                    crate::config::EmbeddingProvider::OpenAI => embedding::ProviderType::OpenAI,
+                    crate::config::EmbeddingProvider::Ollama => embedding::ProviderType::Ollama,
                     crate::config::EmbeddingProvider::Passthrough => {
                         embedding::ProviderType::Passthrough
                     }
@@ -248,14 +228,11 @@ impl Recalld {
                 &config.embedding.document_prefix,
                 &config.embedding.query_prefix,
             )
-                .map_err(|e| RecalldError::Init {
-                    step: "create_embedding_provider",
-                    message: format!(
-                        "failed to create embedding provider: {}",
-                        e,
-                    ),
-                    source: None,
-                })?;
+            .map_err(|e| RecalldError::Init {
+                step: "create_embedding_provider",
+                message: format!("failed to create embedding provider: {}", e,),
+                source: None,
+            })?;
             tracing::info!(
                 provider = ?config.embedding.provider,
                 model = %config.embedding.model_name,
@@ -282,10 +259,7 @@ impl Recalld {
                 max_reduction_per_query: 0.75,
             };
             let engine = RifEngine::new(rif_cfg);
-            tracing::info!(
-                enabled = config.rif.enabled,
-                "RIF engine initialized"
-            );
+            tracing::info!(enabled = config.rif.enabled, "RIF engine initialized");
             Arc::new(engine)
         };
 
@@ -306,12 +280,11 @@ impl Recalld {
             let fts_path = data_dir_path.join("fts.db");
             let is_new = !fts_path.exists();
 
-            let fts = FtsIndex::new(data_dir_path)
-                .map_err(|e| RecalldError::Init {
-                    step: "open_fts_index",
-                    message: format!("failed to open FTS5 index: {}", e),
-                    source: Some(Box::new(e)),
-                })?;
+            let fts = FtsIndex::new(data_dir_path).map_err(|e| RecalldError::Init {
+                step: "open_fts_index",
+                message: format!("failed to open FTS5 index: {}", e),
+                source: Some(Box::new(e)),
+            })?;
 
             // Migration: if the FTS5 database is newly created (no existing
             // fts.db file), populate it from all records in redb storage.
@@ -336,21 +309,15 @@ impl Recalld {
                     );
                     for (memory_id, record) in &all_records {
                         let namespace_id = crate::model::NamespaceId::new(record.namespace_id);
-                        let tag_strings: Vec<String> = record
-                            .tags
-                            .iter()
-                            .map(|t| t.to_string())
-                            .collect();
+                        let tag_strings: Vec<String> =
+                            record.tags.iter().map(|t| t.to_string()).collect();
                         // Retrieve full_text from the text log if available.
                         let full_text = if record.text_length > 0 {
                             let text_ref = crate::storage::TextRef {
                                 file_offset: record.text_offset,
                                 length: record.text_length,
                             };
-                            storage_w
-                                .get_text(text_ref)
-                                .ok()
-                                .flatten()
+                            storage_w.get_text(text_ref).ok().flatten()
                         } else {
                             None
                         };
@@ -368,10 +335,7 @@ impl Recalld {
                             );
                         }
                     }
-                    tracing::info!(
-                        indexed = all_records.len(),
-                        "FTS5 migration complete"
-                    );
+                    tracing::info!(indexed = all_records.len(), "FTS5 migration complete");
                 }
                 drop(storage_w);
             }
@@ -474,9 +438,7 @@ impl Recalld {
             (None, None)
         } else {
             let sweep_cfg = SweepConfig {
-                interval: Duration::from_secs_f64(
-                    config.decay.sweep_interval_hours * 3600.0,
-                ),
+                interval: Duration::from_secs_f64(config.decay.sweep_interval_hours * 3600.0),
                 sweep_on_startup: true,
                 ..SweepConfig::default()
             };
@@ -530,28 +492,24 @@ impl Recalld {
                     embedding_dim: config.embedding.dimensions as u32,
                     initial_stability: 3.7145,
                     default_difficulty: 5.0,
-                    phase_thresholds:
-                        crate::model::namespace::PhaseThresholds::default(),
+                    phase_thresholds: crate::model::namespace::PhaseThresholds::default(),
                     permastore_threshold: 1500.0,
                     created_at: chrono::Utc::now().timestamp_millis(),
                     desired_retention: 0.9,
                 };
-                let mut storage_w =
-                    storage.write().map_err(|e| RecalldError::Init {
-                        step: "create_default_namespace",
-                        message: format!("storage lock poisoned: {}", e),
-                        source: None,
-                    })?;
-                let ns_id = storage_w
-                    .create_namespace(&ns_config)
-                    .map_err(|e| RecalldError::Init {
-                        step: "create_default_namespace",
-                        message: format!(
-                            "failed to create default namespace: {}",
-                            e,
-                        ),
-                        source: Some(Box::new(e)),
-                    })?;
+                let mut storage_w = storage.write().map_err(|e| RecalldError::Init {
+                    step: "create_default_namespace",
+                    message: format!("storage lock poisoned: {}", e),
+                    source: None,
+                })?;
+                let ns_id =
+                    storage_w
+                        .create_namespace(&ns_config)
+                        .map_err(|e| RecalldError::Init {
+                            step: "create_default_namespace",
+                            message: format!("failed to create default namespace: {}", e,),
+                            source: Some(Box::new(e)),
+                        })?;
                 tracing::info!(
                     id = ns_id.get(),
                     dimensions = config.embedding.dimensions,
@@ -674,12 +632,10 @@ impl Recalld {
 
         #[cfg(unix)]
         let terminate = async {
-            tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            )
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
         };
 
         #[cfg(not(unix))]
@@ -723,16 +679,12 @@ impl Recalld {
                 timeout_secs = drain_timeout.as_secs(),
                 "waiting for in-flight requests to drain"
             );
-            let drain_result = tokio::time::timeout(
-                drain_timeout,
-                self.drain_notify.notified(),
-            )
-            .await;
+            let drain_result =
+                tokio::time::timeout(drain_timeout, self.drain_notify.notified()).await;
             match drain_result {
                 Ok(()) => tracing::info!("all in-flight requests drained"),
                 Err(_) => {
-                    let remaining =
-                        self.inflight_count.load(Ordering::Relaxed);
+                    let remaining = self.inflight_count.load(Ordering::Relaxed);
                     tracing::warn!(
                         remaining,
                         "drain timeout exceeded, proceeding with shutdown"
@@ -755,20 +707,17 @@ impl Recalld {
                     tracing::warn!(%e, "decay sweep task panicked")
                 }
                 Err(_) => {
-                    tracing::warn!(
-                        "decay sweep task did not stop within timeout"
-                    )
+                    tracing::warn!("decay sweep task did not stop within timeout")
                 }
             }
         }
 
         // Step 4: Flush and sync storage.
         {
-            let mut storage_w = self.storage.write()
-                .map_err(|e| RecalldError::Shutdown {
-                    message: format!("storage lock poisoned: {}", e),
-                    source: None,
-                })?;
+            let mut storage_w = self.storage.write().map_err(|e| RecalldError::Shutdown {
+                message: format!("storage lock poisoned: {}", e),
+                source: None,
+            })?;
             match storage_w.sync() {
                 Ok(()) => tracing::info!("storage synced"),
                 Err(e) => tracing::error!(
@@ -780,11 +729,10 @@ impl Recalld {
 
         // Step 5: Persist phase index.
         {
-            let storage_r = self.storage.read()
-                .map_err(|e| RecalldError::Shutdown {
-                    message: format!("storage lock poisoned: {}", e),
-                    source: None,
-                })?;
+            let storage_r = self.storage.read().map_err(|e| RecalldError::Shutdown {
+                message: format!("storage lock poisoned: {}", e),
+                source: None,
+            })?;
             if let Err(e) = storage_r.persist_phase_index() {
                 tracing::error!(
                     %e,
@@ -800,10 +748,7 @@ impl Recalld {
         // tasks have already been released (tasks joined above).
 
         let elapsed = shutdown_start.elapsed();
-        tracing::info!(
-            elapsed_ms = elapsed.as_millis(),
-            "shutdown complete"
-        );
+        tracing::info!(elapsed_ms = elapsed.as_millis(), "shutdown complete");
 
         Ok(())
     }

@@ -138,9 +138,7 @@ impl DiskRecord {
         }
 
         // Access history (u16 count, then each: i64 timestamp + u8 kind)
-        buf.extend_from_slice(
-            &(self.access_history.len() as u16).to_le_bytes(),
-        );
+        buf.extend_from_slice(&(self.access_history.len() as u16).to_le_bytes());
         for event in &self.access_history {
             buf.extend_from_slice(&event.timestamp.to_le_bytes());
             buf.push(access_kind_to_u8(event.kind));
@@ -183,19 +181,13 @@ impl DiskRecord {
         pos += 16;
 
         // Fixed numeric fields
-        let namespace_id = u32::from_le_bytes(
-            data[pos..pos + 4].try_into().unwrap(),
-        );
+        let namespace_id = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let created_at = i64::from_le_bytes(
-            data[pos..pos + 8].try_into().unwrap(),
-        );
+        let created_at = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        let last_accessed_at = i64::from_le_bytes(
-            data[pos..pos + 8].try_into().unwrap(),
-        );
+        let last_accessed_at = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
         let phase = data[pos];
@@ -204,47 +196,31 @@ impl DiskRecord {
         }
         pos += 1;
 
-        let strength = f32::from_le_bytes(
-            data[pos..pos + 4].try_into().unwrap(),
-        );
+        let strength = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let decay_strength = f32::from_le_bytes(
-            data[pos..pos + 4].try_into().unwrap(),
-        );
+        let decay_strength = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let stability = f32::from_le_bytes(
-            data[pos..pos + 4].try_into().unwrap(),
-        );
+        let stability = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let difficulty = f32::from_le_bytes(
-            data[pos..pos + 4].try_into().unwrap(),
-        );
+        let difficulty = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
         let is_permastore = data[pos];
         pos += 1;
 
-        let vector_slot = u32::from_le_bytes(
-            data[pos..pos + 4].try_into().unwrap(),
-        );
+        let vector_slot = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let edge_count = u16::from_le_bytes(
-            data[pos..pos + 2].try_into().unwrap(),
-        );
+        let edge_count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
         pos += 2;
 
-        let text_offset = u64::from_le_bytes(
-            data[pos..pos + 8].try_into().unwrap(),
-        );
+        let text_offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        let text_length = u32::from_le_bytes(
-            data[pos..pos + 4].try_into().unwrap(),
-        );
+        let text_length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
         // Variable: summary
@@ -254,8 +230,7 @@ impl DiskRecord {
         let tag_count = read_u16(data, &mut pos, "tag_count")?;
         let mut tags = Vec::with_capacity(tag_count as usize);
         for _ in 0..tag_count {
-            let tag_str =
-                read_length_prefixed_string(data, &mut pos, "tag")?;
+            let tag_str = read_length_prefixed_string(data, &mut pos, "tag")?;
             // Use Tag::new for validation; corrupt tags are a fatal
             // decode error (invalid UTF-8 is caught by the string read).
             match Tag::new(tag_str) {
@@ -270,8 +245,7 @@ impl DiskRecord {
 
         // Variable: access history
         let access_count = read_u16(data, &mut pos, "access_count")?;
-        let mut access_history =
-            Vec::with_capacity(access_count as usize);
+        let mut access_history = Vec::with_capacity(access_count as usize);
         for _ in 0..access_count {
             if pos + 9 > data.len() {
                 return Err(DecodeError::Truncated {
@@ -279,9 +253,7 @@ impl DiskRecord {
                     actual: data.len(),
                 });
             }
-            let timestamp = i64::from_le_bytes(
-                data[pos..pos + 8].try_into().unwrap(),
-            );
+            let timestamp = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
             let kind = access_kind_from_u8(data[pos]);
             pos += 1;
@@ -314,11 +286,7 @@ impl DiskRecord {
 // ── Helper functions for binary decoding ─────────────────────────────
 
 /// Read a little-endian u16 from the buffer at the given position.
-fn read_u16(
-    data: &[u8],
-    pos: &mut usize,
-    field: &'static str,
-) -> Result<u16, DecodeError> {
+fn read_u16(data: &[u8], pos: &mut usize, field: &'static str) -> Result<u16, DecodeError> {
     if *pos + 2 > data.len() {
         return Err(DecodeError::FieldOverflow {
             field,
@@ -326,8 +294,7 @@ fn read_u16(
             available: data.len() - *pos,
         });
     }
-    let val =
-        u16::from_le_bytes(data[*pos..*pos + 2].try_into().unwrap());
+    let val = u16::from_le_bytes(data[*pos..*pos + 2].try_into().unwrap());
     *pos += 2;
     Ok(val)
 }
@@ -348,10 +315,7 @@ fn read_length_prefixed_string(
     }
     let bytes = data[*pos..*pos + len].to_vec();
     *pos += len;
-    String::from_utf8(bytes).map_err(|e| DecodeError::InvalidUtf8 {
-        field,
-        source: e,
-    })
+    String::from_utf8(bytes).map_err(|e| DecodeError::InvalidUtf8 { field, source: e })
 }
 
 /// Convert an `AccessKind` to its on-disk u8 discriminant.
@@ -529,7 +493,7 @@ impl CachedRecord {
             created_at: self.created_at,
             last_accessed_at: self.last_accessed_at,
             summary: self.summary.clone(),
-            full_text: None,    // loaded on demand
+            full_text: None, // loaded on demand
             tags: self.tags.clone(),
             phase: self.phase,
             strength: self.strength,
@@ -538,8 +502,8 @@ impl CachedRecord {
             difficulty: self.difficulty,
             is_permastore: self.is_permastore,
             edge_count: self.edge_count,
-            embedding: None,        // lives in mmap'd vectors.dat
-            access_history: None,   // loaded on demand
+            embedding: None,      // lives in mmap'd vectors.dat
+            access_history: None, // loaded on demand
         }
     }
 }

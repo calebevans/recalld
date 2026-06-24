@@ -140,7 +140,9 @@ impl McpServer {
         let result = InitializeResult {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability { list_changed: false }),
+                tools: Some(ToolsCapability {
+                    list_changed: false,
+                }),
                 resources: Some(ResourcesCapability {
                     subscribe: false,
                     list_changed: false,
@@ -226,15 +228,19 @@ impl McpServer {
 /// Internal dispatch errors mapped to JSON-RPC error codes.
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
+    /// The requested JSON-RPC method does not exist.
     #[error("Method not found: {0}")]
     MethodNotFound(String),
 
+    /// The method parameters were invalid or missing.
     #[error("Invalid params: {0}")]
     InvalidParams(String),
 
+    /// An internal server error occurred.
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// A serialization or deserialization error occurred.
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }

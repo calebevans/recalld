@@ -62,7 +62,7 @@ fn default_cache_max() -> u64 {
 }
 
 /// Which embedding provider backend to use.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderType {
     /// OpenAI embedding API (text-embedding-3-small, text-embedding-3-large).
     OpenAI,
@@ -102,11 +102,8 @@ pub fn build_provider(
                     )
                 })?;
 
-            let mut provider = OpenAIProvider::new(
-                api_key,
-                config.model.clone(),
-                Some(config.dimensions),
-            );
+            let mut provider =
+                OpenAIProvider::new(api_key, config.model.clone(), Some(config.dimensions));
 
             if let Some(ref url) = config.base_url {
                 provider = provider.with_base_url(url.clone());
@@ -123,10 +120,7 @@ pub fn build_provider(
         }
 
         ProviderType::Ollama => {
-            let mut provider = OllamaProvider::new(
-                config.model.clone(),
-                config.dimensions,
-            );
+            let mut provider = OllamaProvider::new(config.model.clone(), config.dimensions);
 
             if let Some(ref url) = config.base_url {
                 provider = provider.with_base_url(url.clone());

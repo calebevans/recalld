@@ -9,13 +9,10 @@ use std::sync::Arc;
 use tokio::time::Instant;
 use tracing::{debug, instrument, warn};
 
-use crate::model::{
-    AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConfig, NamespaceId,
-};
-
 use super::error::{Result, SearchError};
 use super::query::{QueryMode, SearchFilter, SearchQuery};
 use super::response::{MemoryResponse, SearchResponse, SearchResult, StageTimings};
+use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConfig, NamespaceId};
 
 // ---------------------------------------------------------------------------
 // Subsystem Traits (DI contracts for QueryEngine)
@@ -366,9 +363,10 @@ impl QueryEngine {
         let fts_stage_start = Instant::now();
         let fts_text = query.fts_query.as_ref().or(query.text.as_ref());
         let fts_results: Vec<FtsResult> = match fts_text {
-            Some(text) if query.query_mode != QueryMode::MetadataOnly => {
-                self.fts_index.search(ns_config.id, text, fetch_k).unwrap_or_default()
-            }
+            Some(text) if query.query_mode != QueryMode::MetadataOnly => self
+                .fts_index
+                .search(ns_config.id, text, fetch_k)
+                .unwrap_or_default(),
             _ => Vec::new(),
         };
         timings.fts_search_us = fts_stage_start.elapsed().as_micros() as u64;
@@ -379,8 +377,10 @@ impl QueryEngine {
         let fts_ids: Vec<MemoryId> = fts_results.iter().map(|s| s.memory_id).collect();
 
         // Build lookup maps for raw scores.
-        let vector_score_map: std::collections::HashMap<MemoryId, f32> =
-            scored_candidates.iter().map(|s| (s.memory_id, s.score)).collect();
+        let vector_score_map: std::collections::HashMap<MemoryId, f32> = scored_candidates
+            .iter()
+            .map(|s| (s.memory_id, s.score))
+            .collect();
         let fts_score_map: std::collections::HashMap<MemoryId, f32> =
             fts_results.iter().map(|s| (s.memory_id, s.score)).collect();
 
@@ -530,7 +530,9 @@ impl QueryEngine {
                     .collect();
 
                 if !seeds.is_empty() {
-                    let activated = self.graph.spreading_activation(&seeds, ns_config.id, query.graph_depth);
+                    let activated =
+                        self.graph
+                            .spreading_activation(&seeds, ns_config.id, query.graph_depth);
 
                     // Collect existing candidate IDs for dedup.
                     let all_candidate_ids: std::collections::HashSet<MemoryId> =
@@ -560,7 +562,6 @@ impl QueryEngine {
                                 entity_recall_score: 0.0,
                                 composite_score: 0.0,
                                 activation_score: Some(activation),
-
                             });
                         }
                     }
@@ -573,10 +574,8 @@ impl QueryEngine {
         // Compute entity overlap with each candidate's cached entities.
         if !query_entities.is_empty() {
             for candidate in &mut candidates {
-                candidate.entity_score = crate::model::entity_overlap(
-                    &query_entities,
-                    &candidate.record.entities,
-                );
+                candidate.entity_score =
+                    crate::model::entity_overlap(&query_entities, &candidate.record.entities);
             }
         }
 
@@ -677,10 +676,8 @@ impl QueryEngine {
             }
 
             if !replacements_to_inject.is_empty() {
-                let load_ids: Vec<MemoryId> = replacements_to_inject
-                    .iter()
-                    .map(|(id, _)| *id)
-                    .collect();
+                let load_ids: Vec<MemoryId> =
+                    replacements_to_inject.iter().map(|(id, _)| *id).collect();
 
                 if let Ok(records) = self.load_records(&load_ids).await {
                     let score_map: std::collections::HashMap<MemoryId, f32> =
@@ -691,18 +688,12 @@ impl QueryEngine {
                             continue;
                         }
 
-                        let inherited_score = score_map
-                            .get(&record.id)
-                            .copied()
-                            .unwrap_or(0.0);
+                        let inherited_score = score_map.get(&record.id).copied().unwrap_or(0.0);
 
                         let effective_r = Self::compute_effective_r(&record);
 
                         let entity_score = if !query_entities.is_empty() {
-                            crate::model::entity_overlap(
-                                &query_entities,
-                                &record.entities,
-                            )
+                            crate::model::entity_overlap(&query_entities, &record.entities)
                         } else {
                             0.0
                         };
@@ -718,8 +709,7 @@ impl QueryEngine {
                             composite_score: 0.0,
                             activation_score: None,
                         };
-                        replacement.composite_score =
-                            Self::compute_composite_score(&replacement);
+                        replacement.composite_score = Self::compute_composite_score(&replacement);
 
                         replacement.composite_score =
                             replacement.composite_score.max(inherited_score);
@@ -837,7 +827,9 @@ impl QueryEngine {
         };
 
         // Over-fetch by 1 to account for self-match removal.
-        let scored = self.vector_indexes.search(record.namespace_id, &[], k + 1)?;
+        let scored = self
+            .vector_indexes
+            .search(record.namespace_id, &[], k + 1)?;
 
         // Remove the source memory from results.
         let filtered: Vec<ScoredResult> = scored
@@ -852,7 +844,10 @@ impl QueryEngine {
         let results: Vec<SearchResult> = records
             .iter()
             .filter_map(|rec| {
-                let score = filtered.iter().find(|s| s.memory_id == rec.id).map(|s| s.score);
+                let score = filtered
+                    .iter()
+                    .find(|s| s.memory_id == rec.id)
+                    .map(|s| s.score);
                 Some(SearchResult {
                     memory_id: rec.id,
                     created_at: rec.created_at,
@@ -1054,20 +1049,15 @@ impl QueryEngine {
         // that would double-attenuate the signal (see Stage 3 fusion for
         // the cap-scaled variant).
         let fts_signal = match candidate.raw_fts_score {
-            Some(fts) if fts > FTS_COMPOSITE_THRESHOLD => {
-                1.0_f32 - (-fts * FTS_BOOST_RATE).exp()
-            }
+            Some(fts) if fts > FTS_COMPOSITE_THRESHOLD => 1.0_f32 - (-fts * FTS_BOOST_RATE).exp(),
             _ => 0.0,
         };
 
         match candidate.relevance_score {
-            Some(rel) => {
-                0.90 * rel + 0.05 * candidate.entity_score + 0.05 * fts_signal
-            }
+            Some(rel) => 0.90 * rel + 0.05 * candidate.entity_score + 0.05 * fts_signal,
             None if candidate.activation_score.is_some() => {
                 let activation = candidate.activation_score.unwrap();
-                ACTIVATION_WEIGHT * activation
-                    + ACTIVATION_ENTITY_WEIGHT * candidate.entity_score
+                ACTIVATION_WEIGHT * activation + ACTIVATION_ENTITY_WEIGHT * candidate.entity_score
             }
             None if candidate.entity_recall_score > 0.0 => {
                 ENTITY_RECALL_WEIGHT * candidate.entity_recall_score
@@ -1075,9 +1065,7 @@ impl QueryEngine {
                     + ENTITY_RECALL_R_WEIGHT * candidate.effective_r
                     + ENTITY_RECALL_FTS_WEIGHT * fts_signal
             }
-            None => {
-                candidate.effective_r * 0.1
-            }
+            None => candidate.effective_r * 0.1,
         }
     }
 

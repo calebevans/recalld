@@ -34,19 +34,11 @@ impl PhaseThresholds {
         if self.full_threshold <= 0.0 || self.full_threshold >= 1.0 {
             return Err("full_threshold must be in (0.0, 1.0)");
         }
-        if self.summary_threshold <= 0.0
-            || self.summary_threshold >= self.full_threshold
-        {
-            return Err(
-                "summary_threshold must be in (0.0, full_threshold)",
-            );
+        if self.summary_threshold <= 0.0 || self.summary_threshold >= self.full_threshold {
+            return Err("summary_threshold must be in (0.0, full_threshold)");
         }
-        if self.ghost_threshold <= 0.0
-            || self.ghost_threshold >= self.summary_threshold
-        {
-            return Err(
-                "ghost_threshold must be in (0.0, summary_threshold)",
-            );
+        if self.ghost_threshold <= 0.0 || self.ghost_threshold >= self.summary_threshold {
+            return Err("ghost_threshold must be in (0.0, summary_threshold)");
         }
         Ok(())
     }
@@ -150,9 +142,7 @@ impl NamespaceConfig {
         }
 
         // Stability range
-        if !(STABILITY_FLOOR..=STABILITY_CEILING)
-            .contains(&self.initial_stability)
-        {
+        if !(STABILITY_FLOOR..=STABILITY_CEILING).contains(&self.initial_stability) {
             return Err(ValidationError::InvalidStability {
                 value: self.initial_stability,
                 min: STABILITY_FLOOR,
@@ -161,9 +151,7 @@ impl NamespaceConfig {
         }
 
         // Difficulty range
-        if !(DIFFICULTY_MIN..=DIFFICULTY_MAX)
-            .contains(&self.default_difficulty)
-        {
+        if !(DIFFICULTY_MIN..=DIFFICULTY_MAX).contains(&self.default_difficulty) {
             return Err(ValidationError::DifficultyOutOfRange {
                 value: self.default_difficulty,
                 min: DIFFICULTY_MIN,
@@ -182,9 +170,7 @@ impl NamespaceConfig {
 
         // Desired retention in (0.0, 1.0)
         if self.desired_retention <= 0.0 || self.desired_retention >= 1.0 {
-            return Err(ValidationError::StrengthOutOfRange(
-                self.desired_retention,
-            ));
+            return Err(ValidationError::StrengthOutOfRange(self.desired_retention));
         }
 
         Ok(())

@@ -25,8 +25,7 @@ pub mod sweep;
 pub use config::DecayConfig;
 pub use fsrs::FsrsEngine;
 pub use sweep::{
-    DecaySweepRunner, PhaseTransition, SweepConfig, SweepConfigError, SweepRecordError,
-    SweepResult,
+    DecaySweepRunner, PhaseTransition, SweepConfig, SweepConfigError, SweepRecordError, SweepResult,
 };
 
 use crate::model::{AccessEvent, DecayPhase, MemoryId};

@@ -27,23 +27,24 @@ pub use state::AppState;
 
 // Re-export API-layer DI traits so downstream can implement them.
 pub use state::{
-    FsrsEngine, MetricsCollector, NamespaceRegistry, RecordCache,
-    RelationshipGraph, SearchPipeline, StorageEngine,
+    FsrsEngine, MetricsCollector, NamespaceRegistry, RecordCache, RelationshipGraph,
+    SearchPipeline, StorageEngine,
 };
 
 // Re-export API-layer supporting types.
 pub use state::{
-    NamespaceListInfo, NamespaceStats, QueryInput, ReinforceResult,
-    ResolvedSearchResult, SearchFilter, SearchQuery,
+    NamespaceListInfo, NamespaceStats, QueryInput, ReinforceResult, ResolvedSearchResult,
+    SearchFilter, SearchQuery,
 };
 
 // Re-export real error types from their owning modules.
-pub use crate::storage::StorageError;
 pub use crate::embedding::EmbeddingError;
-pub use crate::search::SearchError;
 pub use crate::graph::GraphError;
+pub use crate::search::SearchError;
+pub use crate::storage::StorageError;
 
 use std::net::SocketAddr;
+
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -117,14 +118,10 @@ impl ApiConfig {
 ///
 /// Returns an error if the TCP listener cannot bind or the server
 /// encounters an unrecoverable I/O error.
-pub async fn serve(
-    state: AppState,
-    config: ApiConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn serve(state: AppState, config: ApiConfig) -> Result<(), Box<dyn std::error::Error>> {
     let app = router(state, &config);
 
-    let addr: SocketAddr =
-        format!("{}:{}", config.bind_address, config.port).parse()?;
+    let addr: SocketAddr = format!("{}:{}", config.bind_address, config.port).parse()?;
 
     let listener = TcpListener::bind(addr).await?;
     info!("Recalld API listening on {}", addr);

@@ -3,9 +3,10 @@ use std::path::Path;
 use tokio::io::BufReader;
 use tokio::sync::Mutex;
 
-use crate::mcp::bridge::BridgeError;
 use super::protocol::{DaemonRequest, read_framed_response, write_framed_request};
+use crate::mcp::bridge::BridgeError;
 
+/// Client for communicating with the Recalld daemon over a Unix socket.
 pub struct DaemonClient {
     inner: Mutex<DaemonClientInner>,
 }
@@ -17,6 +18,7 @@ struct DaemonClientInner {
 }
 
 impl DaemonClient {
+    /// Connects to the daemon at the given Unix socket path.
     pub async fn connect(socket_path: &Path) -> std::io::Result<Self> {
         let stream = tokio::net::UnixStream::connect(socket_path).await?;
         let (reader, writer) = stream.into_split();
@@ -64,6 +66,7 @@ impl DaemonClient {
             .ok_or_else(|| BridgeError::Internal("empty daemon response".into()))
     }
 
+    /// Sends a ping to verify the daemon is responsive.
     pub async fn ping(&self) -> Result<(), BridgeError> {
         self.call("ping", serde_json::json!({})).await?;
         Ok(())

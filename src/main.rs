@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use recalld::{Recalld, RecalldError};
 use recalld::config::{RecalldConfig, loader};
+use recalld::{Recalld, RecalldError};
 
 /// Recalld — AI memory system with biologically-inspired decay
 #[derive(Parser, Debug)]
@@ -148,7 +148,11 @@ fn main() -> ExitCode {
         log_json: false,
         port: None,
     }) {
-        Command::Serve { log_level, log_json, .. } => {
+        Command::Serve {
+            log_level,
+            log_json,
+            ..
+        } => {
             let level = log_level.as_deref().unwrap_or("info");
             if let Err(e) = init_tracing(level, *log_json, false) {
                 eprintln!("fatal: failed to initialize tracing: {e}");
@@ -167,15 +171,20 @@ fn main() -> ExitCode {
                 DaemonAction::Start { log_level, .. } => log_level.as_deref().unwrap_or("info"),
                 _ => "info",
             };
-            let stderr_only = matches!(action, DaemonAction::Start { foreground: true, .. });
+            let stderr_only = matches!(
+                action,
+                DaemonAction::Start {
+                    foreground: true,
+                    ..
+                }
+            );
             if let Err(e) = init_tracing(level, false, stderr_only) {
                 eprintln!("fatal: failed to initialize tracing: {e}");
                 return ExitCode::FAILURE;
             }
         }
         #[cfg(feature = "bench")]
-        Command::Bench { .. } => {
-        }
+        Command::Bench { .. } => {}
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -205,41 +214,53 @@ async fn async_main(cli: Cli) -> ExitCode {
         log_json: false,
         port: None,
     }) {
-        Command::Serve { bind, port, .. } => {
-            run_serve(config, bind, port).await
-        }
-        Command::Mcp { .. } => {
-            run_mcp(config).await
-        }
-        Command::Daemon { action } => {
-            run_daemon(config, action).await
-        }
+        Command::Serve { bind, port, .. } => run_serve(config, bind, port).await,
+        Command::Mcp { .. } => run_mcp(config).await,
+        Command::Daemon { action } => run_daemon(config, action).await,
         #[cfg(feature = "bench")]
-        Command::Bench { target, format } => {
-            run_bench(config, target, &format).await
-        }
+        Command::Bench { target, format } => run_bench(config, target, &format).await,
     }
 }
 
 #[cfg(feature = "bench")]
 async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> ExitCode {
     match target {
-        BenchTarget::Locomo { data, top_k, model, judge_model, llm_url, skip_adversarial, diagnose } => {
+        BenchTarget::Locomo {
+            data,
+            top_k,
+            model,
+            judge_model,
+            llm_url,
+            skip_adversarial,
+            diagnose,
+        } => {
             if !data.exists() {
                 eprintln!("error: dataset not found: {}", data.display());
                 eprintln!("  Download it with:");
-                eprintln!("  curl -L https://github.com/snap-research/locomo/raw/refs/heads/main/data/locomo10.json -o locomo10.json");
+                eprintln!(
+                    "  curl -L https://github.com/snap-research/locomo/raw/refs/heads/main/data/locomo10.json -o locomo10.json"
+                );
                 return ExitCode::FAILURE;
             }
             if diagnose {
-                let llm = match recalld::bench::claude::LlmClient::new(model.clone(), llm_url.as_deref()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("LLM backend required for benchmark: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                match recalld::bench::locomo::run_diagnose(&config, &data, top_k, skip_adversarial, &llm).await {
+                let llm =
+                    match recalld::bench::claude::LlmClient::new(model.clone(), llm_url.as_deref())
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("LLM backend required for benchmark: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                match recalld::bench::locomo::run_diagnose(
+                    &config,
+                    &data,
+                    top_k,
+                    skip_adversarial,
+                    &llm,
+                )
+                .await
+                {
                     Ok(()) => return ExitCode::SUCCESS,
                     Err(e) => {
                         eprintln!("diagnostic error: {e}");
@@ -247,7 +268,18 @@ async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> 
                     }
                 }
             }
-            match recalld::bench::locomo::run(&config, &data, top_k, &model, &judge_model, llm_url.as_deref(), format, skip_adversarial).await {
+            match recalld::bench::locomo::run(
+                &config,
+                &data,
+                top_k,
+                &model,
+                &judge_model,
+                llm_url.as_deref(),
+                format,
+                skip_adversarial,
+            )
+            .await
+            {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("benchmark error: {e}");
@@ -258,7 +290,11 @@ async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> 
     }
 }
 
-async fn run_serve(config: RecalldConfig, bind: std::net::SocketAddr, port: Option<u16>) -> ExitCode {
+async fn run_serve(
+    config: RecalldConfig,
+    bind: std::net::SocketAddr,
+    port: Option<u16>,
+) -> ExitCode {
     let bind = if let Some(p) = port {
         std::net::SocketAddr::new(bind.ip(), p)
     } else {
@@ -283,42 +319,29 @@ async fn run_serve(config: RecalldConfig, bind: std::net::SocketAddr, port: Opti
     let app_state = {
         use recalld::api::adapters::*;
 
-        let search: Arc<dyn recalld::api::SearchPipeline> =
-            Arc::new(SearchPipelineAdapter::new(
-                system.query_engine().clone(),
-                system.embedding().clone(),
-                system.vector_index().clone(),
-            ));
-        let storage: Arc<dyn recalld::api::StorageEngine> =
-            Arc::new(StorageEngineAdapter::new(
-                system.storage().clone(),
-                system.cache().clone(),
-                system.embedding().clone(),
-            ));
-        let cache: Arc<dyn recalld::api::RecordCache> =
-            Arc::new(RecordCacheAdapter::new(
-                system.cache().clone(),
-                system.storage().clone(),
-            ));
+        let search: Arc<dyn recalld::api::SearchPipeline> = Arc::new(SearchPipelineAdapter::new(
+            system.query_engine().clone(),
+            system.embedding().clone(),
+            system.vector_index().clone(),
+        ));
+        let storage: Arc<dyn recalld::api::StorageEngine> = Arc::new(StorageEngineAdapter::new(
+            system.storage().clone(),
+            system.cache().clone(),
+            system.embedding().clone(),
+        ));
+        let cache: Arc<dyn recalld::api::RecordCache> = Arc::new(RecordCacheAdapter::new(
+            system.cache().clone(),
+            system.storage().clone(),
+        ));
         let graph: Arc<dyn recalld::api::RelationshipGraph> =
-            Arc::new(RelationshipGraphAdapter::new(
-                system.graph().clone(),
-            ));
+            Arc::new(RelationshipGraphAdapter::new(system.graph().clone()));
         let decay: Arc<dyn recalld::api::FsrsEngine> =
-            Arc::new(FsrsEngineAdapter::new(
-                system.storage().clone(),
-                true,
-            ));
+            Arc::new(FsrsEngineAdapter::new(system.storage().clone(), true));
         let namespaces: Arc<dyn recalld::api::NamespaceRegistry> =
-            Arc::new(NamespaceRegistryAdapter::new(
-                system.storage().clone(),
-            ));
-        let metrics: Arc<dyn recalld::api::MetricsCollector> =
-            Arc::new(NoopMetricsCollector);
+            Arc::new(NamespaceRegistryAdapter::new(system.storage().clone()));
+        let metrics: Arc<dyn recalld::api::MetricsCollector> = Arc::new(NoopMetricsCollector);
 
-        recalld::api::AppState::new(
-            search, storage, cache, graph, decay, namespaces, metrics,
-        )
+        recalld::api::AppState::new(search, storage, cache, graph, decay, namespaces, metrics)
     };
 
     // Start the API server (blocks until shutdown signal).
@@ -368,9 +391,9 @@ async fn run_mcp(config: RecalldConfig) -> ExitCode {
     };
 
     let handler: Arc<dyn recalld::mcp::McpHandler> = Arc::new(bridge);
-    let server = Arc::new(tokio::sync::Mutex::new(
-        recalld::mcp::McpServer::new(handler),
-    ));
+    let server = Arc::new(tokio::sync::Mutex::new(recalld::mcp::McpServer::new(
+        handler,
+    )));
 
     match recalld::mcp::run_stdio(server).await {
         Ok(()) => {
@@ -415,13 +438,9 @@ async fn run_mcp_direct(config: RecalldConfig) -> ExitCode {
                 std::sync::Arc::new(system.config().clone()),
             ));
         let namespaces: Arc<dyn recalld::mcp::bridge::NamespaceRegistry> =
-            Arc::new(McpNamespaceAdapter::new(
-                system.storage().clone(),
-            ));
+            Arc::new(McpNamespaceAdapter::new(system.storage().clone()));
         let health: Arc<dyn recalld::mcp::bridge::HealthChecker> =
-            Arc::new(McpHealthAdapter::new(
-                system.storage().clone(),
-            ));
+            Arc::new(McpHealthAdapter::new(system.storage().clone()));
 
         recalld::mcp::bridge::McpBridge {
             search,
@@ -432,9 +451,9 @@ async fn run_mcp_direct(config: RecalldConfig) -> ExitCode {
     };
 
     let handler: Arc<dyn recalld::mcp::McpHandler> = Arc::new(bridge);
-    let server = Arc::new(tokio::sync::Mutex::new(
-        recalld::mcp::McpServer::new(handler),
-    ));
+    let server = Arc::new(tokio::sync::Mutex::new(recalld::mcp::McpServer::new(
+        handler,
+    )));
 
     match recalld::mcp::run_stdio(server).await {
         Ok(()) => {
@@ -528,7 +547,11 @@ async fn auto_start_daemon(
 
 async fn run_daemon(config: RecalldConfig, action: DaemonAction) -> ExitCode {
     match action {
-        DaemonAction::Start { foreground, idle_timeout, .. } => {
+        DaemonAction::Start {
+            foreground,
+            idle_timeout,
+            ..
+        } => {
             let timeout = if idle_timeout == 0 {
                 Duration::from_secs(u64::MAX / 2)
             } else {
@@ -609,28 +632,26 @@ async fn run_daemon_stop() -> ExitCode {
     }
 
     match recalld::daemon::DaemonClient::connect(&socket).await {
-        Ok(client) => {
-            match client.call("shutdown", serde_json::json!({})).await {
-                Ok(_) => {
-                    eprintln!("daemon shutting down...");
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-                    while socket.exists() && tokio::time::Instant::now() < deadline {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                    if socket.exists() {
-                        eprintln!("warning: daemon may not have shut down cleanly");
-                        ExitCode::FAILURE
-                    } else {
-                        eprintln!("daemon stopped");
-                        ExitCode::SUCCESS
-                    }
+        Ok(client) => match client.call("shutdown", serde_json::json!({})).await {
+            Ok(_) => {
+                eprintln!("daemon shutting down...");
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                while socket.exists() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                Err(e) => {
-                    eprintln!("failed to send shutdown: {e}");
+                if socket.exists() {
+                    eprintln!("warning: daemon may not have shut down cleanly");
                     ExitCode::FAILURE
+                } else {
+                    eprintln!("daemon stopped");
+                    ExitCode::SUCCESS
                 }
             }
-        }
+            Err(e) => {
+                eprintln!("failed to send shutdown: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Err(e) => {
             eprintln!("failed to connect to daemon: {e}");
             ExitCode::FAILURE
@@ -657,24 +678,24 @@ async fn run_daemon_status() -> ExitCode {
         .unwrap_or_else(|| "unknown".into());
 
     match recalld::daemon::DaemonClient::connect(&socket).await {
-        Ok(client) => {
-            match client.call("check_health", serde_json::json!({})).await {
-                Ok(health) => {
-                    eprintln!("daemon is running");
-                    eprintln!("  pid: {pid}");
-                    eprintln!("  socket: {}", socket.display());
-                    if let Ok(status) = serde_json::from_value::<recalld::mcp::bridge::HealthStatus>(health) {
-                        eprintln!("  status: {}", status.status);
-                        eprintln!("  uptime: {}s", status.uptime_secs);
-                    }
-                    ExitCode::SUCCESS
+        Ok(client) => match client.call("check_health", serde_json::json!({})).await {
+            Ok(health) => {
+                eprintln!("daemon is running");
+                eprintln!("  pid: {pid}");
+                eprintln!("  socket: {}", socket.display());
+                if let Ok(status) =
+                    serde_json::from_value::<recalld::mcp::bridge::HealthStatus>(health)
+                {
+                    eprintln!("  status: {}", status.status);
+                    eprintln!("  uptime: {}s", status.uptime_secs);
                 }
-                Err(e) => {
-                    eprintln!("daemon is running but health check failed: {e}");
-                    ExitCode::from(2)
-                }
+                ExitCode::SUCCESS
             }
-        }
+            Err(e) => {
+                eprintln!("daemon is running but health check failed: {e}");
+                ExitCode::from(2)
+            }
+        },
         Err(e) => {
             eprintln!("daemon socket exists but connection failed: {e}");
             ExitCode::FAILURE

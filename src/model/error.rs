@@ -61,8 +61,10 @@ pub enum ValidationError {
     },
 
     /// Embedding dimensionality does not match the namespace.
-    #[error("expected {expected} embedding dimensions for namespace \
-             '{namespace}', got {actual}")]
+    #[error(
+        "expected {expected} embedding dimensions for namespace \
+             '{namespace}', got {actual}"
+    )]
     DimensionMismatch {
         expected: u32,
         actual: u32,
@@ -102,8 +104,10 @@ pub enum ValidationError {
     TimestampOrdering { created: i64, accessed: i64 },
 
     /// Namespace name is invalid (empty, too long, or bad characters).
-    #[error("namespace name must be 1-{max} characters, \
-             alphanumeric/hyphens/underscores")]
+    #[error(
+        "namespace name must be 1-{max} characters, \
+             alphanumeric/hyphens/underscores"
+    )]
     InvalidNamespaceName { max: usize },
 }
 
@@ -135,12 +139,8 @@ impl ValidationError {
             Self::SummaryEmpty | Self::SummaryTooLong { .. } => "summary",
             Self::FullTextTooLong { .. } => "full_text",
             Self::TooManyTags { .. } | Self::InvalidTag { .. } => "tags",
-            Self::DimensionMismatch { .. } | Self::NonFiniteEmbedding { .. } => {
-                "embedding"
-            }
-            Self::NamespaceNotFound { .. } | Self::InvalidNamespaceName { .. } => {
-                "namespace"
-            }
+            Self::DimensionMismatch { .. } | Self::NonFiniteEmbedding { .. } => "embedding",
+            Self::NamespaceNotFound { .. } | Self::InvalidNamespaceName { .. } => "namespace",
             Self::InvalidStability { .. } => "initial_stability",
             Self::StrengthOutOfRange(_) => "strength",
             Self::DecayStrengthOutOfRange(_) => "decay_strength",
@@ -159,8 +159,10 @@ impl ValidationError {
 #[derive(Debug, Error)]
 pub enum DecodeError {
     /// Record data is shorter than the minimum expected size.
-    #[error("record is truncated: expected at least {expected} bytes, \
-             got {actual}")]
+    #[error(
+        "record is truncated: expected at least {expected} bytes, \
+             got {actual}"
+    )]
     Truncated { expected: usize, actual: usize },
 
     /// Schema version is not recognized.
@@ -179,8 +181,10 @@ pub enum DecodeError {
     },
 
     /// A length-prefixed field declares more bytes than remain.
-    #[error("variable-length field '{field}' declares {declared} bytes \
-             but only {available} remain")]
+    #[error(
+        "variable-length field '{field}' declares {declared} bytes \
+             but only {available} remain"
+    )]
     FieldOverflow {
         field: &'static str,
         declared: usize,

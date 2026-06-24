@@ -6,10 +6,11 @@
 //! [`ApiError`](crate::serialization::ApiError).
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
+
 use crate::serialization::ApiError;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -147,10 +148,10 @@ impl IntoResponse for AppError {
 // Re-export real error types from their owning modules so downstream
 // code that was using `super::errors::StorageError` etc. continues to
 // compile.
-pub use crate::storage::StorageError;
 pub use crate::embedding::EmbeddingError;
-pub use crate::search::SearchError;
 pub use crate::graph::GraphError;
+pub use crate::search::SearchError;
+pub use crate::storage::StorageError;
 
 impl From<StorageError> for AppError {
     fn from(err: StorageError) -> Self {
@@ -182,27 +183,19 @@ impl From<StorageError> for AppError {
 impl From<EmbeddingError> for AppError {
     fn from(err: EmbeddingError) -> Self {
         match &err {
-            EmbeddingError::DimensionMismatch { expected, got } => {
-                AppError::UnprocessableEntity {
-                    message: format!(
-                        "embedding dimension mismatch: expected {expected}, got {got}"
-                    ),
-                    field: Some("embedding".to_string()),
-                }
-            }
+            EmbeddingError::DimensionMismatch { expected, got } => AppError::UnprocessableEntity {
+                message: format!("embedding dimension mismatch: expected {expected}, got {got}"),
+                field: Some("embedding".to_string()),
+            },
             EmbeddingError::Unavailable(_)
             | EmbeddingError::RateLimited { .. }
             | EmbeddingError::Network(_) => AppError::ServiceUnavailable {
                 message: format!("embedding provider: {err}"),
             },
-            EmbeddingError::TextTooLong { tokens, limit } => {
-                AppError::BadRequest {
-                    message: format!(
-                        "text too long: {tokens} tokens exceeds limit of {limit}"
-                    ),
-                    field: Some("text".to_string()),
-                }
-            }
+            EmbeddingError::TextTooLong { tokens, limit } => AppError::BadRequest {
+                message: format!("text too long: {tokens} tokens exceeds limit of {limit}"),
+                field: Some("text".to_string()),
+            },
             _ => AppError::Internal {
                 source: Box::new(err),
             },
@@ -228,9 +221,7 @@ impl From<SearchError> for AppError {
                 resource: "memory",
                 id: format!("{id}"),
             },
-            SearchError::StageTimeout { .. } => {
-                AppError::Timeout
-            }
+            SearchError::StageTimeout { .. } => AppError::Timeout,
             _ => AppError::Internal {
                 source: Box::new(err),
             },

@@ -86,10 +86,7 @@ impl EmbeddingProvider for PrefixedProvider {
         }
     }
 
-    async fn embed_batch(
-        &self,
-        texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         if self.document_prefix.is_empty() {
             self.inner.embed_batch(texts).await
         } else {
@@ -142,10 +139,7 @@ mod tests {
             Ok(vec![0.0; self.dims])
         }
 
-        async fn embed_batch(
-            &self,
-            texts: &[&str],
-        ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
             let mut received = self.received.lock().unwrap();
             for text in texts {
                 received.push(text.to_string());
@@ -191,11 +185,8 @@ mod tests {
     #[tokio::test]
     async fn test_empty_document_prefix_passthrough() {
         let (mock, received) = MockProvider::new(4);
-        let provider = PrefixedProvider::new(
-            Box::new(mock),
-            "".to_string(),
-            "search_query: ".to_string(),
-        );
+        let provider =
+            PrefixedProvider::new(Box::new(mock), "".to_string(), "search_query: ".to_string());
         provider.embed("hello").await.unwrap();
         let texts = received.lock().unwrap();
         assert_eq!(texts[0], "hello");
@@ -217,11 +208,8 @@ mod tests {
     #[tokio::test]
     async fn test_batch_prefix_applied() {
         let (mock, received) = MockProvider::new(4);
-        let provider = PrefixedProvider::new(
-            Box::new(mock),
-            "doc: ".to_string(),
-            "query: ".to_string(),
-        );
+        let provider =
+            PrefixedProvider::new(Box::new(mock), "doc: ".to_string(), "query: ".to_string());
         provider.embed_batch(&["a", "b"]).await.unwrap();
         let texts = received.lock().unwrap();
         assert_eq!(texts[0], "doc: a");
@@ -231,11 +219,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_empty_prefix() {
         let (mock, received) = MockProvider::new(4);
-        let provider = PrefixedProvider::new(
-            Box::new(mock),
-            "".to_string(),
-            "query: ".to_string(),
-        );
+        let provider = PrefixedProvider::new(Box::new(mock), "".to_string(), "query: ".to_string());
         provider.embed_batch(&["a", "b"]).await.unwrap();
         let texts = received.lock().unwrap();
         assert_eq!(texts[0], "a");
@@ -245,60 +229,38 @@ mod tests {
     #[tokio::test]
     async fn test_dimensions_passthrough() {
         let (mock, _) = MockProvider::new(768);
-        let provider = PrefixedProvider::new(
-            Box::new(mock),
-            "doc: ".to_string(),
-            "query: ".to_string(),
-        );
+        let provider =
+            PrefixedProvider::new(Box::new(mock), "doc: ".to_string(), "query: ".to_string());
         assert_eq!(provider.dimensions(), 768);
     }
 
     #[tokio::test]
     async fn test_model_name_passthrough() {
         let (mock, _) = MockProvider::new(4);
-        let provider = PrefixedProvider::new(
-            Box::new(mock),
-            "doc: ".to_string(),
-            "query: ".to_string(),
-        );
+        let provider =
+            PrefixedProvider::new(Box::new(mock), "doc: ".to_string(), "query: ".to_string());
         assert_eq!(provider.model_name(), "mock");
     }
 
     #[tokio::test]
     async fn test_has_document_prefix() {
         let (mock1, _) = MockProvider::new(4);
-        let p1 = PrefixedProvider::new(
-            Box::new(mock1),
-            "doc: ".to_string(),
-            "".to_string(),
-        );
+        let p1 = PrefixedProvider::new(Box::new(mock1), "doc: ".to_string(), "".to_string());
         assert!(p1.has_document_prefix());
 
         let (mock2, _) = MockProvider::new(4);
-        let p2 = PrefixedProvider::new(
-            Box::new(mock2),
-            "".to_string(),
-            "".to_string(),
-        );
+        let p2 = PrefixedProvider::new(Box::new(mock2), "".to_string(), "".to_string());
         assert!(!p2.has_document_prefix());
     }
 
     #[tokio::test]
     async fn test_has_query_prefix() {
         let (mock1, _) = MockProvider::new(4);
-        let p1 = PrefixedProvider::new(
-            Box::new(mock1),
-            "".to_string(),
-            "query: ".to_string(),
-        );
+        let p1 = PrefixedProvider::new(Box::new(mock1), "".to_string(), "query: ".to_string());
         assert!(p1.has_query_prefix());
 
         let (mock2, _) = MockProvider::new(4);
-        let p2 = PrefixedProvider::new(
-            Box::new(mock2),
-            "".to_string(),
-            "".to_string(),
-        );
+        let p2 = PrefixedProvider::new(Box::new(mock2), "".to_string(), "".to_string());
         assert!(!p2.has_query_prefix());
     }
 }

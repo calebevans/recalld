@@ -291,12 +291,11 @@ impl<'a> FsrsEngine<'a> {
     ///
     /// Retrievability in [0.0, 1.0]. The curve is monotonically
     /// decreasing in `t` and monotonically increasing in `S`.
-    pub fn retrievability(
-        &self,
-        time_since_access_days: f32,
-        stability: f32,
-    ) -> f32 {
-        debug_assert!(stability > 0.0, "stability must be positive, got {stability}");
+    pub fn retrievability(&self, time_since_access_days: f32, stability: f32) -> f32 {
+        debug_assert!(
+            stability > 0.0,
+            "stability must be positive, got {stability}"
+        );
         debug_assert!(
             time_since_access_days >= 0.0,
             "elapsed days must be non-negative, got {time_since_access_days}"
@@ -331,12 +330,7 @@ impl<'a> FsrsEngine<'a> {
     ///
     /// SInc >= 1.0 always. Accessing a memory never weakens it. The
     /// return value is the multiplicative factor -- NOT the new stability.
-    pub fn stability_increase(
-        &self,
-        stability: f32,
-        retrievability: f32,
-        difficulty: f32,
-    ) -> f32 {
+    pub fn stability_increase(&self, stability: f32, retrievability: f32, difficulty: f32) -> f32 {
         let growth_base = W8.exp(); // e^1.6474 ~ 5.194
         let difficulty_factor = 11.0 - difficulty; // 6.0 at D = 5.0
         let stability_damping = stability.powf(-W9); // S^(-0.1367)
@@ -400,17 +394,11 @@ impl<'a> FsrsEngine<'a> {
         let current_r = self.retrievability(elapsed_days, state.stability);
 
         // 3. Full SInc
-        let full_sinc = self.stability_increase(
-            state.stability,
-            current_r,
-            state.difficulty,
-        );
+        let full_sinc = self.stability_increase(state.stability, current_r, state.difficulty);
 
         // 4. Apply partial weight for neighbor accesses
         let effective_sinc = match access_kind {
-            AccessKind::DirectRetrieval | AccessKind::ManualReinforcement => {
-                full_sinc
-            }
+            AccessKind::DirectRetrieval | AccessKind::ManualReinforcement => full_sinc,
             AccessKind::AssociativeRetrieval => {
                 1.0 + (full_sinc - 1.0) * self.config.partial_access_weight
             }
@@ -418,8 +406,8 @@ impl<'a> FsrsEngine<'a> {
         };
 
         // 5. Update stability with clamping
-        state.stability = (state.stability * effective_sinc)
-            .clamp(STABILITY_FLOOR, STABILITY_CEILING);
+        state.stability =
+            (state.stability * effective_sinc).clamp(STABILITY_FLOOR, STABILITY_CEILING);
 
         // 6. Reset strength -- just accessed = fully retrievable
         state.strength = 1.0;
@@ -435,9 +423,7 @@ impl<'a> FsrsEngine<'a> {
         });
 
         // 9. Check for permastore promotion
-        let event = if state.stability >= self.config.permastore_threshold
-            && !state.is_permastore
-        {
+        let event = if state.stability >= self.config.permastore_threshold && !state.is_permastore {
             state.is_permastore = true;
             // Caller must fill in the real MemoryId -- the engine
             // does not know which memory this state belongs to.
@@ -477,10 +463,7 @@ impl<'a> FsrsEngine<'a> {
     ///
     /// Connection bonus in [0.0, config.max_connection_bonus]. Zero if
     /// the neighbor slice is empty.
-    pub fn connection_bonus(
-        &self,
-        neighbors: &[(f32, usize)],
-    ) -> f32 {
+    pub fn connection_bonus(&self, neighbors: &[(f32, usize)]) -> f32 {
         if neighbors.is_empty() {
             return 0.0;
         }
@@ -507,11 +490,7 @@ impl<'a> FsrsEngine<'a> {
     /// - The bonus has diminishing effect as R approaches 1.0.
     /// - The result stays in [0.0, 1.0]: a memory with R = 0.0 and
     ///   max bonus (0.15) gets effective_R = 0.15, not 1.0.
-    pub fn effective_retrievability(
-        &self,
-        base_r: f32,
-        connection_bonus: f32,
-    ) -> f32 {
+    pub fn effective_retrievability(&self, base_r: f32, connection_bonus: f32) -> f32 {
         (base_r + connection_bonus * (1.0 - base_r)).clamp(0.0, 1.0)
     }
 
@@ -549,11 +528,7 @@ impl<'a> FsrsEngine<'a> {
     /// ```
     ///
     /// Useful for estimating when a memory will transition phases.
-    pub fn days_until_threshold(
-        &self,
-        stability: f32,
-        target_r: f32,
-    ) -> f32 {
+    pub fn days_until_threshold(&self, stability: f32, target_r: f32) -> f32 {
         debug_assert!(target_r > 0.0 && target_r < 1.0);
         stability / FACTOR * (target_r.powf(1.0 / DECAY) - 1.0)
     }

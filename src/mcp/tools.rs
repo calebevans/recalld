@@ -301,16 +301,9 @@ async fn handle_recall_memories(
         .get("minStrength")
         .and_then(|v| v.as_f64())
         .map(|f| f as f32);
-    let depth = arguments
-        .get("depth")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let time_range_start = arguments
-        .get("timeRangeStart")
-        .and_then(|v| v.as_i64());
-    let time_range_end = arguments
-        .get("timeRangeEnd")
-        .and_then(|v| v.as_i64());
+    let depth = arguments.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let time_range_start = arguments.get("timeRangeStart").and_then(|v| v.as_i64());
+    let time_range_end = arguments.get("timeRangeEnd").and_then(|v| v.as_i64());
 
     let input = crate::mcp::bridge::SearchInput {
         query,

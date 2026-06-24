@@ -1,7 +1,7 @@
 //! Error types for the search pipeline.
 
-use thiserror::Error;
 use crate::model::MemoryId;
+use thiserror::Error;
 
 /// Errors that can occur during search operations.
 #[derive(Debug, Error)]

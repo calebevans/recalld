@@ -1,8 +1,9 @@
 //! Ollama embedding provider using the local /api/embed endpoint.
 
+use std::time::Duration;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
@@ -49,22 +50,17 @@ impl OllamaProvider {
 
     /// Check if Ollama is running and reachable.
     pub async fn health_check(&self) -> Result<(), EmbeddingError> {
-        let response = self
-            .client
-            .get(&self.base_url)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_connect() {
-                    EmbeddingError::Unavailable(
-                        "Ollama is not running. Start it with `ollama serve`".into(),
-                    )
-                } else if e.is_timeout() {
-                    EmbeddingError::Unavailable("Ollama connection timed out".into())
-                } else {
-                    EmbeddingError::Network(e)
-                }
-            })?;
+        let response = self.client.get(&self.base_url).send().await.map_err(|e| {
+            if e.is_connect() {
+                EmbeddingError::Unavailable(
+                    "Ollama is not running. Start it with `ollama serve`".into(),
+                )
+            } else if e.is_timeout() {
+                EmbeddingError::Unavailable("Ollama connection timed out".into())
+            } else {
+                EmbeddingError::Network(e)
+            }
+        })?;
 
         if !response.status().is_success() {
             return Err(EmbeddingError::Unavailable(
@@ -102,10 +98,7 @@ impl EmbeddingProvider for OllamaProvider {
             .ok_or_else(|| EmbeddingError::InvalidResponse("empty response".into()))
     }
 
-    async fn embed_batch(
-        &self,
-        texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -220,7 +213,7 @@ struct ModelInfo {
     details: ModelDetails,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Default, Deserialize)]
 struct ModelDetails {
     #[serde(default)]
     #[allow(dead_code)]

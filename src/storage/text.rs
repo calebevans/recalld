@@ -39,7 +39,7 @@ const TEXT_LOG_VERSION: u16 = 1;
 /// 16-byte file header for text.log.
 /// All multi-byte integers are little-endian.
 #[repr(C)]
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct TextLogHeader {
     /// Magic bytes: "MEMT" (0x4D454D54).
     pub magic: [u8; 4],
@@ -168,10 +168,7 @@ impl TextStore {
     pub fn open(path: &Path) -> Result<TextStore, StorageError> {
         if path.exists() {
             // --- Open existing ---
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)?;
+            let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 
             // Read and validate header.
             let mut header_buf = [0u8; TextLogHeader::SIZE];
@@ -261,12 +258,8 @@ impl TextStore {
         // Read entry header (8 bytes).
         let mut header_buf = [0u8; 8];
         self.file.read_exact(&mut header_buf)?;
-        let stored_length = u32::from_le_bytes(
-            header_buf[0..4].try_into().unwrap(),
-        );
-        let stored_crc = u32::from_le_bytes(
-            header_buf[4..8].try_into().unwrap(),
-        );
+        let stored_length = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
 
         // Cross-check length against meta.db's expected value.
         if stored_length != text_ref.length {
@@ -332,7 +325,9 @@ impl TextStore {
         &mut self,
         live_refs: &[(MemoryId, TextRef)],
     ) -> Result<CompactionResult, StorageError> {
-        let parent_dir = self.path.parent()
+        let parent_dir = self
+            .path
+            .parent()
             .ok_or(StorageError::InvalidPath)?
             .to_path_buf();
         let marker_path = parent_dir.join(".compacting");
@@ -342,10 +337,7 @@ impl TextStore {
         let total_possible = self.count_entries_approx();
 
         // Step 1: Write marker.
-        fs::write(
-            &marker_path,
-            b"text.log compaction in progress\n",
-        )?;
+        fs::write(&marker_path, b"text.log compaction in progress\n")?;
         fsync_file(&marker_path)?;
         fsync_dir(&parent_dir)?;
 
@@ -366,8 +358,7 @@ impl TextStore {
         new_file.write_all(zerocopy::IntoBytes::as_bytes(&header))?;
 
         let mut new_write_pos = TextLogHeader::SIZE as u64;
-        let mut new_refs: RefMapping =
-            Vec::with_capacity(live_refs.len());
+        let mut new_refs: RefMapping = Vec::with_capacity(live_refs.len());
 
         // Step 3: Copy live entries.
         for &(memory_id, old_ref) in live_refs {
@@ -406,10 +397,7 @@ impl TextStore {
         fsync_dir(&parent_dir)?;
 
         // Step 8: Reopen file handle.
-        self.file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
+        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         self.write_pos = new_write_pos;
 
         let entries_removed = total_possible.saturating_sub(live_refs.len());

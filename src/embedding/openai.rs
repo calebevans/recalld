@@ -1,8 +1,9 @@
 //! OpenAI embedding provider using the /v1/embeddings API.
 
+use std::time::Duration;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
@@ -203,10 +204,7 @@ impl EmbeddingProvider for OpenAIProvider {
         Ok(data.embedding)
     }
 
-    async fn embed_batch(
-        &self,
-        texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }

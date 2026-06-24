@@ -4,14 +4,13 @@
 //! described in CS-02 for on-disk `meta.db` storage. All multi-byte
 //! values are little-endian. No external crates are used beyond `std`.
 
+use super::{
+    CURRENT_SCHEMA_VERSION, DecodeError, EncodeError, MAX_SUPPORTED_VERSION, RECORD_MAGIC,
+    V1_FIXED_SIZE,
+};
 use crate::model::memory::{AccessEvent, AccessKind};
 use crate::model::record::DiskRecord;
 use crate::model::tag::Tag;
-
-use super::{
-    DecodeError, EncodeError, CURRENT_SCHEMA_VERSION, MAX_SUPPORTED_VERSION, RECORD_MAGIC,
-    V1_FIXED_SIZE,
-};
 
 /// Serializes a `DiskRecord` into the Recalld binary format.
 ///
@@ -361,11 +360,7 @@ fn read_i64_le(bytes: &[u8], pos: &mut usize) -> i64 {
 }
 
 /// Read a little-endian f32 from the buffer, rejecting non-finite values.
-fn read_f32_le(
-    bytes: &[u8],
-    pos: &mut usize,
-    field: &'static str,
-) -> Result<f32, DecodeError> {
+fn read_f32_le(bytes: &[u8], pos: &mut usize, field: &'static str) -> Result<f32, DecodeError> {
     let val = f32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
     *pos += 4;
     if !val.is_finite() {

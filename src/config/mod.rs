@@ -1,29 +1,20 @@
-// Configuration system for the Recalld memory engine.
-//
-// Provides layered configuration loading: compiled defaults -> TOML file ->
-// environment variables -> CLI flags, with validation after merge.
-//
-// Required Cargo.toml entries for this module:
-//
-// [dependencies]
-// toml      = "0.8"
-// serde     = { version = "1", features = ["derive"] }
-// tokio     = { version = "1", features = ["sync", "rt", "macros", "time"] }
-// thiserror = "2"
-// tracing   = "0.1"
+//! Configuration system for the Recalld memory engine.
+//!
+//! Provides layered configuration loading: compiled defaults -> TOML file ->
+//! environment variables -> CLI flags, with validation after merge.
 
 pub mod loader;
 pub mod types;
 
-pub use loader::{generate_default_config, load_config, CliOverrides, ConfigSource};
+pub use loader::{CliOverrides, ConfigSource, generate_default_config, load_config};
 pub use types::{
-    CacheConfig, DecayConfig, EmbeddingConfig, EmbeddingProvider,
-    GraphConfig, LogConfig, LogFormat, PhaseThresholds,
-    RifConfig, ServerConfig, StorageConfig,
+    CacheConfig, DecayConfig, EmbeddingConfig, EmbeddingProvider, GraphConfig, LogConfig,
+    LogFormat, PhaseThresholds, RifConfig, ServerConfig, StorageConfig,
 };
 
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors that can occur during configuration loading or validation.
@@ -108,9 +99,7 @@ impl RecalldConfig {
     ///
     /// Returns all errors found, not just the first, so operators can fix
     /// everything in a single pass.
-    pub fn validate(
-        &self,
-    ) -> std::result::Result<(), Vec<ConfigError>> {
+    pub fn validate(&self) -> std::result::Result<(), Vec<ConfigError>> {
         let mut errors = Vec::new();
 
         // --- Server ---
@@ -140,9 +129,7 @@ impl RecalldConfig {
                 message: "data_dir must not be empty".into(),
             });
         }
-        if self.storage.compaction_threshold <= 0.0
-            || self.storage.compaction_threshold > 1.0
-        {
+        if self.storage.compaction_threshold <= 0.0 || self.storage.compaction_threshold > 1.0 {
             errors.push(ConfigError::Validation {
                 field: "storage.compaction_threshold".into(),
                 message: "must be in (0.0, 1.0]".into(),
@@ -218,8 +205,7 @@ impl RecalldConfig {
                 field: "cache.time_to_idle_secs".into(),
                 message: format!(
                     "time_to_idle ({}) must be <= time_to_live ({})",
-                    self.cache.time_to_idle_secs,
-                    self.cache.time_to_live_secs
+                    self.cache.time_to_idle_secs, self.cache.time_to_live_secs
                 ),
             });
         }
@@ -270,9 +256,7 @@ impl RecalldConfig {
                 message: "must be non-zero".into(),
             });
         }
-        if self.graph.auto_link_threshold <= 0.0
-            || self.graph.auto_link_threshold >= 1.0
-        {
+        if self.graph.auto_link_threshold <= 0.0 || self.graph.auto_link_threshold >= 1.0 {
             errors.push(ConfigError::Validation {
                 field: "graph.auto_link_threshold".into(),
                 message: "must be in (0.0, 1.0)".into(),
@@ -293,23 +277,18 @@ impl RecalldConfig {
 
         // --- RIF ---
         if self.rif.enabled {
-            if self.rif.max_suppression < 0.0
-                || self.rif.max_suppression > 1.0
-            {
+            if self.rif.max_suppression < 0.0 || self.rif.max_suppression > 1.0 {
                 errors.push(ConfigError::Validation {
                     field: "rif.max_suppression".into(),
                     message: "must be in [0.0, 1.0]".into(),
                 });
             }
-            if self.rif.activation_threshold_low
-                >= self.rif.activation_threshold_high
-            {
+            if self.rif.activation_threshold_low >= self.rif.activation_threshold_high {
                 errors.push(ConfigError::Validation {
                     field: "rif.activation_thresholds".into(),
                     message: format!(
                         "low ({}) must be < high ({})",
-                        self.rif.activation_threshold_low,
-                        self.rif.activation_threshold_high
+                        self.rif.activation_threshold_low, self.rif.activation_threshold_high
                     ),
                 });
             }
@@ -323,9 +302,7 @@ impl RecalldConfig {
 
         // --- Log ---
         let valid_levels = ["trace", "debug", "info", "warn", "error"];
-        if !valid_levels
-            .contains(&self.log.level.to_lowercase().as_str())
-        {
+        if !valid_levels.contains(&self.log.level.to_lowercase().as_str()) {
             errors.push(ConfigError::Validation {
                 field: "log.level".into(),
                 message: format!(

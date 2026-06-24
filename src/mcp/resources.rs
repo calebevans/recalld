@@ -102,8 +102,8 @@ async fn read_namespaces(bridge: &McpBridge) -> Result<ResourceReadResult, Strin
 async fn read_health(bridge: &McpBridge) -> Result<ResourceReadResult, String> {
     let health = bridge.health.check_health().await;
 
-    let text = serde_json::to_string_pretty(&health)
-        .map_err(|e| format!("Serialization error: {e}"))?;
+    let text =
+        serde_json::to_string_pretty(&health).map_err(|e| format!("Serialization error: {e}"))?;
 
     Ok(ResourceReadResult {
         contents: vec![ResourceContent {
@@ -125,8 +125,8 @@ async fn read_namespace_stats(
         .await
         .map_err(|e| format!("Failed to get namespace stats: {e}"))?;
 
-    let text = serde_json::to_string_pretty(&stats)
-        .map_err(|e| format!("Serialization error: {e}"))?;
+    let text =
+        serde_json::to_string_pretty(&stats).map_err(|e| format!("Serialization error: {e}"))?;
 
     Ok(ResourceReadResult {
         contents: vec![ResourceContent {

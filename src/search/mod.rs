@@ -9,8 +9,8 @@
 //! - `SearchError` error type (`error`)
 
 // CS-14: SIMD vector search
-mod simd;
 mod index;
+mod simd;
 
 // CS-26: FTS5 full-text search (replaces custom BM25)
 mod fts;
@@ -19,15 +19,15 @@ mod fts;
 mod entity_index;
 
 // CS-16: Search pipeline
-mod query;
-mod pipeline;
-mod response;
 pub mod adapters;
 pub mod error;
+mod pipeline;
+mod query;
+mod response;
 
 // --- CS-14 re-exports ---
-pub use simd::{dot_product_simd, normalize_l2, is_normalized};
-pub use index::{FlatVectorIndex, FilterEntry, TagInterner};
+pub use index::{FilterEntry, FlatVectorIndex, TagInterner};
+pub use simd::{dot_product_simd, is_normalized, normalize_l2};
 
 // --- CS-26 re-exports ---
 pub use fts::FtsIndex;
@@ -36,22 +36,21 @@ pub use fts::FtsIndex;
 pub use entity_index::EntityIndex;
 
 // --- CS-16 re-exports ---
-pub use query::{SearchQuery, QueryMode};
-pub use query::SearchFilter as PipelineSearchFilter;
-pub use pipeline::{
-    QueryEngine, ScoredResult, RifSuppression, FtsResult,
-    NamespaceResolver, EmbeddingProviderRegistry, VectorIndexRegistry,
-    FtsIndexRegistry, EntityIndexReader, EntityRecallResult,
-    RecordCache, MetadataStore, RifProcessor, AccessRecorder, GraphReader,
-};
-pub use response::{
-    SearchResult as PipelineSearchResult,
-    SearchResponse, MemoryResponse, StageTimings,
-};
 pub use error::SearchError;
+pub use pipeline::{
+    AccessRecorder, EmbeddingProviderRegistry, EntityIndexReader, EntityRecallResult,
+    FtsIndexRegistry, FtsResult, GraphReader, MetadataStore, NamespaceResolver, QueryEngine,
+    RecordCache, RifProcessor, RifSuppression, ScoredResult, VectorIndexRegistry,
+};
+pub use query::SearchFilter as PipelineSearchFilter;
+pub use query::{QueryMode, SearchQuery};
+pub use response::{
+    MemoryResponse, SearchResponse, SearchResult as PipelineSearchResult, StageTimings,
+};
+
+use std::path::Path;
 
 use crate::model::{MemoryId, NamespaceId};
-use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // VectorSearchResult (CS-14)

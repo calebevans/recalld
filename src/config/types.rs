@@ -1,8 +1,8 @@
-// Configuration sub-types for the Recalld memory system.
-//
-// Each struct represents a section of the TOML configuration file.
-// All structs derive Deserialize, Serialize, Clone, Debug and use
-// #[serde(default)] so partial TOML files are valid.
+//! Configuration sub-types for the Recalld memory system.
+//!
+//! Each struct represents a section of the TOML configuration file.
+//! All structs derive `Deserialize`, `Serialize`, `Clone`, `Debug` and use
+//! `#[serde(default)]` so partial TOML files are valid.
 
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +55,12 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_dir: dirs::home_dir()
-                .map(|h| h.join(".recalld").join("data").to_string_lossy().into_owned())
+                .map(|h| {
+                    h.join(".recalld")
+                        .join("data")
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .unwrap_or_else(|| ".recalld/data".to_string()),
             max_vector_file_size: 2 * 1024 * 1024 * 1024, // 2 GB
             compaction_threshold: 0.20,
@@ -136,8 +141,8 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_capacity_bytes: 1024 * 1024 * 1024, // 1 GB
-            time_to_idle_secs: 3600,                 // 1 hour
-            time_to_live_secs: 86400,                // 24 hours
+            time_to_idle_secs: 3600,                // 1 hour
+            time_to_live_secs: 86400,               // 24 hours
             warm_file_enabled: true,
         }
     }
@@ -181,7 +186,7 @@ pub struct EmbeddingConfig {
 }
 
 /// Supported embedding providers.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EmbeddingProvider {
     /// OpenAI embedding API.
@@ -309,7 +314,7 @@ pub struct LogConfig {
 }
 
 /// Log output format.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     /// Human-readable, colored output.

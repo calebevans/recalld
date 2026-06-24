@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::client::DaemonClient;
+use super::protocol;
 use crate::mcp::bridge::{
     self, BridgeError, CreateNamespaceInput, HealthStatus, MemoryRecord, NamespaceInfo,
     NamespaceStats, ReinforceResult, SearchHit, SearchInput, SearchPipeline, SearchResponse,
@@ -9,18 +11,17 @@ use crate::mcp::bridge::{
 };
 use crate::model::MemoryId;
 
-use super::client::DaemonClient;
-use super::protocol;
-
 // ═══════════════════════════════════════════════════════════════════════
 // RemoteSearchAdapter
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Delegates search operations to the daemon over a Unix socket.
 pub struct RemoteSearchAdapter {
     client: Arc<DaemonClient>,
 }
 
 impl RemoteSearchAdapter {
+    /// Creates a new adapter backed by the given daemon client.
     pub fn new(client: Arc<DaemonClient>) -> Self {
         Self { client }
     }
@@ -29,8 +30,8 @@ impl RemoteSearchAdapter {
 #[async_trait]
 impl SearchPipeline for RemoteSearchAdapter {
     async fn search(&self, query: SearchInput) -> Result<SearchResponse, BridgeError> {
-        let params = serde_json::to_value(&query)
-            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let params =
+            serde_json::to_value(&query).map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("search", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
@@ -60,11 +61,13 @@ impl SearchPipeline for RemoteSearchAdapter {
 // RemoteStorageAdapter
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Delegates storage operations to the daemon over a Unix socket.
 pub struct RemoteStorageAdapter {
     client: Arc<DaemonClient>,
 }
 
 impl RemoteStorageAdapter {
+    /// Creates a new adapter backed by the given daemon client.
     pub fn new(client: Arc<DaemonClient>) -> Self {
         Self { client }
     }
@@ -73,28 +76,24 @@ impl RemoteStorageAdapter {
 #[async_trait]
 impl bridge::StorageEngine for RemoteStorageAdapter {
     async fn store_memory(&self, input: StoreInput) -> Result<StoredMemory, BridgeError> {
-        let params = serde_json::to_value(&input)
-            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let params =
+            serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("store_memory", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
 
     async fn get_memory(&self, id: MemoryId) -> Result<Option<MemoryRecord>, BridgeError> {
-        let params = serde_json::to_value(protocol::GetMemoryParams {
-            id: id.to_string(),
-        })
-        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let params = serde_json::to_value(protocol::GetMemoryParams { id: id.to_string() })
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("get_memory", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
 
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, BridgeError> {
-        let params = serde_json::to_value(protocol::DeleteMemoryParams {
-            id: id.to_string(),
-        })
-        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let params = serde_json::to_value(protocol::DeleteMemoryParams { id: id.to_string() })
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("delete_memory", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
@@ -120,11 +119,13 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
 // RemoteNamespaceAdapter
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Delegates namespace operations to the daemon over a Unix socket.
 pub struct RemoteNamespaceAdapter {
     client: Arc<DaemonClient>,
 }
 
 impl RemoteNamespaceAdapter {
+    /// Creates a new adapter backed by the given daemon client.
     pub fn new(client: Arc<DaemonClient>) -> Self {
         Self { client }
     }
@@ -145,8 +146,8 @@ impl bridge::NamespaceRegistry for RemoteNamespaceAdapter {
         &self,
         input: CreateNamespaceInput,
     ) -> Result<NamespaceInfo, BridgeError> {
-        let params = serde_json::to_value(&input)
-            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let params =
+            serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("create_namespace", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
@@ -167,11 +168,13 @@ impl bridge::NamespaceRegistry for RemoteNamespaceAdapter {
 // RemoteHealthAdapter
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Delegates health checks to the daemon over a Unix socket.
 pub struct RemoteHealthAdapter {
     client: Arc<DaemonClient>,
 }
 
 impl RemoteHealthAdapter {
+    /// Creates a new adapter backed by the given daemon client.
     pub fn new(client: Arc<DaemonClient>) -> Self {
         Self { client }
     }

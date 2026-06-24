@@ -21,15 +21,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 use tokio::time;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::config::DecayConfig;
 use super::fsrs::FsrsEngine;
 use crate::cache::CacheManager;
-use crate::graph::activation::{connection_bonus, ActivationConfig};
 use crate::graph::SharedGraph;
+use crate::graph::activation::{ActivationConfig, connection_bonus};
 use crate::model::{DecayPhase, MemoryId};
 use crate::storage::{RedbStorageEngine, StorageEngine as _};
 
@@ -579,7 +579,10 @@ impl DecaySweepRunner {
                     );
                     // Fallback: scan meta.db filtering by decay_phase field.
                     match storage_r.scan_phase_records(phase) {
-                        Ok(records) => records.into_iter().map(|(id, _): (MemoryId, _)| id).collect(),
+                        Ok(records) => records
+                            .into_iter()
+                            .map(|(id, _): (MemoryId, _)| id)
+                            .collect(),
                         Err(e2) => {
                             error!(
                                 phase = ?phase,
@@ -641,12 +644,8 @@ impl DecaySweepRunner {
             let raw_r = engine.retrievability(elapsed_days, meta.stability);
 
             // -- Calculate connection bonus -----------------------
-            let connection_bonus = Self::calculate_connection_bonus(
-                *memory_id,
-                graph,
-                activation_config,
-            )
-            .await;
+            let connection_bonus =
+                Self::calculate_connection_bonus(*memory_id, graph, activation_config).await;
             let effective_r = engine.effective_retrievability(raw_r, connection_bonus);
 
             // -- Determine transition -----------------------------
@@ -670,14 +669,7 @@ impl DecaySweepRunner {
 
             // -- Batch flush --------------------------------------
             if pending_transitions.len() >= config.write_batch_size {
-                Self::flush_transitions(
-                    &pending_transitions,
-                    storage,
-                    graph,
-                    cache,
-                    result,
-                )
-                .await;
+                Self::flush_transitions(&pending_transitions, storage, graph, cache, result).await;
                 pending_transitions.clear();
             }
 
@@ -712,14 +704,7 @@ impl DecaySweepRunner {
 
         // Flush remaining transitions
         if !pending_transitions.is_empty() {
-            Self::flush_transitions(
-                &pending_transitions,
-                storage,
-                graph,
-                cache,
-                result,
-            )
-            .await;
+            Self::flush_transitions(&pending_transitions, storage, graph, cache, result).await;
         }
     }
 
@@ -754,29 +739,14 @@ impl DecaySweepRunner {
         for t in transitions {
             let outcome = match t.from_phase {
                 DecayPhase::Full => {
-                    Self::transition_full_to_summary(
-                        t.memory_id,
-                        t.effective_r,
-                        storage,
-                    )
-                    .await
+                    Self::transition_full_to_summary(t.memory_id, t.effective_r, storage).await
                 }
                 DecayPhase::Summary => {
-                    Self::transition_summary_to_ghost(
-                        t.memory_id,
-                        t.effective_r,
-                        storage,
-                    )
-                    .await
+                    Self::transition_summary_to_ghost(t.memory_id, t.effective_r, storage).await
                 }
                 DecayPhase::Ghost => {
-                    Self::transition_ghost_to_deleted(
-                        t.memory_id,
-                        t.effective_r,
-                        storage,
-                        graph,
-                    )
-                    .await
+                    Self::transition_ghost_to_deleted(t.memory_id, t.effective_r, storage, graph)
+                        .await
                 }
             };
 
@@ -823,9 +793,9 @@ impl DecaySweepRunner {
         effective_r: f32,
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     ) -> Result<PhaseTransition, SweepError> {
-        let storage_r = storage.read().map_err(|e| {
-            SweepError::Storage(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = storage
+            .read()
+            .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
 
         // Safety net: verify summary exists before deleting full_text.
         match super::storage_adapter::has_summary(&*storage_r, memory_id) {
@@ -854,13 +824,15 @@ impl DecaySweepRunner {
         };
 
         // Update phase in meta.db + PhaseIndex bitmap.
-        storage_r.update_decay_state(
-            memory_id,
-            DecayPhase::Summary,
-            effective_r,
-            stability,
-            is_permastore,
-        ).map_err(|e| SweepError::Storage(e.to_string()))?;
+        storage_r
+            .update_decay_state(
+                memory_id,
+                DecayPhase::Summary,
+                effective_r,
+                stability,
+                is_permastore,
+            )
+            .map_err(|e| SweepError::Storage(e.to_string()))?;
 
         Ok(PhaseTransition::Summarized {
             id: memory_id,
@@ -882,9 +854,9 @@ impl DecaySweepRunner {
         effective_r: f32,
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     ) -> Result<PhaseTransition, SweepError> {
-        let storage_r = storage.read().map_err(|e| {
-            SweepError::Storage(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = storage
+            .read()
+            .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
 
         // Load stability to preserve it during phase change.
         let meta = super::storage_adapter::get_decay_metadata(&*storage_r, memory_id)?;
@@ -893,13 +865,15 @@ impl DecaySweepRunner {
             None => return Err(SweepError::MemoryNotFound(memory_id)),
         };
 
-        storage_r.update_decay_state(
-            memory_id,
-            DecayPhase::Ghost,
-            effective_r,
-            stability,
-            is_permastore,
-        ).map_err(|e| SweepError::Storage(e.to_string()))?;
+        storage_r
+            .update_decay_state(
+                memory_id,
+                DecayPhase::Ghost,
+                effective_r,
+                stability,
+                is_permastore,
+            )
+            .map_err(|e| SweepError::Storage(e.to_string()))?;
 
         Ok(PhaseTransition::Ghosted {
             id: memory_id,
@@ -941,19 +915,21 @@ impl DecaySweepRunner {
 
         // 2. Remove edge records from storage.
         {
-            let storage_r = storage.read().map_err(|e| {
-                SweepError::Storage(format!("storage lock poisoned: {e}"))
-            })?;
-            let _ = storage_r.remove_all_edges(memory_id)
+            let storage_r = storage
+                .read()
+                .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
+            let _ = storage_r
+                .remove_all_edges(memory_id)
                 .map_err(|e| SweepError::Storage(e.to_string()))?;
         }
 
         // 3. Remove metadata record (must acquire write lock for delete_memory).
         {
-            let mut storage_w = storage.write().map_err(|e| {
-                SweepError::Storage(format!("storage lock poisoned: {e}"))
-            })?;
-            storage_w.delete_memory(memory_id)
+            let mut storage_w = storage
+                .write()
+                .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
+            storage_w
+                .delete_memory(memory_id)
                 .map_err(|e| SweepError::Storage(e.to_string()))?;
         }
 

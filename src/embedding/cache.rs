@@ -36,9 +36,7 @@ impl CachedProvider {
     /// * `max_entries` - Maximum number of cached embeddings. When full,
     ///   TinyLFU eviction removes the least valuable entry.
     pub fn new(inner: Box<dyn EmbeddingProvider>, max_entries: u64) -> Self {
-        let cache = Cache::builder()
-            .max_capacity(max_entries)
-            .build();
+        let cache = Cache::builder().max_capacity(max_entries).build();
 
         Self { inner, cache }
     }
@@ -116,10 +114,7 @@ impl EmbeddingProvider for CachedProvider {
     /// This is the primary optimization path: batch imports with
     /// duplicate texts (e.g., repeated boilerplate) only embed each
     /// unique text once.
-    async fn embed_batch(
-        &self,
-        texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -128,7 +123,7 @@ impl EmbeddingProvider for CachedProvider {
 
         // Step 1-2: Compute hashes and check cache.
         let mut results: Vec<Option<Vec<f32>>> = vec![None; len];
-        let mut miss_indices: Vec<usize> = Vec::new();
+        let mut miss_indices = Vec::new();
         let mut miss_texts: Vec<&str> = Vec::new();
 
         for (i, text) in texts.iter().enumerate() {
@@ -143,8 +138,7 @@ impl EmbeddingProvider for CachedProvider {
 
         // Step 3: Embed only the misses.
         if !miss_texts.is_empty() {
-            let miss_embeddings =
-                self.inner.embed_batch(&miss_texts).await?;
+            let miss_embeddings = self.inner.embed_batch(&miss_texts).await?;
 
             // Step 4: Insert into cache and place into results.
             for (j, embedding) in miss_embeddings.into_iter().enumerate() {

@@ -12,15 +12,15 @@ mod passthrough;
 mod prefix;
 mod provider;
 
+use async_trait::async_trait;
+use thiserror::Error;
+
 pub use cache::CachedProvider;
 pub use ollama::OllamaProvider;
 pub use openai::OpenAIProvider;
 pub use passthrough::PassthroughProvider;
 pub use prefix::PrefixedProvider;
-pub use provider::{build_provider, EmbeddingConfig, ProviderType};
-
-use async_trait::async_trait;
-use thiserror::Error;
+pub use provider::{EmbeddingConfig, ProviderType, build_provider};
 
 /// Errors that can occur during embedding operations.
 #[derive(Debug, Error)]
@@ -95,10 +95,7 @@ pub trait EmbeddingProvider: Send + Sync {
     ///
     /// The default calls `embed` sequentially -- acceptable for Ollama
     /// (local, low latency) but suboptimal for OpenAI (network round trips).
-    async fn embed_batch(
-        &self,
-        texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let mut results = Vec::with_capacity(texts.len());
         for text in texts {
             results.push(self.embed(text).await?);

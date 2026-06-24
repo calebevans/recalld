@@ -12,15 +12,12 @@ use async_trait::async_trait;
 use crate::cache::CacheManager;
 use crate::embedding::EmbeddingProvider;
 use crate::graph::SharedGraph;
-use crate::model::{
-    AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConfig, NamespaceId,
-};
+use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConfig, NamespaceId};
 use crate::search::FlatVectorIndex;
 use crate::storage::RedbStorageEngine;
 // Import the StorageEngine trait so its methods are in scope.
-use crate::storage::StorageEngine as StorageEngineTrait;
-
 use super::state;
+use crate::storage::StorageEngine as StorageEngineTrait;
 
 // ═══════════════════════════════════════════════════════════════════════
 // SearchPipelineAdapter
@@ -34,6 +31,7 @@ pub struct SearchPipelineAdapter {
 }
 
 impl SearchPipelineAdapter {
+    /// Creates a new adapter from the real search subsystem components.
     pub fn new(
         query_engine: Arc<crate::search::QueryEngine>,
         embedding: Arc<dyn EmbeddingProvider>,
@@ -84,37 +82,30 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         Ok(response
             .results
             .into_iter()
-            .map(|r| {
-                state::ResolvedSearchResult {
-                    memory: CachedRecord {
-                        id: r.memory_id,
-                        namespace_id: NamespaceId::UNSET,
-                        created_at: r.created_at,
-                        last_accessed_at: 0,
-                        phase: r.phase,
-                        strength: r.retrievability,
-                        decay_strength: r.effective_r,
-                        stability: r.stability,
-                        difficulty: 5.0,
-                        is_permastore: r.is_permastore,
-                        summary: r.summary.unwrap_or_default(),
-                        tags: r.tags,
-                        edge_count: r.edge_count,
-                        vector_slot: 0,
-                        entities: Vec::new(),
-                    },
-                    score: r.score.unwrap_or(0.0),
-                }
+            .map(|r| state::ResolvedSearchResult {
+                memory: CachedRecord {
+                    id: r.memory_id,
+                    namespace_id: NamespaceId::UNSET,
+                    created_at: r.created_at,
+                    last_accessed_at: 0,
+                    phase: r.phase,
+                    strength: r.retrievability,
+                    decay_strength: r.effective_r,
+                    stability: r.stability,
+                    difficulty: 5.0,
+                    is_permastore: r.is_permastore,
+                    summary: r.summary.unwrap_or_default(),
+                    tags: r.tags,
+                    edge_count: r.edge_count,
+                    vector_slot: 0,
+                    entities: Vec::new(),
+                },
+                score: r.score.unwrap_or(0.0),
             })
             .collect())
     }
 
-    async fn index_memory(
-        &self,
-        id: MemoryId,
-        embedding: &[f32],
-        namespace_id: NamespaceId,
-    ) {
+    async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId) {
         use crate::search::{VectorIndex, VectorMetadata};
         let mut index = self.vector_index.write().await;
         let metadata = VectorMetadata {
@@ -166,6 +157,7 @@ pub struct StorageEngineAdapter {
 }
 
 impl StorageEngineAdapter {
+    /// Creates a new adapter wrapping the storage engine, cache, and embedding provider.
     pub fn new(
         storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
         cache: Arc<CacheManager>,
@@ -190,15 +182,12 @@ impl state::StorageEngine for StorageEngineAdapter {
         embedding: &[f32],
         initial_stability: Option<f32>,
     ) -> Result<CachedRecord, crate::storage::StorageError> {
-        use crate::model::record::DiskRecord;
         use crate::model::Tag;
+        use crate::model::record::DiskRecord;
 
         let id = MemoryId::new();
         let now = chrono::Utc::now().timestamp_millis();
-        let parsed_tags: Vec<Tag> = tags
-            .iter()
-            .filter_map(|t| Tag::new(t).ok())
-            .collect();
+        let parsed_tags: Vec<Tag> = tags.iter().filter_map(|t| Tag::new(t).ok()).collect();
 
         let mut record = DiskRecord {
             version: DiskRecord::CURRENT_VERSION,
@@ -228,13 +217,7 @@ impl state::StorageEngine for StorageEngineAdapter {
                     format!("storage lock poisoned: {e}"),
                 ))
             })?;
-            storage_w.insert_memory(
-                id,
-                namespace_id,
-                &mut record,
-                embedding,
-                full_text,
-            )?;
+            storage_w.insert_memory(id, namespace_id, &mut record, embedding, full_text)?;
         }
 
         let cached = CachedRecord::from(&record);
@@ -242,10 +225,7 @@ impl state::StorageEngine for StorageEngineAdapter {
         Ok(cached)
     }
 
-    async fn delete_memory(
-        &self,
-        id: MemoryId,
-    ) -> Result<bool, crate::storage::StorageError> {
+    async fn delete_memory(&self, id: MemoryId) -> Result<bool, crate::storage::StorageError> {
         let deleted = {
             let mut storage_w = self.storage.write().map_err(|e| {
                 crate::storage::StorageError::Io(std::io::Error::new(
@@ -294,6 +274,7 @@ pub struct RecordCacheAdapter {
 }
 
 impl RecordCacheAdapter {
+    /// Creates a new adapter wrapping the cache manager and storage engine.
     pub fn new(
         cache: Arc<CacheManager>,
         storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
@@ -314,9 +295,9 @@ impl state::RecordCache for RecordCacheAdapter {
         let result = self
             .cache
             .get_or_load(id, || async {
-                let storage_r = storage_clone.read().map_err(|e| {
-                    anyhow::anyhow!("storage lock poisoned: {e}")
-                })?;
+                let storage_r = storage_clone
+                    .read()
+                    .map_err(|e| anyhow::anyhow!("storage lock poisoned: {e}"))?;
                 match storage_r.get_record(id) {
                     Ok(Some(disk)) => Ok(Some(CachedRecord::from(&disk))),
                     Ok(None) => Ok(None),
@@ -358,6 +339,7 @@ pub struct RelationshipGraphAdapter {
 }
 
 impl RelationshipGraphAdapter {
+    /// Creates a new adapter wrapping the shared relationship graph.
     pub fn new(graph: SharedGraph) -> Self {
         Self { graph }
     }
@@ -384,10 +366,7 @@ impl state::RelationshipGraph for RelationshipGraphAdapter {
         Ok(())
     }
 
-    async fn remove_all_edges(
-        &self,
-        id: MemoryId,
-    ) -> Result<(), crate::graph::GraphError> {
+    async fn remove_all_edges(&self, id: MemoryId) -> Result<(), crate::graph::GraphError> {
         let mut graph = self.graph.write().await;
         graph.remove_node(id)?;
         Ok(())
@@ -405,10 +384,8 @@ pub struct FsrsEngineAdapter {
 }
 
 impl FsrsEngineAdapter {
-    pub fn new(
-        storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
-        has_sweep: bool,
-    ) -> Self {
+    /// Creates a new adapter with the storage engine and sweep-thread liveness flag.
+    pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>, has_sweep: bool) -> Self {
         Self {
             storage,
             sweep_alive: has_sweep,
@@ -429,8 +406,7 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         &self,
         _id: MemoryId,
         _quality: u8,
-    ) -> Result<state::ReinforceResult, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<state::ReinforceResult, Box<dyn std::error::Error + Send + Sync>> {
         // Reinforcement requires FSRS stability recalculation.
         // Return a placeholder result reflecting current state.
         Ok(state::ReinforceResult {
@@ -460,6 +436,7 @@ pub struct NamespaceRegistryAdapter {
 }
 
 impl NamespaceRegistryAdapter {
+    /// Creates a new adapter wrapping the storage engine for namespace operations.
     pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
         Self { storage }
     }

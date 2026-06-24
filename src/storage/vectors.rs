@@ -20,48 +20,100 @@ use crate::model::NamespaceId;
 // Error Type
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Errors from vector storage operations.
 #[derive(Debug, Error)]
 pub enum VectorError {
+    /// An I/O error occurred on a vector file.
     #[error("I/O error on {path}: {source}")]
     Io {
+        /// Path to the vector file.
         path: PathBuf,
+        /// The underlying I/O error.
         source: std::io::Error,
     },
 
+    /// The vector file is corrupt or inconsistent.
     #[error("corrupt vector file {path}: {reason}")]
-    Corrupt { path: PathBuf, reason: String },
+    Corrupt {
+        /// Path to the corrupt file.
+        path: PathBuf,
+        /// Description of the corruption.
+        reason: String,
+    },
 
+    /// The file has invalid magic bytes (expected "MEMV").
     #[error("magic mismatch in {path}: expected MEMV, got {found:?}")]
-    BadMagic { path: PathBuf, found: [u8; 4] },
+    BadMagic {
+        /// Path to the file with bad magic.
+        path: PathBuf,
+        /// Actual magic bytes found.
+        found: [u8; 4],
+    },
 
+    /// The file format version is not supported.
     #[error("version mismatch in {path}: expected 1, got {found}")]
-    BadVersion { path: PathBuf, found: u16 },
+    BadVersion {
+        /// Path to the file with the wrong version.
+        path: PathBuf,
+        /// Actual version number found.
+        found: u16,
+    },
 
+    /// The file's embedding dimensionality does not match the request.
     #[error("dimension mismatch: file has {file_dim}, caller requested {requested_dim}")]
-    DimensionMismatch { file_dim: u16, requested_dim: u16 },
+    DimensionMismatch {
+        /// Dimensionality stored in the file header.
+        file_dim: u16,
+        /// Dimensionality the caller expected.
+        requested_dim: u16,
+    },
 
+    /// The file's stride does not match the expected value.
     #[error("stride mismatch in {path}: expected {expected}, got {found}")]
     StrideMismatch {
+        /// Path to the file with the wrong stride.
         path: PathBuf,
+        /// Expected stride in bytes.
         expected: u32,
+        /// Actual stride found in the header.
         found: u32,
     },
 
+    /// The header CRC32 does not match the computed value.
     #[error("header CRC mismatch in {path}: stored {stored:#010x}, computed {computed:#010x}")]
     HeaderCrcMismatch {
+        /// Path to the file with the CRC mismatch.
         path: PathBuf,
+        /// CRC32 stored in the header.
         stored: u32,
+        /// CRC32 computed from the header bytes.
         computed: u32,
     },
 
+    /// A vector slot index is out of bounds.
     #[error("slot {slot} out of bounds (slot_count = {slot_count})")]
-    SlotOutOfBounds { slot: u32, slot_count: u32 },
+    SlotOutOfBounds {
+        /// The requested slot index.
+        slot: u32,
+        /// Total number of allocated slots.
+        slot_count: u32,
+    },
 
+    /// The provided vector length does not match the index dimensions.
     #[error("vector length {got} does not match dimensions {expected}")]
-    WrongVectorLength { expected: usize, got: usize },
+    WrongVectorLength {
+        /// Expected vector length (dimensions).
+        expected: usize,
+        /// Actual vector length provided.
+        got: usize,
+    },
 
+    /// The vector file is already locked by another process.
     #[error("file already locked: {path}")]
-    FileLocked { path: PathBuf },
+    FileLocked {
+        /// Path to the locked file.
+        path: PathBuf,
+    },
 }
 
 /// Convenience alias used throughout this module.
@@ -74,7 +126,7 @@ pub type Result<T> = std::result::Result<T, VectorError>;
 /// 64-byte file header for vectors.dat.
 /// All multi-byte integers are little-endian.
 #[repr(C)]
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct VectorFileHeader {
     /// Magic bytes: b"MEMV" (0x4D454D56).
     pub magic: [u8; 4],
@@ -189,9 +241,7 @@ impl VectorFileHeader {
         // CRC check — zero the crc field in a copy before hashing,
         // matching the way create and update_header compute the CRC.
         let stored_crc = self.header_crc.get();
-        let raw_ref: &[u8; Self::SIZE] = zerocopy::IntoBytes::as_bytes(self)
-            .try_into()
-            .unwrap();
+        let raw_ref: &[u8; Self::SIZE] = zerocopy::IntoBytes::as_bytes(self).try_into().unwrap();
         let mut raw_copy: [u8; Self::SIZE] = *raw_ref;
         // Zero the header_crc field (bytes 28..32) before hashing.
         let crc_offset = std::mem::offset_of!(VectorFileHeader, header_crc);
@@ -230,7 +280,6 @@ pub struct VectorStore {
     path: PathBuf,
 
     // --- Cached header fields (avoid re-reading hot path) ---
-
     /// Embedding dimensionality.
     dimensions: u32,
 
@@ -274,18 +323,19 @@ impl VectorStore {
 
         // Acquire exclusive lock (advisory, prevents concurrent processes).
         use fs2::FileExt;
-        file.try_lock_exclusive().map_err(|_| VectorError::FileLocked {
-            path: path.clone(),
-        })?;
+        file.try_lock_exclusive()
+            .map_err(|_| VectorError::FileLocked { path: path.clone() })?;
 
         if !exists || file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
             // New file -- write header.
             let header = VectorFileHeader::new(dim_u16);
             let header_bytes = zerocopy::IntoBytes::as_bytes(&header);
-            (&file).write_all(header_bytes).map_err(|e| VectorError::Io {
-                path: path.clone(),
-                source: e,
-            })?;
+            (&file)
+                .write_all(header_bytes)
+                .map_err(|e| VectorError::Io {
+                    path: path.clone(),
+                    source: e,
+                })?;
             file.sync_all().map_err(|e| VectorError::Io {
                 path: path.clone(),
                 source: e,
@@ -312,13 +362,12 @@ impl VectorStore {
                 ),
             });
         }
-        let header = zerocopy::Ref::<_, VectorFileHeader>::from_bytes(
-            &mmap[..VectorFileHeader::SIZE],
-        )
-        .map_err(|e| VectorError::Corrupt {
-            path: path.clone(),
-            reason: format!("header parse error: {e}"),
-        })?;
+        let header =
+            zerocopy::Ref::<_, VectorFileHeader>::from_bytes(&mmap[..VectorFileHeader::SIZE])
+                .map_err(|e| VectorError::Corrupt {
+                    path: path.clone(),
+                    reason: format!("header parse error: {e}"),
+                })?;
         header.validate(&path, dim_u16)?;
 
         let dimensions = header.dimensions.get() as u32;
@@ -401,10 +450,12 @@ impl VectorStore {
         let offset = VectorFileHeader::data_offset(slot, self.stride);
 
         // Write vector data via the file descriptor (not through mmap).
-        self.file.seek(SeekFrom::Start(offset)).map_err(|e| VectorError::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| VectorError::Io {
+                path: self.path.clone(),
+                source: e,
+            })?;
         let bytes: &[u8] = bytemuck::cast_slice(vector);
         self.file.write_all(bytes).map_err(|e| VectorError::Io {
             path: self.path.clone(),
@@ -431,9 +482,7 @@ impl VectorStore {
             let offset = VectorFileHeader::data_offset(slot, self.stride) as usize;
 
             // Read the chained next-pointer (first 4 bytes of the free slot).
-            let next = u32::from_le_bytes(
-                self.mmap[offset..offset + 4].try_into().unwrap(),
-            );
+            let next = u32::from_le_bytes(self.mmap[offset..offset + 4].try_into().unwrap());
 
             self.update_header(|h| {
                 h.free_list_head = U32::new(next);
@@ -458,8 +507,7 @@ impl VectorStore {
         let header = self.read_header()?;
         let old_count = header.slot_count.get();
         let new_count = old_count + grow_by;
-        let new_size =
-            VectorFileHeader::SIZE as u64 + (new_count as u64) * (self.stride as u64);
+        let new_size = VectorFileHeader::SIZE as u64 + (new_count as u64) * (self.stride as u64);
 
         // Extend the file. The OS zero-fills the new region.
         self.file.set_len(new_size).map_err(|e| VectorError::Io {
@@ -473,16 +521,18 @@ impl VectorStore {
         let mut current_head = header.free_list_head.get();
         for i in (old_count..new_count).rev() {
             let offset = VectorFileHeader::data_offset(i, self.stride);
-            self.file.seek(SeekFrom::Start(offset)).map_err(|e| VectorError::Io {
-                path: self.path.clone(),
-                source: e,
-            })?;
-            self.file.write_all(&current_head.to_le_bytes()).map_err(|e| {
-                VectorError::Io {
+            self.file
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| VectorError::Io {
                     path: self.path.clone(),
                     source: e,
-                }
-            })?;
+                })?;
+            self.file
+                .write_all(&current_head.to_le_bytes())
+                .map_err(|e| VectorError::Io {
+                    path: self.path.clone(),
+                    source: e,
+                })?;
             current_head = i;
         }
 
@@ -512,10 +562,12 @@ impl VectorStore {
 
         // Zero the entire slot.
         let zeros = vec![0u8; self.stride as usize];
-        self.file.seek(SeekFrom::Start(offset)).map_err(|e| VectorError::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| VectorError::Io {
+                path: self.path.clone(),
+                source: e,
+            })?;
         self.file.write_all(&zeros).map_err(|e| VectorError::Io {
             path: self.path.clone(),
             source: e,
@@ -524,10 +576,12 @@ impl VectorStore {
         // Write the current free_list_head as this slot's next-pointer
         // (first 4 bytes).
         let header = self.read_header()?;
-        self.file.seek(SeekFrom::Start(offset)).map_err(|e| VectorError::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| VectorError::Io {
+                path: self.path.clone(),
+                source: e,
+            })?;
         self.file
             .write_all(&header.free_list_head.get().to_le_bytes())
             .map_err(|e| VectorError::Io {
@@ -550,22 +604,18 @@ impl VectorStore {
 
     /// Read the header from the current mmap.
     fn read_header(&self) -> Result<VectorFileHeader> {
-        let header_ref = zerocopy::Ref::<_, VectorFileHeader>::from_bytes(
-            &self.mmap[..VectorFileHeader::SIZE],
-        )
-        .map_err(|e| VectorError::Corrupt {
-            path: self.path.clone(),
-            reason: format!("header parse: {e}"),
-        })?;
+        let header_ref =
+            zerocopy::Ref::<_, VectorFileHeader>::from_bytes(&self.mmap[..VectorFileHeader::SIZE])
+                .map_err(|e| VectorError::Corrupt {
+                    path: self.path.clone(),
+                    reason: format!("header parse: {e}"),
+                })?;
         Ok(*header_ref)
     }
 
     /// Apply a mutation to the on-disk header. Recomputes the CRC and
     /// writes the full 64-byte header via the file descriptor.
-    fn update_header(
-        &mut self,
-        mutate: impl FnOnce(&mut VectorFileHeader),
-    ) -> Result<()> {
+    fn update_header(&mut self, mutate: impl FnOnce(&mut VectorFileHeader)) -> Result<()> {
         let mut header = self.read_header()?;
         mutate(&mut header);
 
@@ -575,10 +625,12 @@ impl VectorStore {
         let crc = VectorFileHeader::compute_crc(raw.try_into().unwrap());
         header.header_crc = U32::new(crc);
 
-        self.file.seek(SeekFrom::Start(0)).map_err(|e| VectorError::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| VectorError::Io {
+                path: self.path.clone(),
+                source: e,
+            })?;
         self.file
             .write_all(zerocopy::IntoBytes::as_bytes(&header))
             .map_err(|e| VectorError::Io {
@@ -671,10 +723,7 @@ impl VectorManager {
     }
 
     /// Get a mutable reference to an already-opened store.
-    pub fn get_mut(
-        &mut self,
-        namespace_id: NamespaceId,
-    ) -> Option<&mut VectorStore> {
+    pub fn get_mut(&mut self, namespace_id: NamespaceId) -> Option<&mut VectorStore> {
         self.stores.get_mut(&namespace_id)
     }
 

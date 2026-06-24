@@ -107,9 +107,7 @@ impl PhaseIndex {
                     label
                 )));
             }
-            let size = u32::from_le_bytes(
-                data[offset..offset + 4].try_into().unwrap(),
-            ) as usize;
+            let size = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + size > data.len() {
                 return Err(StorageError::CorruptIndex(format!(
@@ -118,13 +116,12 @@ impl PhaseIndex {
                 )));
             }
             let bitmap =
-                RoaringBitmap::deserialize_from(&data[offset..offset + size])
-                    .map_err(|e| {
-                        StorageError::CorruptIndex(format!(
-                            "invalid roaring bitmap for '{}': {}",
-                            label, e
-                        ))
-                    })?;
+                RoaringBitmap::deserialize_from(&data[offset..offset + size]).map_err(|e| {
+                    StorageError::CorruptIndex(format!(
+                        "invalid roaring bitmap for '{}': {}",
+                        label, e
+                    ))
+                })?;
             offset += size;
             bitmaps.push(bitmap);
         }

@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::io::BufReader;
@@ -8,17 +8,17 @@ use tokio::net::UnixListener;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use super::lifecycle;
+use super::protocol::*;
+use crate::Recalld;
 use crate::mcp::bridge::{
     BridgeError, CreateNamespaceInput, HealthChecker, NamespaceRegistry, SearchInput,
-    SearchPipeline, StoreInput, StorageEngine as BridgeStorageEngine,
+    SearchPipeline, StorageEngine as BridgeStorageEngine, StoreInput,
 };
 use crate::mcp::bridge_adapters::*;
 use crate::model::MemoryId;
-use crate::Recalld;
 
-use super::lifecycle;
-use super::protocol::*;
-
+/// The Recalld daemon server, listening on a Unix socket for RPC requests.
 pub struct DaemonServer {
     _system: Recalld,
     search: Arc<dyn SearchPipeline>,
@@ -31,6 +31,7 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
+    /// Creates a new daemon server backed by the given `Recalld` system.
     pub fn new(system: Recalld) -> Self {
         let search: Arc<dyn SearchPipeline> = Arc::new(McpSearchAdapter::new(
             system.query_engine().clone(),
@@ -49,9 +50,7 @@ impl DaemonServer {
             std::sync::Arc::new(system.config().clone()),
         ));
         let namespaces: Arc<dyn NamespaceRegistry> =
-            Arc::new(McpNamespaceAdapter::new(
-                system.storage().clone(),
-            ));
+            Arc::new(McpNamespaceAdapter::new(system.storage().clone()));
         let health: Arc<dyn HealthChecker> =
             Arc::new(McpHealthAdapter::new(system.storage().clone()));
 
@@ -69,6 +68,7 @@ impl DaemonServer {
         }
     }
 
+    /// Binds to `socket_path` and serves RPC requests until shutdown.
     pub async fn run(self, socket_path: &Path, idle_timeout: Duration) -> std::io::Result<()> {
         lifecycle::cleanup_stale_socket(socket_path)?;
 
@@ -90,10 +90,8 @@ impl DaemonServer {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("failed to install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
 
         loop {
             tokio::select! {
@@ -228,8 +226,7 @@ async fn dispatch(
             let input: SearchInput = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let response = search.search(input).await?;
-            serde_json::to_value(response)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(response).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
         "find_similar" => {
@@ -239,16 +236,14 @@ async fn dispatch(
             let results = search
                 .find_similar(id, p.limit, p.min_score, p.same_namespace)
                 .await?;
-            serde_json::to_value(results)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(results).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
         "store_memory" => {
             let input: StoreInput = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let result = storage.store_memory(input).await?;
-            serde_json::to_value(result)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
         "get_memory" => {
@@ -256,8 +251,7 @@ async fn dispatch(
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let id = parse_memory_id(&p.id)?;
             let result = storage.get_memory(id).await?;
-            serde_json::to_value(result)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
         "delete_memory" => {
@@ -265,8 +259,7 @@ async fn dispatch(
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let id = parse_memory_id(&p.id)?;
             let result = storage.delete_memory(id).await?;
-            serde_json::to_value(result)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
         "reinforce_memory" => {
@@ -274,38 +267,35 @@ async fn dispatch(
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let id = parse_memory_id(&p.id)?;
             let result = storage.reinforce_memory(id, p.quality).await?;
-            serde_json::to_value(result)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
         "list_namespaces" => {
             let result = namespaces.list_namespaces().await?;
-            serde_json::to_value(result)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
         "create_namespace" => {
             let input: CreateNamespaceInput = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let result = namespaces.create_namespace(input).await?;
-            serde_json::to_value(result)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
         "namespace_stats" => {
             let p: NamespaceStatsParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let result = namespaces.namespace_stats(&p.name).await?;
-            serde_json::to_value(result)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
         "check_health" => {
             let result = health.check_health().await;
-            serde_json::to_value(result)
-                .map_err(|e| BridgeError::Internal(e.to_string()))
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
-        other => Err(BridgeError::InvalidInput(format!("unknown method: {other}"))),
+        other => Err(BridgeError::InvalidInput(format!(
+            "unknown method: {other}"
+        ))),
     }
 }

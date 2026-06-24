@@ -55,8 +55,7 @@ pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
 
     // Horizontal sum: reduce 8 lanes to a single f32.
     let arr: [f32; 8] = combined.to_array();
-    let mut sum = arr[0] + arr[1] + arr[2] + arr[3]
-               + arr[4] + arr[5] + arr[6] + arr[7];
+    let mut sum = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
 
     // Handle tail elements (0-7 remaining, scalar fallback).
     let tail_start = len - remainder;

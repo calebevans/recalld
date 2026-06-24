@@ -20,6 +20,7 @@ use crate::model::{MemoryId, NamespaceId};
 pub enum FtsError {
     /// A SQLite error occurred.
     Sqlite(rusqlite::Error),
+
     /// The memory ID bytes were invalid.
     InvalidMemoryId,
 }
@@ -229,9 +230,9 @@ impl FtsIndex {
 
     /// Whether the index contains no documents.
     pub fn is_empty(&self) -> Result<bool, FtsError> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM id_map", [], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM id_map", [], |row| row.get(0))?;
         Ok(count == 0)
     }
 }
@@ -274,7 +275,13 @@ mod tests {
         let id3 = MemoryId::new();
 
         index
-            .add(test_ns_id(), id1, "Rust programming language systems", None, &[])
+            .add(
+                test_ns_id(),
+                id1,
+                "Rust programming language systems",
+                None,
+                &[],
+            )
             .unwrap();
         index
             .add(
@@ -286,13 +293,7 @@ mod tests {
             )
             .unwrap();
         index
-            .add(
-                test_ns_id(),
-                id3,
-                "Rust memory safety ownership",
-                None,
-                &[],
-            )
+            .add(test_ns_id(), id3, "Rust memory safety ownership", None, &[])
             .unwrap();
 
         let results = index.search(test_ns_id(), "Rust programming", 10).unwrap();

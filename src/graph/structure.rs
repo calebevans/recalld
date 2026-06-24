@@ -3,8 +3,9 @@
 //! Provides the core in-memory graph representation using `slotmap::DenseSlotMap`
 //! for O(1) insert/remove/lookup with generational key safety.
 
-use slotmap::{new_key_type, DenseSlotMap};
 use std::collections::HashMap;
+
+use slotmap::{DenseSlotMap, new_key_type};
 
 use crate::model::{DecayPhase, EdgeType, MemoryId, NamespaceId};
 
@@ -32,7 +33,7 @@ new_key_type! {
 /// Lightweight graph-local node. The full MemoryRecord lives in meta.db
 /// and the RAM cache -- the graph stores only what traversal and
 /// activation need.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphNode {
     /// Primary key -- maps back to the full MemoryRecord in meta.db.
     pub memory_id: MemoryId,
@@ -75,7 +76,7 @@ impl GraphNode {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// A typed, weighted, directed edge between two graph nodes.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphEdge {
     /// Source node key (the "from" end).
     pub source: NodeKey,
@@ -105,7 +106,7 @@ pub struct GraphEdge {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Direction filter for BFS traversal.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum TraversalDirection {
     /// Follow both outgoing and incoming edges.
     #[default]
@@ -117,7 +118,7 @@ pub enum TraversalDirection {
 }
 
 /// Filter configuration for BFS traversal.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TraversalFilter {
     /// Edge types to follow (None = all types).
     pub edge_types: Option<Vec<EdgeType>>,
@@ -136,7 +137,7 @@ pub struct TraversalFilter {
 
 /// A single result from BFS traversal, carrying the edge that led to
 /// this node and the hop distance from the start.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct TraversalResult {
     /// The graph key of the discovered node.
     pub node_key: NodeKey,
@@ -314,10 +315,7 @@ impl RelationshipGraph {
     /// This is the simple removal path (no bridging). For ghost
     /// deletion with pass-through bridging, use
     /// `remove_memory_with_bridging`.
-    pub fn remove_node(
-        &mut self,
-        memory_id: MemoryId,
-    ) -> Result<Vec<GraphEdge>, GraphError> {
+    pub fn remove_node(&mut self, memory_id: MemoryId) -> Result<Vec<GraphEdge>, GraphError> {
         let node_key = self.resolve_key(memory_id)?;
 
         let node = self
@@ -654,16 +652,14 @@ impl RelationshipGraph {
         let mut bridge_created: Option<GraphEdge> = None;
 
         // Tier 2: Pass-through node (1 in, 1 out, same edge type) -- bridge
-        let should_bridge = in_degree == 1
-            && out_degree == 1
-            && {
-                let in_edge = self.edges.get(node.incoming[0]);
-                let out_edge = self.edges.get(node.outgoing[0]);
-                match (in_edge, out_edge) {
-                    (Some(ie), Some(oe)) => ie.edge_type == oe.edge_type,
-                    _ => false,
-                }
-            };
+        let should_bridge = in_degree == 1 && out_degree == 1 && {
+            let in_edge = self.edges.get(node.incoming[0]);
+            let out_edge = self.edges.get(node.outgoing[0]);
+            match (in_edge, out_edge) {
+                (Some(ie), Some(oe)) => ie.edge_type == oe.edge_type,
+                _ => false,
+            }
+        };
 
         if should_bridge {
             if let (Some(in_edge), Some(out_edge)) = (
@@ -765,7 +761,6 @@ impl RelationshipGraph {
             .copied()
             .ok_or(GraphError::MemoryNotFound(memory_id))
     }
-
 
     /// Check if an edge of a specific type exists between two node keys (either direction).
     fn has_typed_edge_between(&self, a: NodeKey, b: NodeKey, edge_type: EdgeType) -> bool {

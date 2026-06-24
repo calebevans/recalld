@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -21,7 +21,9 @@ pub fn socket_path() -> PathBuf {
     }
 
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("recalld").join("recalld.sock");
+        return PathBuf::from(runtime_dir)
+            .join("recalld")
+            .join("recalld.sock");
     }
 
     dirs::home_dir()
@@ -68,6 +70,7 @@ pub fn cleanup_stale_socket(socket_path: &Path) -> std::io::Result<()> {
 // PID file operations
 // ---------------------------------------------------------------------------
 
+/// Writes the current process ID to the given file path.
 pub fn write_pid_file(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -75,6 +78,7 @@ pub fn write_pid_file(path: &Path) -> std::io::Result<()> {
     std::fs::write(path, std::process::id().to_string())
 }
 
+/// Reads the PID from the given file, returning `None` if absent or unparseable.
 pub fn read_pid_file(path: &Path) -> std::io::Result<Option<u32>> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(contents.trim().parse::<u32>().ok()),
@@ -87,6 +91,7 @@ pub fn read_pid_file(path: &Path) -> std::io::Result<Option<u32>> {
 // Idle monitor
 // ---------------------------------------------------------------------------
 
+/// Returns the current UTC time as milliseconds since the Unix epoch.
 pub fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }

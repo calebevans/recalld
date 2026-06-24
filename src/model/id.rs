@@ -14,8 +14,7 @@ use uuid::Uuid;
 ///
 /// `Copy` because it is 16 bytes — cheap to pass by value.
 /// `Ord` gives chronological ordering (UUID v7 bytes sort by time).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct MemoryId(Uuid);
 
@@ -112,8 +111,7 @@ impl From<MemoryId> for Uuid {
 ///
 /// ID 0 is reserved as an "unset" sentinel in on-disk formats and must
 /// never be assigned to a real namespace. Valid IDs start at 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NamespaceId(u32);
 

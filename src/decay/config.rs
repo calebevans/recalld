@@ -7,9 +7,8 @@
 
 use super::fsrs::{
     DEFAULT_DIFFICULTY, DEFAULT_INITIAL_STABILITY, DEFAULT_MAX_CONNECTION_BONUS,
-    DEFAULT_PARTIAL_ACCESS_WEIGHT, DEFAULT_PERMASTORE_THRESHOLD,
-    DEFAULT_PHASE_1_THRESHOLD, DEFAULT_PHASE_2_THRESHOLD, DEFAULT_PHASE_3_THRESHOLD,
-    STABILITY_CEILING, STABILITY_FLOOR,
+    DEFAULT_PARTIAL_ACCESS_WEIGHT, DEFAULT_PERMASTORE_THRESHOLD, DEFAULT_PHASE_1_THRESHOLD,
+    DEFAULT_PHASE_2_THRESHOLD, DEFAULT_PHASE_3_THRESHOLD, STABILITY_CEILING, STABILITY_FLOOR,
 };
 
 /// All tunable parameters for the FSRS decay engine.
@@ -117,9 +116,7 @@ impl DecayConfig {
     /// Returns `Err` with a descriptive message if any value is invalid.
     /// Called at namespace creation and config update time.
     pub fn validate(&self) -> Result<(), String> {
-        if self.initial_stability < STABILITY_FLOOR
-            || self.initial_stability > STABILITY_CEILING
-        {
+        if self.initial_stability < STABILITY_FLOOR || self.initial_stability > STABILITY_CEILING {
             return Err(format!(
                 "initial_stability must be in [{STABILITY_FLOOR}, {STABILITY_CEILING}], \
                  got {}",

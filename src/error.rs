@@ -11,13 +11,14 @@
 //! to HTTP status codes.
 
 use std::path::PathBuf;
+
 use thiserror::Error;
 
-use crate::storage::error::StorageError;
+use crate::config::ConfigError;
+use crate::decay::sweep::SweepError;
 use crate::embedding::EmbeddingError;
 use crate::search::error::SearchError;
-use crate::decay::sweep::SweepError;
-use crate::config::ConfigError;
+use crate::storage::error::StorageError;
 
 /// Top-level error for Recalld operations.
 ///
@@ -27,7 +28,6 @@ use crate::config::ConfigError;
 #[derive(Debug, Error)]
 pub enum RecalldError {
     // ── Subsystem wrappers ───────────────────────────────────────
-
     /// Storage layer error.
     #[error("storage: {0}")]
     Storage(#[from] StorageError),
@@ -49,7 +49,6 @@ pub enum RecalldError {
     Config(#[from] ConfigError),
 
     // ── System-level errors ──────────────────────────────────────
-
     /// Initialization failed at a named step.
     #[error("initialization failed at step '{step}': {message}")]
     Init {

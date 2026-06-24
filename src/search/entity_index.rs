@@ -1,13 +1,24 @@
+//! Entity inverted index for entity-based memory recall.
+//!
+//! Maps entity names (case-insensitive) to sets of memory IDs,
+//! enabling recall of memories that share named entities with
+//! a query.
+
 use std::collections::{HashMap, HashSet};
 
 use crate::model::MemoryId;
 
+/// Inverted index mapping entity names to the memories that reference them.
+///
+/// Supports case-insensitive entity lookups for entity-based recall
+/// in the search pipeline (CS-29).
 pub struct EntityIndex {
     index: HashMap<String, HashSet<MemoryId>>,
     memory_count: usize,
 }
 
 impl EntityIndex {
+    /// Create a new empty entity index.
     pub fn new() -> Self {
         Self {
             index: HashMap::new(),
@@ -15,6 +26,7 @@ impl EntityIndex {
         }
     }
 
+    /// Create a new entity index with pre-allocated capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             index: HashMap::with_capacity(capacity),
@@ -22,6 +34,10 @@ impl EntityIndex {
         }
     }
 
+    /// Add a memory's entities to the index.
+    ///
+    /// Each entity string is lowercased before indexing.
+    /// No-op if `entities` is empty.
     pub fn add(&mut self, memory_id: MemoryId, entities: &[String]) {
         if entities.is_empty() {
             return;
@@ -39,6 +55,9 @@ impl EntityIndex {
         }
     }
 
+    /// Remove a memory's entities from the index.
+    ///
+    /// Cleans up empty posting lists after removal.
     pub fn remove(&mut self, memory_id: MemoryId, entities: &[String]) {
         let mut removed = false;
         for entity in entities {
@@ -80,10 +99,12 @@ impl EntityIndex {
         results
     }
 
+    /// Return the number of distinct memories in the index.
     pub fn len(&self) -> usize {
         self.memory_count
     }
 
+    /// Whether the index contains no memories.
     pub fn is_empty(&self) -> bool {
         self.memory_count == 0
     }
@@ -152,10 +173,8 @@ mod tests {
         idx.add(mid(1), &["Alice".into(), "Bob".into(), "Charlie".into()]);
         idx.add(mid(2), &["Alice".into()]);
         idx.add(mid(3), &["Alice".into(), "Bob".into()]);
-        let results = idx.find_by_entities(
-            &["Alice".into(), "Bob".into(), "Charlie".into()],
-            mid(1),
-        );
+        let results =
+            idx.find_by_entities(&["Alice".into(), "Bob".into(), "Charlie".into()], mid(1));
         assert_eq!(results[0].0, mid(3)); // 2 shared
         assert_eq!(results[1].0, mid(2)); // 1 shared
     }

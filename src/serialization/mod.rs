@@ -6,6 +6,8 @@
 //! - **JSON**: serde-based camelCase format for the HTTP API wire protocol.
 //!   Uses `serde_json` with skip-if-none and integer-millis timestamps.
 
+use std::fmt;
+
 mod binary;
 mod json;
 
@@ -15,8 +17,6 @@ pub use json::{
     NamespaceResponse, PaginatedResponse, PaginationParams, SearchHit, SearchRequest,
     SearchResponse, UpdateMemoryRequest,
 };
-
-use std::fmt;
 
 /// Magic bytes written at the start of every binary record for validation.
 /// ASCII "CH" (Cold Harbor) -- 2 bytes.

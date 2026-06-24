@@ -6,8 +6,8 @@
 //! `prefetch_worker` that speculatively loads neighbors.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -162,9 +162,7 @@ impl WarmSnapshot {
     ///
     /// Iterates the cache (lock-free), computes priority scores,
     /// and sorts entries by priority descending.
-    pub fn from_cache(
-        cache: &moka::future::Cache<MemoryId, Arc<CachedRecord>>,
-    ) -> Self {
+    pub fn from_cache(cache: &moka::future::Cache<MemoryId, Arc<CachedRecord>>) -> Self {
         let mut entries: Vec<WarmEntry> = cache
             .iter()
             .map(|(id, record)| {
@@ -317,39 +315,32 @@ pub fn load_warm_file(path: &Path) -> WarmLoadResult {
     }
 
     // Validate file size.
-    let expected_entry_bytes =
-        header.count as usize * std::mem::size_of::<WarmEntry>();
+    let expected_entry_bytes = header.count as usize * std::mem::size_of::<WarmEntry>();
     let entry_data = &data[WarmHeader::SIZE..];
 
     if entry_data.len() < expected_entry_bytes {
         // Truncated file. Load as many complete entries as possible.
-        let recoverable =
-            entry_data.len() / std::mem::size_of::<WarmEntry>();
+        let recoverable = entry_data.len() / std::mem::size_of::<WarmEntry>();
         tracing::warn!(
             "warm.bin truncated: expected {} entries, can recover {}",
             header.count,
             recoverable,
         );
         if recoverable == 0 {
-            return WarmLoadResult::Corrupt(
-                "truncated, no recoverable entries".into(),
-            );
+            return WarmLoadResult::Corrupt("truncated, no recoverable entries".into());
         }
         // Fall through -- CRC will fail, but we handle that below.
     }
 
     // Validate CRC32 over entry bytes.
-    let valid_entry_bytes =
-        &entry_data[..std::cmp::min(expected_entry_bytes, entry_data.len())];
+    let valid_entry_bytes = &entry_data[..std::cmp::min(expected_entry_bytes, entry_data.len())];
     let computed_crc = crc32fast::hash(valid_entry_bytes);
 
     let expected_total = WarmHeader::SIZE + expected_entry_bytes;
     if computed_crc != header.crc32 {
         // CRC mismatch. If file is truncated, this is expected.
         if data.len() < expected_total {
-            tracing::warn!(
-                "warm.bin CRC mismatch (truncated file) -- loading recoverable entries"
-            );
+            tracing::warn!("warm.bin CRC mismatch (truncated file) -- loading recoverable entries");
         } else {
             tracing::warn!(
                 "warm.bin CRC mismatch: expected {:#010x}, computed {:#010x}",
@@ -363,8 +354,7 @@ pub fn load_warm_file(path: &Path) -> WarmLoadResult {
     // Copy entries from the buffer into an owned Vec.
     // SAFETY: WarmEntry is #[repr(C)], all fields are naturally aligned,
     // and we verified the byte count above.
-    let entry_count =
-        valid_entry_bytes.len() / std::mem::size_of::<WarmEntry>();
+    let entry_count = valid_entry_bytes.len() / std::mem::size_of::<WarmEntry>();
     let entries: Vec<WarmEntry> = unsafe {
         let ptr = valid_entry_bytes.as_ptr() as *const WarmEntry;
         std::slice::from_raw_parts(ptr, entry_count).to_vec()
@@ -396,9 +386,7 @@ pub async fn warm_cache<S, V>(
     cache: moka::future::Cache<MemoryId, Arc<CachedRecord>>,
     storage: Arc<S>,
     vector_buffer: Arc<V>,
-    reverse_index: Arc<
-        dashmap::DashMap<MemoryId, std::collections::HashSet<MemoryId>>,
-    >,
+    reverse_index: Arc<dashmap::DashMap<MemoryId, std::collections::HashSet<MemoryId>>>,
     prefetch_tx: mpsc::Sender<PrefetchRequest>,
 ) where
     S: StorageEngine,
@@ -408,16 +396,11 @@ pub async fn warm_cache<S, V>(
     let entries = match load_warm_file(&warm_path) {
         WarmLoadResult::Loaded(entries) => entries,
         WarmLoadResult::NotFound => {
-            tracing::info!(
-                "no warm.bin -- cache will warm organically via queries"
-            );
+            tracing::info!("no warm.bin -- cache will warm organically via queries");
             return;
         }
         WarmLoadResult::Corrupt(reason) => {
-            tracing::warn!(
-                "warm.bin corrupt ({}), falling back to cold start",
-                reason
-            );
+            tracing::warn!("warm.bin corrupt ({}), falling back to cold start", reason);
             return;
         }
     };
@@ -450,9 +433,7 @@ pub async fn warm_cache<S, V>(
                 }
 
                 // Update reverse neighborhood index.
-                if let Ok(neighbors) =
-                    storage.load_outgoing_edges(memory_id).await
-                {
+                if let Ok(neighbors) = storage.load_outgoing_edges(memory_id).await {
                     for (target_id, _edge_type) in &neighbors {
                         reverse_index
                             .entry(*target_id)
@@ -467,13 +448,10 @@ pub async fn warm_cache<S, V>(
 
                 // Enqueue 1-hop neighbors for prefetch.
                 // Best-effort -- dropped if the prefetch channel is full.
-                if let Ok(neighbors) =
-                    storage.load_outgoing_edges(memory_id).await
-                {
+                if let Ok(neighbors) = storage.load_outgoing_edges(memory_id).await {
                     for (target_id, _edge_type) in neighbors {
                         if !cache.contains_key(&target_id) {
-                            let _ = prefetch_tx
-                                .try_send(PrefetchRequest::Eager(target_id));
+                            let _ = prefetch_tx.try_send(PrefetchRequest::Eager(target_id));
                         }
                     }
                 }
@@ -483,11 +461,7 @@ pub async fn warm_cache<S, V>(
                 skipped_missing += 1;
             }
             Err(e) => {
-                tracing::warn!(
-                    "warming: failed to load {:?}: {}",
-                    memory_id,
-                    e
-                );
+                tracing::warn!("warming: failed to load {:?}: {}", memory_id, e);
                 errors += 1;
             }
         }
@@ -620,8 +594,7 @@ pub async fn prefetch_worker<S, V>(
         metrics.received.increment(1);
 
         // Check pressure level.
-        let pressure =
-            PressureLevel::from_u8(pressure_level.load(Ordering::Relaxed));
+        let pressure = PressureLevel::from_u8(pressure_level.load(Ordering::Relaxed));
 
         match pressure {
             PressureLevel::Critical => {
@@ -665,14 +638,10 @@ pub async fn prefetch_worker<S, V>(
                 // If Eager (K=1) and pressure Normal, enqueue neighbors
                 // as Lazy (K=2) prefetches via the feedback loop sender.
                 if req.is_eager() && pressure == PressureLevel::Normal {
-                    if let Ok(neighbors) =
-                        storage.load_outgoing_edges(memory_id).await
-                    {
+                    if let Ok(neighbors) = storage.load_outgoing_edges(memory_id).await {
                         for (target_id, _edge_type) in neighbors {
                             if !cache.contains_key(&target_id) {
-                                let _ = lazy_tx.try_send(
-                                    PrefetchRequest::Lazy(target_id),
-                                );
+                                let _ = lazy_tx.try_send(PrefetchRequest::Lazy(target_id));
                             }
                         }
                     }
@@ -682,11 +651,7 @@ pub async fn prefetch_worker<S, V>(
                 metrics.not_found.increment(1);
             }
             Err(e) => {
-                tracing::warn!(
-                    "prefetch failed for {:?}: {}",
-                    memory_id,
-                    e
-                );
+                tracing::warn!("prefetch failed for {:?}: {}", memory_id, e);
                 metrics.errors.increment(1);
             }
         }
@@ -712,8 +677,7 @@ pub async fn enqueue_neighbors_for_prefetch<E: EdgeStore>(
     tx: &mpsc::Sender<PrefetchRequest>,
     pressure_level: &AtomicU8,
 ) {
-    let pressure =
-        PressureLevel::from_u8(pressure_level.load(Ordering::Relaxed));
+    let pressure = PressureLevel::from_u8(pressure_level.load(Ordering::Relaxed));
 
     // Critical: don't even query edges.
     if pressure == PressureLevel::Critical {
@@ -750,8 +714,7 @@ pub async fn enqueue_neighbors_for_prefetch<E: EdgeStore>(
 ///   centrality = 1 - e^(-degree / 10)
 pub fn compute_priority(record: &CachedRecord) -> f32 {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let age_hours =
-        (now_ms - record.last_accessed_at) as f32 / 3_600_000.0;
+    let age_hours = (now_ms - record.last_accessed_at) as f32 / 3_600_000.0;
     let degree = record.edge_count as f32;
 
     let recency_score = 1.0 / (1.0 + age_hours);

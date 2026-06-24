@@ -10,23 +10,20 @@ use async_trait::async_trait;
 use crate::cache::CacheManager;
 use crate::embedding::EmbeddingProvider;
 use crate::graph::SharedGraph;
-use crate::model::{
-    AccessKind, CachedRecord, MemoryId, NamespaceConfig, NamespaceId,
-};
+use crate::model::{AccessKind, CachedRecord, MemoryId, NamespaceConfig, NamespaceId};
 use crate::rif::{NeighborInfo, RifEngine};
 // Import the real StorageEngine trait so its methods are in scope
 // for RedbStorageEngine via the RwLockReadGuard deref.
-use crate::storage::StorageEngine as _;
 use crate::storage::RedbStorageEngine;
+use crate::storage::StorageEngine as _;
 
 use super::error::{Result, SearchError};
 use super::pipeline::{
-    AccessRecorder, FtsIndexRegistry, FtsResult, EmbeddingProviderRegistry,
-    EntityIndexReader, EntityRecallResult, GraphReader,
-    MetadataStore, NamespaceResolver, RecordCache, RifProcessor,
-    RifSuppression, ScoredResult, VectorIndexRegistry,
+    AccessRecorder, EmbeddingProviderRegistry, EntityIndexReader, EntityRecallResult,
+    FtsIndexRegistry, FtsResult, GraphReader, MetadataStore, NamespaceResolver, RecordCache,
+    RifProcessor, RifSuppression, ScoredResult, VectorIndexRegistry,
 };
-use super::{FtsIndex, EntityIndex, FlatVectorIndex, VectorIndex, SearchFilter};
+use super::{EntityIndex, FlatVectorIndex, FtsIndex, SearchFilter, VectorIndex};
 
 // ── NamespaceResolver ──────────────────────────────────────────────
 
@@ -46,9 +43,10 @@ impl StorageNamespaceResolver {
 #[async_trait]
 impl NamespaceResolver for StorageNamespaceResolver {
     async fn resolve(&self, name: &str) -> Result<NamespaceConfig> {
-        let storage_r = self.storage.read().map_err(|e| {
-            SearchError::Internal(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = self
+            .storage
+            .read()
+            .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
         storage_r
             .get_namespace_by_name(name)
             .map_err(|e| SearchError::Internal(e.to_string()))?
@@ -150,12 +148,7 @@ impl SharedFtsIndexRegistry {
 }
 
 impl FtsIndexRegistry for SharedFtsIndexRegistry {
-    fn search(
-        &self,
-        namespace_id: NamespaceId,
-        query: &str,
-        k: usize,
-    ) -> Result<Vec<FtsResult>> {
+    fn search(&self, namespace_id: NamespaceId, query: &str, k: usize) -> Result<Vec<FtsResult>> {
         let index = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.index.lock())
         });
@@ -202,8 +195,7 @@ impl RecordCache for CacheManagerAdapter {
         }
         // Bridge async get to sync context.
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(self.cache.get(*id))
+            tokio::runtime::Handle::current().block_on(self.cache.get(*id))
         })
         .map(|arc| (*arc).clone())
     }
@@ -228,9 +220,10 @@ impl StorageMetadataAdapter {
 #[async_trait]
 impl MetadataStore for StorageMetadataAdapter {
     async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
-        let storage_r = self.storage.read().map_err(|e| {
-            SearchError::MetadataError(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = self
+            .storage
+            .read()
+            .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
         storage_r
             .get_record(*id)
             .map(|opt| opt.map(|disk| CachedRecord::from(&disk)))
@@ -238,9 +231,10 @@ impl MetadataStore for StorageMetadataAdapter {
     }
 
     async fn get_batch(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>> {
-        let storage_r = self.storage.read().map_err(|e| {
-            SearchError::MetadataError(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = self
+            .storage
+            .read()
+            .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
             match storage_r.get_record(*id) {
@@ -346,22 +340,21 @@ impl StorageAccessRecorder {
 impl AccessRecorder for StorageAccessRecorder {
     async fn record_access(&self, id: MemoryId, kind: AccessKind) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        let storage_r = self.storage.read().map_err(|e| {
-            SearchError::Internal(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = self
+            .storage
+            .read()
+            .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
         storage_r
             .update_access(id, now, kind)
             .map_err(|e| SearchError::Internal(e.to_string()))
     }
 
-    async fn record_access_batch(
-        &self,
-        accesses: &[(MemoryId, AccessKind)],
-    ) -> Result<()> {
+    async fn record_access_batch(&self, accesses: &[(MemoryId, AccessKind)]) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        let storage_r = self.storage.read().map_err(|e| {
-            SearchError::Internal(format!("storage lock poisoned: {e}"))
-        })?;
+        let storage_r = self
+            .storage
+            .read()
+            .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
         for (id, kind) in accesses {
             storage_r
                 .update_access(*id, now, *kind)
@@ -392,22 +385,12 @@ impl GraphReader for SharedGraphReader {
         graph
             .outgoing_edges(id)
             .iter()
-            .filter_map(|edge| {
-                graph
-                    .nodes
-                    .get(edge.target)
-                    .map(|node| node.memory_id)
-            })
+            .filter_map(|edge| graph.nodes.get(edge.target).map(|node| node.memory_id))
             .chain(
                 graph
                     .incoming_edges(id)
                     .iter()
-                    .filter_map(|edge| {
-                        graph
-                            .nodes
-                            .get(edge.source)
-                            .map(|node| node.memory_id)
-                    }),
+                    .filter_map(|edge| graph.nodes.get(edge.source).map(|node| node.memory_id)),
             )
             .collect()
     }
@@ -436,12 +419,7 @@ impl GraphReader for SharedGraphReader {
             }
             _ => {}
         }
-        crate::graph::activation::spreading_activation(
-            &graph,
-            seeds,
-            namespace_id,
-            &config,
-        )
+        crate::graph::activation::spreading_activation(&graph, seeds, namespace_id, &config)
     }
 
     fn superseded_by(&self, id: &MemoryId) -> Option<MemoryId> {
@@ -516,5 +494,3 @@ impl EntityIndexReader for SharedEntityIndexReader {
             .collect())
     }
 }
-
-

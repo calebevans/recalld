@@ -1,11 +1,11 @@
-// Configuration loader: TOML parsing, environment variable overlays, CLI flag overrides.
-//
-// Implements the layered configuration loading strategy:
-// 1. Compiled-in defaults
-// 2. TOML config file
-// 3. Environment variable overrides
-// 4. CLI flag overrides
-// 5. Validation
+//! Configuration loader: TOML parsing, environment variable overlays, CLI flag overrides.
+//!
+//! Implements the layered configuration loading strategy:
+//! 1. Compiled-in defaults
+//! 2. TOML config file
+//! 3. Environment variable overrides
+//! 4. CLI flag overrides
+//! 5. Validation
 
 use std::path::{Path, PathBuf};
 
@@ -80,13 +80,12 @@ pub fn load_config(
             }]
         })?;
 
-        let file_config: RecalldConfig =
-            toml::from_str(&contents).map_err(|e| {
-                vec![ConfigError::ParseError {
-                    path: path.clone(),
-                    message: e.to_string(),
-                }]
-            })?;
+        let file_config: RecalldConfig = toml::from_str(&contents).map_err(|e| {
+            vec![ConfigError::ParseError {
+                path: path.clone(),
+                message: e.to_string(),
+            }]
+        })?;
 
         config = merge_config(config, file_config);
     }
@@ -114,9 +113,7 @@ fn merge_config(_base: RecalldConfig, file: RecalldConfig) -> RecalldConfig {
 /// Apply environment variable overrides to the configuration.
 ///
 /// Convention: `RECALLD_<SECTION>_<FIELD>` in SCREAMING_SNAKE_CASE.
-fn apply_env_overrides(
-    config: &mut RecalldConfig,
-) -> std::result::Result<(), Vec<ConfigError>> {
+fn apply_env_overrides(config: &mut RecalldConfig) -> std::result::Result<(), Vec<ConfigError>> {
     let mut errors = Vec::new();
 
     // Helper: read env var, parse, apply. Collects errors.
@@ -127,11 +124,7 @@ fn apply_env_overrides(
                     Ok(parsed) => $field = parsed,
                     Err(_) => errors.push(ConfigError::EnvVarInvalid {
                         var: $var.to_string(),
-                        message: format!(
-                            "cannot parse '{}' as {}",
-                            val,
-                            stringify!($type)
-                        ),
+                        message: format!("cannot parse '{}' as {}", val, stringify!($type)),
                     }),
                 }
             }
@@ -157,10 +150,7 @@ fn apply_env_overrides(
     }
 
     // --- Server ---
-    env_override_string!(
-        "RECALLD_SERVER_BIND_ADDRESS",
-        config.server.bind_address
-    );
+    env_override_string!("RECALLD_SERVER_BIND_ADDRESS", config.server.bind_address);
     env_override!("RECALLD_SERVER_PORT", config.server.port, u16);
     env_override!(
         "RECALLD_SERVER_REQUEST_TIMEOUT_MS",
@@ -174,10 +164,7 @@ fn apply_env_overrides(
     );
 
     // --- Storage ---
-    env_override_string!(
-        "RECALLD_STORAGE_DATA_DIR",
-        config.storage.data_dir
-    );
+    env_override_string!("RECALLD_STORAGE_DATA_DIR", config.storage.data_dir);
     env_override!(
         "RECALLD_STORAGE_MAX_VECTOR_FILE_SIZE",
         config.storage.max_vector_file_size,
@@ -248,9 +235,7 @@ fn apply_env_overrides(
         match val.to_lowercase().as_str() {
             "openai" => config.embedding.provider = EmbeddingProvider::OpenAI,
             "ollama" => config.embedding.provider = EmbeddingProvider::Ollama,
-            "passthrough" => {
-                config.embedding.provider = EmbeddingProvider::Passthrough
-            }
+            "passthrough" => config.embedding.provider = EmbeddingProvider::Passthrough,
             _ => errors.push(ConfigError::EnvVarInvalid {
                 var: "RECALLD_EMBEDDING_PROVIDER".into(),
                 message: format!(
@@ -260,18 +245,12 @@ fn apply_env_overrides(
             }),
         }
     }
-    env_override_string!(
-        "RECALLD_EMBEDDING_MODEL_NAME",
-        config.embedding.model_name
-    );
+    env_override_string!("RECALLD_EMBEDDING_MODEL_NAME", config.embedding.model_name);
     env_override_string!(
         "RECALLD_EMBEDDING_API_KEY_ENV",
         config.embedding.api_key_env
     );
-    env_override_string!(
-        "RECALLD_EMBEDDING_BASE_URL",
-        config.embedding.base_url
-    );
+    env_override_string!("RECALLD_EMBEDDING_BASE_URL", config.embedding.base_url);
     env_override!(
         "RECALLD_EMBEDDING_DIMENSIONS",
         config.embedding.dimensions,
@@ -332,10 +311,7 @@ fn apply_env_overrides(
             "pretty" => config.log.format = LogFormat::Pretty,
             _ => errors.push(ConfigError::EnvVarInvalid {
                 var: "RECALLD_LOG_FORMAT".into(),
-                message: format!(
-                    "'{}' is not a valid format (json, pretty)",
-                    val
-                ),
+                message: format!("'{}' is not a valid format (json, pretty)", val),
             }),
         }
     }

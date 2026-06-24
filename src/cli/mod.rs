@@ -11,8 +11,8 @@ mod output;
 
 pub use client::RecalldClient;
 pub use commands::Cli;
-pub use config::CliConfig;
 pub use commands::OutputFormat;
+pub use config::CliConfig;
 pub use output::{HumanFormatter, JsonFormatter, OutputFormatter};
 
 use std::io::{self, Write};
@@ -142,11 +142,7 @@ async fn cmd_recall(
 }
 
 /// Handle the `get` command: retrieve a memory by ID.
-async fn cmd_get(
-    client: &RecalldClient,
-    fmt: &dyn OutputFormatter,
-    args: GetArgs,
-) -> Result<()> {
+async fn cmd_get(client: &RecalldClient, fmt: &dyn OutputFormatter, args: GetArgs) -> Result<()> {
     let memory = client.get_memory(&args.id).await?;
     print_out(&fmt.get(&memory));
     Ok(())
@@ -217,7 +213,11 @@ async fn cmd_namespaces(
         }
         NamespaceAction::Create(create_args) => {
             let ns = client
-                .create_namespace(&create_args.name, create_args.dim, create_args.initial_stability)
+                .create_namespace(
+                    &create_args.name,
+                    create_args.dim,
+                    create_args.initial_stability,
+                )
                 .await?;
             print_out(&fmt.namespaces_list(&[ns]));
         }

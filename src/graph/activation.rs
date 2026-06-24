@@ -36,7 +36,7 @@ pub const HOP_2_DECAY: f32 = 0.5;
 
 /// Configuration for spreading activation calculation.
 /// Passed to `connection_bonus` and used by the decay sweep.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct ActivationConfig {
     /// Maximum associative strength (ACT-R S_max).
     /// Higher values extend the fan threshold.
@@ -79,7 +79,7 @@ impl Default for ActivationConfig {
 /// increments below `min_spread` are discarded.  The `max_budget`
 /// provides a hard upper bound on nodes processed to prevent runaway
 /// on pathologically dense subgraphs.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct SpreadingActivationConfig {
     /// Maximum associative strength (ACT-R S_max) for fan attenuation.
     /// At `degree >= ceil(e^s_max) - 1`, the fan factor drops to zero.
@@ -115,7 +115,7 @@ pub struct SpreadingActivationConfig {
 impl Default for SpreadingActivationConfig {
     fn default() -> Self {
         Self {
-            s_max: DEFAULT_S_MAX,  // 2.0
+            s_max: DEFAULT_S_MAX, // 2.0
             hop_decay: 0.75,
             firing_threshold: 0.03,
             min_spread: 0.005,
@@ -619,7 +619,7 @@ pub fn spreading_activation(
                 * edge_factor           // edge type modifier [0,1]
                 * fan_attenuation       // ACT-R fan effect [0, s_max]
                 * config.hop_decay      // per-hop signal decay
-                * neighbor.strength;    // FSRS retrievability gate
+                * neighbor.strength; // FSRS retrievability gate
 
             // Drop negligible increments
             if spread < config.min_spread {
@@ -627,16 +627,12 @@ pub fn spreading_activation(
             }
 
             // Accumulate on neighbor (additive, clamped to 1.0)
-            let neighbor_activation = activation
-                .entry(neighbor_key)
-                .or_insert(0.0);
+            let neighbor_activation = activation.entry(neighbor_key).or_insert(0.0);
             let new_activation = (*neighbor_activation + spread).min(1.0);
             *neighbor_activation = new_activation;
 
             // Push to queue if above firing threshold and not yet fired
-            if new_activation >= config.firing_threshold
-                && !fired.contains(&neighbor_key)
-            {
+            if new_activation >= config.firing_threshold && !fired.contains(&neighbor_key) {
                 queue.push(ActivationEntry {
                     activation: new_activation,
                     node_key: neighbor_key,
@@ -664,9 +660,7 @@ pub fn spreading_activation(
         .collect();
 
     // Sort by activation descending
-    results.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
-    });
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
     results
 }
@@ -787,10 +781,7 @@ mod spreading_tests {
     }
 
     /// Helper: add a node with Full phase and strength 1.0.
-    fn add_node(
-        graph: &mut RelationshipGraph,
-        ns: NamespaceId,
-    ) -> MemoryId {
+    fn add_node(graph: &mut RelationshipGraph, ns: NamespaceId) -> MemoryId {
         let id = MemoryId::new();
         graph
             .add_node(id, ns, DecayPhase::Full, 1.0, 0)
@@ -813,12 +804,7 @@ mod spreading_tests {
     }
 
     /// Helper: add an edge with weight 1.0.
-    fn link(
-        graph: &mut RelationshipGraph,
-        src: MemoryId,
-        tgt: MemoryId,
-        edge_type: EdgeType,
-    ) {
+    fn link(graph: &mut RelationshipGraph, src: MemoryId, tgt: MemoryId, edge_type: EdgeType) {
         graph
             .add_edge(src, tgt, edge_type, 1.0, false)
             .expect("add_edge");
@@ -835,12 +821,7 @@ mod spreading_tests {
         link(&mut graph, b, c, EdgeType::Associative);
 
         let config = SpreadingActivationConfig::default();
-        let results = spreading_activation(
-            &graph,
-            &[(a, 1.0)],
-            test_ns(),
-            &config,
-        );
+        let results = spreading_activation(&graph, &[(a, 1.0)], test_ns(), &config);
 
         // Both B and C should appear
         let b_act = results.iter().find(|(id, _)| *id == b).map(|(_, a)| *a);
@@ -851,7 +832,8 @@ mod spreading_tests {
         assert!(
             b_act.unwrap() > c_act.unwrap(),
             "B ({:?}) should have higher activation than C ({:?})",
-            b_act, c_act
+            b_act,
+            c_act
         );
 
         // Seed A should NOT appear in results
@@ -876,12 +858,7 @@ mod spreading_tests {
         link(&mut graph, b, e, EdgeType::Associative);
 
         let config = SpreadingActivationConfig::default();
-        let results = spreading_activation(
-            &graph,
-            &[(a, 1.0), (b, 1.0)],
-            test_ns(),
-            &config,
-        );
+        let results = spreading_activation(&graph, &[(a, 1.0), (b, 1.0)], test_ns(), &config);
 
         let c_act = results.iter().find(|(id, _)| *id == c).map(|(_, a)| *a);
         let d_act = results.iter().find(|(id, _)| *id == d).map(|(_, a)| *a);
@@ -895,12 +872,14 @@ mod spreading_tests {
         assert!(
             c_act.unwrap() > d_act.unwrap(),
             "C ({:?}) should have higher activation than D ({:?}) due to convergence",
-            c_act, d_act
+            c_act,
+            d_act
         );
         assert!(
             c_act.unwrap() > e_act.unwrap(),
             "C ({:?}) should have higher activation than E ({:?}) due to convergence",
-            c_act, e_act
+            c_act,
+            e_act
         );
     }
 
@@ -926,12 +905,7 @@ mod spreading_tests {
         assert!(graph.degree(&hub) >= 7, "hub should have degree >= 7");
 
         let config = SpreadingActivationConfig::default();
-        let results = spreading_activation(
-            &graph,
-            &[(a, 1.0)],
-            test_ns(),
-            &config,
-        );
+        let results = spreading_activation(&graph, &[(a, 1.0)], test_ns(), &config);
 
         // Hub itself may or may not appear (it receives activation
         // from A, which has low degree, so A can spread to it).
@@ -953,12 +927,7 @@ mod spreading_tests {
         link(&mut graph, a, b, EdgeType::Contradicts);
 
         let config = SpreadingActivationConfig::default();
-        let results = spreading_activation(
-            &graph,
-            &[(a, 1.0)],
-            test_ns(),
-            &config,
-        );
+        let results = spreading_activation(&graph, &[(a, 1.0)], test_ns(), &config);
 
         assert!(
             results.iter().all(|(id, _)| *id != b),
@@ -979,12 +948,7 @@ mod spreading_tests {
         }
 
         let config = SpreadingActivationConfig::default();
-        let results = spreading_activation(
-            &graph,
-            &[(chain[0], 1.0)],
-            test_ns(),
-            &config,
-        );
+        let results = spreading_activation(&graph, &[(chain[0], 1.0)], test_ns(), &config);
 
         // Node at position 15+ should not appear (signal too weak)
         for &distant_id in &chain[15..] {
@@ -1012,12 +976,7 @@ mod spreading_tests {
         link(&mut graph, a, c, EdgeType::Associative);
 
         let config = SpreadingActivationConfig::default();
-        let results = spreading_activation(
-            &graph,
-            &[(a, 1.0)],
-            test_ns(),
-            &config,
-        );
+        let results = spreading_activation(&graph, &[(a, 1.0)], test_ns(), &config);
 
         assert!(
             results.iter().all(|(id, _)| *id != b),
@@ -1033,21 +992,14 @@ mod spreading_tests {
     fn test_spreading_ghost_skipped() {
         let mut graph = RelationshipGraph::new();
         let a = add_node(&mut graph, test_ns());
-        let ghost = add_node_with(
-            &mut graph, test_ns(), DecayPhase::Ghost, 0.1,
-        );
+        let ghost = add_node_with(&mut graph, test_ns(), DecayPhase::Ghost, 0.1);
         let c = add_node(&mut graph, test_ns());
 
         link(&mut graph, a, ghost, EdgeType::Associative);
         link(&mut graph, ghost, c, EdgeType::Associative);
 
         let config = SpreadingActivationConfig::default();
-        let results = spreading_activation(
-            &graph,
-            &[(a, 1.0)],
-            test_ns(),
-            &config,
-        );
+        let results = spreading_activation(&graph, &[(a, 1.0)], test_ns(), &config);
 
         // Ghost should not appear in results
         assert!(

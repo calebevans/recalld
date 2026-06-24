@@ -18,10 +18,7 @@ use uuid::Uuid;
 ///
 /// If the client sends an `X-Request-ID` header, it is preserved
 /// rather than overwritten -- this supports distributed tracing.
-pub async fn request_id_middleware(
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn request_id_middleware(req: Request<Body>, next: Next) -> Response {
     let request_id = req
         .headers()
         .get("x-request-id")

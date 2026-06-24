@@ -21,23 +21,23 @@
 
 // ── Module declarations ──────────────────────────────────────────────
 
-pub mod model;
-pub mod serialization;
-pub mod storage;
-pub mod graph;
-pub mod decay;
-pub mod rif;
-pub mod cache;
-pub mod embedding;
-pub mod search;
 pub mod api;
-pub mod cli;
-pub mod config;
-pub mod error;
-pub mod mcp;
-pub mod daemon;
 #[cfg(feature = "bench")]
 pub mod bench;
+pub mod cache;
+pub mod cli;
+pub mod config;
+pub mod daemon;
+pub mod decay;
+pub mod embedding;
+pub mod error;
+pub mod graph;
+pub mod mcp;
+pub mod model;
+pub mod rif;
+pub mod search;
+pub mod serialization;
+pub mod storage;
 pub mod system;
 
 // ── Top-level re-exports ─────────────────────────────────────────────
@@ -45,12 +45,9 @@ pub mod system;
 // Consumers write `use recalld::{Recalld, RecalldConfig, RecalldError}`
 // for the system-level API, and `use recalld::model::*` for data types.
 
-pub use system::Recalld;
 pub use config::RecalldConfig;
 pub use error::RecalldError;
+pub use system::Recalld;
 
 // Re-export core types at the crate root for ergonomics.
-pub use model::{
-    MemoryId, NamespaceId, DecayPhase, EdgeType,
-    Memory, NamespaceConfig,
-};
+pub use model::{DecayPhase, EdgeType, Memory, MemoryId, NamespaceConfig, NamespaceId};

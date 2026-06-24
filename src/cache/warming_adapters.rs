@@ -10,10 +10,9 @@ use async_trait::async_trait;
 use crate::model::{CachedRecord, EdgeType, MemoryId, NamespaceId};
 // Import the real StorageEngine trait so its methods are in scope
 // for RedbStorageEngine via the RwLockReadGuard deref.
-use crate::storage::StorageEngine as _;
-use crate::storage::RedbStorageEngine;
-
 use super::warming::{EdgeStore, StorageEngine};
+use crate::storage::RedbStorageEngine;
+use crate::storage::StorageEngine as _;
 
 // ── StorageEngine adapter ──────────────────────────────────────────
 
@@ -24,6 +23,7 @@ pub struct WarmingStorageAdapter {
 }
 
 impl WarmingStorageAdapter {
+    /// Create a new adapter wrapping the given storage engine.
     pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
         Self { storage }
     }
@@ -31,10 +31,7 @@ impl WarmingStorageAdapter {
 
 #[async_trait]
 impl StorageEngine for WarmingStorageAdapter {
-    async fn load_record(
-        &self,
-        id: MemoryId,
-    ) -> Result<Option<CachedRecord>, anyhow::Error> {
+    async fn load_record(&self, id: MemoryId) -> Result<Option<CachedRecord>, anyhow::Error> {
         let storage_r = self
             .storage
             .read()
@@ -84,6 +81,7 @@ pub struct StorageEdgeAdapter {
 }
 
 impl StorageEdgeAdapter {
+    /// Create a new adapter wrapping the given storage engine.
     pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
         Self { storage }
     }

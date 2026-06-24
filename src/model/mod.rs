@@ -34,4 +34,4 @@ pub use self::id::{MemoryId, NamespaceId};
 pub use self::memory::{AccessEvent, AccessKind, CreateMemory, Memory};
 pub use self::namespace::{NamespaceConfig, PhaseThresholds};
 pub use self::record::{CachedRecord, DiskRecord};
-pub use self::tag::{Tag, StructuredMetadata, parse_structured_tags, entity_overlap};
+pub use self::tag::{StructuredMetadata, Tag, entity_overlap, parse_structured_tags};

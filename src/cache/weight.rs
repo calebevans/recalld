@@ -26,7 +26,7 @@ pub fn weigh_cached_record(record: &CachedRecord) -> u32 {
     let base = std::mem::size_of::<CachedRecord>(); // ~80 bytes stack fields
     let summary_heap = record.summary.len() // heap String content
         + std::mem::size_of::<String>(); // 24 bytes (ptr+len+cap)
-    let tags_heap: usize = record
+    let tags_heap = record
         .tags
         .iter()
         .map(|t| t.as_str().len() + std::mem::size_of::<Tag>())
