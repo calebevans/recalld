@@ -223,5 +223,4 @@ cargo install --path .
 Windows is not supported.
 
 ## License
-
-License TBD.
+AGPL-3.0
