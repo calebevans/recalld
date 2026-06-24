@@ -1,0 +1,107 @@
+[package]
+name = "recalld"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "AI memory system with biologically-inspired decay and retrieval-induced forgetting"
+license = "MIT OR Apache-2.0"
+default-run = "recalld"
+
+[[bin]]
+name = "recalld"
+path = "src/main.rs"
+
+# CLI binary (talks to a running server)
+[[bin]]
+name = "recalld-cli"
+path = "src/bin/recalld.rs"
+
+[lib]
+name = "recalld"
+path = "src/lib.rs"
+
+[features]
+default = ["bench"]
+bench = []
+
+[dependencies]
+# ── Async runtime & networking ────────────────────────────────────
+tokio       = { version = "1", features = ["full"] }
+axum        = { version = "0.8", features = ["macros"] }
+tower       = "0.5"
+tower-http  = { version = "0.6", features = ["trace", "cors", "timeout"] }
+
+# ── Serialization ─────────────────────────────────────────────────
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# ── Configuration ─────────────────────────────────────────────────
+toml        = "0.8"
+clap        = { version = "4", features = ["derive", "env"] }
+
+# ── Logging & tracing ────────────────────────────────────────────
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ── Storage ───────────────────────────────────────────────────────
+redb        = "2"
+roaring     = "0.10"
+memmap2     = "0.9"
+zerocopy    = { version = "0.8", features = ["derive"] }
+bytemuck    = { version = "1", features = ["derive"] }
+crc32fast   = "1"
+fs2         = "0.4"
+
+# ── Graph ─────────────────────────────────────────────────────────
+slotmap     = "1"
+
+# ── Cache ─────────────────────────────────────────────────────────
+moka        = { version = "0.12", features = ["future"] }
+dashmap     = "6"
+metrics     = "0.24"
+anyhow      = "1"
+
+# ── SIMD / math ──────────────────────────────────────────────────
+wide        = "0.7"
+
+# ── Identifiers ──────────────────────────────────────────────────
+uuid        = { version = "1", features = ["v4", "v7", "serde"] }
+
+# ── Error handling ───────────────────────────────────────────────
+thiserror   = "2"
+
+# ── HTTP client (embedding providers) ────────────────────────────
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# ── Time ─────────────────────────────────────────────────────────
+chrono      = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# ── Async traits ─────────────────────────────────────────────────
+async-trait = "0.1"
+
+# ── Misc ─────────────────────────────────────────────────────────
+rand        = "0.8"
+rust-stemmers = "1"
+bincode     = "1"
+libc        = "0.2"
+rusqlite    = { version = "0.35", features = ["bundled"] }
+
+# ── CLI output ───────────────────────────────────────────────────
+comfy-table = "7"
+colored     = "2"
+dirs        = "5"
+tempfile    = "3"
+
+[dev-dependencies]
+tokio-test  = "0.4"
+assert_matches = "1"
+serde_json  = "1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true

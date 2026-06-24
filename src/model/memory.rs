@@ -1,0 +1,384 @@
+//! Memory record types: the public API representation, creation request,
+//! access events, and access kind classification.
+
+use serde::{Deserialize, Serialize};
+
+use crate::model::constants::*;
+use crate::model::decay::DecayPhase;
+use crate::model::error::ValidationError;
+use crate::model::id::MemoryId;
+use crate::model::tag::Tag;
+
+// ═══════════════════════════════════════════════════════════════════════
+// AccessKind
+// ═══════════════════════════════════════════════════════════════════════
+
+/// How a memory was accessed. Influences FSRS stability update magnitude.
+///
+/// - `DirectRetrieval` and `ManualReinforcement` apply the full FSRS
+///   SInc stability multiplier.
+/// - `AssociativeRetrieval` applies 50% of SInc (weaker reinforcement).
+/// - `DecaySweep` does not update stability at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessKind {
+    /// Returned as a direct search result.
+    DirectRetrieval,
+    /// Returned as a related memory via graph traversal.
+    AssociativeRetrieval,
+    /// Read during a decay sweep (not returned to user).
+    DecaySweep,
+    /// Explicitly strengthened by the caller.
+    ManualReinforcement,
+}
+
+impl AccessKind {
+    /// Fraction of the FSRS SInc multiplier to apply for this access kind.
+    /// Returns 0.0 for kinds that should not update stability.
+    pub fn sinc_weight(self) -> f64 {
+        match self {
+            AccessKind::DirectRetrieval => 1.0,
+            AccessKind::ManualReinforcement => 1.0,
+            AccessKind::AssociativeRetrieval => 0.5,
+            AccessKind::DecaySweep => 0.0,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// AccessEvent
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A timestamped record of a single memory access.
+///
+/// 12 bytes on-disk: 8 (timestamp) + 1 (kind) + 3 (padding/alignment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessEvent {
+    /// Milliseconds since Unix epoch (UTC).
+    pub timestamp: i64,
+    /// How the memory was accessed.
+    pub kind: AccessKind,
+}
+
+impl AccessEvent {
+    /// Create a new access event at the current time.
+    pub fn now(kind: AccessKind) -> Self {
+        Self {
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            kind,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Memory — API representation
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The public API representation of a memory record.
+///
+/// Serializes to/from JSON with `camelCase` field names. Optional fields
+/// are omitted from serialization when `None` (not sent as `null`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Memory {
+    /// Unique identifier (UUID v7).
+    pub id: MemoryId,
+    /// Resolved namespace name (not the numeric ID).
+    pub namespace: String,
+    /// Milliseconds since Unix epoch.
+    pub created_at: i64,
+    /// Milliseconds since Unix epoch.
+    pub last_accessed_at: i64,
+    /// Short description, always present, max 2000 bytes.
+    pub summary: String,
+
+    /// Full content. Present only in Phase 1 (Full).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_text: Option<String>,
+
+    /// Validated tags attached to this memory.
+    pub tags: Vec<Tag>,
+    /// Current decay phase.
+    pub phase: DecayPhase,
+    /// Raw FSRS retrievability R, in [0.0, 1.0].
+    pub strength: f32,
+    /// Effective retrievability including connection bonus, in [0.0, 1.0].
+    pub decay_strength: f32,
+    /// FSRS stability S in days.
+    pub stability: f32,
+    /// FSRS difficulty D, fixed at 5.0 for v1.
+    pub difficulty: f32,
+    /// True if stability exceeds the permastore threshold.
+    pub is_permastore: bool,
+    /// Cached count of outgoing edges.
+    pub edge_count: u16,
+
+    /// Embedding vector. Included only when explicitly requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+
+    /// Access history. Included only in detailed/debug responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_history: Option<Vec<AccessEvent>>,
+}
+
+impl Memory {
+    /// Validate all invariants on an existing Memory struct.
+    ///
+    /// Returns the first violation found. Call this after deserialization
+    /// or manual construction to ensure the record is internally
+    /// consistent. This does NOT validate namespace existence or
+    /// embedding dimensions (those require external context).
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        // Summary non-empty
+        if self.summary.is_empty() {
+            return Err(ValidationError::SummaryEmpty);
+        }
+
+        // Summary length
+        if self.summary.len() > SUMMARY_MAX_BYTES {
+            return Err(ValidationError::SummaryTooLong {
+                len: self.summary.len(),
+                max: SUMMARY_MAX_BYTES,
+            });
+        }
+
+        // Full text length
+        if let Some(ref ft) = self.full_text {
+            if ft.len() > FULL_TEXT_MAX_BYTES {
+                return Err(ValidationError::FullTextTooLong {
+                    len: ft.len(),
+                    max: FULL_TEXT_MAX_BYTES,
+                });
+            }
+        }
+
+        // Tag count
+        if self.tags.len() > MAX_TAGS {
+            return Err(ValidationError::TooManyTags {
+                count: self.tags.len(),
+                max: MAX_TAGS,
+            });
+        }
+
+        // Strength range
+        if !(0.0..=1.0).contains(&self.strength) {
+            return Err(ValidationError::StrengthOutOfRange(self.strength));
+        }
+
+        // Decay strength range
+        if !(0.0..=1.0).contains(&self.decay_strength) {
+            return Err(ValidationError::DecayStrengthOutOfRange(
+                self.decay_strength,
+            ));
+        }
+
+        // Stability range
+        if !(STABILITY_FLOOR..=STABILITY_CEILING).contains(&self.stability) {
+            return Err(ValidationError::StabilityOutOfRange {
+                value: self.stability,
+                min: STABILITY_FLOOR,
+                max: STABILITY_CEILING,
+            });
+        }
+
+        // Difficulty range
+        if !(DIFFICULTY_MIN..=DIFFICULTY_MAX).contains(&self.difficulty) {
+            return Err(ValidationError::DifficultyOutOfRange {
+                value: self.difficulty,
+                min: DIFFICULTY_MIN,
+                max: DIFFICULTY_MAX,
+            });
+        }
+
+        // Timestamp ordering
+        if self.created_at > self.last_accessed_at {
+            return Err(ValidationError::TimestampOrdering {
+                created: self.created_at,
+                accessed: self.last_accessed_at,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Validate all invariants, collecting every violation instead of
+    /// short-circuiting on the first.
+    pub fn validate_all(&self) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+
+        if self.summary.is_empty() {
+            errors.push(ValidationError::SummaryEmpty);
+        } else if self.summary.len() > SUMMARY_MAX_BYTES {
+            errors.push(ValidationError::SummaryTooLong {
+                len: self.summary.len(),
+                max: SUMMARY_MAX_BYTES,
+            });
+        }
+
+        if let Some(ref ft) = self.full_text {
+            if ft.len() > FULL_TEXT_MAX_BYTES {
+                errors.push(ValidationError::FullTextTooLong {
+                    len: ft.len(),
+                    max: FULL_TEXT_MAX_BYTES,
+                });
+            }
+        }
+
+        if self.tags.len() > MAX_TAGS {
+            errors.push(ValidationError::TooManyTags {
+                count: self.tags.len(),
+                max: MAX_TAGS,
+            });
+        }
+
+        if !(0.0..=1.0).contains(&self.strength) {
+            errors.push(ValidationError::StrengthOutOfRange(self.strength));
+        }
+
+        if !(0.0..=1.0).contains(&self.decay_strength) {
+            errors.push(ValidationError::DecayStrengthOutOfRange(
+                self.decay_strength,
+            ));
+        }
+
+        if !(STABILITY_FLOOR..=STABILITY_CEILING).contains(&self.stability) {
+            errors.push(ValidationError::StabilityOutOfRange {
+                value: self.stability,
+                min: STABILITY_FLOOR,
+                max: STABILITY_CEILING,
+            });
+        }
+
+        if !(DIFFICULTY_MIN..=DIFFICULTY_MAX).contains(&self.difficulty) {
+            errors.push(ValidationError::DifficultyOutOfRange {
+                value: self.difficulty,
+                min: DIFFICULTY_MIN,
+                max: DIFFICULTY_MAX,
+            });
+        }
+
+        if self.created_at > self.last_accessed_at {
+            errors.push(ValidationError::TimestampOrdering {
+                created: self.created_at,
+                accessed: self.last_accessed_at,
+            });
+        }
+
+        errors
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CreateMemory — API request body
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Request body for creating a new memory.
+///
+/// Tags arrive as raw strings and are validated into `Tag` values on the
+/// server side.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateMemory {
+    /// Target namespace name. Defaults to `"default"`.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+
+    /// Short description. Required, max 2000 bytes.
+    pub summary: String,
+
+    /// Full content. Optional, max 1 MiB.
+    #[serde(default)]
+    pub full_text: Option<String>,
+
+    /// Raw tag strings. Validated into `Tag` values server-side.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Pre-computed embedding. If omitted, the server generates one.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
+
+    /// Explicit initial stability override (days).
+    /// Must be in [0.01, 36500.0]. Uses namespace default if omitted.
+    #[serde(default)]
+    pub initial_stability: Option<f32>,
+}
+
+/// Default namespace name for `CreateMemory`.
+fn default_namespace() -> String {
+    "default".to_string()
+}
+
+impl CreateMemory {
+    /// Validate the request body. This checks content limits and tag
+    /// format only — namespace existence and embedding dimensions
+    /// require external context and are checked by the API layer.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        // Summary
+        if self.summary.is_empty() {
+            return Err(ValidationError::SummaryEmpty);
+        }
+        if self.summary.len() > SUMMARY_MAX_BYTES {
+            return Err(ValidationError::SummaryTooLong {
+                len: self.summary.len(),
+                max: SUMMARY_MAX_BYTES,
+            });
+        }
+
+        // Full text
+        if let Some(ref ft) = self.full_text {
+            if ft.len() > FULL_TEXT_MAX_BYTES {
+                return Err(ValidationError::FullTextTooLong {
+                    len: ft.len(),
+                    max: FULL_TEXT_MAX_BYTES,
+                });
+            }
+        }
+
+        // Tags: count
+        if self.tags.len() > MAX_TAGS {
+            return Err(ValidationError::TooManyTags {
+                count: self.tags.len(),
+                max: MAX_TAGS,
+            });
+        }
+
+        // Tags: format (attempt to construct each)
+        for raw in &self.tags {
+            Tag::new(raw.as_str()).map_err(ValidationError::from)?;
+        }
+
+        // Embedding: finite check
+        if let Some(ref emb) = self.embedding {
+            for (i, &val) in emb.iter().enumerate() {
+                if !val.is_finite() {
+                    return Err(ValidationError::NonFiniteEmbedding { index: i });
+                }
+            }
+        }
+
+        // Stability override
+        if let Some(s) = self.initial_stability {
+            if !(STABILITY_FLOOR..=STABILITY_CEILING).contains(&s) {
+                return Err(ValidationError::InvalidStability {
+                    value: s,
+                    min: STABILITY_FLOOR,
+                    max: STABILITY_CEILING,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert raw tag strings into validated `Tag` values.
+    /// Returns an error on the first invalid tag.
+    pub fn validated_tags(&self) -> Result<Vec<Tag>, ValidationError> {
+        self.tags
+            .iter()
+            .map(|s| Tag::new(s.as_str()).map_err(ValidationError::from))
+            .collect()
+    }
+}
