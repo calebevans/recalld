@@ -47,7 +47,7 @@ pub struct CliOverrides {
     pub log_format: Option<String>,
 }
 
-/// Per-directory configuration loaded from `.sulcus.toml` in a project root.
+/// Per-directory configuration loaded from `.recalld.toml` in a project root.
 ///
 /// Contains a required `namespace` field and optional config section overrides.
 /// When present, config sections replace the corresponding global config section
@@ -123,18 +123,18 @@ pub struct LoadedConfig {
     /// The fully-resolved configuration.
     pub config: RecalldConfig,
     /// The default namespace for MCP operations from this directory.
-    /// Falls back to `"default"` when no `.sulcus.toml` is found.
+    /// Falls back to `"default"` when no `.recalld.toml` is found.
     pub default_namespace: String,
 }
 
-/// Walk up from `start_dir` to find the nearest `.sulcus.toml`.
+/// Walk up from `start_dir` to find the nearest `.recalld.toml`.
 ///
 /// Returns `None` if no per-directory config file is found before reaching
 /// the filesystem root.
 fn find_per_dir_config(start_dir: &Path) -> Option<PathBuf> {
     let mut current = start_dir.canonicalize().ok()?;
     loop {
-        let candidate = current.join(".sulcus.toml");
+        let candidate = current.join(".recalld.toml");
         if candidate.exists() && candidate.is_file() {
             return Some(candidate);
         }
@@ -190,7 +190,7 @@ fn apply_per_dir_overrides(base: RecalldConfig, per_dir: &PerDirConfig) -> Recal
 /// Layer order (highest priority wins):
 /// 1. Compiled defaults
 /// 2. Global TOML (`~/.recalld/config.toml`)
-/// 3. Per-directory TOML (`.sulcus.toml` — closest ancestor)
+/// 3. Per-directory TOML (`.recalld.toml` — closest ancestor)
 /// 4. Environment variables (`RECALLD_*`)
 /// 5. CLI flags
 pub fn load_config(
@@ -239,7 +239,7 @@ pub fn load_config(
         config = merge_config(config, file_config);
     }
 
-    // Layer 3: Per-directory TOML (.sulcus.toml — closest ancestor)
+    // Layer 3: Per-directory TOML (.recalld.toml — closest ancestor)
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(per_dir_path) = find_per_dir_config(&cwd) {
             match load_per_dir_config(&per_dir_path) {
@@ -573,7 +573,7 @@ pub fn generate_default_config() -> String {
 
 [graph]
 # max_auto_links = 15
-# auto_link_threshold = 0.75
+# auto_link_threshold = 0.50
 # spreading_activation_s_max = 2.0
 # max_bonus = 0.15
 

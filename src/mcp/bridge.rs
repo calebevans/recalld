@@ -481,7 +481,7 @@ pub struct McpBridge {
 impl McpBridge {
     /// Get the default namespace for this session.
     ///
-    /// Derived from the nearest `.sulcus.toml` file, or `"default"` when
+    /// Derived from the nearest `.recalld.toml` file, or `"default"` when
     /// no per-directory config is found.
     pub fn default_namespace(&self) -> &str {
         &self.default_namespace

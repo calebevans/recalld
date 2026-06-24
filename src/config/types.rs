@@ -187,14 +187,14 @@ pub struct EmbeddingConfig {
     /// Applied by PrefixedProvider to every `embed()` / `embed_batch()` call.
     ///
     /// Set to empty string to disable document prefixing.
-    /// Default: "search_document: "
+    /// Default: "title: none | text: "
     pub document_prefix: String,
 
     /// Prefix prepended to text before embedding during query/search.
     /// Applied by PrefixedProvider to every `embed_query()` call.
     ///
     /// Set to empty string to disable query prefixing.
-    /// Default: "search_query: "
+    /// Default: "task: search result | query: "
     pub query_prefix: String,
 }
 
