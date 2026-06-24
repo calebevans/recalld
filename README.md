@@ -32,20 +32,19 @@ See [docs/guide.md](docs/guide.md#2-embedding-setup) for OpenAI and other provid
 
 ### 3. Connect to Claude Code
 
-Add the MCP server to your `.claude/settings.json` (global) or project `.claude/settings.json`:
+Register recalld as an MCP server (global, available in all projects):
 
-```json
-{
-  "mcpServers": {
-    "recalld": {
-      "command": "recalld",
-      "args": ["mcp"]
-    }
-  }
-}
+```sh
+claude mcp add --scope user recalld -- recalld mcp
 ```
 
-Then allow the MCP tools so Claude can use them without prompting you each time. Add to your `.claude/settings.json` or `.claude/settings.local.json`:
+Or for a single project only:
+
+```sh
+claude mcp add --scope project recalld -- recalld mcp
+```
+
+Then allow the MCP tools so Claude can use them without prompting each time. Add to your `~/.claude/settings.local.json` (global) or project `.claude/settings.local.json`:
 
 ```json
 {

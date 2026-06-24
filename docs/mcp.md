@@ -4,35 +4,25 @@
 
 ### Claude Code
 
-Add to your `~/.claude/settings.json` (or project `.claude/settings.json`):
+Register recalld as an MCP server using the CLI:
 
-```json
-{
-  "mcpServers": {
-    "recalld": {
-      "command": "recalld",
-      "args": ["mcp"]
-    }
-  }
-}
+```sh
+# Global (available in all projects)
+claude mcp add --scope user recalld -- recalld mcp
+
+# Or project-only
+claude mcp add --scope project recalld -- recalld mcp
 ```
 
 If recalld is not on your PATH, use the full path:
 
-```json
-{
-  "mcpServers": {
-    "recalld": {
-      "command": "/Users/you/.local/bin/recalld",
-      "args": ["mcp"]
-    }
-  }
-}
+```sh
+claude mcp add --scope user recalld -- /path/to/recalld mcp
 ```
 
 #### Allowing MCP tool permissions
 
-By default, Claude Code will prompt you for approval each time an MCP tool is called. To allow recalld tools automatically, add them to your `.claude/settings.json` or `.claude/settings.local.json`:
+By default, Claude Code will prompt you for approval each time an MCP tool is called. To allow recalld tools automatically, add them to your `~/.claude/settings.local.json` (global) or project `.claude/settings.local.json`:
 
 ```json
 {
@@ -50,7 +40,7 @@ By default, Claude Code will prompt you for approval each time an MCP tool is ca
 }
 ```
 
-You can place this in either the global (`~/.claude/settings.json`) or project-level (`.claude/settings.json`) settings file. The `permissions.allow` array merges across both files, so you can allow the MCP tools globally and they'll work in every project.
+The `permissions.allow` array merges across global and project-level settings files, so you can allow the MCP tools globally and they'll work in every project.
 
 To set a custom default namespace for a project, create a `.recalld.toml` file in the project root:
 

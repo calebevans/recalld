@@ -319,17 +319,14 @@ recalld has three run modes: MCP server (stdio), HTTP API server, and daemon.
 
 This is the most common setup. recalld runs as a stdio-based MCP server, launched by your AI tool.
 
-**Claude Code** -- add to `.claude/settings.json` (project) or `~/.claude/settings.json` (global):
+**Claude Code:**
 
-```json
-{
-  "mcpServers": {
-    "recalld": {
-      "command": "recalld",
-      "args": ["mcp"]
-    }
-  }
-}
+```sh
+# Global (all projects)
+claude mcp add --scope user recalld -- recalld mcp
+
+# Or project-only
+claude mcp add --scope project recalld -- recalld mcp
 ```
 
 **Cursor** -- add to `.cursor/mcp.json`:
@@ -353,17 +350,10 @@ Logs in MCP mode go to stderr (stdout is the protocol channel). Set log level wi
 recalld mcp --log-level debug
 ```
 
-To enable debug logging in the MCP JSON config, add the flag to the `args` array:
+To enable debug logging in Claude Code:
 
-```json
-{
-  "mcpServers": {
-    "recalld": {
-      "command": "recalld",
-      "args": ["mcp", "--log-level", "debug"]
-    }
-  }
-}
+```sh
+claude mcp add --scope user recalld -- recalld mcp --log-level debug
 ```
 
 ### As HTTP API server
