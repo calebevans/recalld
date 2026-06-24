@@ -566,4 +566,65 @@ impl<'a> FsrsEngine<'a> {
         debug_assert!(target_r > 0.0 && target_r < 1.0);
         stability / FACTOR * (target_r.powf(1.0 / DECAY) - 1.0)
     }
+
+    /// Compute new stability after a review with the given quality rating.
+    ///
+    /// This is a simplified entry point for MCP `reinforce_memory` that
+    /// takes the raw quality rating (1-4) and computes the stability
+    /// update without requiring a full `DecayState`.
+    ///
+    /// Quality ratings map to FSRS behavior:
+    /// - 1 (forgot): stability decreases (lapse — uses the SInc formula
+    ///   with a penalty factor to reduce stability)
+    /// - 2 (hard): moderate stability increase
+    /// - 3 (good): standard stability increase (default FSRS recall)
+    /// - 4 (easy): strongest stability increase
+    ///
+    /// The core FSRS recall formula is:
+    /// ```text
+    /// SInc = e^W8 * (11 - D) * S^(-W9) * (e^(W10 * (1 - R)) - 1) + 1
+    /// new_stability = old_stability * SInc
+    /// ```
+    ///
+    /// For quality != 3 (Good), a grade multiplier adjusts SInc:
+    /// - Quality 1 (forgot): multiplier = 0.2 (significant penalty)
+    /// - Quality 2 (hard):   multiplier = 0.7
+    /// - Quality 3 (good):   multiplier = 1.0 (standard FSRS)
+    /// - Quality 4 (easy):   multiplier = 1.3
+    ///
+    /// # Arguments
+    ///
+    /// - `stability`: Current FSRS stability S, in days.
+    /// - `elapsed_days`: Days since last access.
+    /// - `quality`: Review quality rating 1-4.
+    /// - `decay_rate_multiplier`: Namespace decay rate multiplier (1.0 = normal).
+    ///
+    /// # Returns
+    ///
+    /// New stability value, clamped to `[STABILITY_FLOOR, STABILITY_CEILING]`.
+    pub fn review_stability(
+        &self,
+        stability: f32,
+        elapsed_days: f32,
+        quality: u8,
+        decay_rate_multiplier: f32,
+    ) -> f32 {
+        // Compute current retrievability at the moment of review.
+        let current_r = self.retrievability(elapsed_days, stability, decay_rate_multiplier);
+
+        // Compute the base SInc using the standard FSRS formula.
+        let base_sinc = self.stability_increase(stability, current_r, self.config.difficulty);
+
+        // Apply a grade-dependent multiplier to the growth portion (SInc - 1).
+        let grade_multiplier = match quality {
+            1 => 0.2, // forgot — substantial penalty
+            2 => 0.7, // hard — reduced growth
+            3 => 1.0, // good — standard FSRS
+            _ => 1.3, // easy (4+) — boosted growth
+        };
+
+        let effective_sinc = 1.0 + (base_sinc - 1.0) * grade_multiplier;
+
+        (stability * effective_sinc).clamp(STABILITY_FLOOR, STABILITY_CEILING)
+    }
 }

@@ -71,13 +71,23 @@ pub trait StorageEngine: Send + Sync {
     /// Read the full text for a memory from text.log.
     ///
     /// Returns `None` if the text ref points to no data.
-    fn get_text(&mut self, text_ref: TextRef) -> Result<Option<String>, StorageError>;
+    fn get_text(&self, text_ref: TextRef) -> Result<Option<String>, StorageError>;
 
     /// Delete a memory and all associated data (meta, vector slot,
     /// edges). Text.log space is reclaimed lazily via compaction.
     ///
     /// Returns the deleted `DiskRecord` if it existed, or `None`.
     fn delete_memory(&mut self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError>;
+
+    /// Tombstone a memory: strip content (summary, tags, full_text
+    /// pointer) and set phase to Tombstone, but preserve the record
+    /// in meta.db so the graph node and edges remain intact.
+    ///
+    /// The caller is responsible for removing the memory from vector,
+    /// FTS, and entity indexes separately.
+    ///
+    /// Returns `Ok(())` if the memory existed, or `Err(NotFound)` if not.
+    fn tombstone_memory(&self, id: MemoryId) -> Result<(), StorageError>;
 
     // ── Decay State ─────────────────────────────────────────────────
 
@@ -192,11 +202,24 @@ pub trait StorageEngine: Send + Sync {
     /// Iterate all records in creation order.
     fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError>;
 
-    /// Count the total number of memory records.
+    /// Count the total number of memory records (including tombstones).
     fn count(&self) -> Result<u64, StorageError>;
+
+    /// Count only active (non-tombstoned) memory records.
+    fn count_active(&self) -> Result<u64, StorageError>;
 
     /// Check if a memory ID exists without deserializing.
     fn exists(&self, id: MemoryId) -> Result<bool, StorageError>;
+
+    /// Free a vector slot on disk for the given namespace.
+    ///
+    /// Called after tombstoning a memory to return the on-disk slot
+    /// to the free list so it can be reused.
+    fn free_vector_slot(
+        &mut self,
+        namespace_id: NamespaceId,
+        slot: u32,
+    ) -> Result<(), StorageError>;
 
     /// Flush pending writes to durable storage.
     fn sync(&mut self) -> Result<(), StorageError>;
@@ -377,6 +400,9 @@ impl StorageEngine for RedbStorageEngine {
         record.vector_slot = vector_slot;
 
         // 2. Append full_text to text.log if present.
+        // Note: text.log is append-only; if this succeeds but step 3
+        // fails, the entry becomes orphaned dead space that compaction
+        // will reclaim. No explicit rollback needed for text.
         if let Some(text) = full_text {
             let text_ref = self.text_store.append(text)?;
             record.text_offset = text_ref.file_offset;
@@ -384,7 +410,32 @@ impl StorageEngine for RedbStorageEngine {
         }
 
         // 3. Insert the completed record into meta.db.
-        self.meta_store.insert(id, record)?;
+        if let Err(e) = self.meta_store.insert(id, record) {
+            // Best-effort rollback: free the vector slot so it can be
+            // reused. The text.log entry (if written) becomes orphaned
+            // dead space that compaction will eventually reclaim.
+            if let Some(vs) = self.vector_manager.get_mut(namespace_id) {
+                if let Err(rollback_err) = vs.free_slot(vector_slot) {
+                    tracing::warn!(
+                        memory_id = %id,
+                        vector_slot,
+                        error = %rollback_err,
+                        "Failed to roll back vector slot after meta.db insert failure; \
+                         slot is leaked until next compaction or restart"
+                    );
+                }
+            }
+            if full_text.is_some() {
+                tracing::warn!(
+                    memory_id = %id,
+                    text_offset = record.text_offset,
+                    text_length = record.text_length,
+                    "Orphaned text.log entry after meta.db insert failure; \
+                     dead space will be reclaimed by next compaction"
+                );
+            }
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -405,7 +456,7 @@ impl StorageEngine for RedbStorageEngine {
         Ok(vector_store.get_vector(slot).map(|v| v.to_vec()))
     }
 
-    fn get_text(&mut self, text_ref: TextRef) -> Result<Option<String>, StorageError> {
+    fn get_text(&self, text_ref: TextRef) -> Result<Option<String>, StorageError> {
         if !text_ref.is_some() {
             return Ok(None);
         }
@@ -434,6 +485,10 @@ impl StorageEngine for RedbStorageEngine {
         // 4. Text.log space is reclaimed lazily via compaction.
 
         Ok(Some(record))
+    }
+
+    fn tombstone_memory(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.meta_store.tombstone(id)
     }
 
     // ── Decay State ─────────────────────────────────────────────────
@@ -617,8 +672,23 @@ impl StorageEngine for RedbStorageEngine {
         self.meta_store.count()
     }
 
+    fn count_active(&self) -> Result<u64, StorageError> {
+        self.meta_store.count_active()
+    }
+
     fn exists(&self, id: MemoryId) -> Result<bool, StorageError> {
         self.meta_store.exists(id)
+    }
+
+    fn free_vector_slot(
+        &mut self,
+        namespace_id: NamespaceId,
+        slot: u32,
+    ) -> Result<(), StorageError> {
+        if let Some(vector_store) = self.vector_manager.get_mut(namespace_id) {
+            vector_store.free_slot(slot)?;
+        }
+        Ok(())
     }
 
     fn sync(&mut self) -> Result<(), StorageError> {

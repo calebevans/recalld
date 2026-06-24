@@ -9,7 +9,6 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::graph::structure::{GraphNode, NodeKey, RelationshipGraph};
 use crate::model::{DecayPhase, EdgeType, MemoryId, NamespaceId};
-use crate::storage::PersistedEdge;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Constants
@@ -152,36 +151,6 @@ pub fn spreading_edge_factor(edge_type: EdgeType) -> f32 {
         EdgeType::Contradicts => 0.0,
         EdgeType::Entity => 0.6,
         EdgeType::Temporal => 0.6,
-        EdgeType::Supersedes => 0.0,
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// rif_edge_factor (defined here for co-location, separate from spreading)
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Weight factor for RIF competitor activation propagation.
-///
-/// Separate from `spreading_edge_factor` because the two serve different
-/// cognitive functions: spreading activation asks "should retrieving A
-/// help preserve B?", while RIF asks "does retrieving A compete with B?"
-///
-/// | Edge Type    | Factor | Rationale                                  |
-/// |-------------|--------|--------------------------------------------|
-/// | Associative | 1.0    | Primary competition pathway                |
-/// | ParentChild | 0.7    | Hierarchical, moderate competition         |
-/// | Causal      | 0.3    | Sequential, not competing                  |
-/// | Contradicts | 1.0    | Strongest competitors -- opposing claims   |
-/// | Entity      | 0.5    | Moderate competition via shared referent   |
-/// | Temporal    | 0.2    | Minimal competition, co-occurrence only    |
-pub fn rif_edge_factor(edge_type: EdgeType) -> f32 {
-    match edge_type {
-        EdgeType::Associative => 1.0,
-        EdgeType::ParentChild => 0.7,
-        EdgeType::Causal => 0.3,
-        EdgeType::Contradicts => 1.0,
-        EdgeType::Entity => 0.5,
-        EdgeType::Temporal => 0.2,
         EdgeType::Supersedes => 0.0,
     }
 }
@@ -367,9 +336,11 @@ pub fn recompute_centrality(
     let mut bonuses = HashMap::with_capacity(graph.nodes.len());
 
     for (_, node) in graph.nodes.iter() {
-        // Skip ghosts -- they don't benefit from connection bonus
-        // (they're below R=0.3 and heading toward deletion)
-        if node.decay_phase == DecayPhase::Ghost {
+        // Skip ghosts and tombstones -- ghosts don't benefit from
+        // connection bonus (they're below R=0.3 and heading toward
+        // deletion), and tombstones have been explicitly deleted by
+        // the user (content stripped, strength zeroed).
+        if node.decay_phase == DecayPhase::Ghost || node.decay_phase == DecayPhase::Tombstone {
             continue;
         }
 
@@ -508,8 +479,11 @@ pub fn spreading_activation(
             continue;
         }
 
-        // Ghost gate: ghosts don't seed activation
-        if node.decay_phase == DecayPhase::Ghost {
+        // Ghost/Tombstone gate: ghosts and tombstones don't seed activation.
+        // Tombstones have no content relevance; ghosts are nearly forgotten.
+        // Both can still relay activation when they're encountered as
+        // neighbors during spreading.
+        if node.decay_phase == DecayPhase::Ghost || node.decay_phase == DecayPhase::Tombstone {
             continue;
         }
 
@@ -557,7 +531,11 @@ pub fn spreading_activation(
             continue;
         };
 
-        // Ghost gate: don't fire ghost nodes
+        // Ghost gate: don't fire ghost nodes.
+        // NOTE: Tombstone nodes ARE allowed to fire — they serve as
+        // relay nodes that propagate activation through the graph even
+        // though their content has been stripped. This preserves
+        // relationship chain continuity after user-initiated deletion.
         if node.decay_phase == DecayPhase::Ghost {
             continue;
         }
@@ -608,7 +586,9 @@ pub fn spreading_activation(
                 continue;
             }
 
-            // Ghost gate: ghosts don't receive activation
+            // Ghost gate: ghosts don't receive activation.
+            // NOTE: Tombstone nodes DO receive activation so they can
+            // relay it to their neighbors, preserving relationship chains.
             if neighbor.decay_phase == DecayPhase::Ghost {
                 continue;
             }
@@ -655,6 +635,12 @@ pub fn spreading_activation(
                 return None;
             }
             let node = graph.nodes.get(node_key)?;
+            // Exclude tombstone nodes from output — they served as
+            // relay nodes during spreading but have no content to
+            // return to the caller.
+            if node.decay_phase == DecayPhase::Tombstone {
+                return None;
+            }
             Some((node.memory_id, act))
         })
         .collect();
@@ -663,92 +649,6 @@ pub fn spreading_activation(
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
     results
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// rebuild_from_storage
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Rebuild the in-memory graph from edges.db records.
-///
-/// Called at startup AFTER meta.db has been loaded (so id_index is
-/// populated with all MemoryId -> NodeKey mappings).
-///
-/// # Sequence
-/// 1. meta.db load populates nodes + id_index (CS-10 / CS-07)
-/// 2. This function iterates edges.db and inserts edges
-/// 3. For each edge: resolve source/target MemoryId to NodeKey
-///    via id_index, create GraphEdge, push EdgeKey into
-///    source.outgoing and target.incoming
-///
-/// # Error handling
-/// Edges referencing unknown MemoryIds are logged and skipped.
-/// This can happen if meta.db was compacted but edges.db was not
-/// (a consistency violation that should be rare but survivable).
-///
-/// # Returns
-/// Count of successfully loaded edges.
-pub fn rebuild_from_storage(
-    graph: &mut RelationshipGraph,
-    edge_iter: impl Iterator<Item = PersistedEdge>,
-) -> usize {
-    let mut loaded: usize = 0;
-    let mut skipped: usize = 0;
-
-    for persisted in edge_iter {
-        let source_key = match graph.id_index.get(&persisted.source) {
-            Some(&k) => k,
-            None => {
-                skipped += 1;
-                tracing::debug!(
-                    source = %persisted.source,
-                    "rebuild_from_storage: edge source not found in id_index"
-                );
-                continue;
-            }
-        };
-        let target_key = match graph.id_index.get(&persisted.target) {
-            Some(&k) => k,
-            None => {
-                skipped += 1;
-                tracing::debug!(
-                    target = %persisted.target,
-                    "rebuild_from_storage: edge target not found in id_index"
-                );
-                continue;
-            }
-        };
-
-        let edge = crate::graph::structure::GraphEdge {
-            source: source_key,
-            target: target_key,
-            edge_type: persisted.edge_type,
-            weight: persisted.weight,
-            auto_created: persisted.auto_created,
-            created_at: persisted.created_at as i64,
-        };
-
-        let ek = graph.edges.insert(edge);
-
-        if let Some(source_node) = graph.nodes.get_mut(source_key) {
-            source_node.outgoing.push(ek);
-        }
-        if let Some(target_node) = graph.nodes.get_mut(target_key) {
-            target_node.incoming.push(ek);
-        }
-
-        loaded += 1;
-    }
-
-    if skipped > 0 {
-        tracing::warn!(
-            loaded,
-            skipped,
-            "rebuild_from_storage: skipped edges with missing endpoints"
-        );
-    }
-
-    loaded
 }
 
 // ═══════════════════════════════════════════════════════════════════════

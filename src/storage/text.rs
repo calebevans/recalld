@@ -6,6 +6,8 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use zerocopy::byteorder::little_endian::U16;
@@ -25,6 +27,11 @@ pub const MAX_ENTRY_SIZE: u32 = 1_048_576;
 
 /// Entry header size: 4 bytes length + 4 bytes CRC32.
 const ENTRY_HEADER_SIZE: u64 = 8;
+
+/// Minimum fragmentation ratio (dead bytes / total bytes) before
+/// compaction is considered worthwhile. Below this threshold,
+/// `compact()` returns a no-op result to avoid unnecessary I/O.
+const COMPACTION_FRAGMENTATION_THRESHOLD: f64 = 0.20;
 
 /// Magic bytes identifying a text.log file.
 const TEXT_LOG_MAGIC: [u8; 4] = *b"MEMT";
@@ -90,6 +97,32 @@ fn compute_crc32(data: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(data);
     hasher.finalize()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Positional Read Helper
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Read exactly `buf.len()` bytes from `file` at the given byte offset,
+/// without mutating the file's seek cursor. Uses `pread(2)` on Unix
+/// so the call is safe to issue from `&self` (no `&mut` needed).
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), StorageError> {
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        match file.read_at(&mut buf[pos..], offset + pos as u64) {
+            Ok(0) => {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF during positional read",
+                )));
+            }
+            Ok(n) => pos += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(StorageError::Io(e)),
+        }
+    }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -248,16 +281,19 @@ impl TextStore {
     /// Read the text entry at the given `TextRef`.
     ///
     /// Validates length match and CRC32 integrity.
-    pub fn read(&mut self, text_ref: TextRef) -> Result<String, StorageError> {
+    ///
+    /// Uses positional reads (`pread`) so this method takes `&self`
+    /// rather than `&mut self`. This avoids requiring an exclusive
+    /// write lock for read-only operations, enabling concurrent
+    /// readers via `RwLock`.
+    pub fn read(&self, text_ref: TextRef) -> Result<String, StorageError> {
         if !text_ref.is_some() {
             return Err(StorageError::InvalidTextRef);
         }
 
-        self.file.seek(SeekFrom::Start(text_ref.file_offset))?;
-
-        // Read entry header (8 bytes).
+        // Read entry header (8 bytes) using positional I/O.
         let mut header_buf = [0u8; 8];
-        self.file.read_exact(&mut header_buf)?;
+        read_exact_at(&self.file, &mut header_buf, text_ref.file_offset)?;
         let stored_length = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
         let stored_crc = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
 
@@ -270,9 +306,10 @@ impl TextStore {
             });
         }
 
-        // Read payload.
+        // Read payload using positional I/O.
         let mut data = vec![0u8; stored_length as usize];
-        self.file.read_exact(&mut data)?;
+        let data_offset = text_ref.file_offset + ENTRY_HEADER_SIZE;
+        read_exact_at(&self.file, &mut data, data_offset)?;
 
         // Verify CRC32.
         let computed_crc = compute_crc32(&data);
@@ -284,7 +321,9 @@ impl TextStore {
             });
         }
 
-        // Validate UTF-8.
+        // Defense-in-depth: validate UTF-8 even though we only accept
+        // valid UTF-8 at write time. Guards against on-disk corruption
+        // that passes the CRC check (e.g., bit-flip in both data and CRC).
         String::from_utf8(data).map_err(|e| StorageError::InvalidUtf8 {
             offset: text_ref.file_offset,
             source: e,
@@ -335,6 +374,37 @@ impl TextStore {
 
         let old_size = self.write_pos;
         let total_possible = self.count_entries_approx();
+
+        // Estimate live data size to check if compaction is worthwhile.
+        let live_data_size: u64 = live_refs
+            .iter()
+            .map(|(_, r)| ENTRY_HEADER_SIZE + r.length as u64)
+            .sum::<u64>()
+            + TextLogHeader::SIZE as u64;
+        let dead_bytes = old_size.saturating_sub(live_data_size);
+        let fragmentation = if old_size > 0 {
+            dead_bytes as f64 / old_size as f64
+        } else {
+            0.0
+        };
+
+        if fragmentation < COMPACTION_FRAGMENTATION_THRESHOLD {
+            tracing::debug!(
+                fragmentation = format!("{:.1}%", fragmentation * 100.0),
+                threshold = format!("{:.0}%", COMPACTION_FRAGMENTATION_THRESHOLD * 100.0),
+                "Skipping text.log compaction: fragmentation below threshold"
+            );
+            return Ok(CompactionResult {
+                old_size,
+                new_size: old_size,
+                entries_removed: 0,
+                entries_kept: live_refs.len(),
+                new_refs: live_refs
+                    .iter()
+                    .map(|&(id, text_ref)| (id, text_ref))
+                    .collect(),
+            });
+        }
 
         // Step 1: Write marker.
         fs::write(&marker_path, b"text.log compaction in progress\n")?;

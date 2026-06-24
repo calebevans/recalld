@@ -16,31 +16,16 @@ use crate::model::{MemoryId, NamespaceId};
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during FTS5 operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FtsError {
     /// A SQLite error occurred.
-    Sqlite(rusqlite::Error),
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 
     /// The memory ID bytes were invalid.
+    #[error("invalid memory ID bytes")]
     InvalidMemoryId,
 }
-
-impl From<rusqlite::Error> for FtsError {
-    fn from(e: rusqlite::Error) -> Self {
-        FtsError::Sqlite(e)
-    }
-}
-
-impl std::fmt::Display for FtsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FtsError::Sqlite(e) => write!(f, "SQLite error: {e}"),
-            FtsError::InvalidMemoryId => write!(f, "invalid memory ID bytes"),
-        }
-    }
-}
-
-impl std::error::Error for FtsError {}
 
 // ---------------------------------------------------------------------------
 // FtsIndex

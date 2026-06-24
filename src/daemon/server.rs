@@ -102,6 +102,17 @@ impl DaemonServer {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
+                            let current = self.connection_count.load(Ordering::Relaxed);
+                            if current >= MAX_CONNECTIONS {
+                                tracing::warn!(
+                                    current,
+                                    max = MAX_CONNECTIONS,
+                                    "connection limit reached, dropping new connection"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+
                             self.connection_count.fetch_add(1, Ordering::Relaxed);
 
                             tokio::spawn(handle_connection(

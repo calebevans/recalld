@@ -41,6 +41,16 @@ pub enum VectorError {
         reason: String,
     },
 
+    /// The namespace name contains path traversal characters or escapes
+    /// the base directory.
+    #[error("invalid namespace name {name:?}: {reason}")]
+    InvalidNamespaceName {
+        /// The rejected namespace name.
+        name: String,
+        /// Why it was rejected.
+        reason: String,
+    },
+
     /// The file has invalid magic bytes (expected "MEMV").
     #[error("magic mismatch in {path}: expected MEMV, got {found:?}")]
     BadMagic {
@@ -438,7 +448,22 @@ impl VectorStore {
     /// Prefers re-using a free-list slot. When the free list is empty,
     /// extends the file by `GROWTH_CHUNK` slots and populates the free
     /// list from the new range.
+    ///
+    /// Remaps the mmap after insertion so subsequent `get_vector` calls
+    /// see the new data. For batch inserts, use [`insert_vector_no_remap`]
+    /// followed by a single [`finish_batch`] call.
     pub fn insert_vector(&mut self, vector: &[f32]) -> Result<u32> {
+        let slot = self.insert_vector_no_remap(vector)?;
+        // Re-mmap so subsequent get_vector calls see the new data.
+        self.remap()?;
+        Ok(slot)
+    }
+
+    /// Like [`insert_vector`], but skips the mmap remap. The caller
+    /// **must** call [`finish_batch`] after all insertions to refresh
+    /// the mmap. This avoids thousands of mmap/munmap syscalls during
+    /// batch operations.
+    pub fn insert_vector_no_remap(&mut self, vector: &[f32]) -> Result<u32> {
         if vector.len() != self.dimensions as usize {
             return Err(VectorError::WrongVectorLength {
                 expected: self.dimensions as usize,
@@ -463,10 +488,14 @@ impl VectorStore {
         })?;
         // Note: fsync is deferred to the caller's batch sync.
 
-        // Re-mmap so subsequent get_vector calls see the new data.
-        self.remap()?;
-
         Ok(slot)
+    }
+
+    /// Finish a batch of `insert_vector_no_remap` calls by performing
+    /// a single mmap remap. This refreshes the read view so that
+    /// `get_vector` and `all_vectors_raw` see all newly written data.
+    pub fn finish_batch(&mut self) -> Result<()> {
+        self.remap()
     }
 
     // ── Slot Allocation ──────────────────────────────────────────────
@@ -709,7 +738,49 @@ impl VectorManager {
         dimensions: usize,
     ) -> Result<&mut VectorStore> {
         if !self.stores.contains_key(&namespace_id) {
+            // Reject names containing path traversal characters.
+            if namespace_name.contains('/')
+                || namespace_name.contains('\\')
+                || namespace_name.contains("..")
+            {
+                return Err(VectorError::InvalidNamespaceName {
+                    name: namespace_name.to_string(),
+                    reason: "must not contain '/', '\\', or '..'".to_string(),
+                });
+            }
+
             let dir = self.base_path.join(namespace_name);
+
+            // Canonicalize and verify the resolved path stays under base_path.
+            // We must ensure base_path exists first for canonicalize to succeed.
+            std::fs::create_dir_all(&self.base_path).map_err(|e| VectorError::Io {
+                path: self.base_path.clone(),
+                source: e,
+            })?;
+            let canonical_base = self.base_path.canonicalize().map_err(|e| VectorError::Io {
+                path: self.base_path.clone(),
+                source: e,
+            })?;
+            // Create the namespace dir so we can canonicalize it too.
+            std::fs::create_dir_all(&dir).map_err(|e| VectorError::Io {
+                path: dir.clone(),
+                source: e,
+            })?;
+            let canonical_dir = dir.canonicalize().map_err(|e| VectorError::Io {
+                path: dir.clone(),
+                source: e,
+            })?;
+            if !canonical_dir.starts_with(&canonical_base) {
+                return Err(VectorError::InvalidNamespaceName {
+                    name: namespace_name.to_string(),
+                    reason: format!(
+                        "resolved path {} escapes base directory {}",
+                        canonical_dir.display(),
+                        canonical_base.display()
+                    ),
+                });
+            }
+
             let store = VectorStore::open(&dir, dimensions)?;
             self.stores.insert(namespace_id, store);
         }

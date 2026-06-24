@@ -29,6 +29,7 @@ pub fn get_decay_metadata(
                 last_accessed_at: record.last_accessed_at,
                 is_permastore: record.is_permastore != 0,
                 decay_rate_multiplier,
+                has_summary: !record.summary.is_empty(),
             }))
         }
         Ok(None) => Ok(None),

@@ -133,6 +133,22 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         index.get_vector(id)
     }
 
+    fn get_embeddings_batch(&self, ids: &[MemoryId]) -> std::collections::HashMap<MemoryId, Vec<f32>> {
+        use crate::search::VectorIndex;
+        // Acquire the lock once for the entire batch instead of
+        // once per ID, amortizing the block_in_place overhead.
+        let index = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.vector_index.read())
+        });
+        let mut result = std::collections::HashMap::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(vec) = index.get_vector(id) {
+                result.insert(id, vec);
+            }
+        }
+        result
+    }
+
     fn indexed_count(&self) -> usize {
         use crate::search::VectorIndex;
         let index = tokio::task::block_in_place(|| {
@@ -198,7 +214,7 @@ impl state::StorageEngine for StorageEngineAdapter {
             namespace_id: namespace_id.get(),
             created_at: now,
             last_accessed_at: now,
-            phase: DecayPhase::Full.as_u8(),
+            phase: DecayPhase::Full,
             strength: 1.0,
             decay_strength: 1.0,
             stability: initial_stability.unwrap_or(3.7),
@@ -228,36 +244,122 @@ impl state::StorageEngine for StorageEngineAdapter {
         Ok(cached)
     }
 
+    async fn get_record(&self, id: MemoryId) -> Option<DiskRecord> {
+        let storage_r = self.storage.read().ok()?;
+        storage_r.get_record(id).ok().flatten()
+    }
+
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, crate::storage::StorageError> {
-        let deleted = {
+        // Read the existing record to get namespace and vector slot info,
+        // and to short-circuit if already tombstoned or missing.
+        let existing_record = {
+            let storage_r = self.storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("storage lock poisoned: {e}"),
+                ))
+            })?;
+            storage_r.get_record(id)?
+        };
+
+        let Some(existing_record) = existing_record else {
+            return Ok(false);
+        };
+
+        if existing_record.phase == DecayPhase::Tombstone {
+            return Ok(false);
+        }
+
+        // Tombstone the record (preserves graph edges).
+        {
+            let storage_r = self.storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("storage lock poisoned: {e}"),
+                ))
+            })?;
+            storage_r.tombstone_memory(id)?;
+        }
+
+        // Free the vector slot on disk.
+        {
             let mut storage_w = self.storage.write().map_err(|e| {
                 crate::storage::StorageError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("storage lock poisoned: {e}"),
                 ))
             })?;
-            storage_w.delete_memory(id)?
-        };
-        if deleted.is_some() {
-            self.cache.invalidate(id).await;
+            let ns_id = NamespaceId::new(existing_record.namespace_id);
+            if let Err(e) = storage_w.free_vector_slot(ns_id, existing_record.vector_slot) {
+                tracing::warn!(
+                    memory_id = %id,
+                    vector_slot = existing_record.vector_slot,
+                    %e,
+                    "vector slot free failed (non-fatal)"
+                );
+            }
         }
-        Ok(deleted.is_some())
+
+        self.cache.invalidate(id).await;
+        Ok(true)
     }
 
     async fn namespace_stats(
         &self,
-        _namespace_id: NamespaceId,
+        namespace_id: NamespaceId,
     ) -> Result<state::NamespaceStats, crate::storage::StorageError> {
-        // Full namespace stats would require iterating records.
-        // Return a basic placeholder until a dedicated stats query exists.
+        let storage_r = self.storage.read().map_err(|e| {
+            crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("storage lock poisoned: {e}"),
+            ))
+        })?;
+
+        let all_records = storage_r.scan_all()?;
+
+        let mut memory_count: u64 = 0;
+        let mut phase_1_count: u64 = 0;
+        let mut phase_2_count: u64 = 0;
+        let mut phase_3_count: u64 = 0;
+        let mut permastore_count: u64 = 0;
+        let mut strength_sum: f64 = 0.0;
+        let mut edge_count: u64 = 0;
+
+        for (_id, record) in &all_records {
+            if NamespaceId::new(record.namespace_id) != namespace_id {
+                continue;
+            }
+            memory_count += 1;
+
+            match record.phase {
+                DecayPhase::Full => phase_1_count += 1,
+                DecayPhase::Summary => phase_2_count += 1,
+                DecayPhase::Ghost => phase_3_count += 1,
+                DecayPhase::Tombstone => {} // tombstones are not counted in phase stats
+            }
+
+            if record.is_permastore != 0 {
+                permastore_count += 1;
+            }
+
+            strength_sum += record.decay_strength as f64;
+            edge_count += record.edge_count as u64;
+        }
+
+        let avg_strength = if memory_count > 0 {
+            (strength_sum / memory_count as f64) as f32
+        } else {
+            0.0
+        };
+
         Ok(state::NamespaceStats {
-            memory_count: 0,
-            phase_1_count: 0,
-            phase_2_count: 0,
-            phase_3_count: 0,
-            permastore_count: 0,
-            avg_strength: 0.0,
-            edge_count: 0,
+            memory_count,
+            phase_1_count,
+            phase_2_count,
+            phase_3_count,
+            permastore_count,
+            avg_strength,
+            edge_count,
         })
     }
 
@@ -277,6 +379,11 @@ impl state::StorageEngine for StorageEngineAdapter {
         let filtered: Vec<CachedRecord> = all_records
             .into_iter()
             .filter(|(_id, record)| {
+                // Exclude tombstoned records from listings.
+                if record.phase == DecayPhase::Tombstone {
+                    return false;
+                }
+
                 // Filter by namespace
                 if let Some(ns_id) = filter.namespace_id {
                     if NamespaceId::new(record.namespace_id) != ns_id {
@@ -286,9 +393,7 @@ impl state::StorageEngine for StorageEngineAdapter {
 
                 // Filter by phase
                 if let Some(phase) = filter.phase {
-                    let record_phase =
-                        DecayPhase::from_u8(record.phase).unwrap_or(DecayPhase::Full);
-                    if record_phase != phase {
+                    if record.phase != phase {
                         return false;
                     }
                 }
@@ -360,16 +465,12 @@ impl state::StorageEngine for StorageEngineAdapter {
 /// Adapts `CacheManager` to the API `RecordCache` trait.
 pub struct RecordCacheAdapter {
     cache: Arc<CacheManager>,
-    storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
 }
 
 impl RecordCacheAdapter {
-    /// Creates a new adapter wrapping the cache manager and storage engine.
-    pub fn new(
-        cache: Arc<CacheManager>,
-        storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
-    ) -> Self {
-        Self { cache, storage }
+    /// Creates a new adapter wrapping the cache manager.
+    pub fn new(cache: Arc<CacheManager>) -> Self {
+        Self { cache }
     }
 }
 
@@ -378,26 +479,23 @@ impl state::RecordCache for RecordCacheAdapter {
     async fn get_or_load(
         &self,
         id: MemoryId,
-        _storage: &dyn state::StorageEngine,
-    ) -> Option<CachedRecord> {
-        // Use the real storage, not the trait object, for loading.
-        let storage_clone = self.storage.clone();
-        let result = self
-            .cache
-            .get_or_load(id, || async {
-                let storage_r = storage_clone
-                    .read()
-                    .map_err(|e| anyhow::anyhow!("storage lock poisoned: {e}"))?;
-                match storage_r.get_record(id) {
-                    Ok(Some(disk)) => Ok(Some(CachedRecord::from(&disk))),
-                    Ok(None) => Ok(None),
-                    Err(e) => Err(anyhow::anyhow!("{e}")),
-                }
-            })
-            .await;
-        match result {
-            Ok(Some(arc)) => Some((*arc).clone()),
-            _ => None,
+        storage: &dyn state::StorageEngine,
+    ) -> Option<Arc<CachedRecord>> {
+        // Use the injected storage trait for loading on cache miss.
+        // First check the cache directly for a fast-path hit.
+        if let Some(arc) = self.cache.get(id).await {
+            return Some(arc);
+        }
+
+        // Cache miss: load from the injected storage engine.
+        match storage.get_record(id).await {
+            Some(disk) => {
+                let record = CachedRecord::from(&disk);
+                self.cache.insert(id, record.clone()).await;
+                // Re-fetch to get the Arc-wrapped version from moka.
+                self.cache.get(id).await
+            }
+            None => None,
         }
     }
 
@@ -558,19 +656,33 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        match storage_r.list_namespaces() {
-            Ok(namespaces) => namespaces
-                .into_iter()
-                .map(|ns| state::NamespaceListInfo {
+
+        let namespaces = match storage_r.list_namespaces() {
+            Ok(ns) => ns,
+            Err(_) => return Vec::new(),
+        };
+
+        // Count memories per namespace in a single scan.
+        let mut counts = std::collections::HashMap::<u32, u64>::new();
+        if let Ok(all_records) = storage_r.scan_all() {
+            for (_id, record) in &all_records {
+                *counts.entry(record.namespace_id).or_default() += 1;
+            }
+        }
+
+        namespaces
+            .into_iter()
+            .map(|ns| {
+                let memory_count = counts.get(&ns.id.get()).copied().unwrap_or(0);
+                state::NamespaceListInfo {
                     id: ns.id.get(),
                     name: ns.name.clone(),
                     embedding_dim: ns.embedding_dim,
-                    memory_count: 0,
+                    memory_count,
                     created_at: ns.created_at,
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+                }
+            })
+            .collect()
     }
 
     async fn create(

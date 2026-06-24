@@ -7,7 +7,9 @@
 //! - **Anthropic API**: Set `ANTHROPIC_API_KEY`. Direct API calls.
 
 use crate::model::MemoryId;
+use crate::time::format_timestamp as format_timestamp_tz;
 
+use chrono_tz::Tz;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -244,12 +246,7 @@ fn get_gcloud_token() -> Result<String, String> {
 // ── Implementation ───────────────────────────────────────────────
 
 fn format_timestamp(millis: i64) -> String {
-    use chrono::{DateTime, Utc};
-    let dt = DateTime::<Utc>::from_timestamp_millis(millis);
-    match dt {
-        Some(d) => d.format("%d %b %Y").to_string(),
-        None => "unknown date".to_string(),
-    }
+    format_timestamp_tz(millis, Tz::UTC)
 }
 
 fn build_relation_map(
@@ -632,9 +629,24 @@ impl LlmClient {
             - Store facts from BOTH speakers, not just the main topic.\n\
             - Small facts matter: pets' names, weekend plans, favorite foods, how long someone \
             has done something — these are exactly the kind of details questions will ask about.\n\
+            - Quantities and durations: Always preserve specific numbers — \"5 years\", \
+            \"every morning\", \"three times a week\", \"$200\". If someone says something \
+            vague like \"we've been married a while\" but context gives a specific duration, \
+            store the specific duration.\n\
+            - Cross-speaker opinions: When person A expresses an opinion about person B \
+            (e.g., \"I think she'd be an awesome mom\"), store it as its own separate memory \
+            with both speakers as entities. These are distinct from factual statements.\n\
+            - Inferrable conclusions: When facts in the conversation strongly imply a conclusion \
+            (e.g., a bad experience on a trip implies they wouldn't want to repeat it), store \
+            the inference as a separate memory with appropriate context. Tag it with the \
+            relevant entities and topics so it can be found later.\n\
             - Multiple memories per turn is fine if the turn contains multiple distinct facts.\n\
             - Do NOT store: greetings, filler, or emotional reactions without new factual content.\n\
             - Be specific. Include names, titles, dates, objects, and details.\n\
+            - Book/media titles: If a book, movie, song, or other titled work is discussed, \
+            ALWAYS include the exact title in both the summary and full_text. If the speaker \
+            references a work by description without naming it, try to identify it from context. \
+            If you truly cannot identify it, store what you know but note the title is unknown.\n\
             - Always include relevant dates, times, and temporal markers in the summary. \
             If the fact has a date, the summary MUST contain it.\n\
             - If the conversation mentions relative time ('last week', 'yesterday', \
@@ -652,7 +664,10 @@ impl LlmClient {
             Include who said what, exact names, dates, numbers, and any nuance. This should be \
             a rich, self-contained account that someone could read without seeing the original \
             conversation. Provide this for any memory where the summary alone would lose \
-            important detail. Include direct quotes from the conversation when possible.\n\
+            important detail. Include direct quotes from the conversation when possible. \
+            IMPORTANT: ALWAYS provide full_text for any memory containing specific names, titles, \
+            dates, numbers, or quotes. The summary can be brief, but full_text must capture all \
+            surrounding context verbatim — this is critical for recall accuracy.\n\
             - \"entities\" (required, array of strings): ALL people, pets, places, organizations, \
             book/movie/song titles, and proper nouns mentioned in this memory. You MUST always \
             provide this field. Use their canonical name (e.g., \"Caroline\", \"Oliver\", \"Sweden\", \
@@ -729,13 +744,22 @@ impl LlmClient {
               query that sounds like a memory summary.\n\
               - \"fts_query\" (optional, string): Keyword-focused query for full-text search (BM25). \
               Include ONLY key entities, names, and distinctive terms. Example: for \"What did Sarah \
-              say about her trip to Japan?\", use \"Sarah trip Japan\".\n\
+              say about her trip to Japan?\", use \"Sarah trip Japan\". When the question mentions a \
+              specific proper noun (book title, place name, event name), ALWAYS include it in the \
+              fts_query even if it appears in the semantic query too — FTS excels at exact name matching.\n\
             Use multiple queries when the question has multiple angles. For example:\n\
               - \"What books has Melanie read?\" -> one query about Melanie reading habits, another about \
               specific book titles Melanie mentioned.\n\
               - \"Would Caroline enjoy hiking?\" -> one query about Caroline's outdoor activities, another \
               about Caroline's exercise or fitness preferences.\n\
             For simple factual questions, one query is fine.\n\
+            Each query in the set should come from a genuinely different angle — not paraphrases of \
+            each other. Think about how the ANSWER might be phrased in a stored memory, not just how \
+            the question is phrased. One query for direct matches, one for how the information might \
+            have been originally described or stored.\n\
+            For opinion or inference questions (\"Would X do Y?\", \"What does X think about Y?\"), \
+            search for the underlying facts and experiences rather than the inference itself. The \
+            memory system stores what happened, not what it means.\n\
             - \"entities\" (optional, array of strings): Filter to memories mentioning specific \
             people, places, or proper nouns. Use the canonical name as it would appear in a memory \
             (e.g., \"Caroline\", \"Sweden\", \"Oliver\"). When the question asks about a specific person, \
@@ -750,8 +774,11 @@ impl LlmClient {
             emotions. Use lowercase single words. Examples: \"anxious\", \"excited\", \"grateful\", \
             \"frustrated\". Only include when the question specifically asks about feelings or \
             emotional states. Provide at most ONE emotion -- multiple emotions use AND logic.\n\
-            - \"depth\" (optional, integer 0-3, default 1): Graph hops to include related memories. \
-            Use 2-3 when the question requires combining information across memories or making inferences.\n\
+            - \"depth\" (optional, integer 0-3, default 2): Graph hops to include related memories. \
+            Use depth 2 as the DEFAULT for any question about opinions, personality, hypotheticals, \
+            \"would X...\", cross-person relationships, or questions requiring inference from multiple \
+            facts. Use depth 1 only for simple direct factual lookups (\"When did X?\", \"What is X's \
+            name?\"). Use depth 3 for complex multi-hop reasoning.\n\
             - \"time_range_start\" (optional, integer): Lower bound timestamp in milliseconds since Unix \
             epoch. Set when the question references a specific time period.\n\
             - \"time_range_end\" (optional, integer): Upper bound timestamp in milliseconds since Unix \
@@ -792,7 +819,7 @@ impl LlmClient {
                     entities: parsed.entities,
                     topics: parsed.topics,
                     emotions: parsed.emotions,
-                    depth: parsed.depth.unwrap_or(1).min(3),
+                    depth: parsed.depth.unwrap_or(2).min(3),
                     time_range_start: parsed.time_range_start,
                     time_range_end: parsed.time_range_end,
                 })
@@ -805,7 +832,7 @@ impl LlmClient {
                 entities: Vec::new(),
                 topics: Vec::new(),
                 emotions: Vec::new(),
-                depth: 1,
+                depth: 2,
                 time_range_start: None,
                 time_range_end: None,
             }),

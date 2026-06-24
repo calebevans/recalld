@@ -129,6 +129,13 @@ impl VectorIndexRegistry for SharedVectorIndexRegistry {
             })
             .collect())
     }
+
+    fn get_vector(&self, id: MemoryId) -> Option<Vec<f32>> {
+        let index = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.index.read())
+        });
+        index.get_vector(id)
+    }
 }
 
 // ── FtsIndexRegistry ──────────────────────────────────────────────

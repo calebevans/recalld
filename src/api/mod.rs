@@ -16,12 +16,11 @@ pub mod adapters;
 mod errors;
 mod handlers;
 mod middleware;
-mod models;
+pub(crate) mod models;
 mod routes;
 mod state;
 
 pub use errors::AppError;
-pub use models::*;
 pub use routes::router;
 pub use state::AppState;
 
@@ -36,12 +35,6 @@ pub use state::{
     NamespaceListInfo, NamespaceStats, QueryInput, ReinforceResult, ResolvedSearchResult,
     SearchFilter, SearchQuery,
 };
-
-// Re-export real error types from their owning modules.
-pub use crate::embedding::EmbeddingError;
-pub use crate::graph::GraphError;
-pub use crate::search::SearchError;
-pub use crate::storage::StorageError;
 
 use std::net::SocketAddr;
 

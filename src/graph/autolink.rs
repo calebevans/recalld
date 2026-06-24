@@ -132,7 +132,7 @@ pub fn auto_link(
 
         // Skip if any edge already exists between new_memory and candidate
         if graph.contains(candidate_id) && graph.contains(&new_memory) {
-            if has_typed_edge_between(graph, &new_memory, candidate_id, EdgeType::Associative) {
+            if graph.has_typed_edge_between_ids(&new_memory, candidate_id, EdgeType::Associative) {
                 continue;
             }
         }
@@ -169,33 +169,6 @@ pub fn auto_link(
         .collect()
 }
 
-/// Check if an edge of a specific type exists between two memories (either direction).
-fn has_typed_edge_between(
-    graph: &RelationshipGraph,
-    a: &MemoryId,
-    b: &MemoryId,
-    edge_type: EdgeType,
-) -> bool {
-    let Some(&a_key) = graph.id_index.get(a) else {
-        return false;
-    };
-    let Some(&b_key) = graph.id_index.get(b) else {
-        return false;
-    };
-
-    let Some(a_node) = graph.nodes.get(a_key) else {
-        return false;
-    };
-
-    for &ek in a_node.outgoing.iter().chain(a_node.incoming.iter()) {
-        if let Some(edge) = graph.edges.get(ek) {
-            if (edge.source == b_key || edge.target == b_key) && edge.edge_type == edge_type {
-                return true;
-            }
-        }
-    }
-    false
-}
 
 // ═══════════════════════════════════════════════════════════════════════
 // AutoLinkError
@@ -216,6 +189,75 @@ pub enum AutoLinkError {
     /// A shared lock was poisoned by a panicking thread.
     #[error("lock poisoned: {0}")]
     LockPoisoned(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// persist_edges — shared helper for edge persistence + graph insertion
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Persist a batch of edges to storage, insert them into the in-memory
+/// graph, and update the edge count on the source memory.
+///
+/// This helper consolidates the boilerplate that was previously duplicated
+/// across `perform_autolink`, `perform_entity_link`, and `perform_temporal_link`.
+///
+/// # Returns
+///
+/// The number of edges successfully inserted into the graph.
+pub(crate) async fn persist_edges(
+    new_memory_id: MemoryId,
+    persisted_edges: &[PersistedEdge],
+    graph: &SharedGraph,
+    storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: &Arc<CacheManager>,
+) -> Result<usize, AutoLinkError> {
+    if persisted_edges.is_empty() {
+        return Ok(0);
+    }
+
+    // Step 1: Persist edges to edges.db.
+    {
+        let storage_r = storage
+            .read()
+            .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
+        storage_r
+            .batch_add_edges(persisted_edges)
+            .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
+    }
+
+    // Step 2: Write-lock graph for edge insertion.
+    let edges_created = {
+        let mut graph_w = graph.write().await;
+        let mut created = 0usize;
+        for pe in persisted_edges {
+            match graph_w.add_edge(pe.source, pe.target, pe.edge_type, pe.weight, true) {
+                Ok(_) => created += 1,
+                Err(crate::graph::GraphError::EdgeExists(_, _)) => {}
+                Err(crate::graph::GraphError::MemoryNotFound(_)) => {}
+                Err(e) => return Err(AutoLinkError::Graph(e)),
+            }
+        }
+        created
+    };
+
+    // Step 3: Additive edge_count update.
+    if edges_created > 0 {
+        let current_count = cache
+            .get(new_memory_id)
+            .await
+            .map(|r| r.edge_count)
+            .unwrap_or(0);
+        let new_count = current_count + edges_created as u16;
+        {
+            let storage_r = storage
+                .read()
+                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
+            let _ = storage_r.update_edge_count(new_memory_id, new_count);
+        }
+        cache.update_edge_count(new_memory_id, new_count).await;
+    }
+
+    Ok(edges_created)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -332,55 +374,8 @@ pub async fn perform_autolink(
         })
         .collect();
 
-    // Step 5: Persist edges to edges.db.
-    {
-        let storage_r = storage
-            .read()
-            .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
-        storage_r
-            .batch_add_edges(&persisted_edges)
-            .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
-    }
-
-    // Step 6: Write-lock graph for edge insertion.
-    let edges_created = {
-        let mut graph_w = graph.write().await;
-        let mut created = 0usize;
-        for pe in &persisted_edges {
-            match graph_w.add_edge(pe.source, pe.target, pe.edge_type, pe.weight, true) {
-                Ok(_) => created += 1,
-                Err(crate::graph::GraphError::EdgeExists(_, _)) => {
-                    // Edge already exists (race condition or duplicate) -- skip silently.
-                }
-                Err(crate::graph::GraphError::MemoryNotFound(_)) => {
-                    // Node was removed between discovery and insertion -- skip silently.
-                }
-                Err(e) => return Err(AutoLinkError::Graph(e)),
-            }
-        }
-        created
-    };
-
-    // Step 7: Update edge_count on the new memory's DiskRecord (additive).
-    if edges_created > 0 {
-        let current_count = cache
-            .get(new_memory_id)
-            .await
-            .map(|r| r.edge_count)
-            .unwrap_or(0);
-        let new_count = current_count + edges_created as u16;
-        {
-            let storage_r = storage
-                .read()
-                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
-            // Best-effort: don't fail the whole autolink if edge_count update fails.
-            let _ = storage_r.update_edge_count(new_memory_id, new_count);
-        }
-
-        cache.update_edge_count(new_memory_id, new_count).await;
-    }
-
-    Ok(edges_created)
+    // Steps 5-7: Persist edges, insert into graph, update edge count.
+    persist_edges(new_memory_id, &persisted_edges, graph, storage, cache).await
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -433,7 +428,7 @@ pub async fn perform_entity_link(
         candidates
             .iter()
             .filter(|(cid, _)| {
-                !has_typed_edge_between(&graph_r, &new_memory_id, cid, EdgeType::Entity)
+                !graph_r.has_typed_edge_between_ids(&new_memory_id, cid, EdgeType::Entity)
             })
             .take(max_entity_links)
             .map(|(cid, shared)| {
@@ -474,47 +469,7 @@ pub async fn perform_entity_link(
         })
         .collect();
 
-    {
-        let storage_r = storage
-            .read()
-            .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
-        storage_r
-            .batch_add_edges(&persisted_edges)
-            .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
-    }
-
-    let edges_created = {
-        let mut graph_w = graph.write().await;
-        let mut created = 0usize;
-        for pe in &persisted_edges {
-            match graph_w.add_edge(pe.source, pe.target, pe.edge_type, pe.weight, true) {
-                Ok(_) => created += 1,
-                Err(crate::graph::GraphError::EdgeExists(_, _)) => {}
-                Err(crate::graph::GraphError::MemoryNotFound(_)) => {}
-                Err(e) => return Err(AutoLinkError::Graph(e)),
-            }
-        }
-        created
-    };
-
-    // Additive edge_count update.
-    if edges_created > 0 {
-        let current_count = cache
-            .get(new_memory_id)
-            .await
-            .map(|r| r.edge_count)
-            .unwrap_or(0);
-        let new_count = current_count + edges_created as u16;
-        {
-            let storage_r = storage
-                .read()
-                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
-            let _ = storage_r.update_edge_count(new_memory_id, new_count);
-        }
-        cache.update_edge_count(new_memory_id, new_count).await;
-    }
-
-    Ok(edges_created)
+    persist_edges(new_memory_id, &persisted_edges, graph, storage, cache).await
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -568,7 +523,7 @@ pub async fn perform_temporal_link(
         candidates
             .iter()
             .filter(|(cid, _)| {
-                !has_typed_edge_between(&graph_r, &new_memory_id, cid, EdgeType::Temporal)
+                !graph_r.has_typed_edge_between_ids(&new_memory_id, cid, EdgeType::Temporal)
             })
             .take(max_temporal_links)
             .cloned()
@@ -596,45 +551,5 @@ pub async fn perform_temporal_link(
         })
         .collect();
 
-    {
-        let storage_r = storage
-            .read()
-            .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
-        storage_r
-            .batch_add_edges(&persisted_edges)
-            .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
-    }
-
-    let edges_created = {
-        let mut graph_w = graph.write().await;
-        let mut created = 0usize;
-        for pe in &persisted_edges {
-            match graph_w.add_edge(pe.source, pe.target, pe.edge_type, pe.weight, true) {
-                Ok(_) => created += 1,
-                Err(crate::graph::GraphError::EdgeExists(_, _)) => {}
-                Err(crate::graph::GraphError::MemoryNotFound(_)) => {}
-                Err(e) => return Err(AutoLinkError::Graph(e)),
-            }
-        }
-        created
-    };
-
-    // Additive edge_count update.
-    if edges_created > 0 {
-        let current_count = cache
-            .get(new_memory_id)
-            .await
-            .map(|r| r.edge_count)
-            .unwrap_or(0);
-        let new_count = current_count + edges_created as u16;
-        {
-            let storage_r = storage
-                .read()
-                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
-            let _ = storage_r.update_edge_count(new_memory_id, new_count);
-        }
-        cache.update_edge_count(new_memory_id, new_count).await;
-    }
-
-    Ok(edges_created)
+    persist_edges(new_memory_id, &persisted_edges, graph, storage, cache).await
 }

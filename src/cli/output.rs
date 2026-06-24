@@ -478,72 +478,77 @@ pub trait OutputFormatter {
 /// consumption.
 pub struct JsonFormatter;
 
+/// Fallback JSON string when serialization unexpectedly fails.
+fn serialize_or_error<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|e| format!(r#"{{"error":"serialization failed: {e}"}}"#))
+}
+
 impl OutputFormatter for JsonFormatter {
     fn store(&self, result: &StoreResult) -> String {
-        serde_json::to_string(result).unwrap()
+        serialize_or_error(result)
     }
 
     fn recall(&self, result: &SearchResult) -> String {
-        serde_json::to_string(result).unwrap()
+        serialize_or_error(result)
     }
 
     fn get(&self, memory: &MemoryView) -> String {
-        serde_json::to_string(memory).unwrap()
+        serialize_or_error(memory)
     }
 
     fn forget(&self, result: &ForgetResult) -> String {
-        serde_json::to_string(result).unwrap()
+        serialize_or_error(result)
     }
 
     fn reinforce(&self, result: &ReinforceResult) -> String {
-        serde_json::to_string(result).unwrap()
+        serialize_or_error(result)
     }
 
     fn inspect(&self, view: &InspectView) -> String {
-        serde_json::to_string(view).unwrap()
+        serialize_or_error(view)
     }
 
     fn namespaces_list(&self, namespaces: &[NamespaceView]) -> String {
-        serde_json::to_string(namespaces).unwrap()
+        serialize_or_error(namespaces)
     }
 
     fn namespace_stats(&self, stats: &[NamespaceStatsView]) -> String {
-        serde_json::to_string(stats).unwrap()
+        serialize_or_error(stats)
     }
 
     fn sweep(&self, result: &SweepResult) -> String {
-        serde_json::to_string(result).unwrap()
+        serialize_or_error(result)
     }
 
     fn status(&self, status: &StatusView) -> String {
-        serde_json::to_string(status).unwrap()
+        serialize_or_error(status)
     }
 
     fn health(&self, report: &HealthReportView) -> String {
-        serde_json::to_string(report).unwrap()
+        serialize_or_error(report)
     }
 
     fn list(&self, result: &ListResult) -> String {
-        serde_json::to_string(result).unwrap()
+        serialize_or_error(result)
     }
 
     fn export_record(&self, memory: &MemoryView) -> String {
-        serde_json::to_string(memory).unwrap()
+        serialize_or_error(memory)
     }
 
     fn import_result(&self, result: &ImportResult) -> String {
-        serde_json::to_string(result).unwrap()
+        serialize_or_error(result)
     }
 
     fn import_dry_run(&self, result: &ImportDryRunResult) -> String {
-        serde_json::to_string(result).unwrap()
+        serialize_or_error(result)
     }
 
     fn error(&self, err: &CliError) -> String {
-        serde_json::to_string(&serde_json::json!({
+        serialize_or_error(&serde_json::json!({
             "error": format!("{err}")
         }))
-        .unwrap()
     }
 }
 
@@ -913,11 +918,13 @@ impl OutputFormatter for HumanFormatter {
     fn export_record(&self, memory: &MemoryView) -> String {
         // In human mode, export still writes JSON (export is a data operation).
         // But prefix each record with a header line.
+        let pretty = serde_json::to_string_pretty(memory)
+            .unwrap_or_else(|e| format!(r#"{{"error":"serialization failed: {e}"}}"#));
         format!(
             "--- {} ({}) ---\n{}\n",
             &memory.id[..8],
             memory.decay_phase,
-            serde_json::to_string_pretty(memory).unwrap()
+            pretty
         )
     }
 

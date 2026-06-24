@@ -615,7 +615,7 @@ async fn store_single_memory(
         namespace_id: ns_config.id.get(),
         created_at: timestamp_ms,
         last_accessed_at: timestamp_ms,
-        phase: DecayPhase::Full.as_u8(),
+        phase: DecayPhase::Full,
         strength: 1.0,
         decay_strength: 1.0,
         stability: ns_config.initial_stability,

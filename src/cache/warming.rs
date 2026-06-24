@@ -432,9 +432,12 @@ pub async fn warm_cache<S, V>(
                     vector_buffer.insert(memory_id, &embedding);
                 }
 
+                // Load outgoing edges once for both reverse index and prefetch.
+                let neighbors = storage.load_outgoing_edges(memory_id).await.ok();
+
                 // Update reverse neighborhood index.
-                if let Ok(neighbors) = storage.load_outgoing_edges(memory_id).await {
-                    for (target_id, _edge_type) in &neighbors {
+                if let Some(ref neighbors) = neighbors {
+                    for (target_id, _edge_type) in neighbors {
                         reverse_index
                             .entry(*target_id)
                             .or_default()
@@ -448,7 +451,7 @@ pub async fn warm_cache<S, V>(
 
                 // Enqueue 1-hop neighbors for prefetch.
                 // Best-effort -- dropped if the prefetch channel is full.
-                if let Ok(neighbors) = storage.load_outgoing_edges(memory_id).await {
+                if let Some(neighbors) = neighbors {
                     for (target_id, _edge_type) in neighbors {
                         if !cache.contains_key(&target_id) {
                             let _ = prefetch_tx.try_send(PrefetchRequest::Eager(target_id));

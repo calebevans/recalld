@@ -8,6 +8,27 @@ use tracing::{debug, warn};
 
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 
+/// A string wrapper that redacts its contents in `Debug` output.
+///
+/// Use this for secrets (API keys, tokens) to prevent accidental
+/// exposure in logs or debug-formatted error messages.
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
 /// OpenAI embeddings provider using the /v1/embeddings API.
 ///
 /// Supports text-embedding-3-small (1536-dim default) and
@@ -15,7 +36,7 @@ use crate::embedding::{EmbeddingError, EmbeddingProvider};
 /// dimension reduction via the `dimensions` parameter.
 pub struct OpenAIProvider {
     client: Client,
-    api_key: String,
+    api_key: SecretString,
     model: String,
     /// Effective output dimensionality. Equals `reduced_dim` if set,
     /// otherwise the model's native dimensionality.
@@ -44,7 +65,7 @@ impl OpenAIProvider {
 
         Self {
             client,
-            api_key,
+            api_key: SecretString::new(api_key),
             model,
             dim,
             reduced_dim,
@@ -86,7 +107,7 @@ impl OpenAIProvider {
             let response = self
                 .client
                 .post(format!("{}/v1/embeddings", self.base_url))
-                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Authorization", format!("Bearer {}", self.api_key.expose()))
                 .header("Content-Type", "application/json")
                 .json(&request_body)
                 .send()

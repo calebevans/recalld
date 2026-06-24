@@ -53,7 +53,7 @@ pub enum ConfigError {
 /// Convenience alias for config operations.
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
-/// Top-level configuration for Recalld (renamed from ColdHarborConfig).
+/// Top-level configuration for Recalld.
 ///
 /// Aggregates all sub-configs. Loading priority (highest wins):
 /// 1. CLI flags

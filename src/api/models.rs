@@ -184,7 +184,7 @@ pub struct NamespaceStatsResponse {
 }
 
 /// Memory count breakdown by decay phase.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhaseCounts {
     /// Memories in Full phase (phase 1).
@@ -368,7 +368,7 @@ pub struct HealthReportQuery {
 }
 
 /// GET /health/report -- comprehensive decay health report.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthReport {
     /// Namespace name (if filtered), or "all".
@@ -394,7 +394,7 @@ pub struct HealthReport {
 }
 
 /// Overview section of the health report.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthOverview {
     /// Total memory count.
@@ -406,7 +406,7 @@ pub struct HealthOverview {
 }
 
 /// Decay forecast with transitions bucketed by time horizon.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecayForecast {
     /// Phase transitions expected within 7 days.
@@ -418,7 +418,7 @@ pub struct DecayForecast {
 }
 
 /// Count of phase transitions by type.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransitionCounts {
     /// Full -> Summary transitions.
@@ -430,7 +430,7 @@ pub struct TransitionCounts {
 }
 
 /// A memory at risk of deletion.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AtRiskMemory {
     /// Short UUID (first 8 chars).
@@ -446,7 +446,7 @@ pub struct AtRiskMemory {
 }
 
 /// Memory age statistics.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgeDistribution {
     /// Unix millis of oldest memory.
@@ -460,7 +460,7 @@ pub struct AgeDistribution {
 }
 
 /// Storage breakdown by file.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageBreakdown {
     /// Total size of data directory in bytes.
@@ -476,7 +476,7 @@ pub struct StorageBreakdown {
 }
 
 /// Size of a single namespace's vector file.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorFileSize {
     /// Namespace name.
@@ -486,7 +486,7 @@ pub struct VectorFileSize {
 }
 
 /// Tag statistics section of the health report.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataStats {
     /// Top 10 tags by memory count.
@@ -496,7 +496,7 @@ pub struct MetadataStats {
 }
 
 /// A single tag with its memory count.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TagCount {
     /// Tag string.

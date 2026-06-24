@@ -18,6 +18,9 @@ pub struct SearchResult {
     /// Created-at timestamp (millis since epoch).
     pub created_at: i64,
 
+    /// Last-accessed-at timestamp (millis since epoch).
+    pub last_accessed_at: i64,
+
     /// Cosine similarity to the query embedding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f32>,

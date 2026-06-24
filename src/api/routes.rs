@@ -12,6 +12,7 @@ use axum::{
 };
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
+use tracing::warn;
 
 use super::ApiConfig;
 use super::handlers;
@@ -38,6 +39,14 @@ use super::state::AppState;
 /// | GET    | /health/report            | health_report            | Decay health report        |
 /// | GET    | /metrics                  | metrics                  | Prometheus metrics export  |
 pub fn router(state: AppState, config: &ApiConfig) -> Router {
+    let addr = config.bind_address.as_str();
+    if addr != "127.0.0.1" && addr != "::1" && addr != "localhost" {
+        warn!(
+            bind_address = addr,
+            "API server binding to non-loopback address -- the API is exposed to the network without authentication"
+        );
+    }
+
     let memory_routes = Router::new()
         .route("/", get(handlers::list_memories))
         .route("/", post(handlers::create_memory))

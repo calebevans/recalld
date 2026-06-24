@@ -1,5 +1,6 @@
 //! Validated, lowercased tag newtype with hierarchical naming support.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::ops::Deref;
 
@@ -149,17 +150,11 @@ pub fn entity_overlap(query_entities: &[String], memory_entities: &[String]) -> 
         return 0.0;
     }
 
-    let memory_lower: Vec<String> = memory_entities.iter().map(|e| e.to_lowercase()).collect();
+    let query_set: HashSet<String> = query_entities.iter().map(|e| e.to_lowercase()).collect();
+    let memory_set: HashSet<String> = memory_entities.iter().map(|e| e.to_lowercase()).collect();
 
-    let intersection_count = query_entities
-        .iter()
-        .filter(|qe| {
-            let qe_lower = qe.to_lowercase();
-            memory_lower.iter().any(|me| *me == qe_lower)
-        })
-        .count();
-
-    let union_size = query_entities.len() + memory_entities.len() - intersection_count;
+    let intersection_count = query_set.intersection(&memory_set).count();
+    let union_size = query_set.union(&memory_set).count();
 
     intersection_count as f32 / union_size as f32
 }

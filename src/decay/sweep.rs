@@ -18,6 +18,7 @@
 //! It does NOT hold a global lock -- individual record operations are
 //! serialized at the storage transaction level.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,10 @@ pub struct DecayMetadata {
     /// Namespace-specific decay rate multiplier, if set.
     /// None means inherit from global config.
     pub decay_rate_multiplier: Option<f32>,
+    /// Whether the record has a non-empty summary.
+    /// Used by Full -> Summary transitions to skip the summary check
+    /// without re-reading the record from storage.
+    pub has_summary: bool,
 }
 
 // ── SweepConfig ─────────────────────────────────────────────────────
@@ -253,11 +258,21 @@ pub enum SweepError {
 
 /// A pending phase transition collected during the scan, to be applied
 /// in batch to minimize storage round-trips.
+///
+/// Carries the decay metadata snapshot from scan time so that transition
+/// methods do not need to re-read the record from storage.
 #[derive(Debug)]
 struct PendingTransition {
     memory_id: MemoryId,
     from_phase: DecayPhase,
     effective_r: f32,
+    /// FSRS stability from the scan-time metadata snapshot.
+    stability: f32,
+    /// Permastore flag from the scan-time metadata snapshot.
+    is_permastore: bool,
+    /// Whether the memory has a non-empty summary (only relevant for
+    /// Full -> Summary transitions; set to `true` for other phases).
+    has_summary: bool,
 }
 
 // ── Maximum connection bonus constant ───────────────────────────────
@@ -530,9 +545,13 @@ impl DecaySweepRunner {
         .await;
 
         // -- Text.log compaction ----------------------------------
-        // text_dead_ratio is not directly available from the storage
-        // trait; compaction can be triggered via compact_text_log.
-        {
+        // Only attempt compaction when this sweep actually created dead
+        // space in text.log. Dead space is created by:
+        //   - Full -> Summary transitions (full_text pointers zeroed)
+        //   - Ghost -> Deleted transitions (all text removed)
+        // If neither occurred, there is no new fragmentation to compact
+        // and we skip the expensive write-lock + I/O entirely.
+        if result.deletions > 0 || result.full_to_summary > 0 {
             let mut storage_w = storage.write().unwrap_or_else(|e| {
                 error!("storage lock poisoned during compaction check: {e}");
                 e.into_inner()
@@ -567,7 +586,8 @@ impl DecaySweepRunner {
     /// Process all memories in a single phase.
     ///
     /// Loads memory IDs from the PhaseIndex (RoaringBitmap) for the given
-    /// phase, then iterates them. For each memory:
+    /// phase, then loads metadata in batches to minimize storage lock
+    /// acquisitions. For each memory:
     /// 1. Skip if permastore
     /// 2. Calculate raw retrievability R
     /// 3. Calculate connection bonus -> effective R
@@ -588,161 +608,323 @@ impl DecaySweepRunner {
         result: &mut SweepResult,
     ) {
         // Get all memory IDs in this phase from the PhaseIndex.
-        let memory_ids = {
-            let storage_r = storage.read().unwrap_or_else(|e| {
-                error!("storage lock poisoned: {e}");
-                e.into_inner()
-            });
-            match storage_r.ids_in_phase(phase) {
-                Ok(ids) => ids,
-                Err(e) => {
-                    warn!(
-                        phase = ?phase,
-                        error = %e,
-                        "PhaseIndex lookup failed, falling back to full table scan"
-                    );
-                    // Fallback: scan meta.db filtering by decay_phase field.
-                    match storage_r.scan_phase_records(phase) {
-                        Ok(records) => records
-                            .into_iter()
-                            .map(|(id, _): (MemoryId, _)| id)
-                            .collect(),
-                        Err(e2) => {
-                            error!(
-                                phase = ?phase,
-                                error = %e2,
-                                "full table scan also failed, skipping phase"
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
+        let memory_ids = Self::load_phase_ids(phase, storage);
+        let memory_ids = match memory_ids {
+            Some(ids) => ids,
+            None => return,
         };
 
         debug!(phase = ?phase, count = memory_ids.len(), "scanning phase");
 
         let mut pending_transitions: Vec<PendingTransition> = Vec::new();
 
-        for (i, memory_id) in memory_ids.iter().enumerate() {
-            // Cooperative yielding: give query tasks a chance to run
-            if i > 0 && i % config.yield_every_n == 0 {
-                tokio::task::yield_now().await;
-            }
-
-            result.memories_scanned += 1;
-
-            // Load decay-relevant metadata for this memory via storage adapter.
-            let meta = {
+        // Process records in batches for metadata loading.
+        // Each batch acquires the storage lock once to load all metadata,
+        // then processes records individually for graph lookups.
+        for chunk in memory_ids.chunks(config.write_batch_size) {
+            // Batch-load metadata for this chunk under a single lock.
+            let (meta_batch, meta_errors) = {
                 let storage_r = storage.read().unwrap_or_else(|e| {
                     error!("storage lock poisoned: {e}");
                     e.into_inner()
                 });
-                match super::storage_adapter::get_decay_metadata(&*storage_r, *memory_id) {
-                    Ok(Some(m)) => m,
-                    Ok(None) => {
-                        // Memory was deleted between bitmap load and now.
-                        debug!(id = %memory_id, "memory not found, skipping");
-                        continue;
-                    }
-                    Err(e) => {
-                        result.errors.push(SweepRecordError {
-                            memory_id: *memory_id,
-                            phase,
-                            error: format!("failed to load metadata: {e}"),
-                        });
-                        continue;
-                    }
+                Self::load_metadata_batch(&*storage_r, chunk)
+            };
+
+            // Record batch-load errors.
+            for (id, err_msg) in meta_errors {
+                result.errors.push(SweepRecordError {
+                    memory_id: id,
+                    phase,
+                    error: err_msg,
+                });
+            }
+
+            for (i, memory_id) in chunk.iter().enumerate() {
+                // Cooperative yielding: give query tasks a chance to run.
+                // Track total count across chunks for yield cadence.
+                let global_idx = result.memories_scanned as usize;
+                if global_idx > 0 && global_idx % config.yield_every_n == 0 {
+                    tokio::task::yield_now().await;
                 }
-            };
 
-            // -- Permastore exemption -----------------------------
-            if meta.is_permastore {
-                result.permastore_skipped += 1;
-                continue;
-            }
+                result.memories_scanned += 1;
 
-            // -- Get effective decay rate multiplier ---------------
-            // Namespace override > global default
-            let multiplier = meta
-                .decay_rate_multiplier
-                .map(|m| m as f64)
-                .unwrap_or(global_decay_multiplier);
+                let meta = match meta_batch.get(memory_id) {
+                    Some(m) => m.clone(),
+                    None => {
+                        // Memory was deleted between bitmap load and now,
+                        // or had a load error (already recorded above).
+                        debug!(id = %memory_id, "memory not found in batch, skipping");
+                        continue;
+                    }
+                };
 
-            // -- Decay disabled check -----------------------------
-            if multiplier == 0.0 {
-                result.decay_disabled_skipped += 1;
-                continue;
-            }
-
-            // -- Calculate raw retrievability ---------------------
-            let elapsed_millis = (now_millis - meta.last_accessed_at).max(0) as f64;
-            let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
-            let raw_r =
-                engine.retrievability(elapsed_days, meta.stability, multiplier as f32);
-
-            // -- Calculate connection bonus -----------------------
-            let connection_bonus =
-                Self::calculate_connection_bonus(*memory_id, graph, activation_config).await;
-            let effective_r = engine.effective_retrievability(raw_r, connection_bonus);
-
-            // -- Determine transition -----------------------------
-            let threshold = match phase {
-                DecayPhase::Ghost => engine.config.phase_3_threshold,
-                DecayPhase::Summary => engine.config.phase_2_threshold,
-                DecayPhase::Full => engine.config.phase_1_threshold,
-            };
-
-            if effective_r <= threshold {
-                pending_transitions.push(PendingTransition {
-                    memory_id: *memory_id,
-                    from_phase: phase,
-                    effective_r,
-                });
-            } else if raw_r <= threshold && effective_r > threshold {
-                // Raw R crossed the threshold, but connection bonus
-                // pulled effective R back above it.
-                result.saved_by_connection_bonus += 1;
-            }
-
-            // -- Batch flush --------------------------------------
-            if pending_transitions.len() >= config.write_batch_size {
-                Self::flush_transitions(&pending_transitions, storage, graph, cache, result).await;
-                pending_transitions.clear();
-            }
-
-            // Update decay_strength in metadata regardless of transition.
-            {
-                let storage_r = storage.read().unwrap_or_else(|e| {
-                    error!("storage lock poisoned: {e}");
-                    e.into_inner()
-                });
-                if let Err(e) = storage_r.update_decay_state(
+                // Evaluate this record for a possible phase transition.
+                let effective_r = Self::evaluate_record(
                     *memory_id,
                     phase,
-                    effective_r,
-                    meta.stability,
-                    meta.is_permastore,
-                ) {
-                    result.errors.push(SweepRecordError {
-                        memory_id: *memory_id,
-                        phase,
-                        error: format!("failed to update decay_strength: {e}"),
-                    });
-                }
-            }
+                    &meta,
+                    engine,
+                    activation_config,
+                    graph,
+                    now_millis,
+                    global_decay_multiplier,
+                    &mut pending_transitions,
+                    result,
+                )
+                .await;
 
-            // Sync graph node state so next phase's connection bonus
-            // calculations use current values.
-            {
-                let mut graph_w = graph.write().await;
-                let _ = graph_w.update_node_state(*memory_id, phase, effective_r);
+                // Flush write batch if full.
+                if pending_transitions.len() >= config.write_batch_size {
+                    Self::flush_transitions(
+                        &pending_transitions,
+                        storage,
+                        graph,
+                        cache,
+                        result,
+                    )
+                    .await;
+                    pending_transitions.clear();
+                }
+
+                // Update decay_strength in storage and sync graph state.
+                // Skip if the record was not evaluated (permastore/decay-disabled).
+                if let Some(eff_r) = effective_r {
+                    Self::update_record_state(
+                        *memory_id,
+                        phase,
+                        eff_r,
+                        &meta,
+                        storage,
+                        graph,
+                        result,
+                    )
+                    .await;
+                }
+
+                let _ = i; // suppress unused warning
             }
         }
 
-        // Flush remaining transitions
+        // Flush remaining transitions.
         if !pending_transitions.is_empty() {
             Self::flush_transitions(&pending_transitions, storage, graph, cache, result).await;
+        }
+    }
+
+    /// Load all memory IDs belonging to the given phase.
+    ///
+    /// Tries the PhaseIndex bitmap first, falls back to a full table scan.
+    /// Returns `None` if both lookups fail (the phase is skipped).
+    fn load_phase_ids(
+        phase: DecayPhase,
+        storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+    ) -> Option<Vec<MemoryId>> {
+        let storage_r = storage.read().unwrap_or_else(|e| {
+            error!("storage lock poisoned: {e}");
+            e.into_inner()
+        });
+        match storage_r.ids_in_phase(phase) {
+            Ok(ids) => Some(ids),
+            Err(e) => {
+                warn!(
+                    phase = ?phase,
+                    error = %e,
+                    "PhaseIndex lookup failed, falling back to full table scan"
+                );
+                match storage_r.scan_phase_records(phase) {
+                    Ok(records) => Some(
+                        records
+                            .into_iter()
+                            .map(|(id, _): (MemoryId, _)| id)
+                            .collect(),
+                    ),
+                    Err(e2) => {
+                        error!(
+                            phase = ?phase,
+                            error = %e2,
+                            "full table scan also failed, skipping phase"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load decay metadata for a batch of memory IDs in a single pass.
+    ///
+    /// Pre-loads namespace configs to avoid repeated per-record lookups,
+    /// then iterates the IDs calling `get_record` for each. All of this
+    /// happens under the caller's already-acquired storage lock, so the
+    /// lock is held once per batch rather than once per record.
+    ///
+    /// Missing records (deleted between bitmap load and now) are silently
+    /// omitted. Errors are collected in the returned vector.
+    fn load_metadata_batch(
+        storage: &RedbStorageEngine,
+        ids: &[MemoryId],
+    ) -> (HashMap<MemoryId, DecayMetadata>, Vec<(MemoryId, String)>) {
+        // Pre-load namespace configs to avoid repeated lookups.
+        // There are typically very few namespaces (< 10).
+        let ns_cache: HashMap<u32, Option<f32>> = storage
+            .list_namespaces()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|ns| (ns.id.get(), ns.decay_rate_multiplier))
+            .collect();
+
+        let mut results = HashMap::with_capacity(ids.len());
+        let mut errors = Vec::new();
+
+        for &id in ids {
+            match storage.get_record(id) {
+                Ok(Some(record)) => {
+                    let decay_rate_multiplier = ns_cache
+                        .get(&record.namespace_id)
+                        .copied()
+                        .flatten();
+
+                    results.insert(
+                        id,
+                        DecayMetadata {
+                            stability: record.stability,
+                            last_accessed_at: record.last_accessed_at,
+                            is_permastore: record.is_permastore != 0,
+                            decay_rate_multiplier,
+                            has_summary: !record.summary.is_empty(),
+                        },
+                    );
+                }
+                Ok(None) => {
+                    // Memory deleted between bitmap load and now -- skip.
+                }
+                Err(e) => {
+                    errors.push((id, format!("failed to load metadata: {e}")));
+                }
+            }
+        }
+
+        (results, errors)
+    }
+
+    /// Evaluate a single record for a possible phase transition.
+    ///
+    /// Checks permastore exemption, computes raw and effective
+    /// retrievability, and pushes a `PendingTransition` if the
+    /// effective R falls below the phase threshold.
+    ///
+    /// Returns `Some(effective_r)` if the record was evaluated (not
+    /// skipped), or `None` if the record was skipped (permastore or
+    /// decay disabled).
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_record(
+        memory_id: MemoryId,
+        phase: DecayPhase,
+        meta: &DecayMetadata,
+        engine: &FsrsEngine<'_>,
+        activation_config: &ActivationConfig,
+        graph: &SharedGraph,
+        now_millis: i64,
+        global_decay_multiplier: f64,
+        pending_transitions: &mut Vec<PendingTransition>,
+        result: &mut SweepResult,
+    ) -> Option<f32> {
+        // -- Permastore exemption ---------------------------------
+        if meta.is_permastore {
+            result.permastore_skipped += 1;
+            return None;
+        }
+
+        // -- Get effective decay rate multiplier -------------------
+        // Namespace override > global default
+        let multiplier = meta
+            .decay_rate_multiplier
+            .map(|m| m as f64)
+            .unwrap_or(global_decay_multiplier);
+
+        // -- Decay disabled check ---------------------------------
+        if multiplier == 0.0 {
+            result.decay_disabled_skipped += 1;
+            return None;
+        }
+
+        // -- Calculate raw retrievability -------------------------
+        let elapsed_millis = (now_millis - meta.last_accessed_at).max(0) as f64;
+        let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
+        let raw_r = engine.retrievability(elapsed_days, meta.stability, multiplier as f32);
+
+        // -- Calculate connection bonus ---------------------------
+        let connection_bonus =
+            Self::calculate_connection_bonus(memory_id, graph, activation_config).await;
+        let effective_r = engine.effective_retrievability(raw_r, connection_bonus);
+
+        // -- Determine transition ---------------------------------
+        let threshold = match phase {
+            DecayPhase::Ghost => engine.config.phase_3_threshold,
+            DecayPhase::Summary => engine.config.phase_2_threshold,
+            DecayPhase::Full => engine.config.phase_1_threshold,
+            // Tombstone is a terminal phase set by explicit deletion;
+            // the decay sweep never processes tombstoned memories.
+            DecayPhase::Tombstone => return None,
+        };
+
+        if effective_r <= threshold {
+            pending_transitions.push(PendingTransition {
+                memory_id,
+                from_phase: phase,
+                effective_r,
+                stability: meta.stability,
+                is_permastore: meta.is_permastore,
+                has_summary: meta.has_summary,
+            });
+        } else if raw_r <= threshold && effective_r > threshold {
+            // Raw R crossed the threshold, but connection bonus
+            // pulled effective R back above it.
+            result.saved_by_connection_bonus += 1;
+        }
+
+        Some(effective_r)
+    }
+
+    /// Update a record's decay_strength in storage and sync the
+    /// graph node state after evaluation.
+    async fn update_record_state(
+        memory_id: MemoryId,
+        phase: DecayPhase,
+        effective_r: f32,
+        meta: &DecayMetadata,
+        storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+        graph: &SharedGraph,
+        result: &mut SweepResult,
+    ) {
+        // Update decay_strength in metadata regardless of transition.
+        {
+            let storage_r = storage.read().unwrap_or_else(|e| {
+                error!("storage lock poisoned: {e}");
+                e.into_inner()
+            });
+            if let Err(e) = storage_r.update_decay_state(
+                memory_id,
+                phase,
+                effective_r,
+                meta.stability,
+                meta.is_permastore,
+            ) {
+                result.errors.push(SweepRecordError {
+                    memory_id,
+                    phase,
+                    error: format!("failed to update decay_strength: {e}"),
+                });
+            }
+        }
+
+        // Sync graph node state so next phase's connection bonus
+        // calculations use current values.
+        {
+            let mut graph_w = graph.write().await;
+            let _ = graph_w.update_node_state(memory_id, phase, effective_r);
         }
     }
 
@@ -777,15 +959,32 @@ impl DecaySweepRunner {
         for t in transitions {
             let outcome = match t.from_phase {
                 DecayPhase::Full => {
-                    Self::transition_full_to_summary(t.memory_id, t.effective_r, storage).await
+                    Self::transition_full_to_summary(
+                        t.memory_id,
+                        t.effective_r,
+                        t.stability,
+                        t.is_permastore,
+                        t.has_summary,
+                        storage,
+                    )
+                    .await
                 }
                 DecayPhase::Summary => {
-                    Self::transition_summary_to_ghost(t.memory_id, t.effective_r, storage).await
+                    Self::transition_summary_to_ghost(
+                        t.memory_id,
+                        t.effective_r,
+                        t.stability,
+                        t.is_permastore,
+                        storage,
+                    )
+                    .await
                 }
                 DecayPhase::Ghost => {
                     Self::transition_ghost_to_deleted(t.memory_id, t.effective_r, storage, graph)
                         .await
                 }
+                // Tombstone is a terminal phase; no transitions from it.
+                DecayPhase::Tombstone => continue,
             };
 
             match outcome {
@@ -795,6 +994,7 @@ impl DecaySweepRunner {
                         DecayPhase::Full => result.full_to_summary += 1,
                         DecayPhase::Summary => result.summary_to_ghost += 1,
                         DecayPhase::Ghost => result.deletions += 1,
+                        DecayPhase::Tombstone => {} // unreachable, handled above
                     }
 
                     // Invalidate cache entry
@@ -826,9 +1026,15 @@ impl DecaySweepRunner {
     ///    mark the space as dead -- no physical deletion until compaction).
     /// 3. Update decay_phase = Summary in meta.db.
     /// 4. Update PhaseIndex bitmap (clear Full bit, set Summary bit).
+    ///
+    /// `stability`, `is_permastore`, and `has_summary` are carried from
+    /// the scan-time metadata snapshot so we avoid re-reading the record.
     async fn transition_full_to_summary(
         memory_id: MemoryId,
         effective_r: f32,
+        stability: f32,
+        is_permastore: bool,
+        has_summary: bool,
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     ) -> Result<PhaseTransition, SweepError> {
         let storage_r = storage
@@ -836,30 +1042,13 @@ impl DecaySweepRunner {
             .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
 
         // Safety net: verify summary exists before deleting full_text.
-        match super::storage_adapter::has_summary(&*storage_r, memory_id) {
-            Ok(false) => {
-                warn!(
-                    id = %memory_id,
-                    "memory has no summary at Full->Summary transition; \
-                     proceeding anyway -- summary was expected at creation time"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    id = %memory_id,
-                    error = %e,
-                    "failed to check summary existence, proceeding with transition"
-                );
-            }
-            Ok(true) => {}
+        if !has_summary {
+            warn!(
+                id = %memory_id,
+                "memory has no summary at Full->Summary transition; \
+                 proceeding anyway -- summary was expected at creation time"
+            );
         }
-
-        // Load stability from metadata to preserve it during phase change.
-        let meta = super::storage_adapter::get_decay_metadata(&*storage_r, memory_id)?;
-        let (stability, is_permastore) = match meta {
-            Some(m) => (m.stability, m.is_permastore),
-            None => return Err(SweepError::MemoryNotFound(memory_id)),
-        };
 
         // Update phase in meta.db + PhaseIndex bitmap.
         storage_r
@@ -887,21 +1076,19 @@ impl DecaySweepRunner {
     /// 3. Update PhaseIndex bitmap.
     ///
     /// After this, only the embedding and relationship edges remain.
+    ///
+    /// `stability` and `is_permastore` are carried from the scan-time
+    /// metadata snapshot so we avoid re-reading the record.
     async fn transition_summary_to_ghost(
         memory_id: MemoryId,
         effective_r: f32,
+        stability: f32,
+        is_permastore: bool,
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     ) -> Result<PhaseTransition, SweepError> {
         let storage_r = storage
             .read()
             .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
-
-        // Load stability to preserve it during phase change.
-        let meta = super::storage_adapter::get_decay_metadata(&*storage_r, memory_id)?;
-        let (stability, is_permastore) = match meta {
-            Some(m) => (m.stability, m.is_permastore),
-            None => return Err(SweepError::MemoryNotFound(memory_id)),
-        };
 
         storage_r
             .update_decay_state(

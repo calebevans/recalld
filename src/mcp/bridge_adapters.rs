@@ -102,10 +102,11 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             namespace: query.namespace.clone(),
             filter: crate::search::PipelineSearchFilter {
                 require_tags,
+                min_strength: query.min_strength,
                 ..Default::default()
             },
             limit: query.limit,
-            min_score: query.min_strength.unwrap_or(0.0),
+            min_score: 0.0,
             include_ghosts: false,
             query_mode: crate::search::QueryMode::default(),
             graph_depth: query.depth.min(3) as u8,
@@ -192,8 +193,8 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                     strength: r.retrievability,
                     created_at: r.created_at,
                     created_at_formatted: Some(format_timestamp(r.created_at, tz)),
-                    last_accessed_at: r.created_at,
-                    last_accessed_at_formatted: Some(format_timestamp(r.created_at, tz)),
+                    last_accessed_at: r.last_accessed_at,
+                    last_accessed_at_formatted: Some(format_timestamp(r.last_accessed_at, tz)),
                     related,
                 }
             })
@@ -324,8 +325,8 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                     strength: r.retrievability,
                     created_at: r.created_at,
                     created_at_formatted: Some(format_timestamp(r.created_at, tz)),
-                    last_accessed_at: r.created_at,
-                    last_accessed_at_formatted: Some(format_timestamp(r.created_at, tz)),
+                    last_accessed_at: r.last_accessed_at,
+                    last_accessed_at_formatted: Some(format_timestamp(r.last_accessed_at, tz)),
                     related: Vec::new(),
                 }
             })
@@ -454,7 +455,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             namespace_id: ns_config.id.get(),
             created_at: now,
             last_accessed_at: now,
-            phase: DecayPhase::Full.as_u8(),
+            phase: DecayPhase::Full,
             strength: 1.0,
             decay_strength: 1.0,
             stability: input
@@ -548,6 +549,31 @@ impl bridge::StorageEngine for McpStorageAdapter {
                         %e,
                         "supersedes edge failed (non-fatal)"
                     );
+                } else {
+                    // Persist the supersedes edge to edges.db.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let persisted = crate::storage::PersistedEdge {
+                        source: memory_id,
+                        target: old_id,
+                        edge_type: crate::model::EdgeType::Supersedes,
+                        weight: 1.0,
+                        auto_created: false,
+                        created_at: now_ms,
+                    };
+                    let storage_r = self.storage.read().map_err(|e| {
+                        bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                    })?;
+                    if let Err(e) = storage_r.batch_add_edges(&[persisted]) {
+                        tracing::warn!(
+                            memory_id = %memory_id,
+                            superseded = %old_id,
+                            %e,
+                            "supersedes edge persistence failed (non-fatal)"
+                        );
+                    }
                 }
             }
         }
@@ -672,14 +698,45 @@ impl bridge::StorageEngine for McpStorageAdapter {
 
         match disk_record {
             Some(record) => {
+                // Tombstoned memories: return a record with empty content
+                // and phase "Tombstone" so callers know it was deleted but
+                // its graph connections are preserved.
+                if record.phase == DecayPhase::Tombstone {
+                    let ns_name = storage_w
+                        .get_namespace(NamespaceId::new(record.namespace_id))
+                        .ok()
+                        .flatten()
+                        .map(|ns| ns.name.clone())
+                        .unwrap_or_default();
+
+                    let tz = self.timezone;
+                    return Ok(Some(bridge::MemoryRecord {
+                        id: id.to_string(),
+                        namespace: ns_name,
+                        summary: String::new(),
+                        full_text: None,
+                        tags: Vec::new(),
+                        phase: "Tombstone".to_string(),
+                        strength: 0.0,
+                        stability: record.stability,
+                        created_at: record.created_at,
+                        created_at_formatted: Some(format_timestamp(record.created_at, tz)),
+                        last_accessed_at: record.last_accessed_at,
+                        last_accessed_at_formatted: Some(format_timestamp(
+                            record.last_accessed_at,
+                            tz,
+                        )),
+                        is_permastore: false,
+                        edge_count: record.edge_count,
+                    }));
+                }
+
                 let ns_name = storage_w
                     .get_namespace(NamespaceId::new(record.namespace_id))
                     .ok()
                     .flatten()
                     .map(|ns| ns.name.clone())
                     .unwrap_or_default();
-
-                let phase = DecayPhase::from_u8(record.phase).unwrap_or(DecayPhase::Full);
 
                 let full_text = if record.text_length > 0 {
                     let text_ref = crate::storage::TextRef {
@@ -698,7 +755,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     summary: record.summary.clone(),
                     full_text,
                     tags: record.tags.iter().map(|t| t.to_string()).collect(),
-                    phase: format!("{:?}", phase),
+                    phase: format!("{:?}", record.phase),
                     strength: record.strength,
                     stability: record.stability,
                     created_at: record.created_at,
@@ -717,18 +774,61 @@ impl bridge::StorageEngine for McpStorageAdapter {
     }
 
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, bridge::BridgeError> {
-        let deleted = {
+        // Tombstone-based deletion: strip content from the record but
+        // preserve the graph node and edges so relationship chains
+        // remain intact for spreading activation traversal.
+
+        // 1. Read the current record to get tags for entity index cleanup.
+        let existing_record = {
+            let storage_r = self.storage.read().map_err(|e| {
+                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+            })?;
+            storage_r
+                .get_record(id)
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+        };
+
+        let Some(existing_record) = existing_record else {
+            return Ok(false);
+        };
+
+        // Short-circuit if already tombstoned to avoid redundant work.
+        if existing_record.phase == DecayPhase::Tombstone {
+            return Ok(false);
+        }
+
+        // 2. Tombstone the record in storage: clear content fields,
+        //    set phase to Tombstone. The record remains in meta.db.
+        {
+            let storage_r = self.storage.read().map_err(|e| {
+                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+            })?;
+            storage_r
+                .tombstone_memory(id)
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+        }
+
+        // 2b. Free the vector slot on disk so it can be reused.
+        {
             let mut storage_w = self.storage.write().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
             })?;
-            storage_w
-                .delete_memory(id)
-                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
-        };
-        if deleted.is_some() {
-            self.cache.invalidate(id).await;
-            // Remove from FTS5 index. Single call — memory_id is globally
-            // unique so namespace doesn't matter.
+            let ns_id = NamespaceId::new(existing_record.namespace_id);
+            if let Err(e) = storage_w.free_vector_slot(ns_id, existing_record.vector_slot) {
+                tracing::warn!(
+                    memory_id = %id,
+                    vector_slot = existing_record.vector_slot,
+                    %e,
+                    "vector slot free failed (non-fatal)"
+                );
+            }
+        }
+
+        // 3. Invalidate cache entry.
+        self.cache.invalidate(id).await;
+
+        // 4. Remove from FTS5 index.
+        {
             let fts = self.fts_index.lock().await;
             if let Err(e) = fts.remove(id) {
                 tracing::warn!(
@@ -738,31 +838,117 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 );
             }
         }
-        Ok(deleted.is_some())
+
+        // 5. Remove from vector index.
+        {
+            use crate::search::VectorIndex;
+            let mut vi = self.vector_index.write().await;
+            if let Err(e) = vi.remove(id) {
+                tracing::warn!(
+                    memory_id = %id,
+                    %e,
+                    "vector index removal failed (non-fatal)"
+                );
+            }
+        }
+
+        // 6. Remove from entity index.
+        {
+            let metadata = crate::model::parse_structured_tags(&existing_record.tags);
+            if !metadata.entities.is_empty() {
+                let mut ei = self.entity_index.write().await;
+                ei.remove(id, &metadata.entities);
+            }
+        }
+
+        // 7. Update graph node phase to Tombstone (keep node and edges).
+        {
+            let mut graph_w = self.graph.write().await;
+            let _ = graph_w.update_node_state(id, DecayPhase::Tombstone, 0.0);
+        }
+
+        Ok(true)
     }
 
     async fn reinforce_memory(
         &self,
         id: MemoryId,
-        _quality: u8,
+        quality: u8,
     ) -> Result<bridge::ReinforceResult, bridge::BridgeError> {
-        let storage_r = self
-            .storage
-            .read()
-            .map_err(|e| bridge::BridgeError::Internal(format!("storage lock poisoned: {e}")))?;
-        let record = storage_r
-            .get_record(id)
-            .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
-            .ok_or_else(|| bridge::BridgeError::NotFound(format!("memory {id} not found")))?;
+        // Step 1: Read the current record.
+        let record = {
+            let storage_r = self.storage.read().map_err(|e| {
+                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+            })?;
+            storage_r
+                .get_record(id)
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+                .ok_or_else(|| bridge::BridgeError::NotFound(format!("memory {id} not found")))?
+        };
 
-        let phase = DecayPhase::from_u8(record.phase).unwrap_or(DecayPhase::Full);
+        // Tombstoned memories cannot be reinforced.
+        if record.phase == DecayPhase::Tombstone {
+            return Err(bridge::BridgeError::NotFound(format!(
+                "memory {id} has been deleted (tombstoned)"
+            )));
+        }
+
+        let phase = record.phase;
+
+        // Step 2: Compute elapsed days since last access.
+        let now = chrono::Utc::now().timestamp_millis();
+        let elapsed_millis = (now - record.last_accessed_at).max(0) as f64;
+        let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
+
+        // Step 3: Use FSRS to compute new stability based on quality rating.
+        let decay_config = crate::decay::DecayConfig::default();
+        let engine = crate::decay::FsrsEngine::new(&decay_config);
+        let new_stability = engine.review_stability(
+            record.stability,
+            elapsed_days,
+            quality,
+            1.0, // default decay rate multiplier
+        );
+
+        // Step 4: Compute new retrievability (just reinforced = 1.0).
+        let new_strength = 1.0_f32;
+        let is_permastore = record.is_permastore != 0
+            || new_stability >= decay_config.permastore_threshold;
+
+        // Step 5: Persist the updated decay state and access event.
+        {
+            let storage_r = self.storage.read().map_err(|e| {
+                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+            })?;
+            storage_r
+                .update_decay_state(id, phase, new_strength, new_stability, is_permastore)
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+            storage_r
+                .update_access(
+                    id,
+                    now,
+                    crate::model::AccessKind::ManualReinforcement,
+                )
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+        }
+
+        // Step 6: Update cache.
+        if let Some(existing) = self.cache.get(id).await {
+            let mut updated = (*existing).clone();
+            updated.stability = new_stability;
+            updated.strength = new_strength;
+            updated.decay_strength = new_strength;
+            updated.is_permastore = is_permastore;
+            updated.last_accessed_at = now;
+            self.cache.insert(id, updated).await;
+        }
 
         Ok(bridge::ReinforceResult {
             id: id.to_string(),
-            strength: record.strength,
-            stability: record.stability,
+            strength: new_strength,
+            stability: new_stability,
             phase: format!("{:?}", phase),
-            is_permastore: record.is_permastore != 0,
+            is_permastore,
         })
     }
 }

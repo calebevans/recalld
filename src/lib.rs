@@ -33,6 +33,7 @@ pub mod decay;
 pub mod embedding;
 pub mod error;
 pub mod graph;
+pub mod health;
 pub mod mcp;
 pub mod model;
 pub mod rif;

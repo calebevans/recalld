@@ -36,8 +36,8 @@ pub struct DiskRecord {
     pub created_at: i64,
     /// Last-accessed-at timestamp (millis since epoch), little-endian.
     pub last_accessed_at: i64,
-    /// `DecayPhase` as `repr(u8)`.
-    pub phase: u8,
+    /// Current decay phase.
+    pub phase: DecayPhase,
     /// Raw FSRS retrievability, IEEE 754 f32.
     pub strength: f32,
     /// Effective retrievability with connection bonus, IEEE 754 f32.
@@ -113,7 +113,7 @@ impl DiskRecord {
         buf.extend_from_slice(&self.namespace_id.to_le_bytes());
         buf.extend_from_slice(&self.created_at.to_le_bytes());
         buf.extend_from_slice(&self.last_accessed_at.to_le_bytes());
-        buf.push(self.phase);
+        buf.push(self.phase.as_u8());
         buf.extend_from_slice(&self.strength.to_le_bytes());
         buf.extend_from_slice(&self.decay_strength.to_le_bytes());
         buf.extend_from_slice(&self.stability.to_le_bytes());
@@ -190,10 +190,9 @@ impl DiskRecord {
         let last_accessed_at = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        let phase = data[pos];
-        if DecayPhase::from_u8(phase).is_none() {
-            return Err(DecodeError::InvalidPhase(phase));
-        }
+        let phase_byte = data[pos];
+        let phase = DecayPhase::from_u8(phase_byte)
+            .ok_or(DecodeError::InvalidPhase(phase_byte))?;
         pos += 1;
 
         let strength = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
@@ -437,7 +436,7 @@ impl From<&Memory> for DiskRecord {
             namespace_id: 0, // Must be set by caller from namespace registry
             created_at: m.created_at,
             last_accessed_at: m.last_accessed_at,
-            phase: m.phase.as_u8(),
+            phase: m.phase,
             strength: m.strength,
             decay_strength: m.decay_strength,
             stability: m.stability,
@@ -465,7 +464,7 @@ impl From<&DiskRecord> for CachedRecord {
             namespace_id: NamespaceId::new(d.namespace_id),
             created_at: d.created_at,
             last_accessed_at: d.last_accessed_at,
-            phase: DecayPhase::from_u8(d.phase).unwrap_or(DecayPhase::Full),
+            phase: d.phase,
             strength: d.strength,
             decay_strength: d.decay_strength,
             stability: d.stability,

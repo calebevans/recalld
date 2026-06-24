@@ -55,6 +55,9 @@ pub enum RestoreError {
     #[error("zip error: {0}")]
     Zip(#[from] zip::result::ZipError),
 
+    #[error("backup entry attempts path traversal: {0}")]
+    PathTraversal(String),
+
     #[error("user cancelled restore")]
     Cancelled,
 }
@@ -306,6 +309,35 @@ fn extract_backup(
         })?;
 
         let target_path = data_dir.join(&entry.name);
+
+        // ── Zip Slip prevention ──────────────────────────────────────
+        // Reject entry names that could escape the data directory via
+        // path traversal (e.g. "../../etc/passwd" or absolute paths).
+        {
+            // Reject absolute paths.
+            if Path::new(&entry.name).is_absolute() {
+                return Err(RestoreError::PathTraversal(entry.name.clone()));
+            }
+
+            // Reject any component that is "..".
+            if Path::new(&entry.name)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(RestoreError::PathTraversal(entry.name.clone()));
+            }
+
+            // Canonicalize data_dir and verify the target resolves within it.
+            // We canonicalize data_dir (which exists), then ensure the target
+            // path — after joining — starts with the canonical data_dir prefix.
+            let canonical_data_dir = data_dir.canonicalize()?;
+            // Parent dirs of target_path already exist or will be created below,
+            // so we build the canonical form by joining on the canonical base.
+            let canonical_target = canonical_data_dir.join(&entry.name);
+            if !canonical_target.starts_with(&canonical_data_dir) {
+                return Err(RestoreError::PathTraversal(entry.name.clone()));
+            }
+        }
 
         // Ensure parent directory exists (critical for namespace subdirectories).
         if let Some(parent) = target_path.parent() {

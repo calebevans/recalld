@@ -49,6 +49,9 @@ pub trait VectorIndexRegistry: Send + Sync {
         query_vec: &[f32],
         k: usize,
     ) -> Result<Vec<ScoredResult>>;
+
+    /// Retrieve the raw embedding vector for a given memory ID, if present.
+    fn get_vector(&self, id: MemoryId) -> Option<Vec<f32>>;
 }
 
 /// Scored result from vector index search.
@@ -214,6 +217,23 @@ struct Candidate {
     activation_score: Option<f32>,
 }
 
+impl Candidate {
+    /// Create a new candidate with default scores.
+    fn new(record: CachedRecord) -> Self {
+        Self {
+            record,
+            relevance_score: None,
+            raw_vector_score: None,
+            raw_fts_score: None,
+            effective_r: 0.0,
+            entity_score: 0.0,
+            entity_recall_score: 0.0,
+            composite_score: 0.0,
+            activation_score: None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FTS boost constants (used in both search() and compute_composite_score())
 // ---------------------------------------------------------------------------
@@ -342,41 +362,25 @@ impl QueryEngine {
         };
         timings.embed_us = stage_start.elapsed().as_micros() as u64;
 
-        // -- Stage 3: Vector Search + FTS + Score Fusion --------------------
-        let stage_start = Instant::now();
-        // Over-fetch by 8x (floor 100) to leave room for multi-stage
-        // attrition (entity scoring, tag/phase/strength filters, RIF
-        // suppression). The floor ensures small limits still produce
-        // a meaningful candidate pool.
+        // -- Stage 3: Vector Search + FTS + Entity Recall -----------------
         let fetch_k = match query.query_mode {
             QueryMode::MetadataOnly => 0,
             _ => (query.limit * 8).max(100).min(SearchQuery::MAX_FETCH_K),
         };
-        let scored_candidates: Vec<ScoredResult> = if let Some(ref emb) = query_embedding {
-            self.vector_indexes.search(ns_config.id, emb, fetch_k)?
-        } else {
-            Vec::new()
-        };
-        timings.vector_search_us = stage_start.elapsed().as_micros() as u64;
 
-        // FTS5 keyword search. Prefer fts_query (keyword-optimized) over text.
-        let fts_stage_start = Instant::now();
-        let fts_text = query.fts_query.as_ref().or(query.text.as_ref());
-        let fts_results: Vec<FtsResult> = match fts_text {
-            Some(text) if query.query_mode != QueryMode::MetadataOnly => self
-                .fts_index
-                .search(ns_config.id, text, fetch_k)
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        timings.fts_search_us = fts_stage_start.elapsed().as_micros() as u64;
+        let (scored_candidates, vector_search_us) =
+            self.run_vector_search(&query_embedding, ns_config.id, fetch_k)?;
+        timings.vector_search_us = vector_search_us;
 
-        // -- Score fusion: raw vector + bounded FTS boost --
+        let (fts_results, fts_search_us) =
+            self.run_fts_search(&query, ns_config.id, fetch_k)?;
+        timings.fts_search_us = fts_search_us;
+
+        // -- Score fusion: build lookup maps --
         let fusion_stage_start = Instant::now();
         let vector_ids: Vec<MemoryId> = scored_candidates.iter().map(|s| s.memory_id).collect();
         let fts_ids: Vec<MemoryId> = fts_results.iter().map(|s| s.memory_id).collect();
 
-        // Build lookup maps for raw scores.
         let vector_score_map: std::collections::HashMap<MemoryId, f32> = scored_candidates
             .iter()
             .map(|s| (s.memory_id, s.score))
@@ -391,7 +395,7 @@ impl QueryEngine {
         // -- Stage 3d: Entity Index Recall --------------------------------
         let entity_recall_start = Instant::now();
         let entity_recall_cap = query.limit * 2;
-        let mut entity_only_ids: Vec<(MemoryId, f32)> = Vec::new(); // (id, entity_recall_score)
+        let mut entity_only_ids: Vec<(MemoryId, f32)> = Vec::new();
 
         // Union vector and FTS results into the candidate pool.
         let mut all_candidate_ids: Vec<MemoryId> = vector_ids.clone();
@@ -403,23 +407,18 @@ impl QueryEngine {
             }
         }
 
-        // Build set for deduplication of entity recall results.
-        let existing_candidate_set: std::collections::HashSet<MemoryId> =
-            all_candidate_ids.iter().copied().collect();
-
         if !query_entities.is_empty() && query.query_mode != QueryMode::MetadataOnly {
             let entity_results = self.entity_index.find_by_entities(
                 ns_config.id,
                 &query_entities,
                 MemoryId::nil(),
-                entity_recall_cap + all_candidate_ids.len(), // over-fetch to account for dedup
+                entity_recall_cap + all_candidate_ids.len(),
             )?;
 
             let query_entity_count = query_entities.len() as f32;
 
             for result in entity_results {
-                // Skip candidates already found by vector or FTS.
-                if existing_candidate_set.contains(&result.memory_id) {
+                if candidate_id_set.contains(&result.memory_id) {
                     continue;
                 }
                 if entity_only_ids.len() >= entity_recall_cap {
@@ -431,157 +430,57 @@ impl QueryEngine {
         }
         timings.entity_recall_us = entity_recall_start.elapsed().as_micros() as u64;
 
-        // Add entity-only candidate IDs to the pool.
         for &(eid, _) in &entity_only_ids {
             all_candidate_ids.push(eid);
         }
 
-        // -- Stage 4: Load Metadata --------------------------------------
+        // -- Stage 4: Load Metadata & Build Candidates --------------------
         let stage_start = Instant::now();
         let records = self.load_records(&all_candidate_ids).await?;
 
-        // Build a lookup for entity recall scores.
         let entity_recall_map: std::collections::HashMap<MemoryId, f32> =
             entity_only_ids.iter().cloned().collect();
 
         let mut candidates: Vec<Candidate> = Vec::with_capacity(records.len());
         for record in records {
             if let Some(&recall_score) = entity_recall_map.get(&record.id) {
-                // Entity-index-only candidate (not found by vector/FTS).
-                candidates.push(Candidate {
-                    record,
-                    relevance_score: None,
-                    raw_vector_score: None,
-                    raw_fts_score: None,
-                    effective_r: 0.0,
-                    entity_score: 0.0,
-                    entity_recall_score: recall_score,
-                    composite_score: 0.0,
-                    activation_score: None,
-                });
+                let mut c = Candidate::new(record);
+                c.entity_recall_score = recall_score;
+                candidates.push(c);
             } else {
                 let raw_vector = vector_score_map.get(&record.id).copied();
                 let raw_fts = fts_score_map.get(&record.id).copied();
+                let relevance = Self::fuse_scores(raw_vector, raw_fts);
 
-                // Raw vector score + bounded FTS boost.
-                // FTS-only candidates get a small fixed relevance.
-                let relevance = match (raw_vector, raw_fts) {
-                    (Some(vs), Some(fts)) => {
-                        // Scaled FTS boost: saturating exponential curve.
-                        // Weak matches (~1.0 FTS) -> ~0.01 boost
-                        // Medium matches (~3.0 FTS) -> ~0.04 boost
-                        // Strong matches (>=5.0 FTS) -> asymptotes to 0.05
-                        let fts_boost = FTS_BOOST_CAP * (1.0 - (-fts * FTS_BOOST_RATE).exp());
-                        Some(vs + fts_boost)
-                    }
-                    (Some(vs), None) => Some(vs),
-                    (None, Some(fts)) => {
-                        // FTS-only: saturating curve bounded below vector-hit range.
-                        // Preserves ordering: strong FTS matches rank above weak ones.
-                        Some(FTS_ONLY_CAP * (1.0 - (-fts * FTS_ONLY_RATE).exp()))
-                    }
-                    (None, None) => None,
-                };
-
-                candidates.push(Candidate {
-                    record,
-                    relevance_score: relevance,
-                    raw_vector_score: raw_vector,
-                    raw_fts_score: raw_fts,
-                    effective_r: 0.0,
-                    entity_score: 0.0,
-                    entity_recall_score: 0.0,
-                    composite_score: 0.0,
-                    activation_score: None,
-                });
+                let mut c = Candidate::new(record);
+                c.relevance_score = relevance;
+                c.raw_vector_score = raw_vector;
+                c.raw_fts_score = raw_fts;
+                candidates.push(c);
             }
         }
 
-        // For MetadataOnly mode, scan metadata store for matching records.
         if query.query_mode == QueryMode::MetadataOnly {
             let metadata_results = self
                 .scan_by_metadata(ns_config.id, &query.filter, query.limit * 4)
                 .await?;
             for record in metadata_results {
-                candidates.push(Candidate {
-                    record,
-                    relevance_score: None,
-                    raw_vector_score: None,
-                    raw_fts_score: None,
-                    effective_r: 0.0,
-                    entity_score: 0.0,
-                    entity_recall_score: 0.0,
-                    composite_score: 0.0,
-                    activation_score: None,
-                });
+                candidates.push(Candidate::new(record));
             }
         }
         timings.load_metadata_us = stage_start.elapsed().as_micros() as u64;
 
-        // -- Stage 4b: Spreading Activation Graph Expansion ---------------
+        // -- Stage 4b: Graph Expansion ------------------------------------
         {
             let stage_start = Instant::now();
-            if query.graph_depth > 0 && !candidates.is_empty() {
-                // Build seed set: only candidates with a relevance_score
-                // (from vector/FTS), not entity-recall-only or metadata-only.
-                let seeds: Vec<(MemoryId, f32)> = candidates
-                    .iter()
-                    .filter_map(|c| c.relevance_score.map(|s| (c.record.id, s)))
-                    .collect();
-
-                if !seeds.is_empty() {
-                    let activated =
-                        self.graph
-                            .spreading_activation(&seeds, ns_config.id, query.graph_depth);
-
-                    // Collect existing candidate IDs for dedup.
-                    let all_candidate_ids: std::collections::HashSet<MemoryId> =
-                        candidates.iter().map(|c| c.record.id).collect();
-
-                    // Filter out candidates we already have.
-                    let new_ids: Vec<(MemoryId, f32)> = activated
-                        .into_iter()
-                        .filter(|(mid, _)| !all_candidate_ids.contains(mid))
-                        .collect();
-
-                    if !new_ids.is_empty() {
-                        let load_ids: Vec<MemoryId> = new_ids.iter().map(|(mid, _)| *mid).collect();
-                        let activation_map: std::collections::HashMap<MemoryId, f32> =
-                            new_ids.into_iter().collect();
-                        let expand_records = self.load_records(&load_ids).await?;
-
-                        for record in expand_records {
-                            let activation = activation_map.get(&record.id).copied().unwrap_or(0.0);
-                            candidates.push(Candidate {
-                                record,
-                                relevance_score: None,
-                                raw_vector_score: None,
-                                raw_fts_score: None,
-                                effective_r: 0.0,
-                                entity_score: 0.0,
-                                entity_recall_score: 0.0,
-                                composite_score: 0.0,
-                                activation_score: Some(activation),
-                            });
-                        }
-                    }
-                }
-            }
+            self.expand_graph_candidates(&mut candidates, ns_config.id, query.graph_depth)
+                .await?;
             timings.graph_expansion_us = stage_start.elapsed().as_micros() as u64;
         }
 
-        // -- Entity overlap scoring -----------------------------------------
-        // Compute entity overlap with each candidate's cached entities.
-        if !query_entities.is_empty() {
-            for candidate in &mut candidates {
-                candidate.entity_score =
-                    crate::model::entity_overlap(&query_entities, &candidate.record.entities);
-            }
-        }
-
-        // -- Stage 5: Apply Filters --------------------------------------
+        // -- Stage 5: Apply Filters (entity overlap + metadata filters) ---
         let stage_start = Instant::now();
-        candidates.retain(|c| Self::passes_filters(c, &query));
+        self.apply_filters(&mut candidates, &query, &query_entities);
         timings.apply_filters_us = stage_start.elapsed().as_micros() as u64;
 
         // -- Stage 6: Calculate Effective R --------------------------------
@@ -593,49 +492,13 @@ impl QueryEngine {
 
         // -- Stage 7: Apply RIF -------------------------------------------
         let stage_start = Instant::now();
-        let retrieved_ids: Vec<MemoryId> = candidates.iter().map(|c| c.record.id).collect();
-
-        // Collect all neighbor IDs for RIF computation.
-        let mut all_neighbor_ids: Vec<MemoryId> = Vec::new();
-        for id in &retrieved_ids {
-            let neighbors = self.graph.neighbors(id);
-            all_neighbor_ids.extend(neighbors);
-        }
-
-        let suppressions = self
-            .rif_engine
-            .compute_suppressions(&retrieved_ids, &all_neighbor_ids);
-
-        for suppression in &suppressions {
-            if let Some(candidate) = candidates
-                .iter_mut()
-                .find(|c| c.record.id == suppression.target)
-            {
-                candidate.effective_r *= suppression.suppression_factor;
-            }
-        }
+        self.apply_rif(&mut candidates);
         timings.apply_rif_us = stage_start.elapsed().as_micros() as u64;
 
-        // -- Stage 8: Composite Score + Sort --------------------------------
+        // -- Stage 8: Composite Score + Boosts + Sort ----------------------
         let stage_start = Instant::now();
         let total_matches = candidates.len();
-        for candidate in &mut candidates {
-            candidate.composite_score = Self::compute_composite_score(candidate);
-        }
-
-        // Temporal boost: Gaussian falloff centered on the query's time range.
-        // Gives ~1.5x at center, ~1.3x at the edges, decaying to ~1.0 beyond.
-        if query.time_range_start.is_some() || query.time_range_end.is_some() {
-            let range_start = query.time_range_start.unwrap_or(i64::MIN) as f64;
-            let range_end = query.time_range_end.unwrap_or(i64::MAX) as f64;
-            let range_mid = (range_start + range_end) / 2.0;
-            let sigma = ((range_end - range_start) / 2.0).max(86_400_000.0);
-            for candidate in &mut candidates {
-                let distance = (candidate.record.created_at as f64 - range_mid).abs();
-                let boost = 1.0 + 0.5 * (-0.5 * (distance / sigma).powi(2)).exp();
-                candidate.composite_score *= boost as f32;
-            }
-        }
+        self.apply_boosts(&mut candidates, &query);
 
         // Stable sort preserves insertion order for equal scores.
         candidates.sort_by(|a, b| {
@@ -645,89 +508,9 @@ impl QueryEngine {
         });
         timings.rank_us = stage_start.elapsed().as_micros() as u64;
 
-        // -- Stage 8c: Supersedes Resolution ---------------------------------
-        // Drop candidates that have been superseded by a newer memory.
-        // If the replacement isn't already in the result set, load it and
-        // insert it so the user gets the most current version.
-        {
-            use std::collections::HashSet;
-
-            let candidate_id_set: HashSet<MemoryId> =
-                candidates.iter().map(|c| c.record.id).collect();
-
-            let mut to_remove: HashSet<usize> = HashSet::new();
-            let mut replacements_to_inject: Vec<(MemoryId, f32)> = Vec::new();
-
-            for (idx, candidate) in candidates.iter().enumerate() {
-                if let Some(replacement_id) = self.graph.superseded_by(&candidate.record.id) {
-                    to_remove.insert(idx);
-                    if !candidate_id_set.contains(&replacement_id) {
-                        if let Some(entry) = replacements_to_inject
-                            .iter_mut()
-                            .find(|(id, _)| *id == replacement_id)
-                        {
-                            entry.1 = entry.1.max(candidate.composite_score);
-                        } else {
-                            replacements_to_inject
-                                .push((replacement_id, candidate.composite_score));
-                        }
-                    }
-                }
-            }
-
-            if !replacements_to_inject.is_empty() {
-                let load_ids: Vec<MemoryId> =
-                    replacements_to_inject.iter().map(|(id, _)| *id).collect();
-
-                if let Ok(records) = self.load_records(&load_ids).await {
-                    let score_map: std::collections::HashMap<MemoryId, f32> =
-                        replacements_to_inject.iter().cloned().collect();
-
-                    for record in records {
-                        if record.phase == DecayPhase::Ghost && !query.include_ghosts {
-                            continue;
-                        }
-
-                        let inherited_score = score_map.get(&record.id).copied().unwrap_or(0.0);
-
-                        let effective_r = Self::compute_effective_r(&record);
-
-                        let entity_score = if !query_entities.is_empty() {
-                            crate::model::entity_overlap(&query_entities, &record.entities)
-                        } else {
-                            0.0
-                        };
-
-                        let mut replacement = Candidate {
-                            record,
-                            relevance_score: None,
-                            raw_vector_score: None,
-                            raw_fts_score: None,
-                            effective_r,
-                            entity_score,
-                            entity_recall_score: 0.0,
-                            composite_score: 0.0,
-                            activation_score: None,
-                        };
-                        replacement.composite_score = Self::compute_composite_score(&replacement);
-
-                        replacement.composite_score =
-                            replacement.composite_score.max(inherited_score);
-
-                        candidates.push(replacement);
-                    }
-                }
-            }
-
-            if !to_remove.is_empty() {
-                let mut keep_idx = 0;
-                candidates.retain(|_| {
-                    let keep = !to_remove.contains(&keep_idx);
-                    keep_idx += 1;
-                    keep
-                });
-            }
-        }
+        // -- Stage 8c: Supersedes Resolution ------------------------------
+        self.resolve_supersedes(&mut candidates, &query, &query_entities)
+            .await;
 
         candidates.sort_by(|a, b| {
             b.composite_score
@@ -746,7 +529,6 @@ impl QueryEngine {
         timings.total_us = pipeline_start.elapsed().as_micros() as u64;
         let query_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Record access events asynchronously.
         self.record_accesses_async(&candidates);
 
         let response = SearchResponse {
@@ -765,6 +547,255 @@ impl QueryEngine {
         );
 
         Ok(response)
+    }
+
+    /// Stage 3a: Run vector similarity search.
+    ///
+    /// Returns scored results and elapsed time in microseconds.
+    fn run_vector_search(
+        &self,
+        query_embedding: &Option<Vec<f32>>,
+        namespace_id: NamespaceId,
+        fetch_k: usize,
+    ) -> Result<(Vec<ScoredResult>, u64)> {
+        let stage_start = Instant::now();
+        let scored = if let Some(emb) = query_embedding {
+            self.vector_indexes.search(namespace_id, emb, fetch_k)?
+        } else {
+            Vec::new()
+        };
+        Ok((scored, stage_start.elapsed().as_micros() as u64))
+    }
+
+    /// Stage 3b: Run FTS5 full-text keyword search.
+    ///
+    /// Returns FTS results and elapsed time in microseconds.
+    fn run_fts_search(
+        &self,
+        query: &SearchQuery,
+        namespace_id: NamespaceId,
+        fetch_k: usize,
+    ) -> Result<(Vec<FtsResult>, u64)> {
+        let stage_start = Instant::now();
+        let fts_text = query.fts_query.as_ref().or(query.text.as_ref());
+        let results = match fts_text {
+            Some(text) if query.query_mode != QueryMode::MetadataOnly => self
+                .fts_index
+                .search(namespace_id, text, fetch_k)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        Ok((results, stage_start.elapsed().as_micros() as u64))
+    }
+
+    /// Fuse raw vector and FTS scores into a single relevance score.
+    fn fuse_scores(raw_vector: Option<f32>, raw_fts: Option<f32>) -> Option<f32> {
+        match (raw_vector, raw_fts) {
+            (Some(vs), Some(fts)) => {
+                let fts_boost = FTS_BOOST_CAP * (1.0 - (-fts * FTS_BOOST_RATE).exp());
+                Some(vs + fts_boost)
+            }
+            (Some(vs), None) => Some(vs),
+            (None, Some(fts)) => {
+                Some(FTS_ONLY_CAP * (1.0 - (-fts * FTS_ONLY_RATE).exp()))
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// Stage 4b: Expand candidates via spreading activation graph traversal.
+    async fn expand_graph_candidates(
+        &self,
+        candidates: &mut Vec<Candidate>,
+        namespace_id: NamespaceId,
+        graph_depth: u8,
+    ) -> Result<()> {
+        if graph_depth == 0 || candidates.is_empty() {
+            return Ok(());
+        }
+
+        let seeds: Vec<(MemoryId, f32)> = candidates
+            .iter()
+            .filter_map(|c| c.relevance_score.map(|s| (c.record.id, s)))
+            .collect();
+
+        if seeds.is_empty() {
+            return Ok(());
+        }
+
+        let activated = self.graph.spreading_activation(&seeds, namespace_id, graph_depth);
+
+        let existing_ids: std::collections::HashSet<MemoryId> =
+            candidates.iter().map(|c| c.record.id).collect();
+
+        let new_ids: Vec<(MemoryId, f32)> = activated
+            .into_iter()
+            .filter(|(mid, _)| !existing_ids.contains(mid))
+            .collect();
+
+        if !new_ids.is_empty() {
+            let load_ids: Vec<MemoryId> = new_ids.iter().map(|(mid, _)| *mid).collect();
+            let activation_map: std::collections::HashMap<MemoryId, f32> =
+                new_ids.into_iter().collect();
+            let expand_records = self.load_records(&load_ids).await?;
+
+            for record in expand_records {
+                let activation = activation_map.get(&record.id).copied().unwrap_or(0.0);
+                let mut c = Candidate::new(record);
+                c.activation_score = Some(activation);
+                candidates.push(c);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Stage 5: Apply entity overlap scoring and metadata filters.
+    fn apply_filters(
+        &self,
+        candidates: &mut Vec<Candidate>,
+        query: &SearchQuery,
+        query_entities: &[String],
+    ) {
+        // Entity overlap scoring.
+        if !query_entities.is_empty() {
+            for candidate in candidates.iter_mut() {
+                candidate.entity_score =
+                    crate::model::entity_overlap(query_entities, &candidate.record.entities);
+            }
+        }
+
+        // Metadata filters (ghost, min_score, tags, phase, strength).
+        candidates.retain(|c| Self::passes_filters(c, query));
+    }
+
+    /// Stage 7: Apply retrieval-induced forgetting suppressions.
+    fn apply_rif(&self, candidates: &mut Vec<Candidate>) {
+        let retrieved_ids: Vec<MemoryId> = candidates.iter().map(|c| c.record.id).collect();
+
+        let mut all_neighbor_ids: Vec<MemoryId> = Vec::new();
+        for id in &retrieved_ids {
+            let neighbors = self.graph.neighbors(id);
+            all_neighbor_ids.extend(neighbors);
+        }
+
+        let suppressions = self
+            .rif_engine
+            .compute_suppressions(&retrieved_ids, &all_neighbor_ids);
+
+        // Build index for O(1) candidate lookup during suppression.
+        let candidate_index: std::collections::HashMap<MemoryId, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.record.id, i))
+            .collect();
+
+        for suppression in &suppressions {
+            if let Some(&idx) = candidate_index.get(&suppression.target) {
+                candidates[idx].effective_r *= suppression.suppression_factor;
+            }
+        }
+    }
+
+    /// Stage 8: Compute composite scores and apply temporal boost.
+    fn apply_boosts(&self, candidates: &mut Vec<Candidate>, query: &SearchQuery) {
+        for candidate in candidates.iter_mut() {
+            candidate.composite_score = Self::compute_composite_score(candidate);
+        }
+
+        // Temporal boost: Gaussian falloff centered on the query's time range.
+        // Requires both bounds; one-sided ranges produce a degenerate uniform boost.
+        if let (Some(start), Some(end)) = (query.time_range_start, query.time_range_end) {
+            let range_start = start as f64;
+            let range_end = end as f64;
+            let range_mid = (range_start + range_end) / 2.0;
+            let sigma = ((range_end - range_start) / 2.0).max(86_400_000.0);
+            for candidate in candidates.iter_mut() {
+                let distance = (candidate.record.created_at as f64 - range_mid).abs();
+                let boost = 1.0 + 0.5 * (-0.5 * (distance / sigma).powi(2)).exp();
+                candidate.composite_score *= boost as f32;
+            }
+        }
+    }
+
+    /// Stage 8c: Resolve superseded memories by replacing them with current versions.
+    async fn resolve_supersedes(
+        &self,
+        candidates: &mut Vec<Candidate>,
+        query: &SearchQuery,
+        query_entities: &[String],
+    ) {
+        use std::collections::HashSet;
+
+        let candidate_id_set: HashSet<MemoryId> =
+            candidates.iter().map(|c| c.record.id).collect();
+
+        let mut to_remove: HashSet<usize> = HashSet::new();
+        let mut replacements_to_inject: Vec<(MemoryId, f32)> = Vec::new();
+
+        for (idx, candidate) in candidates.iter().enumerate() {
+            if let Some(replacement_id) = self.graph.superseded_by(&candidate.record.id) {
+                to_remove.insert(idx);
+                if !candidate_id_set.contains(&replacement_id) {
+                    if let Some(entry) = replacements_to_inject
+                        .iter_mut()
+                        .find(|(id, _)| *id == replacement_id)
+                    {
+                        entry.1 = entry.1.max(candidate.composite_score);
+                    } else {
+                        replacements_to_inject
+                            .push((replacement_id, candidate.composite_score));
+                    }
+                }
+            }
+        }
+
+        if !replacements_to_inject.is_empty() {
+            let load_ids: Vec<MemoryId> =
+                replacements_to_inject.iter().map(|(id, _)| *id).collect();
+
+            if let Ok(records) = self.load_records(&load_ids).await {
+                let score_map: std::collections::HashMap<MemoryId, f32> =
+                    replacements_to_inject.iter().cloned().collect();
+
+                for record in records {
+                    // Skip tombstoned and ghost memories.
+                    if record.phase == DecayPhase::Tombstone {
+                        continue;
+                    }
+                    if record.phase == DecayPhase::Ghost && !query.include_ghosts {
+                        continue;
+                    }
+
+                    let inherited_score = score_map.get(&record.id).copied().unwrap_or(0.0);
+                    let effective_r = Self::compute_effective_r(&record);
+
+                    let entity_score = if !query_entities.is_empty() {
+                        crate::model::entity_overlap(query_entities, &record.entities)
+                    } else {
+                        0.0
+                    };
+
+                    let mut replacement = Candidate::new(record);
+                    replacement.effective_r = effective_r;
+                    replacement.entity_score = entity_score;
+                    replacement.composite_score = Self::compute_composite_score(&replacement);
+                    replacement.composite_score =
+                        replacement.composite_score.max(inherited_score);
+
+                    candidates.push(replacement);
+                }
+            }
+        }
+
+        if !to_remove.is_empty() {
+            let mut keep_idx = 0;
+            candidates.retain(|_| {
+                let keep = !to_remove.contains(&keep_idx);
+                keep_idx += 1;
+                keep
+            });
+        }
     }
 
     /// Retrieve a single memory by ID.
@@ -795,7 +826,7 @@ impl QueryEngine {
             namespace: String::new(), // Resolved by API layer from namespace_id
             created_at: record.created_at,
             last_accessed_at: record.last_accessed_at,
-            summary: if record.phase != DecayPhase::Ghost {
+            summary: if record.phase != DecayPhase::Ghost && record.phase != DecayPhase::Tombstone {
                 Some(record.summary.clone())
             } else {
                 None
@@ -826,10 +857,15 @@ impl QueryEngine {
                 .ok_or(SearchError::MemoryNotFound(id))?,
         };
 
+        // Load the source memory's embedding from the vector index.
+        let source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
+            SearchError::Internal(format!("no embedding found for memory {id:?}"))
+        })?;
+
         // Over-fetch by 1 to account for self-match removal.
         let scored = self
             .vector_indexes
-            .search(record.namespace_id, &[], k + 1)?;
+            .search(record.namespace_id, &source_embedding, k + 1)?;
 
         // Remove the source memory from results.
         let filtered: Vec<ScoredResult> = scored
@@ -851,13 +887,14 @@ impl QueryEngine {
                 Some(SearchResult {
                     memory_id: rec.id,
                     created_at: rec.created_at,
+                    last_accessed_at: rec.last_accessed_at,
                     score,
                     fts_score: None,
                     composite_score: score,
                     retrievability: rec.strength,
                     effective_r: rec.decay_strength,
                     phase: rec.phase,
-                    summary: if rec.phase != DecayPhase::Ghost {
+                    summary: if rec.phase != DecayPhase::Ghost && rec.phase != DecayPhase::Tombstone {
                         Some(rec.summary.clone())
                     } else {
                         None
@@ -936,55 +973,22 @@ impl QueryEngine {
         let filtered: Vec<CachedRecord> = all_records
             .into_iter()
             .filter(|r| r.namespace_id == namespace_id)
-            .filter(|r| {
-                if !filter.phases.is_empty() && !filter.phases.contains(&r.phase) {
-                    return false;
-                }
-                if let Some(min_strength) = filter.min_strength {
-                    if r.strength < min_strength {
-                        return false;
-                    }
-                }
-                if filter.permastore_only && !r.is_permastore {
-                    return false;
-                }
-                if !filter.require_tags.is_empty() {
-                    for required in &filter.require_tags {
-                        if !r.tags.contains(required) {
-                            return false;
-                        }
-                    }
-                }
-                for excluded in &filter.exclude_tags {
-                    if r.tags.contains(excluded) {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|r| Self::record_passes_filter(r, filter))
             .take(max_results)
             .collect();
 
         Ok(filtered)
     }
 
-    /// Check if a candidate passes all query filters.
-    fn passes_filters(candidate: &Candidate, query: &SearchQuery) -> bool {
-        let record = &candidate.record;
-
-        // Ghost filter
-        if record.phase == DecayPhase::Ghost && !query.include_ghosts {
+    /// Check if a record passes the metadata filter criteria.
+    ///
+    /// Shared filtering logic used by both `passes_filters()` (post-retrieval)
+    /// and `scan_by_metadata()` (MetadataOnly path).
+    fn record_passes_filter(record: &CachedRecord, filter: &SearchFilter) -> bool {
+        // Tombstone filter: always exclude tombstoned memories.
+        if record.phase == DecayPhase::Tombstone {
             return false;
         }
-
-        // Minimum score filter (applied to fused relevance score).
-        if let Some(score) = candidate.relevance_score {
-            if score < query.min_score {
-                return false;
-            }
-        }
-
-        let filter = &query.filter;
 
         // Phase filter
         if !filter.phases.is_empty() && !filter.phases.contains(&record.phase) {
@@ -1020,6 +1024,32 @@ impl QueryEngine {
         }
 
         true
+    }
+
+    /// Check if a candidate passes all query filters.
+    fn passes_filters(candidate: &Candidate, query: &SearchQuery) -> bool {
+        let record = &candidate.record;
+
+        // Tombstone filter: always exclude tombstoned memories from
+        // search results. Their content has been stripped; they only
+        // exist as graph relay nodes for spreading activation.
+        if record.phase == DecayPhase::Tombstone {
+            return false;
+        }
+
+        // Ghost filter
+        if record.phase == DecayPhase::Ghost && !query.include_ghosts {
+            return false;
+        }
+
+        // Minimum score filter (applied to fused relevance score).
+        if let Some(score) = candidate.relevance_score {
+            if score < query.min_score {
+                return false;
+            }
+        }
+
+        Self::record_passes_filter(record, &query.filter)
     }
 
     /// Compute effective retrievability for a memory.
@@ -1078,6 +1108,7 @@ impl QueryEngine {
                 SearchResult {
                     memory_id: record.id,
                     created_at: record.created_at,
+                    last_accessed_at: record.last_accessed_at,
                     score: c.raw_vector_score,
                     fts_score: c.raw_fts_score,
                     composite_score: Some(c.composite_score),

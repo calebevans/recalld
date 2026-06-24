@@ -115,6 +115,41 @@ impl MetadataStore {
 // ── Core Methods ────────────────────────────────────────────────────
 
 impl MetadataStore {
+    /// Generic read-modify-write helper for a single memory record.
+    ///
+    /// Opens a write transaction, loads the record for `id`, passes it
+    /// to the closure `f` for mutation, re-serializes, writes back,
+    /// and commits. Returns the mutated record so callers can perform
+    /// post-commit side effects (e.g., updating the phase bitmap).
+    ///
+    /// # Errors
+    /// - `StorageError::NotFound` if no record exists for this ID.
+    fn update_record<F>(&self, id: &MemoryId, f: F) -> Result<DiskRecord, StorageError>
+    where
+        F: FnOnce(&mut DiskRecord),
+    {
+        let key = id.as_bytes().as_slice();
+
+        let write_txn = self.db.begin_write()?;
+        let record = {
+            let mut table = write_txn.open_table(META_TABLE)?;
+            let mut record = {
+                let existing = table
+                    .get(key)?
+                    .ok_or(StorageError::NotFound(id.into_inner()))?;
+                DiskRecord::from_bytes(existing.value())?
+            };
+
+            f(&mut record);
+
+            table.insert(key, record.to_bytes().as_slice())?;
+            record
+        };
+        write_txn.commit()?;
+
+        Ok(record)
+    }
+
     /// Persist a new memory record. Updates all secondary indexes
     /// (phase bitmap, tag index, namespace index) in the same
     /// write transaction.
@@ -184,37 +219,22 @@ impl MetadataStore {
         stability: f32,
         is_permastore: bool,
     ) -> Result<(), StorageError> {
-        let key = id.as_bytes().as_slice();
+        let mut old_phase = None;
 
-        let write_txn = self.db.begin_write()?;
-        let old_phase;
-        let vector_slot;
-        {
-            let mut table = write_txn.open_table(META_TABLE)?;
-            let mut record = {
-                let existing = table
-                    .get(key)?
-                    .ok_or(StorageError::NotFound(id.into_inner()))?;
-                DiskRecord::from_bytes(existing.value())?
-            };
-
-            old_phase = DecayPhase::from_u8(record.phase)
-                .ok_or(StorageError::InvalidPhase(record.phase))?;
-            vector_slot = record.vector_slot;
-
-            record.phase = phase as u8;
+        let record = self.update_record(&id, |record| {
+            old_phase = Some(record.phase);
+            record.phase = phase;
             record.strength = strength;
             record.stability = stability;
             record.is_permastore = if is_permastore { 1 } else { 0 };
+        })?;
 
-            table.insert(key, record.to_bytes().as_slice())?;
-        }
-        write_txn.commit()?;
+        let old_phase = old_phase.expect("update_record closure always runs");
 
         // Update phase bitmap if phase changed.
         if old_phase != phase {
             let mut pi = self.phase_index.write().unwrap();
-            pi.transition(vector_slot, old_phase, phase);
+            pi.transition(record.vector_slot, old_phase, phase);
         }
 
         Ok(())
@@ -230,18 +250,7 @@ impl MetadataStore {
         timestamp: i64,
         kind: AccessKind,
     ) -> Result<(), StorageError> {
-        let key = id.as_bytes().as_slice();
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(META_TABLE)?;
-            let mut record = {
-                let existing = table
-                    .get(key)?
-                    .ok_or(StorageError::NotFound(id.into_inner()))?;
-                DiskRecord::from_bytes(existing.value())?
-            };
-
+        self.update_record(&id, |record| {
             record.last_accessed_at = timestamp;
 
             let event = AccessEvent { timestamp, kind };
@@ -249,10 +258,7 @@ impl MetadataStore {
                 record.access_history.remove(0);
             }
             record.access_history.push(event);
-
-            table.insert(key, record.to_bytes().as_slice())?;
-        }
-        write_txn.commit()?;
+        })?;
 
         Ok(())
     }
@@ -296,13 +302,76 @@ impl MetadataStore {
 
         // 4. Remove from in-memory phase bitmap.
         {
-            let phase = DecayPhase::from_u8(deleted_record.phase)
-                .ok_or(StorageError::InvalidPhase(deleted_record.phase))?;
             let mut pi = self.phase_index.write().unwrap();
-            pi.remove(deleted_record.vector_slot, phase);
+            pi.remove(deleted_record.vector_slot, deleted_record.phase);
         }
 
         Ok(Some(deleted_record))
+    }
+
+    /// Tombstone a memory: strip content fields (summary, tags,
+    /// full_text pointer) and set phase to Tombstone.
+    ///
+    /// Unlike `delete`, this preserves the record in meta.db so that
+    /// the graph node and edges remain intact. The caller is
+    /// responsible for cleaning up vector, FTS, and entity indexes.
+    ///
+    /// The tag index entries are removed and the phase bitmap is
+    /// updated (removed from old phase, NOT added to tombstone since
+    /// tombstoned records don't have valid vector slots for bitmap
+    /// tracking).
+    pub fn tombstone(&self, id: MemoryId) -> Result<(), StorageError> {
+        let key = id.as_bytes().as_slice();
+
+        let write_txn = self.db.begin_write()?;
+        let old_phase;
+        let old_tags;
+        let old_vector_slot;
+        {
+            let mut meta = write_txn.open_table(META_TABLE)?;
+            let mut record = {
+                let existing = meta
+                    .get(key)?
+                    .ok_or(StorageError::NotFound(id.into_inner()))?;
+                DiskRecord::from_bytes(existing.value())?
+            };
+
+            old_phase = record.phase;
+            old_tags = record.tags.clone();
+            old_vector_slot = record.vector_slot;
+
+            // Strip content fields.
+            record.summary = String::new();
+            record.tags = Vec::new();
+            record.text_offset = 0;
+            record.text_length = 0;
+            record.phase = DecayPhase::Tombstone;
+            record.strength = 0.0;
+            record.decay_strength = 0.0;
+
+            meta.insert(key, record.to_bytes().as_slice())?;
+
+            // Remove from tag index.
+            let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
+            for tag in &old_tags {
+                tags.remove(tag.as_str(), key)?;
+            }
+
+            // Remove from namespace index (matches delete() behavior).
+            let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+            ns_idx.remove(record.namespace_id, key)?;
+        }
+        write_txn.commit()?;
+
+        // Update phase bitmap: remove from old phase.
+        // Tombstoned records are not tracked in the bitmap since their
+        // vector slots are freed.
+        {
+            let mut pi = self.phase_index.write().unwrap();
+            pi.remove(old_vector_slot, old_phase);
+        }
+
+        Ok(())
     }
 
     /// Return all memory IDs currently in the given decay phase.
@@ -384,23 +453,9 @@ impl MetadataStore {
     /// Performs a read-modify-write in a single redb write transaction.
     /// Does not update any secondary indexes (edge_count is not indexed).
     pub fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
-        let key = id.as_bytes().as_slice();
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(META_TABLE)?;
-            let mut record = {
-                let existing = table
-                    .get(key)?
-                    .ok_or(StorageError::NotFound(id.into_inner()))?;
-                DiskRecord::from_bytes(existing.value())?
-            };
-
+        self.update_record(&id, |record| {
             record.edge_count = edge_count;
-
-            table.insert(key, record.to_bytes().as_slice())?;
-        }
-        write_txn.commit()?;
+        })?;
 
         Ok(())
     }
@@ -496,8 +551,7 @@ impl MetadataStore {
             for result in table.iter()? {
                 let (key_bytes, value) = result?;
                 let record = DiskRecord::from_bytes(value.value())?;
-                let old_phase = DecayPhase::from_u8(record.phase)
-                    .ok_or(StorageError::InvalidPhase(record.phase))?;
+                let old_phase = record.phase;
 
                 if let Some(new_record) = compute_new_state(&record) {
                     let uuid = uuid::Uuid::from_slice(key_bytes.value()).map_err(|_| {
@@ -528,10 +582,8 @@ impl MetadataStore {
         {
             let mut pi = self.phase_index.write().unwrap();
             for (_, record, old_phase) in &updates {
-                let new_phase = DecayPhase::from_u8(record.phase)
-                    .ok_or(StorageError::InvalidPhase(record.phase))?;
-                if *old_phase != new_phase {
-                    pi.transition(record.vector_slot, *old_phase, new_phase);
+                if *old_phase != record.phase {
+                    pi.transition(record.vector_slot, *old_phase, record.phase);
                 }
             }
 
@@ -590,9 +642,7 @@ impl MetadataStore {
         for result in table.iter()? {
             let (_, value) = result?;
             let record = DiskRecord::from_bytes(value.value())?;
-            let phase = DecayPhase::from_u8(record.phase)
-                .ok_or(StorageError::InvalidPhase(record.phase))?;
-            slot_phases.push((record.vector_slot, phase));
+            slot_phases.push((record.vector_slot, record.phase));
         }
         drop(table);
         drop(read_txn);
@@ -800,11 +850,28 @@ impl MetadataStore {
         Ok(records)
     }
 
-    /// Count the total number of memory records.
+    /// Count the total number of memory records (including tombstones).
+    ///
+    /// For a count that excludes tombstoned records, use `count_active()`.
     pub fn count(&self) -> Result<u64, StorageError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         Ok(table.len()?)
+    }
+
+    /// Count only active (non-tombstoned) memory records.
+    pub fn count_active(&self) -> Result<u64, StorageError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(META_TABLE)?;
+        let mut count = 0u64;
+        for result in table.iter()? {
+            let (_, value) = result?;
+            let record = DiskRecord::from_bytes(value.value())?;
+            if record.phase != DecayPhase::Tombstone {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Check if a memory ID exists without deserializing the record.

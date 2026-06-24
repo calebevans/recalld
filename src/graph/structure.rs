@@ -763,7 +763,7 @@ impl RelationshipGraph {
     }
 
     /// Check if an edge of a specific type exists between two node keys (either direction).
-    fn has_typed_edge_between(&self, a: NodeKey, b: NodeKey, edge_type: EdgeType) -> bool {
+    pub(crate) fn has_typed_edge_between(&self, a: NodeKey, b: NodeKey, edge_type: EdgeType) -> bool {
         if let Some(node_a) = self.nodes.get(a) {
             // Check a's outgoing for edges targeting b with matching type
             for &ek in &node_a.outgoing {
@@ -783,6 +783,26 @@ impl RelationshipGraph {
             }
         }
         false
+    }
+
+    /// Check if an edge of a specific type exists between two memories (either direction).
+    ///
+    /// Convenience wrapper around `has_typed_edge_between` that resolves
+    /// `MemoryId`s to `NodeKey`s first. Returns `false` if either memory
+    /// is not present in the graph.
+    pub(crate) fn has_typed_edge_between_ids(
+        &self,
+        a: &MemoryId,
+        b: &MemoryId,
+        edge_type: EdgeType,
+    ) -> bool {
+        let Some(&a_key) = self.id_index.get(a) else {
+            return false;
+        };
+        let Some(&b_key) = self.id_index.get(b) else {
+            return false;
+        };
+        self.has_typed_edge_between(a_key, b_key, edge_type)
     }
 
     /// Provide read-only access to the node slotmap for iteration.

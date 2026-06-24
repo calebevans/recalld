@@ -29,6 +29,11 @@ pub struct PhaseIndex {
     summary: RoaringBitmap,
     /// Phase 3: embedding only.
     ghost: RoaringBitmap,
+    /// Phase 4: tombstone — content stripped, graph preserved.
+    /// Tombstoned memories are removed from the vector index, so this
+    /// bitmap is typically empty in practice (vector slots are freed).
+    /// It exists for completeness of the phase tracking.
+    tombstone: RoaringBitmap,
 }
 
 impl PhaseIndex {
@@ -38,6 +43,7 @@ impl PhaseIndex {
             full: RoaringBitmap::new(),
             summary: RoaringBitmap::new(),
             ghost: RoaringBitmap::new(),
+            tombstone: RoaringBitmap::new(),
         }
     }
 
@@ -63,6 +69,7 @@ impl PhaseIndex {
             DecayPhase::Full => &self.full,
             DecayPhase::Summary => &self.summary,
             DecayPhase::Ghost => &self.ghost,
+            DecayPhase::Tombstone => &self.tombstone,
         }
     }
 
@@ -76,17 +83,21 @@ impl PhaseIndex {
             DecayPhase::Full => &mut self.full,
             DecayPhase::Summary => &mut self.summary,
             DecayPhase::Ghost => &mut self.ghost,
+            DecayPhase::Tombstone => &mut self.tombstone,
         }
     }
 
-    /// Serialize all three bitmaps into a single byte buffer.
+    /// Serialize all bitmaps into a single byte buffer.
     ///
     /// Format: `[u32 size_1][bitmap_1 bytes][u32 size_2][bitmap_2 bytes]
-    ///          [u32 size_3][bitmap_3 bytes]`
-    /// Order: full, summary, ghost.
+    ///          [u32 size_3][bitmap_3 bytes][u32 size_4][bitmap_4 bytes]`
+    /// Order: full, summary, ghost, tombstone.
+    ///
+    /// Backward-compatible: `from_bytes` tolerates the absence of the
+    /// tombstone bitmap (pre-tombstone data files).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        for bitmap in [&self.full, &self.summary, &self.ghost] {
+        for bitmap in [&self.full, &self.summary, &self.ghost, &self.tombstone] {
             let size = bitmap.serialized_size();
             buf.extend_from_slice(&(size as u32).to_le_bytes());
             bitmap
@@ -97,11 +108,31 @@ impl PhaseIndex {
     }
 
     /// Deserialize from bytes produced by `to_bytes()`.
+    ///
+    /// Backward-compatible: if only 3 bitmaps are present (pre-tombstone
+    /// format), the tombstone bitmap is initialized as empty.
     pub fn from_bytes(data: &[u8]) -> Result<Self, StorageError> {
         let mut offset = 0;
-        let mut bitmaps = Vec::with_capacity(3);
-        for label in ["full", "summary", "ghost"] {
+        let labels = ["full", "summary", "ghost", "tombstone"];
+        let mut bitmaps = Vec::with_capacity(4);
+        for (i, label) in labels.iter().enumerate() {
+            // The tombstone bitmap is optional for backward compatibility.
+            if offset >= data.len() {
+                if i >= 3 {
+                    // Tombstone bitmap missing — use empty.
+                    bitmaps.push(RoaringBitmap::new());
+                    break;
+                }
+                return Err(StorageError::CorruptIndex(format!(
+                    "phase bitmap '{}' truncated at length prefix",
+                    label
+                )));
+            }
             if offset + 4 > data.len() {
+                if i >= 3 {
+                    bitmaps.push(RoaringBitmap::new());
+                    break;
+                }
                 return Err(StorageError::CorruptIndex(format!(
                     "phase bitmap '{}' truncated at length prefix",
                     label
@@ -125,10 +156,15 @@ impl PhaseIndex {
             offset += size;
             bitmaps.push(bitmap);
         }
+        // Ensure we have exactly 4 bitmaps.
+        while bitmaps.len() < 4 {
+            bitmaps.push(RoaringBitmap::new());
+        }
         Ok(Self {
             full: bitmaps.remove(0),
             summary: bitmaps.remove(0),
             ghost: bitmaps.remove(0),
+            tombstone: bitmaps.remove(0),
         })
     }
 
@@ -137,6 +173,11 @@ impl PhaseIndex {
     pub fn rebuild_from_records(records: &[(u32, DecayPhase)]) -> Self {
         let mut index = Self::new();
         for &(slot, phase) in records {
+            // Tombstoned records have had their vector slot freed, so
+            // they should not be tracked in the bitmap. Skip them.
+            if phase == DecayPhase::Tombstone {
+                continue;
+            }
             index.bitmap_mut(phase).insert(slot);
         }
         index

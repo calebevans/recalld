@@ -173,15 +173,22 @@ enum BenchTarget {
     },
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-
-    match cli.command.as_ref().unwrap_or(&Command::Serve {
+/// Default `Command::Serve` used when the user invokes `recalld` with no
+/// subcommand.  Centralised so the default values live in exactly one place.
+fn default_serve_command() -> Command {
+    Command::Serve {
         bind: "127.0.0.1:7680".parse().unwrap(),
         log_level: None,
         log_json: false,
         port: None,
-    }) {
+    }
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    let default_cmd = default_serve_command();
+    match cli.command.as_ref().unwrap_or(&default_cmd) {
         Command::Serve {
             log_level,
             log_json,
@@ -248,12 +255,7 @@ async fn async_main(cli: Cli) -> ExitCode {
         }
     };
 
-    match cli.command.unwrap_or(Command::Serve {
-        bind: "127.0.0.1:7680".parse().unwrap(),
-        log_level: None,
-        log_json: false,
-        port: None,
-    }) {
+    match cli.command.unwrap_or_else(default_serve_command) {
         Command::Serve { bind, port, .. } => run_serve(loaded.config, bind, port).await,
         Command::Mcp { .. } => run_mcp(loaded).await,
         Command::Daemon { action } => run_daemon(loaded.config, action).await,
@@ -381,7 +383,6 @@ async fn run_serve(
         ));
         let cache: Arc<dyn recalld::api::RecordCache> = Arc::new(RecordCacheAdapter::new(
             system.cache().clone(),
-            system.storage().clone(),
         ));
         let graph: Arc<dyn recalld::api::RelationshipGraph> =
             Arc::new(RelationshipGraphAdapter::new(system.graph().clone()));
@@ -462,6 +463,51 @@ async fn run_mcp(loaded: LoadedConfig) -> ExitCode {
     }
 }
 
+/// Build an `McpBridge` backed by a local `Recalld` instance (direct mode,
+/// no daemon).
+fn create_direct_mcp_bridge(
+    system: &Recalld,
+    default_namespace: String,
+) -> recalld::mcp::bridge::McpBridge {
+    use recalld::mcp::bridge_adapters::*;
+
+    let tz = recalld::time::resolve_timezone(&system.config().timezone);
+
+    let search: Arc<dyn recalld::mcp::bridge::SearchPipeline> =
+        Arc::new(McpSearchAdapter::new(
+            system.query_engine().clone(),
+            system.embedding().clone(),
+            system.storage().clone(),
+            system.graph().clone(),
+            tz,
+        ));
+    let storage: Arc<dyn recalld::mcp::bridge::StorageEngine> =
+        Arc::new(McpStorageAdapter::new(
+            system.storage().clone(),
+            system.cache().clone(),
+            system.embedding().clone(),
+            system.vector_index().clone(),
+            system.fts_index().clone(),
+            system.entity_index().clone(),
+            system.graph().clone(),
+            std::sync::Arc::new(system.config().clone()),
+            tz,
+        ));
+    let namespaces: Arc<dyn recalld::mcp::bridge::NamespaceRegistry> =
+        Arc::new(McpNamespaceAdapter::new(system.storage().clone(), tz));
+    let health: Arc<dyn recalld::mcp::bridge::HealthChecker> =
+        Arc::new(McpHealthAdapter::new(system.storage().clone()));
+
+    recalld::mcp::bridge::McpBridge {
+        search,
+        storage,
+        namespaces,
+        health,
+        default_namespace,
+        timezone: tz,
+    }
+}
+
 async fn run_mcp_direct(loaded: LoadedConfig) -> ExitCode {
     let default_namespace = loaded.default_namespace;
     let system = match Recalld::new(loaded.config).await {
@@ -472,45 +518,7 @@ async fn run_mcp_direct(loaded: LoadedConfig) -> ExitCode {
         }
     };
 
-    let bridge = {
-        use recalld::mcp::bridge_adapters::*;
-
-        let tz = recalld::time::resolve_timezone(&system.config().timezone);
-
-        let search: Arc<dyn recalld::mcp::bridge::SearchPipeline> =
-            Arc::new(McpSearchAdapter::new(
-                system.query_engine().clone(),
-                system.embedding().clone(),
-                system.storage().clone(),
-                system.graph().clone(),
-                tz,
-            ));
-        let storage: Arc<dyn recalld::mcp::bridge::StorageEngine> =
-            Arc::new(McpStorageAdapter::new(
-                system.storage().clone(),
-                system.cache().clone(),
-                system.embedding().clone(),
-                system.vector_index().clone(),
-                system.fts_index().clone(),
-                system.entity_index().clone(),
-                system.graph().clone(),
-                std::sync::Arc::new(system.config().clone()),
-                tz,
-            ));
-        let namespaces: Arc<dyn recalld::mcp::bridge::NamespaceRegistry> =
-            Arc::new(McpNamespaceAdapter::new(system.storage().clone(), tz));
-        let health: Arc<dyn recalld::mcp::bridge::HealthChecker> =
-            Arc::new(McpHealthAdapter::new(system.storage().clone()));
-
-        recalld::mcp::bridge::McpBridge {
-            search,
-            storage,
-            namespaces,
-            health,
-            default_namespace,
-            timezone: tz,
-        }
-    };
+    let bridge = create_direct_mcp_bridge(&system, default_namespace);
 
     let handler: Arc<dyn recalld::mcp::McpHandler> = Arc::new(bridge);
     let server = Arc::new(tokio::sync::Mutex::new(recalld::mcp::McpServer::new(
@@ -529,24 +537,37 @@ async fn run_mcp_direct(loaded: LoadedConfig) -> ExitCode {
     }
 }
 
-async fn try_daemon_connection(
-    socket: &Path,
+/// Build an `McpBridge` backed by a remote daemon connection.
+///
+/// This is the single factory for the daemon-backed bridge so that adapter
+/// wiring is not duplicated across `try_daemon_connection` and
+/// `auto_start_daemon`.
+fn create_remote_mcp_bridge(
+    client: Arc<recalld::daemon::DaemonClient>,
     default_namespace: &str,
     tz: chrono_tz::Tz,
-) -> Result<recalld::mcp::bridge::McpBridge, Box<dyn std::error::Error>> {
+) -> recalld::mcp::bridge::McpBridge {
     use recalld::daemon::bridge_adapters::*;
 
-    let client = Arc::new(recalld::daemon::DaemonClient::connect(socket).await?);
-    client.ping().await?;
-
-    Ok(recalld::mcp::bridge::McpBridge {
+    recalld::mcp::bridge::McpBridge {
         search: Arc::new(RemoteSearchAdapter::new(client.clone())),
         storage: Arc::new(RemoteStorageAdapter::new(client.clone())),
         namespaces: Arc::new(RemoteNamespaceAdapter::new(client.clone())),
         health: Arc::new(RemoteHealthAdapter::new(client.clone())),
         default_namespace: default_namespace.to_string(),
         timezone: tz,
-    })
+    }
+}
+
+async fn try_daemon_connection(
+    socket: &Path,
+    default_namespace: &str,
+    tz: chrono_tz::Tz,
+) -> Result<recalld::mcp::bridge::McpBridge, Box<dyn std::error::Error>> {
+    let client = Arc::new(recalld::daemon::DaemonClient::connect(socket).await?);
+    client.ping().await?;
+
+    Ok(create_remote_mcp_bridge(client, default_namespace, tz))
 }
 
 async fn auto_start_daemon(
@@ -599,15 +620,7 @@ async fn auto_start_daemon(
         if let Ok(client) = recalld::daemon::DaemonClient::connect(socket).await {
             let client = Arc::new(client);
             if client.ping().await.is_ok() {
-                use recalld::daemon::bridge_adapters::*;
-                return Ok(recalld::mcp::bridge::McpBridge {
-                    search: Arc::new(RemoteSearchAdapter::new(client.clone())),
-                    storage: Arc::new(RemoteStorageAdapter::new(client.clone())),
-                    namespaces: Arc::new(RemoteNamespaceAdapter::new(client.clone())),
-                    health: Arc::new(RemoteHealthAdapter::new(client.clone())),
-                    default_namespace: default_namespace.to_string(),
-                    timezone: tz,
-                });
+                return Ok(create_remote_mcp_bridge(client, default_namespace, tz));
             }
         }
     }

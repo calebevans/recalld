@@ -16,20 +16,20 @@ use crate::model::{MemoryId, NamespaceId};
 // TagInterner
 // ---------------------------------------------------------------------------
 
-/// Intern table for tag strings, mapping between strings and u16 indices.
+/// Intern table for tag strings, mapping between strings and u32 indices.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TagInterner {
-    tag_to_index: HashMap<String, u16>,
+    tag_to_index: HashMap<String, u32>,
     index_to_tag: Vec<String>,
 }
 
 impl TagInterner {
     /// Intern a tag string, returning its index.
-    pub fn intern(&mut self, tag: &str) -> u16 {
+    pub fn intern(&mut self, tag: &str) -> u32 {
         if let Some(&idx) = self.tag_to_index.get(tag) {
             return idx;
         }
-        let idx = self.index_to_tag.len() as u16;
+        let idx = self.index_to_tag.len() as u32;
         self.index_to_tag.push(tag.to_string());
         self.tag_to_index.insert(tag.to_string(), idx);
         idx
@@ -37,12 +37,12 @@ impl TagInterner {
 
     /// Resolve an index back to its tag string.
     #[allow(dead_code)]
-    pub fn resolve(&self, idx: u16) -> Option<&str> {
+    pub fn resolve(&self, idx: u32) -> Option<&str> {
         self.index_to_tag.get(idx as usize).map(|s| s.as_str())
     }
 
     /// Look up a tag string's index without interning it.
-    pub fn lookup(&self, tag: &str) -> Option<u16> {
+    pub fn lookup(&self, tag: &str) -> Option<u32> {
         self.tag_to_index.get(tag).copied()
     }
 }
@@ -61,7 +61,7 @@ pub struct FilterEntry {
     /// Decay phase (1/2/3) for phase filtering.
     pub decay_phase: u8,
     /// Tags as interned indices.
-    pub tag_indices: Vec<u16>,
+    pub tag_indices: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +172,7 @@ impl FlatVectorIndex {
         // Rebuild derived structures.
         let mut tag_to_index = HashMap::new();
         for (i, tag) in index_to_tag.iter().enumerate() {
-            tag_to_index.insert(tag.clone(), i as u16);
+            tag_to_index.insert(tag.clone(), i as u32);
         }
 
         let mut id_to_slot = HashMap::with_capacity(count);
@@ -250,7 +250,7 @@ impl VectorIndex for FlatVectorIndex {
             });
         }
 
-        let tag_indices: Vec<u16> = metadata.tags.iter().map(|t| self.tags.intern(t)).collect();
+        let tag_indices: Vec<u32> = metadata.tags.iter().map(|t| self.tags.intern(t)).collect();
 
         // If this ID already exists, overwrite in place.
         if let Some(&slot) = self.id_to_slot.get(&id) {
@@ -352,7 +352,9 @@ impl VectorIndex for FlatVectorIndex {
         }
 
         // Extract results sorted by descending score.
-        let mut results: Vec<VectorSearchResult> = heap
+        // `into_sorted_vec()` returns ascending order (by min-heap's reversed Ord),
+        // and `.rev()` flips it to descending — no additional sort needed.
+        let results: Vec<VectorSearchResult> = heap
             .into_sorted_vec()
             .into_iter()
             .rev()
@@ -362,8 +364,6 @@ impl VectorIndex for FlatVectorIndex {
                 decay_phase: self.entries[se.index].decay_phase,
             })
             .collect();
-
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 
         Ok(results)
     }
@@ -427,7 +427,7 @@ impl VectorIndex for FlatVectorIndex {
         let Some(&slot) = self.id_to_slot.get(&id) else {
             return Ok(false);
         };
-        let tag_indices: Vec<u16> = metadata.tags.iter().map(|t| self.tags.intern(t)).collect();
+        let tag_indices: Vec<u32> = metadata.tags.iter().map(|t| self.tags.intern(t)).collect();
         self.entries[slot].namespace_id = metadata.namespace_id;
         self.entries[slot].decay_phase = metadata.decay_phase;
         self.entries[slot].tag_indices = tag_indices;

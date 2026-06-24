@@ -5,6 +5,7 @@
 //! Handlers never construct subsystem references themselves -- they
 //! receive them through `AppState`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -51,6 +52,11 @@ pub trait SearchPipeline: Send + Sync {
     /// Retrieve the embedding vector for a memory, if indexed.
     fn get_embedding(&self, id: MemoryId) -> Option<Vec<f32>>;
 
+    /// Retrieve embedding vectors for multiple memories in a single
+    /// lock acquisition. Returns a map from `MemoryId` to its embedding
+    /// vector. IDs not found in the index are omitted from the result.
+    fn get_embeddings_batch(&self, ids: &[MemoryId]) -> HashMap<MemoryId, Vec<f32>>;
+
     /// Return the total number of indexed vectors.
     fn indexed_count(&self) -> usize;
 
@@ -74,6 +80,11 @@ pub trait StorageEngine: Send + Sync {
 
     /// Delete a memory by ID. Returns `true` if it existed.
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, StorageError>;
+
+    /// Retrieve a single memory's DiskRecord by ID.
+    ///
+    /// Returns `None` if no record exists for this ID.
+    async fn get_record(&self, id: MemoryId) -> Option<DiskRecord>;
 
     /// Retrieve namespace statistics.
     async fn namespace_stats(
@@ -113,7 +124,15 @@ pub trait StorageEngine: Send + Sync {
 #[async_trait::async_trait]
 pub trait RecordCache: Send + Sync {
     /// Look up a record in the cache, or load from storage on miss.
-    async fn get_or_load(&self, id: MemoryId, storage: &dyn StorageEngine) -> Option<CachedRecord>;
+    ///
+    /// Returns an `Arc<CachedRecord>` to avoid deep-cloning on every
+    /// cache hit. Callers can dereference or clone only when mutation
+    /// is needed.
+    async fn get_or_load(
+        &self,
+        id: MemoryId,
+        storage: &dyn StorageEngine,
+    ) -> Option<Arc<CachedRecord>>;
 
     /// Insert a record into the cache.
     async fn insert(&self, record: &CachedRecord);

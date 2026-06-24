@@ -171,7 +171,11 @@ impl DaemonResponse {
 //
 // Length-prefixed JSON: [4-byte big-endian length][JSON payload].
 
-const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1 MB
+
+/// Maximum number of concurrent client connections the daemon will accept.
+/// Additional connections are dropped immediately until an existing one closes.
+pub const MAX_CONNECTIONS: u32 = 32;
 
 /// Reads a length-prefixed JSON-RPC request from the stream.
 pub async fn read_framed_message<R: AsyncReadExt + Unpin>(

@@ -119,10 +119,24 @@ async fn handle_store_memory(bridge: &McpBridge, arguments: serde_json::Value) -
         None => return ToolCallResult::error("Missing required parameter: summary"),
     };
 
+    // Issue 2: Enforce summary length limit
+    if summary.len() > 2000 {
+        return ToolCallResult::error("Summary exceeds maximum length of 2000 characters");
+    }
+
     let full_text = arguments
         .get("fullText")
         .and_then(|v| v.as_str())
         .map(String::from);
+
+    // Issue 2: Enforce full_text length limit (1 MB)
+    const MAX_FULL_TEXT_BYTES: usize = 1_048_576;
+    if let Some(ref ft) = full_text {
+        if ft.len() > MAX_FULL_TEXT_BYTES {
+            return ToolCallResult::error("fullText exceeds maximum length of 1 MB");
+        }
+    }
+
     let tags: Vec<String> = arguments
         .get("tags")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -139,6 +153,20 @@ async fn handle_store_memory(bridge: &McpBridge, arguments: serde_json::Value) -
         .get("emotions")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+
+    // Issue 3: Enforce array size limits
+    if tags.len() > 64 {
+        return ToolCallResult::error("Too many tags (maximum 64)");
+    }
+    if entities.len() > 32 {
+        return ToolCallResult::error("Too many entities (maximum 32)");
+    }
+    if topics.len() > 32 {
+        return ToolCallResult::error("Too many topics (maximum 32)");
+    }
+    if emotions.len() > 32 {
+        return ToolCallResult::error("Too many emotions (maximum 32)");
+    }
     let namespace = arguments
         .get("namespace")
         .and_then(|v| v.as_str())
@@ -371,8 +399,7 @@ fn get_memory_def() -> ToolInfo {
     ToolInfo {
         name: "get_memory".to_string(),
         title: Some("Get Memory".to_string()),
-        description: "Retrieve a specific memory by its ID. Also records an access \
-            event, which strengthens the memory through the spaced repetition system."
+        description: "Retrieve a specific memory by its ID."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -469,14 +496,16 @@ async fn handle_reinforce_memory(
     };
     let id = crate::model::MemoryId::from_uuid(uuid);
 
-    let quality = arguments
+    // Issue 4: Validate the u64 value BEFORE casting to u8 to prevent truncation
+    let quality_u64 = arguments
         .get("quality")
         .and_then(|v| v.as_u64())
-        .unwrap_or(3) as u8;
+        .unwrap_or(3);
 
-    if !(1..=4).contains(&quality) {
+    if !(1..=4).contains(&quality_u64) {
         return ToolCallResult::error("Quality must be 1-4");
     }
+    let quality = quality_u64 as u8;
 
     match bridge.storage.reinforce_memory(id, quality).await {
         Ok(result) => match ToolCallResult::json(&result) {
@@ -703,6 +732,18 @@ async fn handle_create_namespace(
         Some(s) => s.to_string(),
         None => return ToolCallResult::error("Missing required parameter: name"),
     };
+
+    // Issue 1: Server-side validation of namespace name
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return ToolCallResult::error(
+            "Invalid namespace name: must be 1-64 characters, alphanumeric, hyphens, or underscores only",
+        );
+    }
 
     let embedding_dim = arguments
         .get("embeddingDim")

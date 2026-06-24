@@ -128,7 +128,21 @@ impl Recalld {
             Arc::new(std::sync::RwLock::new(engine))
         };
 
-        // -- Step 2: Build relationship graph from storage ------------
+        // -- Step 2: Scan all records once, reuse for graph / FTS / entity index
+        let all_records = {
+            let storage_r = storage.read().map_err(|e| RecalldError::Init {
+                step: "lock_storage_for_scan",
+                message: format!("storage lock poisoned: {}", e),
+                source: None,
+            })?;
+            storage_r.scan_all().map_err(|e| RecalldError::Init {
+                step: "scan_all_records",
+                message: "failed to scan meta.db".into(),
+                source: Some(Box::new(e)),
+            })?
+        };
+
+        // -- Step 2b: Build relationship graph from scanned records ---
         let graph: SharedGraph = {
             let storage_r = storage.read().map_err(|e| RecalldError::Init {
                 step: "lock_storage_for_graph",
@@ -136,26 +150,11 @@ impl Recalld {
                 source: None,
             })?;
 
-            // Count records for pre-sizing.
-            let record_count = storage_r.count().map_err(|e| RecalldError::Init {
-                step: "count_records",
-                message: "failed to count records in meta.db".into(),
-                source: Some(Box::new(e)),
-            })? as usize;
-
-            let mut rel_graph = RelationshipGraph::with_capacity(record_count);
-
-            // Load all nodes from meta.db scan.
-            let all_records = storage_r.scan_all().map_err(|e| RecalldError::Init {
-                step: "load_graph_nodes",
-                message: "failed to scan meta.db for graph nodes".into(),
-                source: Some(Box::new(e)),
-            })?;
+            let mut rel_graph = RelationshipGraph::with_capacity(all_records.len());
 
             for (memory_id, record) in &all_records {
                 let namespace_id = crate::model::NamespaceId::new(record.namespace_id);
-                let phase = crate::model::DecayPhase::from_u8(record.phase)
-                    .unwrap_or(crate::model::DecayPhase::Full);
+                let phase = record.phase;
                 // Silently skip duplicates during startup load.
                 let _ = rel_graph.add_node(
                     *memory_id,
@@ -291,18 +290,12 @@ impl Recalld {
             // Also handles the case where fts.db exists but is empty
             // (e.g., previous crash during first migration).
             if is_new || fts.is_empty().unwrap_or(true) {
-                let mut storage_w = storage.write().map_err(|e| RecalldError::Init {
-                    step: "fts_migration",
-                    message: format!("storage lock poisoned: {}", e),
-                    source: None,
-                })?;
-                let all_records = storage_w.scan_all().map_err(|e| RecalldError::Init {
-                    step: "fts_migration",
-                    message: "failed to scan records for FTS5 migration".into(),
-                    source: Some(Box::new(e)),
-                })?;
-
                 if !all_records.is_empty() {
+                    let storage_r = storage.read().map_err(|e| RecalldError::Init {
+                        step: "fts_migration",
+                        message: format!("storage lock poisoned: {}", e),
+                        source: None,
+                    })?;
                     tracing::info!(
                         records = all_records.len(),
                         "migrating records to FTS5 index"
@@ -317,7 +310,7 @@ impl Recalld {
                                 file_offset: record.text_offset,
                                 length: record.text_length,
                             };
-                            storage_w.get_text(text_ref).ok().flatten()
+                            storage_r.get_text(text_ref).ok().flatten()
                         } else {
                             None
                         };
@@ -335,9 +328,9 @@ impl Recalld {
                             );
                         }
                     }
+                    drop(storage_r);
                     tracing::info!(indexed = all_records.len(), "FTS5 migration complete");
                 }
-                drop(storage_w);
             }
 
             // Clean up old BM25 binary files from disk.
@@ -367,19 +360,8 @@ impl Recalld {
             Arc::new(tokio::sync::Mutex::new(fts))
         };
 
-        // -- Step 6c: Build entity index from storage -----------------
+        // -- Step 6c: Build entity index from scanned records ----------
         let entity_index = {
-            let storage_r = storage.read().map_err(|e| RecalldError::Init {
-                step: "build_entity_index",
-                message: format!("storage lock poisoned: {}", e),
-                source: None,
-            })?;
-            let all_records = storage_r.scan_all().map_err(|e| RecalldError::Init {
-                step: "build_entity_index",
-                message: "failed to scan meta.db for entity index".into(),
-                source: Some(Box::new(e)),
-            })?;
-
             let mut idx = EntityIndex::with_capacity(all_records.len());
             for (memory_id, record) in &all_records {
                 let entities = crate::model::parse_structured_tags(&record.tags).entities;

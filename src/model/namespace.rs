@@ -11,33 +11,33 @@ use crate::model::id::NamespaceId;
 
 /// Retrievability thresholds that govern phase transitions.
 ///
-/// - `R > full_threshold` => Full (Phase 1)
-/// - `summary_threshold < R <= full_threshold` => Summary (Phase 2)
-/// - `ghost_threshold < R <= summary_threshold` => Ghost (Phase 3)
-/// - `R <= ghost_threshold` => eligible for deletion
+/// - `R > full_to_summary` => Full (Phase 1)
+/// - `summary_to_ghost < R <= full_to_summary` => Summary (Phase 2)
+/// - `ghost_to_delete < R <= summary_to_ghost` => Ghost (Phase 3)
+/// - `R <= ghost_to_delete` => eligible for deletion
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhaseThresholds {
-    /// Retrievability above this triggers Full phase.
-    pub full_threshold: f32,
-    /// Retrievability above this (below full) triggers Summary phase.
-    pub summary_threshold: f32,
-    /// Retrievability above this (below summary) triggers Ghost phase.
-    pub ghost_threshold: f32,
+    /// R below this triggers Full -> Summary transition.
+    pub full_to_summary: f32,
+    /// R below this triggers Summary -> Ghost transition.
+    pub summary_to_ghost: f32,
+    /// R below this triggers Ghost -> deletion.
+    pub ghost_to_delete: f32,
 }
 
 impl PhaseThresholds {
     /// Validate that thresholds are ordered: full > summary > ghost > 0,
     /// and all are in (0.0, 1.0).
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.full_threshold <= 0.0 || self.full_threshold >= 1.0 {
-            return Err("full_threshold must be in (0.0, 1.0)");
+        if self.full_to_summary <= 0.0 || self.full_to_summary >= 1.0 {
+            return Err("full_to_summary must be in (0.0, 1.0)");
         }
-        if self.summary_threshold <= 0.0 || self.summary_threshold >= self.full_threshold {
-            return Err("summary_threshold must be in (0.0, full_threshold)");
+        if self.summary_to_ghost <= 0.0 || self.summary_to_ghost >= self.full_to_summary {
+            return Err("summary_to_ghost must be in (0.0, full_to_summary)");
         }
-        if self.ghost_threshold <= 0.0 || self.ghost_threshold >= self.summary_threshold {
-            return Err("ghost_threshold must be in (0.0, summary_threshold)");
+        if self.ghost_to_delete <= 0.0 || self.ghost_to_delete >= self.summary_to_ghost {
+            return Err("ghost_to_delete must be in (0.0, summary_to_ghost)");
         }
         Ok(())
     }
@@ -47,9 +47,9 @@ impl PhaseThresholds {
 impl Default for PhaseThresholds {
     fn default() -> Self {
         Self {
-            full_threshold: DEFAULT_FULL_THRESHOLD,
-            summary_threshold: DEFAULT_SUMMARY_THRESHOLD,
-            ghost_threshold: DEFAULT_GHOST_THRESHOLD,
+            full_to_summary: DEFAULT_FULL_THRESHOLD,
+            summary_to_ghost: DEFAULT_SUMMARY_THRESHOLD,
+            ghost_to_delete: DEFAULT_GHOST_THRESHOLD,
         }
     }
 }
