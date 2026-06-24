@@ -88,6 +88,13 @@ memory across sessions.
   obvious from the code
 - Important decisions and their rationale
 
+IMPORTANT: Do not wait until the end of a conversation or until asked.
+Store memories as they arise. After every significant exchange (a decision
+is made, a preference is expressed, a project detail is learned, or a
+recommendation is accepted/rejected), store immediately. If you are unsure
+whether something is worth storing, store it. Memories decay naturally if
+they are not useful.
+
 Do NOT store: ephemeral task details, code snippets, or anything derivable
 from the codebase.
 

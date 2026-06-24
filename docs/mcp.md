@@ -530,6 +530,13 @@ memory needs a `summary` (concise, 1-2 sentences) and should include
 - Cross-session context the user shares (deadlines, relationships between
   projects, priorities)
 
+**IMPORTANT:** Do not wait until the end of a conversation or until asked.
+Store memories as they arise. After every significant exchange (a decision
+is made, a preference is expressed, a project detail is learned, or a
+recommendation is accepted/rejected), store immediately. If you are unsure
+whether something is worth storing, store it. Memories decay naturally if
+they are not useful.
+
 **What NOT to store:**
 - Ephemeral task details (current branch, in-progress work, specific line
   numbers)
