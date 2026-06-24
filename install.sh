@@ -76,6 +76,45 @@ download_and_install() {
     chmod +x "${INSTALL_DIR}/recalld" "${INSTALL_DIR}/recalld-cli"
 }
 
+setup_config() {
+    local config_dir="$HOME/.recalld"
+    local config_file="${config_dir}/config.toml"
+
+    mkdir -p "${config_dir}/data"
+
+    if [ -f "$config_file" ]; then
+        return
+    fi
+
+    info "Creating default config at ${config_file}..."
+    cat > "$config_file" <<'TOML'
+# recalld configuration
+# Full reference: https://github.com/calebevans/recalld/blob/main/docs/guide.md
+
+[embedding]
+provider = "ollama"
+model_name = "embeddinggemma:latest"
+base_url = "http://localhost:11434"
+dimensions = 768
+
+# To use OpenAI instead, uncomment below and set OPENAI_API_KEY:
+# provider = "openai"
+# model_name = "text-embedding-3-small"
+# dimensions = 1536
+
+[decay]
+sweep_interval_hours = 24.0
+# decay_rate_multiplier = 1.0  # >1.0 = slower decay, <1.0 = faster, 0.0 = disabled
+
+[storage]
+# data_dir = "~/.recalld/data"
+
+[server]
+# bind_address = "127.0.0.1"
+# port = 7680
+TOML
+}
+
 check_path() {
     case ":${PATH}:" in
         *":${INSTALL_DIR}:"*) ;;
@@ -145,6 +184,7 @@ main() {
     fi
 
     download_and_install
+    setup_config
     check_path
     echo ""
     info "Done! Run 'recalld --help' to get started."
