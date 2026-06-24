@@ -57,22 +57,21 @@ get_target_version() {
 download_and_install() {
     local asset="recalld-${PLATFORM}.tar.gz"
     local url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
-    local tmp
 
-    tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
+    TMP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$TMP_DIR"' EXIT
 
     info "Downloading recalld ${VERSION} for ${PLATFORM}..."
 
     if command -v curl &>/dev/null; then
-        curl -fSL --progress-bar "$url" -o "${tmp}/${asset}"
+        curl -fSL --progress-bar "$url" -o "${TMP_DIR}/${asset}"
     else
-        wget -q --show-progress "$url" -O "${tmp}/${asset}"
+        wget -q --show-progress "$url" -O "${TMP_DIR}/${asset}"
     fi
 
     info "Extracting to ${INSTALL_DIR}..."
     mkdir -p "$INSTALL_DIR"
-    tar xzf "${tmp}/${asset}" -C "$INSTALL_DIR"
+    tar xzf "${TMP_DIR}/${asset}" -C "$INSTALL_DIR"
     chmod +x "${INSTALL_DIR}/recalld" "${INSTALL_DIR}/recalld-cli"
 }
 
