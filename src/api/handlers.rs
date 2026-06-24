@@ -5,11 +5,12 @@
 //! the same pattern: extract, validate, delegate to subsystem, convert
 //! result, respond.
 
+use std::path::Path as FilePath;
 use std::time::Instant;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use uuid::Uuid;
@@ -17,7 +18,10 @@ use uuid::Uuid;
 use super::errors::AppError;
 use super::models::*;
 use super::state::{AppState, QueryInput, SearchQuery};
-use crate::model::id::MemoryId;
+use crate::decay::config::DecayConfig;
+use crate::decay::fsrs::FsrsEngine as FsrsCalculator;
+use crate::model::decay::DecayPhase;
+use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
 use crate::serialization::{
     ApiResponse, MemoryResponse, NamespaceRequest, NamespaceResponse, SearchHit, SearchRequest,
@@ -266,6 +270,158 @@ pub async fn reinforce_memory(
             phase: format!("{:?}", updated.phase),
             is_permastore: updated.is_permastore,
         },
+        took_us: Some(took),
+    }))
+}
+
+/// GET /memories -- list memories with filtering and pagination.
+///
+/// Steps:
+/// 1. Parse and validate query parameters.
+/// 2. Resolve namespace if specified.
+/// 3. Request filtered records from storage adapter.
+/// 4. Sort results in memory.
+/// 5. Apply pagination (offset + limit).
+/// 6. Convert to MemoryResponse objects.
+/// 7. Return ListMemoriesResponse with pagination metadata.
+pub async fn list_memories(
+    State(state): State<AppState>,
+    Query(params): Query<ListMemoriesQuery>,
+) -> Result<Json<ApiResponse<ListMemoriesResponse>>, AppError> {
+    let start = Instant::now();
+
+    // Validate limit (cap at 1000)
+    let limit = params.limit.unwrap_or(50).min(1000) as usize;
+    let offset = params.offset.unwrap_or(0) as usize;
+
+    // Validate phase
+    if let Some(ref phase) = params.phase {
+        if !["full", "summary", "ghost"].contains(&phase.as_str()) {
+            return Err(AppError::BadRequest {
+                message: format!(
+                    "invalid phase '{phase}', must be: full, summary, ghost"
+                ),
+                field: Some("phase".into()),
+            });
+        }
+    }
+
+    // Validate sort field
+    let sort_field = params.sort.as_deref().unwrap_or("created");
+    if !["created", "accessed", "strength", "stability"].contains(&sort_field) {
+        return Err(AppError::BadRequest {
+            message: format!(
+                "invalid sort field '{sort_field}', must be: created, accessed, strength, stability"
+            ),
+            field: Some("sort".into()),
+        });
+    }
+
+    // Validate order
+    let order = params.order.as_deref().unwrap_or("desc");
+    if !["asc", "desc"].contains(&order) {
+        return Err(AppError::BadRequest {
+            message: format!("invalid order '{order}', must be: asc, desc"),
+            field: Some("order".into()),
+        });
+    }
+
+    // Resolve namespace if specified
+    let namespace_id = if let Some(ref ns_name) = params.namespace {
+        let ns = state
+            .namespaces
+            .resolve(ns_name)
+            .ok_or_else(|| AppError::NotFound {
+                resource: "namespace",
+                id: ns_name.clone(),
+            })?;
+        Some(ns.id)
+    } else {
+        None
+    };
+
+    // Convert phase string to DecayPhase enum
+    let phase_filter = params.phase.as_ref().map(|p| match p.as_str() {
+        "full" => crate::model::DecayPhase::Full,
+        "summary" => crate::model::DecayPhase::Summary,
+        "ghost" => crate::model::DecayPhase::Ghost,
+        _ => crate::model::DecayPhase::Full, // unreachable due to validation above
+    });
+
+    // Build filter struct
+    let filter = ListFilter {
+        namespace_id,
+        phase: phase_filter,
+        tags: params.tags,
+    };
+
+    // Get filtered records from storage
+    let mut records = state.storage.list_memories(&filter).await?;
+
+    // Sort in memory
+    match (sort_field, order) {
+        ("created", "asc") => records.sort_by_key(|r| r.created_at),
+        ("created", "desc") => {
+            records.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        }
+        ("accessed", "asc") => records.sort_by_key(|r| r.last_accessed_at),
+        ("accessed", "desc") => {
+            records.sort_by_key(|r| std::cmp::Reverse(r.last_accessed_at));
+        }
+        ("strength", "asc") => records.sort_by(|a, b| {
+            a.decay_strength
+                .partial_cmp(&b.decay_strength)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        ("strength", "desc") => records.sort_by(|a, b| {
+            b.decay_strength
+                .partial_cmp(&a.decay_strength)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        ("stability", "asc") => records.sort_by(|a, b| {
+            a.stability
+                .partial_cmp(&b.stability)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        ("stability", "desc") => records.sort_by(|a, b| {
+            b.stability
+                .partial_cmp(&a.stability)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        _ => {} // unreachable
+    }
+
+    let total = records.len() as u64;
+
+    // Apply pagination
+    let page_records: Vec<_> = records.into_iter().skip(offset).take(limit).collect();
+
+    // Convert to MemoryResponse objects
+    let memories: Vec<MemoryResponse> = page_records
+        .into_iter()
+        .map(|record| {
+            let ns_name = state
+                .namespaces
+                .name_for(record.namespace_id)
+                .unwrap_or_else(|| "unknown".to_string());
+            MemoryResponse::from_cached(&record, ns_name)
+        })
+        .collect();
+
+    let has_more = (offset + memories.len()) < total as usize;
+
+    let response = ListMemoriesResponse {
+        memories,
+        total,
+        limit: limit as u32,
+        offset: offset as u32,
+        has_more,
+    };
+
+    let took = start.elapsed().as_micros() as u64;
+
+    Ok(Json(ApiResponse {
+        data: response,
         took_us: Some(took),
     }))
 }
@@ -731,6 +887,380 @@ where
         },
         latency_us: Some(latency),
     }
+}
+
+/// GET /health/report -- comprehensive decay health report.
+///
+/// Computes decay forecast, at-risk memories, storage breakdown,
+/// age distribution, and tag statistics. Optionally scoped to a
+/// single namespace via `?namespace=<name>`.
+pub async fn health_report(
+    State(state): State<AppState>,
+    Query(params): Query<HealthReportQuery>,
+) -> Result<Json<ApiResponse<HealthReport>>, AppError> {
+    let start = Instant::now();
+
+    // Resolve optional namespace filter
+    let namespace_filter: Option<NamespaceId> = if let Some(ref ns_name) = params.namespace {
+        Some(
+            state
+                .namespaces
+                .resolve(ns_name)
+                .ok_or_else(|| AppError::NotFound {
+                    resource: "namespace",
+                    id: ns_name.clone(),
+                })?
+                .id,
+        )
+    } else {
+        None
+    };
+
+    // Scan all records once and reuse across sections
+    let all_records = state.storage.scan_all().await?;
+
+    // Filter records by namespace if applicable
+    let filtered: Vec<_> = all_records
+        .iter()
+        .filter(|(_, r)| {
+            if let Some(ns_id) = namespace_filter {
+                r.namespace_id == ns_id.get()
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let overview = compute_overview(&filtered);
+    let decay_forecast = compute_decay_forecast(&filtered, &state);
+    let at_risk = compute_at_risk(&filtered, &state);
+    let age_distribution = compute_age_distribution(&filtered);
+    let storage = compute_storage_breakdown(&state, namespace_filter).await;
+    let metadata = compute_metadata_stats(&state, namespace_filter).await?;
+
+    let scope = params.namespace.unwrap_or_else(|| "all".to_string());
+
+    let report = HealthReport {
+        scope,
+        overview,
+        decay_forecast,
+        at_risk,
+        age_distribution,
+        storage,
+        metadata,
+    };
+
+    let took = start.elapsed().as_micros() as u64;
+
+    Ok(Json(ApiResponse {
+        data: report,
+        took_us: Some(took),
+    }))
+}
+
+/// Build a DecayConfig from a NamespaceConfig's phase thresholds.
+fn decay_config_for_namespace(
+    ns: &crate::model::namespace::NamespaceConfig,
+) -> DecayConfig {
+    DecayConfig {
+        initial_stability: ns.initial_stability,
+        phase_1_threshold: ns.phase_thresholds.full_threshold,
+        phase_2_threshold: ns.phase_thresholds.summary_threshold,
+        phase_3_threshold: ns.phase_thresholds.ghost_threshold,
+        permastore_threshold: ns.permastore_threshold,
+        ..DecayConfig::default()
+    }
+}
+
+/// Compute overview section from pre-filtered records.
+fn compute_overview(
+    records: &[&(MemoryId, crate::model::record::DiskRecord)],
+) -> HealthOverview {
+    let mut full = 0u64;
+    let mut summary = 0u64;
+    let mut ghost = 0u64;
+    let mut permastore = 0u64;
+
+    for (_, r) in records {
+        match DecayPhase::from_u8(r.phase) {
+            Some(DecayPhase::Full) => full += 1,
+            Some(DecayPhase::Summary) => summary += 1,
+            Some(DecayPhase::Ghost) => ghost += 1,
+            None => {}
+        }
+        if r.is_permastore != 0 {
+            permastore += 1;
+        }
+    }
+
+    HealthOverview {
+        total_memories: records.len() as u64,
+        phase_counts: PhaseCounts { full, summary, ghost },
+        permastore_count: permastore,
+    }
+}
+
+/// Compute decay forecast from pre-filtered records.
+fn compute_decay_forecast(
+    records: &[&(MemoryId, crate::model::record::DiskRecord)],
+    state: &AppState,
+) -> DecayForecast {
+    let now_millis = chrono::Utc::now().timestamp_millis();
+    let mut t7 = TransitionCounts::default();
+    let mut t30 = TransitionCounts::default();
+    let mut t90 = TransitionCounts::default();
+
+    for (_, record) in records {
+        // Skip permastore -- they never decay
+        if record.is_permastore != 0 {
+            continue;
+        }
+
+        // Get namespace config for thresholds
+        let ns_config = match state.namespaces.get_by_id(record.namespace_id) {
+            Some(c) => c,
+            None => continue,
+        };
+        let dc = decay_config_for_namespace(&ns_config);
+        let engine = FsrsCalculator::new(&dc);
+
+        // Compute elapsed time
+        let elapsed_millis = (now_millis - record.last_accessed_at).max(0) as f64;
+        let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
+
+        // Current retrievability for forecasting
+        let current_r = engine.retrievability(elapsed_days, record.stability, 1.0);
+
+        // Determine current phase and next threshold
+        let current_phase = match DecayPhase::from_u8(record.phase) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let (phase_label, threshold) = match current_phase {
+            DecayPhase::Full => (DecayPhase::Full, dc.phase_1_threshold),
+            DecayPhase::Summary => (DecayPhase::Summary, dc.phase_2_threshold),
+            DecayPhase::Ghost => (DecayPhase::Ghost, dc.phase_3_threshold),
+        };
+
+        if current_r <= threshold {
+            // Already below threshold -- will transition on next sweep
+            count_transition(phase_label, 0.0, &mut t7, &mut t30, &mut t90);
+        } else {
+            let days_until = engine.days_until_threshold(record.stability, threshold);
+            let remaining = days_until - elapsed_days;
+            if remaining > 0.0 {
+                count_transition(phase_label, remaining, &mut t7, &mut t30, &mut t90);
+            } else {
+                count_transition(phase_label, 0.0, &mut t7, &mut t30, &mut t90);
+            }
+        }
+    }
+
+    DecayForecast {
+        transitions_7d: t7,
+        transitions_30d: t30,
+        transitions_90d: t90,
+    }
+}
+
+/// Increment the appropriate transition counter based on phase and horizon.
+fn count_transition(
+    phase: DecayPhase,
+    days: f32,
+    t7: &mut TransitionCounts,
+    t30: &mut TransitionCounts,
+    t90: &mut TransitionCounts,
+) {
+    let increment = |tc: &mut TransitionCounts| match phase {
+        DecayPhase::Full => tc.full_to_summary += 1,
+        DecayPhase::Summary => tc.summary_to_ghost += 1,
+        DecayPhase::Ghost => tc.ghost_to_deleted += 1,
+    };
+
+    if days <= 7.0 {
+        increment(t7);
+        increment(t30);
+        increment(t90);
+    } else if days <= 30.0 {
+        increment(t30);
+        increment(t90);
+    } else if days <= 90.0 {
+        increment(t90);
+    }
+}
+
+/// Compute at-risk memories (Ghost phase, closest to deletion).
+fn compute_at_risk(
+    records: &[&(MemoryId, crate::model::record::DiskRecord)],
+    state: &AppState,
+) -> Vec<AtRiskMemory> {
+    let now_millis = chrono::Utc::now().timestamp_millis();
+    let mut candidates: Vec<AtRiskMemory> = Vec::new();
+
+    for (id, record) in records {
+        // Only Ghost phase, non-permastore
+        if record.phase != DecayPhase::Ghost.as_u8() || record.is_permastore != 0 {
+            continue;
+        }
+
+        let ns_config = match state.namespaces.get_by_id(record.namespace_id) {
+            Some(c) => c,
+            None => continue,
+        };
+        let dc = decay_config_for_namespace(&ns_config);
+        let engine = FsrsCalculator::new(&dc);
+
+        let elapsed_millis = (now_millis - record.last_accessed_at).max(0) as f64;
+        let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
+        let current_r = engine.retrievability(elapsed_days, record.stability, 1.0);
+
+        let days_until_deletion = if current_r <= dc.phase_3_threshold {
+            0.0
+        } else {
+            let days_until = engine.days_until_threshold(record.stability, dc.phase_3_threshold);
+            (days_until - elapsed_days).max(0.0)
+        };
+
+        let id_str = id.to_string();
+        let short_id = if id_str.len() >= 8 {
+            id_str[..8].to_string()
+        } else {
+            id_str.clone()
+        };
+
+        candidates.push(AtRiskMemory {
+            id: short_id,
+            summary: record.summary.chars().take(100).collect(),
+            strength: current_r,
+            days_until_deletion,
+            phase: "ghost".to_string(),
+        });
+    }
+
+    // Sort by days_until_deletion ascending, take top 10
+    candidates.sort_by(|a, b| {
+        a.days_until_deletion
+            .partial_cmp(&b.days_until_deletion)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(10);
+
+    candidates
+}
+
+/// Compute age distribution from pre-filtered records.
+fn compute_age_distribution(
+    records: &[&(MemoryId, crate::model::record::DiskRecord)],
+) -> AgeDistribution {
+    if records.is_empty() {
+        return AgeDistribution {
+            oldest_created_at: None,
+            newest_created_at: None,
+            avg_age_days: 0.0,
+            median_stability: 0.0,
+        };
+    }
+
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut oldest = i64::MAX;
+    let mut newest = i64::MIN;
+    let mut total_age_ms = 0i64;
+    let mut stabilities: Vec<f32> = Vec::with_capacity(records.len());
+
+    for (_, r) in records {
+        if r.created_at < oldest {
+            oldest = r.created_at;
+        }
+        if r.created_at > newest {
+            newest = r.created_at;
+        }
+        total_age_ms += now - r.created_at;
+        stabilities.push(r.stability);
+    }
+
+    let avg_age_days = (total_age_ms as f64 / records.len() as f64) / 86_400_000.0;
+
+    stabilities.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_stability = stabilities[stabilities.len() / 2];
+
+    AgeDistribution {
+        oldest_created_at: Some(oldest),
+        newest_created_at: Some(newest),
+        avg_age_days: avg_age_days as f32,
+        median_stability,
+    }
+}
+
+/// Compute storage breakdown from file sizes on disk.
+async fn compute_storage_breakdown(
+    state: &AppState,
+    namespace_filter: Option<NamespaceId>,
+) -> StorageBreakdown {
+    let db_path = state.storage.storage_path();
+
+    let meta_db_bytes = file_size(&db_path.join("meta.db")).unwrap_or(0);
+    let edges_db_bytes = file_size(&db_path.join("edges.db")).unwrap_or(0);
+    let text_log_bytes = file_size(&db_path.join("text.log")).unwrap_or(0);
+
+    let namespaces = state.namespaces.list_all().await;
+    let mut vector_files = Vec::new();
+
+    for ns in &namespaces {
+        // Apply namespace filter if present
+        if let Some(filter_id) = namespace_filter {
+            if ns.id != filter_id.get() {
+                continue;
+            }
+        }
+
+        let vector_path = db_path.join("vectors").join(format!("{}.dat", ns.name));
+        let bytes = file_size(&vector_path).unwrap_or(0);
+        vector_files.push(VectorFileSize {
+            namespace: ns.name.clone(),
+            bytes,
+        });
+    }
+
+    let total_bytes = meta_db_bytes
+        + edges_db_bytes
+        + text_log_bytes
+        + vector_files.iter().map(|v| v.bytes).sum::<u64>();
+
+    StorageBreakdown {
+        total_bytes,
+        meta_db_bytes,
+        edges_db_bytes,
+        text_log_bytes,
+        vector_files,
+    }
+}
+
+/// Get file size in bytes, returning an io::Error on failure.
+fn file_size(path: &FilePath) -> Result<u64, std::io::Error> {
+    std::fs::metadata(path).map(|m| m.len())
+}
+
+/// Compute metadata/tag statistics.
+async fn compute_metadata_stats(
+    state: &AppState,
+    _namespace_filter: Option<NamespaceId>,
+) -> Result<MetadataStats, AppError> {
+    // list_tags returns all tags sorted by count descending
+    let all_tags = state.storage.list_tags().await?;
+
+    let unique_tags = all_tags.len() as u64;
+    let top_tags: Vec<TagCount> = all_tags
+        .into_iter()
+        .take(10)
+        .map(|(tag, count)| TagCount { tag, count })
+        .collect();
+
+    Ok(MetadataStats {
+        top_tags,
+        unique_tags,
+    })
 }
 
 /// GET /metrics -- Prometheus exposition format.

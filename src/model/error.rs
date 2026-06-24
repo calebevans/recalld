@@ -109,6 +109,10 @@ pub enum ValidationError {
              alphanumeric/hyphens/underscores"
     )]
     InvalidNamespaceName { max: usize },
+
+    /// Decay rate multiplier is negative.
+    #[error("decay_rate_multiplier must be >= 0.0, got {value}")]
+    InvalidDecayMultiplier { value: f32 },
 }
 
 impl ValidationError {
@@ -130,6 +134,7 @@ impl ValidationError {
             Self::DifficultyOutOfRange { .. } => "INVALID_DIFFICULTY",
             Self::TimestampOrdering { .. } => "INVALID_TIMESTAMPS",
             Self::InvalidNamespaceName { .. } => "INVALID_NAMESPACE_NAME",
+            Self::InvalidDecayMultiplier { .. } => "INVALID_DECAY_MULTIPLIER",
         }
     }
 
@@ -147,6 +152,7 @@ impl ValidationError {
             Self::StabilityOutOfRange { .. } => "stability",
             Self::DifficultyOutOfRange { .. } => "difficulty",
             Self::TimestampOrdering { .. } => "timestamps",
+            Self::InvalidDecayMultiplier { .. } => "decay_rate_multiplier",
         }
     }
 }

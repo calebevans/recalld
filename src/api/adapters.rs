@@ -5,6 +5,7 @@
 //! gap between the API server's DI traits and the concrete subsystem
 //! types held by the `Recalld` struct.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,7 +13,9 @@ use async_trait::async_trait;
 use crate::cache::CacheManager;
 use crate::embedding::EmbeddingProvider;
 use crate::graph::SharedGraph;
-use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConfig, NamespaceId};
+use crate::model::{
+    AccessKind, CachedRecord, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId,
+};
 use crate::search::FlatVectorIndex;
 use crate::storage::RedbStorageEngine;
 // Import the StorageEngine trait so its methods are in scope.
@@ -258,8 +261,95 @@ impl state::StorageEngine for StorageEngineAdapter {
         })
     }
 
+    async fn list_memories(
+        &self,
+        filter: &crate::api::models::ListFilter,
+    ) -> Result<Vec<CachedRecord>, crate::storage::StorageError> {
+        let storage_r = self.storage.read().map_err(|e| {
+            crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("storage lock poisoned: {e}"),
+            ))
+        })?;
+
+        let all_records = storage_r.scan_all()?;
+
+        let filtered: Vec<CachedRecord> = all_records
+            .into_iter()
+            .filter(|(_id, record)| {
+                // Filter by namespace
+                if let Some(ns_id) = filter.namespace_id {
+                    if NamespaceId::new(record.namespace_id) != ns_id {
+                        return false;
+                    }
+                }
+
+                // Filter by phase
+                if let Some(phase) = filter.phase {
+                    let record_phase =
+                        DecayPhase::from_u8(record.phase).unwrap_or(DecayPhase::Full);
+                    if record_phase != phase {
+                        return false;
+                    }
+                }
+
+                // Filter by tags (AND logic: must have ALL)
+                if !filter.tags.is_empty()
+                    && !filter.tags.iter().all(|tag| {
+                        record.tags.iter().any(|t| t.as_str() == tag)
+                    })
+                {
+                    return false;
+                }
+
+                true
+            })
+            .map(|(_id, disk_record)| CachedRecord::from(&disk_record))
+            .collect();
+
+        Ok(filtered)
+    }
+
     async fn ping(&self) -> bool {
         self.storage.read().is_ok()
+    }
+
+    async fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, crate::storage::StorageError> {
+        let storage_r = self.storage.read().map_err(|e| {
+            crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("storage lock poisoned: {e}"),
+            ))
+        })?;
+        storage_r.scan_all()
+    }
+
+    async fn scan_phase_records(
+        &self,
+        phase: DecayPhase,
+    ) -> Result<Vec<(MemoryId, DiskRecord)>, crate::storage::StorageError> {
+        let storage_r = self.storage.read().map_err(|e| {
+            crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("storage lock poisoned: {e}"),
+            ))
+        })?;
+        storage_r.scan_phase_records(phase)
+    }
+
+    async fn list_tags(&self) -> Result<Vec<(String, u64)>, crate::storage::StorageError> {
+        let storage_r = self.storage.read().map_err(|e| {
+            crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("storage lock poisoned: {e}"),
+            ))
+        })?;
+        storage_r.list_tags()
+    }
+
+    fn storage_path(&self) -> PathBuf {
+        let storage_r = self.storage.read().expect("storage lock not poisoned");
+        storage_r.db_path().to_path_buf()
     }
 }
 
@@ -501,6 +591,7 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
             permastore_threshold: 1500.0,
             created_at: now,
             desired_retention,
+            decay_rate_multiplier: None,
         };
         let mut storage_w = self.storage.write().map_err(|e| {
             Box::new(std::io::Error::new(

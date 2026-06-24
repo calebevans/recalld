@@ -8,8 +8,8 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 
 use crate::cli::output::{
-    ForgetResult, InspectView, MemoryView, NamespaceStatsView, NamespaceView, ReinforceResult,
-    SearchResult, StatusView, StoreResult, SweepResult,
+    ForgetResult, HealthReportView, InspectView, ListResult, MemoryView, NamespaceStatsView,
+    NamespaceView, ReinforceResult, SearchResult, StatusView, StoreResult, SweepResult,
 };
 
 /// HTTP client for the Recalld API server.
@@ -130,6 +130,39 @@ impl RecalldClient {
             tags,
             namespace,
             parent_id,
+        };
+
+        self.post("/v1/memories", &body).await
+    }
+
+    /// POST /v1/memories — store a memory with explicit summary and full_text.
+    ///
+    /// Unlike [`store_memory`], this method accepts pre-split summary and
+    /// full_text fields directly. Used by the import command where the
+    /// export already contains separate fields.
+    pub async fn store_memory_raw(
+        &self,
+        summary: &str,
+        full_text: Option<&str>,
+        tags: &[String],
+        namespace: Option<&str>,
+    ) -> crate::cli::Result<StoreResult> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            summary: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            full_text: Option<&'a str>,
+            tags: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            namespace: Option<&'a str>,
+        }
+
+        let body = Body {
+            summary,
+            full_text,
+            tags,
+            namespace,
         };
 
         self.post("/v1/memories", &body).await
@@ -261,6 +294,25 @@ impl RecalldClient {
         self.get("/v1/status").await
     }
 
+    /// GET /v1/health/report — comprehensive decay health report.
+    pub async fn health_report(
+        &self,
+        namespace: Option<&str>,
+    ) -> crate::cli::Result<HealthReportView> {
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(ns) = namespace {
+            params.push(("namespace", ns.to_string()));
+        }
+        let query_pairs: Vec<(&str, &str)> =
+            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+        if query_pairs.is_empty() {
+            self.get("/v1/health/report").await
+        } else {
+            self.get_with_query("/v1/health/report", &query_pairs).await
+        }
+    }
+
     /// GET /v1/memories/export — bulk export.
     ///
     /// Returns all matching memories as a vector. For v1, the entire
@@ -285,5 +337,38 @@ impl RecalldClient {
         let query_pairs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         self.get_with_query("/v1/memories/export", &query_pairs)
             .await
+    }
+
+    /// GET /v1/memories -- list memories with filters and pagination.
+    pub async fn list_memories(
+        &self,
+        namespace: Option<&str>,
+        phase: Option<&str>,
+        tags: &[String],
+        sort: &str,
+        order: &str,
+        limit: u32,
+        offset: u32,
+    ) -> crate::cli::Result<ListResult> {
+        let mut params: Vec<(&str, String)> = Vec::new();
+
+        if let Some(ns) = namespace {
+            params.push(("namespace", ns.to_string()));
+        }
+        if let Some(p) = phase {
+            params.push(("phase", p.to_string()));
+        }
+        if !tags.is_empty() {
+            params.push(("tags", tags.join(",")));
+        }
+
+        params.push(("sort", sort.to_string()));
+        params.push(("order", order.to_string()));
+        params.push(("limit", limit.to_string()));
+        params.push(("offset", offset.to_string()));
+
+        let query_pairs: Vec<(&str, &str)> =
+            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.get_with_query("/v1/memories", &query_pairs).await
     }
 }

@@ -33,11 +33,14 @@ pub struct DaemonServer {
 impl DaemonServer {
     /// Creates a new daemon server backed by the given `Recalld` system.
     pub fn new(system: Recalld) -> Self {
+        let tz = crate::time::resolve_timezone(&system.config().timezone);
+
         let search: Arc<dyn SearchPipeline> = Arc::new(McpSearchAdapter::new(
             system.query_engine().clone(),
             system.embedding().clone(),
             system.storage().clone(),
             system.graph().clone(),
+            tz,
         ));
         let storage: Arc<dyn BridgeStorageEngine> = Arc::new(McpStorageAdapter::new(
             system.storage().clone(),
@@ -48,9 +51,10 @@ impl DaemonServer {
             system.entity_index().clone(),
             system.graph().clone(),
             std::sync::Arc::new(system.config().clone()),
+            tz,
         ));
         let namespaces: Arc<dyn NamespaceRegistry> =
-            Arc::new(McpNamespaceAdapter::new(system.storage().clone()));
+            Arc::new(McpNamespaceAdapter::new(system.storage().clone(), tz));
         let health: Arc<dyn HealthChecker> =
             Arc::new(McpHealthAdapter::new(system.storage().clone()));
 

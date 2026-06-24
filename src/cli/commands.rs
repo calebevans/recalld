@@ -68,6 +68,15 @@ pub enum Command {
 
     /// Bulk export memories
     Export(ExportArgs),
+
+    /// List all memories with filtering, sorting, and pagination
+    List(ListArgs),
+
+    /// Bulk import memories from file
+    Import(ImportArgs),
+
+    /// Comprehensive health report: decay forecast, at-risk memories, storage breakdown
+    Health(HealthArgs),
 }
 
 // ── Store ──────────────────────────────────────────────────────────
@@ -259,4 +268,126 @@ pub enum ExportFormat {
     Json,
     /// One JSON object per line (streaming-friendly)
     Jsonl,
+}
+
+// ── List ──────────────────────────────────────────────────────────
+
+/// Arguments for the `list` command.
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Filter by namespace name.
+    #[arg(long, short)]
+    pub namespace: Option<String>,
+
+    /// Filter by decay phase: full, summary, ghost.
+    #[arg(long, short, value_parser = parse_phase)]
+    pub phase: Option<String>,
+
+    /// Filter by tag (can be repeated, comma-separated). Memories must have ALL tags.
+    #[arg(long, value_delimiter = ',')]
+    pub tags: Vec<String>,
+
+    /// Sort field: created, accessed, strength, stability.
+    #[arg(long, default_value = "created", value_enum)]
+    pub sort: SortField,
+
+    /// Sort direction: asc, desc.
+    #[arg(long, default_value = "desc", value_enum)]
+    pub order: SortOrder,
+
+    /// Maximum number of results.
+    #[arg(long, short, default_value_t = 50)]
+    pub limit: u32,
+
+    /// Pagination offset.
+    #[arg(long, default_value_t = 0)]
+    pub offset: u32,
+}
+
+/// Sort field for list command.
+#[derive(Debug, Clone, ValueEnum)]
+pub enum SortField {
+    /// Sort by creation timestamp
+    Created,
+    /// Sort by last access timestamp
+    Accessed,
+    /// Sort by retrievability/strength
+    Strength,
+    /// Sort by stability (days)
+    Stability,
+}
+
+/// Sort order.
+#[derive(Debug, Clone, ValueEnum)]
+pub enum SortOrder {
+    /// Ascending (oldest/weakest first)
+    Asc,
+    /// Descending (newest/strongest first)
+    Desc,
+}
+
+/// Parse phase string, validating it's one of: full, summary, ghost.
+fn parse_phase(s: &str) -> Result<String, String> {
+    match s.to_lowercase().as_str() {
+        "full" | "summary" | "ghost" => Ok(s.to_lowercase()),
+        _ => Err(format!(
+            "phase must be one of: full, summary, ghost (got '{s}')"
+        )),
+    }
+}
+
+// ── Import ──────────────────────────────────────────────────────────
+
+/// Arguments for the `import` command.
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// Path to JSON or JSONL file (or '-' for stdin).
+    pub file: String,
+
+    /// Input format (auto-detected from extension if omitted).
+    #[arg(long, value_enum)]
+    pub import_format: Option<ImportFormat>,
+
+    /// Override namespace for all imported memories.
+    #[arg(long, short)]
+    pub namespace: Option<String>,
+
+    /// Show what would be imported without actually importing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip memories whose summary already exists (fuzzy match).
+    #[arg(long)]
+    pub skip_duplicates: bool,
+
+    /// Number of memories per batch (reserved for future use).
+    #[arg(long, default_value_t = 50)]
+    pub batch_size: u32,
+
+    /// Continue importing even if some memories fail.
+    #[arg(long)]
+    pub continue_on_error: bool,
+}
+
+/// Import file format.
+#[derive(Debug, Clone, ValueEnum)]
+pub enum ImportFormat {
+    /// Single JSON array
+    Json,
+    /// One JSON object per line (streaming-friendly)
+    Jsonl,
+}
+
+// ── Health ─────────────────────────────────────────────────────────
+
+/// Arguments for the `health` command.
+#[derive(Debug, Args)]
+pub struct HealthArgs {
+    /// Filter to a specific namespace.
+    #[arg(long, short)]
+    pub namespace: Option<String>,
+
+    /// Output format (overrides global --format).
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormat>,
 }

@@ -3,8 +3,8 @@ name = "recalld"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "AI memory system with biologically-inspired decay and retrieval-induced forgetting"
-license = "MIT OR Apache-2.0"
+description = "AI memory system"
+license = ""
 default-run = "recalld"
 
 [[bin]]
@@ -75,6 +75,7 @@ reqwest     = { version = "0.12", default-features = false, features = ["json", 
 
 # ── Time ─────────────────────────────────────────────────────────
 chrono      = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono-tz   = "0.10"
 
 # ── Async traits ─────────────────────────────────────────────────
 async-trait = "0.1"
@@ -91,6 +92,8 @@ comfy-table = "7"
 colored     = "2"
 dirs        = "5"
 tempfile    = "3"
+hostname    = "0.4"
+zip         = { version = "2", features = ["deflate-zlib"] }
 
 [dev-dependencies]
 tokio-test  = "0.4"

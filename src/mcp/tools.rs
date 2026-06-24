@@ -142,8 +142,8 @@ async fn handle_store_memory(bridge: &McpBridge, arguments: serde_json::Value) -
     let namespace = arguments
         .get("namespace")
         .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
+        .map(String::from)
+        .unwrap_or_else(|| bridge.default_namespace().to_string());
     let parent_id = arguments
         .get("parentId")
         .and_then(|v| v.as_str())
@@ -244,12 +244,18 @@ fn recall_memories_def() -> ToolInfo {
                     "maximum": 3
                 },
                 "timeRangeStart": {
-                    "type": "integer",
-                    "description": "Lower bound timestamp in milliseconds since Unix epoch. Memories created at or after this time get a relevance boost."
+                    "description": "Lower bound timestamp: either milliseconds since Unix epoch (integer) or ISO 8601 string (e.g. \"2024-06-24T00:00:00Z\"). Memories created at or after this time get a relevance boost.",
+                    "oneOf": [
+                        { "type": "integer" },
+                        { "type": "string" }
+                    ]
                 },
                 "timeRangeEnd": {
-                    "type": "integer",
-                    "description": "Upper bound timestamp in milliseconds since Unix epoch. Memories created at or before this time get a relevance boost."
+                    "description": "Upper bound timestamp: either milliseconds since Unix epoch (integer) or ISO 8601 string (e.g. \"2024-06-24T00:00:00Z\"). Memories created at or before this time get a relevance boost.",
+                    "oneOf": [
+                        { "type": "integer" },
+                        { "type": "string" }
+                    ]
                 }
             },
             "required": ["query"]
@@ -279,8 +285,8 @@ async fn handle_recall_memories(
     let namespace = arguments
         .get("namespace")
         .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
+        .map(String::from)
+        .unwrap_or_else(|| bridge.default_namespace().to_string());
     let tags: Vec<String> = arguments
         .get("tags")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -302,8 +308,24 @@ async fn handle_recall_memories(
         .and_then(|v| v.as_f64())
         .map(|f| f as f32);
     let depth = arguments.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let time_range_start = arguments.get("timeRangeStart").and_then(|v| v.as_i64());
-    let time_range_end = arguments.get("timeRangeEnd").and_then(|v| v.as_i64());
+
+    // Parse time range values: accept either integer (millis) or ISO 8601 string.
+    let time_range_start = match arguments.get("timeRangeStart") {
+        Some(v) => match crate::time::parse_time_value(v) {
+            Some(Ok(ms)) => Some(ms),
+            Some(Err(e)) => return ToolCallResult::error(format!("Invalid timeRangeStart: {e}")),
+            None => None,
+        },
+        None => None,
+    };
+    let time_range_end = match arguments.get("timeRangeEnd") {
+        Some(v) => match crate::time::parse_time_value(v) {
+            Some(Ok(ms)) => Some(ms),
+            Some(Err(e)) => return ToolCallResult::error(format!("Invalid timeRangeEnd: {e}")),
+            None => None,
+        },
+        None => None,
+    };
 
     let input = crate::mcp::bridge::SearchInput {
         query,
@@ -628,7 +650,9 @@ fn create_namespace_def() -> ToolInfo {
         title: Some("Create Namespace".to_string()),
         description: "Create a new memory namespace for organizing memories by \
             domain or project. Each namespace has its own embedding space and \
-            decay configuration. Embedding dimensions are fixed after creation."
+            decay configuration. You can set a custom decay rate multiplier to \
+            make memories in this namespace decay faster, slower, or not at all. \
+            Embedding dimensions are fixed after creation."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -653,6 +677,11 @@ fn create_namespace_def() -> ToolInfo {
                     "default": 0.9,
                     "minimum": 0.0,
                     "maximum": 1.0
+                },
+                "decayRateMultiplier": {
+                    "type": "number",
+                    "description": "Decay rate multiplier for this namespace. 1.0 = normal (default), 2.0 = 2x slower decay, 0.5 = 2x faster decay, 0.0 = decay disabled. Omit to inherit global setting.",
+                    "minimum": 0.0
                 }
             },
             "required": ["name"]
@@ -687,12 +716,17 @@ async fn handle_create_namespace(
         .get("desiredRetention")
         .and_then(|v| v.as_f64())
         .map(|f| f as f32);
+    let decay_rate_multiplier = arguments
+        .get("decayRateMultiplier")
+        .and_then(|v| v.as_f64())
+        .map(|f| f as f32);
 
     let input = crate::mcp::bridge::CreateNamespaceInput {
         name,
         embedding_dim,
         initial_stability,
         desired_retention,
+        decay_rate_multiplier,
     };
 
     match bridge.namespaces.create_namespace(input).await {

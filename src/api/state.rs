@@ -5,14 +5,16 @@
 //! Handlers never construct subsystem references themselves -- they
 //! receive them through `AppState`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::embedding::EmbeddingError;
 use crate::graph::GraphError;
+use crate::model::decay::DecayPhase;
 use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
 use crate::model::namespace::NamespaceConfig;
-use crate::model::record::CachedRecord;
+use crate::model::record::{CachedRecord, DiskRecord};
 use crate::search::SearchError;
 use crate::storage::StorageError;
 
@@ -79,8 +81,32 @@ pub trait StorageEngine: Send + Sync {
         namespace_id: NamespaceId,
     ) -> Result<NamespaceStats, StorageError>;
 
+    /// List memories with filters applied.
+    ///
+    /// Returns `CachedRecord` instances matching all filter criteria.
+    /// Results are UNSORTED -- the caller must sort them.
+    async fn list_memories(
+        &self,
+        filter: &crate::api::models::ListFilter,
+    ) -> Result<Vec<CachedRecord>, StorageError>;
+
     /// Health probe: returns `true` if the storage engine can read/write.
     async fn ping(&self) -> bool;
+
+    /// Iterate all records in creation order.
+    async fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError>;
+
+    /// Return all (MemoryId, DiskRecord) pairs in a given phase.
+    async fn scan_phase_records(
+        &self,
+        phase: DecayPhase,
+    ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError>;
+
+    /// List all distinct tags with their memory counts.
+    async fn list_tags(&self) -> Result<Vec<(String, u64)>, StorageError>;
+
+    /// Return the database directory path for file-size computation.
+    fn storage_path(&self) -> PathBuf;
 }
 
 /// RAM record cache (moka-backed).

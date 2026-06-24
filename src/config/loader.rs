@@ -9,7 +9,12 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::types::{EmbeddingProvider, LogFormat};
+use serde::Deserialize;
+
+use crate::config::types::{
+    CacheConfig, DecayConfig, EmbeddingConfig, EmbeddingProvider, GraphConfig, LogConfig,
+    LogFormat, RifConfig, ServerConfig, StorageConfig,
+};
 use crate::config::{ConfigError, RecalldConfig};
 
 /// Identifies where a config value originated (for diagnostics).
@@ -42,15 +47,159 @@ pub struct CliOverrides {
     pub log_format: Option<String>,
 }
 
+/// Per-directory configuration loaded from `.sulcus.toml` in a project root.
+///
+/// Contains a required `namespace` field and optional config section overrides.
+/// When present, config sections replace the corresponding global config section
+/// entirely (section-level granularity).
+#[derive(Debug, Deserialize)]
+pub struct PerDirConfig {
+    /// Required: default namespace for this directory.
+    pub namespace: String,
+    /// Optional server config override.
+    #[serde(default)]
+    pub server: Option<ServerConfig>,
+    /// Optional storage config override.
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+    /// Optional decay config override.
+    #[serde(default)]
+    pub decay: Option<DecayConfig>,
+    /// Optional cache config override.
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
+    /// Optional embedding config override.
+    #[serde(default)]
+    pub embedding: Option<EmbeddingConfig>,
+    /// Optional graph config override.
+    #[serde(default)]
+    pub graph: Option<GraphConfig>,
+    /// Optional RIF config override.
+    #[serde(default)]
+    pub rif: Option<RifConfig>,
+    /// Optional log config override.
+    #[serde(default)]
+    pub log: Option<LogConfig>,
+}
+
+impl PerDirConfig {
+    /// Validate the per-directory config.
+    pub fn validate(&self) -> std::result::Result<(), Vec<ConfigError>> {
+        let mut errors = Vec::new();
+
+        if !is_valid_namespace_name(&self.namespace) {
+            errors.push(ConfigError::Validation {
+                field: "namespace".into(),
+                message: format!(
+                    "invalid namespace name '{}' (must match ^[a-zA-Z0-9_-]{{1,64}}$)",
+                    self.namespace
+                ),
+            });
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Check whether a namespace name is valid: 1-64 chars, alphanumeric plus `_` and `-`.
+fn is_valid_namespace_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Loaded configuration with the resolved default namespace.
+///
+/// Returned by [`load_config`] so callers receive both the fully-resolved
+/// `RecalldConfig` and the default namespace derived from per-directory config.
+#[derive(Debug)]
+pub struct LoadedConfig {
+    /// The fully-resolved configuration.
+    pub config: RecalldConfig,
+    /// The default namespace for MCP operations from this directory.
+    /// Falls back to `"default"` when no `.sulcus.toml` is found.
+    pub default_namespace: String,
+}
+
+/// Walk up from `start_dir` to find the nearest `.sulcus.toml`.
+///
+/// Returns `None` if no per-directory config file is found before reaching
+/// the filesystem root.
+fn find_per_dir_config(start_dir: &Path) -> Option<PathBuf> {
+    let mut current = start_dir.canonicalize().ok()?;
+    loop {
+        let candidate = current.join(".sulcus.toml");
+        if candidate.exists() && candidate.is_file() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            // Reached filesystem root
+            return None;
+        }
+    }
+}
+
+/// Load and parse a per-directory config file from disk.
+fn load_per_dir_config(path: &Path) -> std::result::Result<PerDirConfig, Vec<ConfigError>> {
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        vec![ConfigError::ReadError {
+            path: path.to_path_buf(),
+            source: e,
+        }]
+    })?;
+
+    let per_dir: PerDirConfig = toml::from_str(&contents).map_err(|e| {
+        vec![ConfigError::ParseError {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        }]
+    })?;
+
+    per_dir.validate()?;
+
+    Ok(per_dir)
+}
+
+/// Apply per-directory config overrides to a base config (section-level replacement).
+fn apply_per_dir_overrides(base: RecalldConfig, per_dir: &PerDirConfig) -> RecalldConfig {
+    RecalldConfig {
+        server: per_dir.server.clone().unwrap_or(base.server),
+        storage: per_dir.storage.clone().unwrap_or(base.storage),
+        decay: per_dir.decay.clone().unwrap_or(base.decay),
+        cache: per_dir.cache.clone().unwrap_or(base.cache),
+        embedding: per_dir.embedding.clone().unwrap_or(base.embedding),
+        graph: per_dir.graph.clone().unwrap_or(base.graph),
+        rif: per_dir.rif.clone().unwrap_or(base.rif),
+        log: per_dir.log.clone().unwrap_or(base.log),
+        timezone: base.timezone,
+    }
+}
+
 /// Load configuration by applying layers in priority order.
 ///
-/// Returns the fully-resolved, validated configuration or all errors found.
+/// Returns a [`LoadedConfig`] containing the fully-resolved, validated
+/// configuration together with the default namespace (from per-directory
+/// config or `"default"` as fallback).
+///
+/// Layer order (highest priority wins):
+/// 1. Compiled defaults
+/// 2. Global TOML (`~/.recalld/config.toml`)
+/// 3. Per-directory TOML (`.sulcus.toml` — closest ancestor)
+/// 4. Environment variables (`RECALLD_*`)
+/// 5. CLI flags
 pub fn load_config(
     config_path: Option<&Path>,
     cli_overrides: &CliOverrides,
-) -> std::result::Result<RecalldConfig, Vec<ConfigError>> {
+) -> std::result::Result<LoadedConfig, Vec<ConfigError>> {
     // Layer 1: defaults
     let mut config = RecalldConfig::default();
+    let mut default_namespace = "default".to_string();
 
     // Layer 2: TOML file
     // Search order: explicit --config flag → ./recalld.toml → ~/.recalld/config.toml
@@ -90,16 +239,42 @@ pub fn load_config(
         config = merge_config(config, file_config);
     }
 
-    // Layer 3: environment variables
+    // Layer 3: Per-directory TOML (.sulcus.toml — closest ancestor)
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(per_dir_path) = find_per_dir_config(&cwd) {
+            match load_per_dir_config(&per_dir_path) {
+                Ok(per_dir) => {
+                    tracing::debug!(
+                        path = %per_dir_path.display(),
+                        namespace = %per_dir.namespace,
+                        "loaded per-directory config"
+                    );
+                    default_namespace = per_dir.namespace.clone();
+                    config = apply_per_dir_overrides(config, &per_dir);
+                }
+                Err(errors) => {
+                    // Log warning and continue (graceful degradation)
+                    for error in &errors {
+                        tracing::warn!(%error, "invalid per-directory config, ignoring");
+                    }
+                }
+            }
+        }
+    }
+
+    // Layer 4: environment variables
     apply_env_overrides(&mut config)?;
 
-    // Layer 4: CLI flags
+    // Layer 5: CLI flags
     apply_cli_overrides(&mut config, cli_overrides);
 
     // Validate the fully-resolved config
     config.validate()?;
 
-    Ok(config)
+    Ok(LoadedConfig {
+        config,
+        default_namespace,
+    })
 }
 
 /// Merge a file-parsed config into the base.
@@ -205,6 +380,11 @@ fn apply_env_overrides(config: &mut RecalldConfig) -> std::result::Result<(), Ve
     env_override!(
         "RECALLD_DECAY_PERMASTORE_THRESHOLD_DAYS",
         config.decay.permastore_threshold_days,
+        f64
+    );
+    env_override!(
+        "RECALLD_DECAY_RATE_MULTIPLIER",
+        config.decay.decay_rate_multiplier,
         f64
     );
 
@@ -317,6 +497,9 @@ fn apply_env_overrides(config: &mut RecalldConfig) -> std::result::Result<(), Ve
     }
     env_override_opt_string!("RECALLD_LOG_FILE", config.log.file);
 
+    // --- Timezone ---
+    env_override_string!("RECALLD_TIMEZONE", config.timezone);
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -367,6 +550,7 @@ pub fn generate_default_config() -> String {
 [decay]
 # sweep_interval_hours = 24.0
 # permastore_threshold_days = 1500.0
+# decay_rate_multiplier = 1.0           # 1.0 = normal, 2.0 = 2x slower, 0.0 = disabled
 
 [decay.phase_thresholds]
 # full_to_summary = 0.7

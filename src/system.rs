@@ -452,6 +452,7 @@ impl Recalld {
                 storage.clone(),
                 graph.clone(),
                 cache.clone(),
+                config.decay.decay_rate_multiplier,
             ) {
                 Ok(runner) => {
                     let handle = runner.start();
@@ -496,6 +497,7 @@ impl Recalld {
                     permastore_threshold: 1500.0,
                     created_at: chrono::Utc::now().timestamp_millis(),
                     desired_retention: 0.9,
+                    decay_rate_multiplier: None,
                 };
                 let mut storage_w = storage.write().map_err(|e| RecalldError::Init {
                     step: "create_default_namespace",

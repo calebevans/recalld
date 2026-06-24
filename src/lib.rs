@@ -22,6 +22,7 @@
 // ── Module declarations ──────────────────────────────────────────────
 
 pub mod api;
+pub mod backup;
 #[cfg(feature = "bench")]
 pub mod bench;
 pub mod cache;
@@ -39,6 +40,7 @@ pub mod search;
 pub mod serialization;
 pub mod storage;
 pub mod system;
+pub mod time;
 
 // ── Top-level re-exports ─────────────────────────────────────────────
 //

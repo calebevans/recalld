@@ -189,10 +189,16 @@ pub struct SearchHit {
     pub phase: String,
     /// Current memory strength (0.0-1.0).
     pub strength: f32,
-    /// Creation timestamp in milliseconds since epoch.
+    /// Creation timestamp in milliseconds since epoch (UTC).
     pub created_at: i64,
-    /// Last access timestamp in milliseconds since epoch.
+    /// Human-readable formatted creation timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_formatted: Option<String>,
+    /// Last access timestamp in milliseconds since epoch (UTC).
     pub last_accessed_at: i64,
+    /// Human-readable formatted last access timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at_formatted: Option<String>,
     /// Related memories connected by graph edges.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<RelatedMemory>,
@@ -243,8 +249,11 @@ pub struct StoredMemory {
     pub strength: f32,
     /// Initial stability in days.
     pub stability: f32,
-    /// Creation timestamp in milliseconds since epoch.
+    /// Creation timestamp in milliseconds since epoch (UTC).
     pub created_at: i64,
+    /// Human-readable formatted creation timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_formatted: Option<String>,
 }
 
 /// A full memory record returned by get.
@@ -267,10 +276,16 @@ pub struct MemoryRecord {
     pub strength: f32,
     /// Current stability in days.
     pub stability: f32,
-    /// Creation timestamp in milliseconds since epoch.
+    /// Creation timestamp in milliseconds since epoch (UTC).
     pub created_at: i64,
-    /// Last access timestamp in milliseconds since epoch.
+    /// Human-readable formatted creation timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_formatted: Option<String>,
+    /// Last access timestamp in milliseconds since epoch (UTC).
     pub last_accessed_at: i64,
+    /// Human-readable formatted last access timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at_formatted: Option<String>,
     /// Whether this memory is in permastore.
     pub is_permastore: bool,
     /// Number of graph edges connected to this memory.
@@ -305,6 +320,10 @@ pub struct CreateNamespaceInput {
     pub initial_stability: Option<f32>,
     /// Target retention rate (0.0-1.0).
     pub desired_retention: Option<f32>,
+    /// Decay rate multiplier for this namespace.
+    /// None = inherit from global config.
+    /// Some(1.0) = normal, Some(0.0) = disabled.
+    pub decay_rate_multiplier: Option<f32>,
 }
 
 /// Namespace information.
@@ -319,8 +338,11 @@ pub struct NamespaceInfo {
     pub embedding_dim: u16,
     /// Number of memories in this namespace.
     pub memory_count: u64,
-    /// Creation timestamp in milliseconds since epoch.
+    /// Creation timestamp in milliseconds since epoch (UTC).
     pub created_at: i64,
+    /// Human-readable formatted creation timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_formatted: Option<String>,
 }
 
 /// Namespace statistics.
@@ -404,6 +426,34 @@ pub enum BridgeError {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Time range value (supports both millis and ISO 8601 input)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Time range value: either raw epoch millis or an ISO 8601 string.
+///
+/// Uses serde's `untagged` representation so JSON callers can pass either
+/// `1719187200000` or `"2024-06-24T00:00:00Z"` for the same field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TimeRangeValue {
+    /// Raw Unix epoch milliseconds.
+    Millis(i64),
+    /// ISO 8601 string (e.g. `"2024-06-24T10:00:00Z"`).
+    Iso8601(String),
+}
+
+impl TimeRangeValue {
+    /// Convert to Unix epoch milliseconds.
+    pub fn to_millis(&self) -> Result<i64, BridgeError> {
+        match self {
+            TimeRangeValue::Millis(ms) => Ok(*ms),
+            TimeRangeValue::Iso8601(s) => crate::time::parse_iso8601_to_millis(s)
+                .map_err(|e| BridgeError::InvalidInput(e)),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // McpBridge
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -420,6 +470,21 @@ pub struct McpBridge {
     pub namespaces: Arc<dyn NamespaceRegistry>,
     /// Health checker for subsystem status.
     pub health: Arc<dyn HealthChecker>,
+    /// Default namespace for this MCP session (from per-dir config).
+    /// Set once at initialization, immutable thereafter.
+    pub default_namespace: String,
+    /// Resolved display timezone for formatted timestamps.
+    pub timezone: chrono_tz::Tz,
+}
+
+impl McpBridge {
+    /// Get the default namespace for this session.
+    ///
+    /// Derived from the nearest `.sulcus.toml` file, or `"default"` when
+    /// no per-directory config is found.
+    pub fn default_namespace(&self) -> &str {
+        &self.default_namespace
+    }
 }
 
 #[async_trait]

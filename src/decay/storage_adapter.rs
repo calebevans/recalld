@@ -6,20 +6,31 @@
 //! engine's interface (e.g. `get_record` returning a full `DiskRecord`).
 
 use super::sweep::{DecayMetadata, SweepError};
-use crate::model::{DecayPhase, MemoryId};
+use crate::model::{DecayPhase, MemoryId, NamespaceId};
 use crate::storage::StorageEngine;
 
-/// Extract decay-relevant metadata from a `DiskRecord`.
+/// Extract decay-relevant metadata from a `DiskRecord`, including the
+/// namespace's decay rate multiplier (if set).
 pub fn get_decay_metadata(
     storage: &dyn StorageEngine,
     id: MemoryId,
 ) -> Result<Option<DecayMetadata>, SweepError> {
     match storage.get_record(id) {
-        Ok(Some(record)) => Ok(Some(DecayMetadata {
-            stability: record.stability,
-            last_accessed_at: record.last_accessed_at,
-            is_permastore: record.is_permastore != 0,
-        })),
+        Ok(Some(record)) => {
+            // Look up the namespace config to get the decay rate multiplier.
+            let decay_rate_multiplier = storage
+                .get_namespace(NamespaceId::new(record.namespace_id))
+                .ok()
+                .flatten()
+                .and_then(|ns| ns.decay_rate_multiplier);
+
+            Ok(Some(DecayMetadata {
+                stability: record.stability,
+                last_accessed_at: record.last_accessed_at,
+                is_permastore: record.is_permastore != 0,
+                decay_rate_multiplier,
+            }))
+        }
         Ok(None) => Ok(None),
         Err(e) => Err(SweepError::Storage(e.to_string())),
     }

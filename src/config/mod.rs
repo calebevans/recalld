@@ -6,7 +6,9 @@
 pub mod loader;
 pub mod types;
 
-pub use loader::{CliOverrides, ConfigSource, generate_default_config, load_config};
+pub use loader::{
+    CliOverrides, ConfigSource, LoadedConfig, PerDirConfig, generate_default_config, load_config,
+};
 pub use types::{
     CacheConfig, DecayConfig, EmbeddingConfig, EmbeddingProvider, GraphConfig, LogConfig,
     LogFormat, PhaseThresholds, RifConfig, ServerConfig, StorageConfig,
@@ -77,6 +79,18 @@ pub struct RecalldConfig {
     pub rif: RifConfig,
     /// Logging configuration.
     pub log: LogConfig,
+
+    /// Display timezone for formatted timestamps.
+    ///
+    /// Accepts IANA timezone names (e.g. `"America/New_York"`), `"UTC"`, or
+    /// `"local"` (falls back to UTC). Default: `"UTC"`.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+}
+
+/// Default timezone value for serde deserialization.
+fn default_timezone() -> String {
+    "UTC".to_string()
 }
 
 impl Default for RecalldConfig {
@@ -90,6 +104,7 @@ impl Default for RecalldConfig {
             graph: GraphConfig::default(),
             rif: RifConfig::default(),
             log: LogConfig::default(),
+            timezone: default_timezone(),
         }
     }
 }
@@ -178,6 +193,15 @@ impl RecalldConfig {
             errors.push(ConfigError::Validation {
                 field: "decay.permastore_threshold_days".into(),
                 message: "must be positive".into(),
+            });
+        }
+        if self.decay.decay_rate_multiplier < 0.0 {
+            errors.push(ConfigError::Validation {
+                field: "decay.decay_rate_multiplier".into(),
+                message: format!(
+                    "must be >= 0.0, got {}",
+                    self.decay.decay_rate_multiplier
+                ),
             });
         }
 

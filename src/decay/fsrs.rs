@@ -279,6 +279,17 @@ impl<'a> FsrsEngine<'a> {
     /// R(t, S) = (1 + FACTOR * t / S) ^ DECAY
     /// ```
     ///
+    /// When a `decay_rate_multiplier` is provided, elapsed time is divided
+    /// by the multiplier before being fed into the formula:
+    ///
+    /// ```text
+    /// effective_t = t / decay_rate_multiplier
+    /// R = (1 + FACTOR * effective_t / S) ^ DECAY
+    /// ```
+    ///
+    /// A multiplier of 2.0 makes memories appear half as old (slower decay).
+    /// A multiplier of 0.0 disables decay entirely (returns 1.0).
+    ///
     /// # Arguments
     ///
     /// - `time_since_access_days`: Elapsed time since last access, in
@@ -286,12 +297,19 @@ impl<'a> FsrsEngine<'a> {
     ///   (just-accessed memory has perfect retrievability).
     /// - `stability`: FSRS stability S, in days. Must be > 0.0.
     ///   Represents the number of days until R drops to 0.9.
+    /// - `decay_rate_multiplier`: Controls the rate of decay. 1.0 = normal,
+    ///   > 1.0 = slower decay, 0.0 = no decay. Must be >= 0.0.
     ///
     /// # Returns
     ///
     /// Retrievability in [0.0, 1.0]. The curve is monotonically
     /// decreasing in `t` and monotonically increasing in `S`.
-    pub fn retrievability(&self, time_since_access_days: f32, stability: f32) -> f32 {
+    pub fn retrievability(
+        &self,
+        time_since_access_days: f32,
+        stability: f32,
+        decay_rate_multiplier: f32,
+    ) -> f32 {
         debug_assert!(
             stability > 0.0,
             "stability must be positive, got {stability}"
@@ -300,12 +318,24 @@ impl<'a> FsrsEngine<'a> {
             time_since_access_days >= 0.0,
             "elapsed days must be non-negative, got {time_since_access_days}"
         );
+        debug_assert!(
+            decay_rate_multiplier >= 0.0,
+            "decay_rate_multiplier must be non-negative, got {decay_rate_multiplier}"
+        );
 
         if time_since_access_days == 0.0 {
             return 1.0;
         }
 
-        (1.0 + FACTOR * time_since_access_days / stability).powf(DECAY)
+        // Special case: decay disabled
+        if decay_rate_multiplier == 0.0 {
+            return 1.0;
+        }
+
+        // Apply multiplier to elapsed time
+        let effective_elapsed = time_since_access_days / decay_rate_multiplier;
+
+        (1.0 + FACTOR * effective_elapsed / stability).powf(DECAY)
     }
 
     /// Calculate the stability increase factor (SInc) for an access.
@@ -362,6 +392,8 @@ impl<'a> FsrsEngine<'a> {
     /// - `state`: Mutable reference to the memory's decay state.
     /// - `access_kind`: How the memory was accessed. `DecaySweep` is
     ///   a no-op -- sweeps do not count as accesses.
+    /// - `decay_rate_multiplier`: Controls the rate of decay for
+    ///   retrievability calculation. 1.0 = normal, 0.0 = no decay.
     /// - `now_millis`: Current time as milliseconds since Unix epoch.
     ///
     /// # Returns
@@ -379,6 +411,7 @@ impl<'a> FsrsEngine<'a> {
         &self,
         state: &mut DecayState,
         access_kind: AccessKind,
+        decay_rate_multiplier: f32,
         now_millis: i64,
     ) -> (f32, Option<DecayEvent>) {
         // Sweep encounters are not accesses
@@ -390,8 +423,9 @@ impl<'a> FsrsEngine<'a> {
         let elapsed_millis = (now_millis - state.last_accessed_at).max(0) as f64;
         let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
 
-        // 2. Current retrievability
-        let current_r = self.retrievability(elapsed_days, state.stability);
+        // 2. Current retrievability (with decay rate multiplier)
+        let current_r =
+            self.retrievability(elapsed_days, state.stability, decay_rate_multiplier);
 
         // 3. Full SInc
         let full_sinc = self.stability_increase(state.stability, current_r, state.difficulty);

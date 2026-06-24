@@ -99,6 +99,14 @@ pub struct NamespaceConfig {
 
     /// Target retention rate for FSRS interval scheduling.
     pub desired_retention: f32,
+
+    /// Namespace-specific decay rate multiplier.
+    /// - None (default) = inherit from global [decay] config
+    /// - Some(1.0) = normal decay
+    /// - Some(0.0) = decay disabled for this namespace
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decay_rate_multiplier: Option<f32>,
 }
 
 impl NamespaceConfig {
@@ -114,6 +122,7 @@ impl NamespaceConfig {
             permastore_threshold: DEFAULT_PERMASTORE_THRESHOLD,
             created_at: now_millis,
             desired_retention: DEFAULT_DESIRED_RETENTION,
+            decay_rate_multiplier: None,
         }
     }
 
@@ -171,6 +180,13 @@ impl NamespaceConfig {
         // Desired retention in (0.0, 1.0)
         if self.desired_retention <= 0.0 || self.desired_retention >= 1.0 {
             return Err(ValidationError::StrengthOutOfRange(self.desired_retention));
+        }
+
+        // Decay rate multiplier must be >= 0.0 if set
+        if let Some(mult) = self.decay_rate_multiplier {
+            if mult < 0.0 {
+                return Err(ValidationError::InvalidDecayMultiplier { value: mult });
+            }
         }
 
         Ok(())

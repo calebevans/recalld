@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use recalld::config::{RecalldConfig, loader};
+use recalld::config::LoadedConfig;
 use recalld::{Recalld, RecalldError};
 
 /// Recalld — AI memory system with biologically-inspired decay
@@ -63,6 +64,39 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
+    },
+
+    /// Create a backup of all Recalld data
+    Backup {
+        /// Destination path for the backup archive (file or directory)
+        ///
+        /// If a directory, generates timestamped filename automatically.
+        /// If a file path ending in .zip, uses that exact name.
+        #[arg(short, long)]
+        destination: std::path::PathBuf,
+
+        /// Override the data directory to back up
+        #[arg(short = 'D', long)]
+        source_data_dir: Option<std::path::PathBuf>,
+
+        /// Continue even if some files cannot be locked (DANGEROUS)
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Restore data from a backup archive
+    Restore {
+        /// Path to the backup zip file
+        #[arg(long, value_name = "PATH")]
+        from: std::path::PathBuf,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+
+        /// Don't attempt to stop the daemon
+        #[arg(long)]
+        no_stop_daemon: bool,
     },
 
     /// Run external benchmarks (LoCoMo, etc.)
@@ -183,6 +217,12 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+        Command::Backup { .. } | Command::Restore { .. } => {
+            if let Err(e) = init_tracing("info", false, false) {
+                eprintln!("fatal: failed to initialize tracing: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
         #[cfg(feature = "bench")]
         Command::Bench { .. } => {}
     }
@@ -200,7 +240,7 @@ fn main() -> ExitCode {
 }
 
 async fn async_main(cli: Cli) -> ExitCode {
-    let config = match load_config(&cli) {
+    let loaded = match load_config(&cli) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(%e, "configuration error");
@@ -214,11 +254,21 @@ async fn async_main(cli: Cli) -> ExitCode {
         log_json: false,
         port: None,
     }) {
-        Command::Serve { bind, port, .. } => run_serve(config, bind, port).await,
-        Command::Mcp { .. } => run_mcp(config).await,
-        Command::Daemon { action } => run_daemon(config, action).await,
+        Command::Serve { bind, port, .. } => run_serve(loaded.config, bind, port).await,
+        Command::Mcp { .. } => run_mcp(loaded).await,
+        Command::Daemon { action } => run_daemon(loaded.config, action).await,
+        Command::Backup {
+            destination,
+            source_data_dir,
+            force,
+        } => run_backup_command(loaded.config, destination, source_data_dir, force).await,
+        Command::Restore {
+            from,
+            force,
+            no_stop_daemon,
+        } => run_restore_command(loaded.config, from, force, no_stop_daemon).await,
         #[cfg(feature = "bench")]
-        Command::Bench { target, format } => run_bench(config, target, &format).await,
+        Command::Bench { target, format } => run_bench(loaded.config, target, &format).await,
     }
 }
 
@@ -368,24 +418,29 @@ async fn run_serve(
     }
 }
 
-async fn run_mcp(config: RecalldConfig) -> ExitCode {
-    tracing::info!("Recalld MCP server starting (stdio)");
+async fn run_mcp(loaded: LoadedConfig) -> ExitCode {
+    tracing::info!(
+        default_namespace = %loaded.default_namespace,
+        "Recalld MCP server starting (stdio)"
+    );
 
     let socket = recalld::daemon::socket_path();
+    let default_ns = loaded.default_namespace.clone();
+    let tz = recalld::time::resolve_timezone(&loaded.config.timezone);
 
-    let bridge = match try_daemon_connection(&socket).await {
+    let bridge = match try_daemon_connection(&socket, &default_ns, tz).await {
         Ok(bridge) => {
             tracing::info!(socket = %socket.display(), "connected to daemon");
             bridge
         }
-        Err(_) => match auto_start_daemon(&config, &socket).await {
+        Err(_) => match auto_start_daemon(&loaded.config, &socket, &default_ns, tz).await {
             Ok(bridge) => {
                 tracing::info!("auto-started daemon, connected");
                 bridge
             }
             Err(e) => {
                 tracing::warn!(%e, "daemon unavailable, falling back to direct mode");
-                return run_mcp_direct(config).await;
+                return run_mcp_direct(loaded).await;
             }
         },
     };
@@ -407,8 +462,9 @@ async fn run_mcp(config: RecalldConfig) -> ExitCode {
     }
 }
 
-async fn run_mcp_direct(config: RecalldConfig) -> ExitCode {
-    let system = match Recalld::new(config).await {
+async fn run_mcp_direct(loaded: LoadedConfig) -> ExitCode {
+    let default_namespace = loaded.default_namespace;
+    let system = match Recalld::new(loaded.config).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "startup failed");
@@ -419,12 +475,15 @@ async fn run_mcp_direct(config: RecalldConfig) -> ExitCode {
     let bridge = {
         use recalld::mcp::bridge_adapters::*;
 
+        let tz = recalld::time::resolve_timezone(&system.config().timezone);
+
         let search: Arc<dyn recalld::mcp::bridge::SearchPipeline> =
             Arc::new(McpSearchAdapter::new(
                 system.query_engine().clone(),
                 system.embedding().clone(),
                 system.storage().clone(),
                 system.graph().clone(),
+                tz,
             ));
         let storage: Arc<dyn recalld::mcp::bridge::StorageEngine> =
             Arc::new(McpStorageAdapter::new(
@@ -436,9 +495,10 @@ async fn run_mcp_direct(config: RecalldConfig) -> ExitCode {
                 system.entity_index().clone(),
                 system.graph().clone(),
                 std::sync::Arc::new(system.config().clone()),
+                tz,
             ));
         let namespaces: Arc<dyn recalld::mcp::bridge::NamespaceRegistry> =
-            Arc::new(McpNamespaceAdapter::new(system.storage().clone()));
+            Arc::new(McpNamespaceAdapter::new(system.storage().clone(), tz));
         let health: Arc<dyn recalld::mcp::bridge::HealthChecker> =
             Arc::new(McpHealthAdapter::new(system.storage().clone()));
 
@@ -447,6 +507,8 @@ async fn run_mcp_direct(config: RecalldConfig) -> ExitCode {
             storage,
             namespaces,
             health,
+            default_namespace,
+            timezone: tz,
         }
     };
 
@@ -469,6 +531,8 @@ async fn run_mcp_direct(config: RecalldConfig) -> ExitCode {
 
 async fn try_daemon_connection(
     socket: &Path,
+    default_namespace: &str,
+    tz: chrono_tz::Tz,
 ) -> Result<recalld::mcp::bridge::McpBridge, Box<dyn std::error::Error>> {
     use recalld::daemon::bridge_adapters::*;
 
@@ -480,12 +544,16 @@ async fn try_daemon_connection(
         storage: Arc::new(RemoteStorageAdapter::new(client.clone())),
         namespaces: Arc::new(RemoteNamespaceAdapter::new(client.clone())),
         health: Arc::new(RemoteHealthAdapter::new(client.clone())),
+        default_namespace: default_namespace.to_string(),
+        timezone: tz,
     })
 }
 
 async fn auto_start_daemon(
     config: &RecalldConfig,
     socket: &Path,
+    default_namespace: &str,
+    tz: chrono_tz::Tz,
 ) -> Result<recalld::mcp::bridge::McpBridge, Box<dyn std::error::Error>> {
     use std::process::Command as StdCommand;
 
@@ -537,8 +605,79 @@ async fn auto_start_daemon(
                     storage: Arc::new(RemoteStorageAdapter::new(client.clone())),
                     namespaces: Arc::new(RemoteNamespaceAdapter::new(client.clone())),
                     health: Arc::new(RemoteHealthAdapter::new(client.clone())),
+                    default_namespace: default_namespace.to_string(),
+                    timezone: tz,
                 });
             }
+        }
+    }
+}
+
+// ── Backup & restore commands ──────────────────────────────────────
+
+async fn run_backup_command(
+    config: RecalldConfig,
+    destination: std::path::PathBuf,
+    source_data_dir: Option<std::path::PathBuf>,
+    force: bool,
+) -> ExitCode {
+    match recalld::backup::run_backup(&config, &destination, source_data_dir.as_deref(), force)
+        .await
+    {
+        Ok(archive_path) => {
+            tracing::info!(path = %archive_path.display(), "backup created");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+
+            // Provide helpful hints for common errors.
+            if let recalld::backup::BackupError::LockFailed { .. } = e {
+                eprintln!();
+                eprintln!("This usually means Recalld is currently running. Try:");
+                eprintln!("  1. Stop the daemon: recalld daemon stop");
+                eprintln!("  2. Run the backup");
+                eprintln!("  3. Restart the daemon: recalld daemon start");
+                eprintln!();
+                eprintln!("Or, use --force to attempt backup anyway (not recommended).");
+            }
+
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_restore_command(
+    config: RecalldConfig,
+    backup_path: std::path::PathBuf,
+    force: bool,
+    no_stop_daemon: bool,
+) -> ExitCode {
+    use recalld::backup::{RestoreOptions, restore_from_backup};
+
+    let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
+
+    let opts = RestoreOptions {
+        backup_path,
+        data_dir,
+        force,
+        no_stop_daemon,
+    };
+
+    match restore_from_backup(opts).await {
+        Ok(()) => {
+            eprintln!();
+            eprintln!("Restore completed successfully");
+            eprintln!();
+            eprintln!("Next steps:");
+            eprintln!("  1. Start the daemon: recalld daemon start");
+            eprintln!("  2. Verify data: recalld daemon status");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!();
+            eprintln!("Restore failed: {e}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -606,7 +745,8 @@ async fn run_daemon_background(config: &RecalldConfig) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match auto_start_daemon(config, &socket).await {
+    let tz = recalld::time::resolve_timezone(&config.timezone);
+    match auto_start_daemon(config, &socket, "default", tz).await {
         Ok(_bridge) => {
             let pid = recalld::daemon::lifecycle::read_pid_file(&recalld::daemon::pid_path())
                 .ok()
@@ -703,7 +843,7 @@ async fn run_daemon_status() -> ExitCode {
     }
 }
 
-fn load_config(cli: &Cli) -> std::result::Result<RecalldConfig, RecalldError> {
+fn load_config(cli: &Cli) -> std::result::Result<LoadedConfig, RecalldError> {
     let cli_overrides = loader::CliOverrides {
         config_path: cli.config.clone(),
         data_dir: cli.data_dir.clone(),
@@ -712,7 +852,7 @@ fn load_config(cli: &Cli) -> std::result::Result<RecalldConfig, RecalldError> {
 
     let config_path = cli.config.as_deref();
 
-    let config = loader::load_config(config_path, &cli_overrides).map_err(|errors| {
+    let loaded = loader::load_config(config_path, &cli_overrides).map_err(|errors| {
         let message = errors
             .iter()
             .map(|e| e.to_string())
@@ -725,7 +865,7 @@ fn load_config(cli: &Cli) -> std::result::Result<RecalldConfig, RecalldError> {
         }
     })?;
 
-    Ok(config)
+    Ok(loaded)
 }
 
 /// Initialize the tracing subscriber.

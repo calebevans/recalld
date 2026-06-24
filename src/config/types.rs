@@ -85,6 +85,18 @@ pub struct DecayConfig {
     /// Skip starting the decay sweep runner entirely (used by benchmarks).
     #[serde(default)]
     pub disable_sweep: bool,
+
+    /// Global decay rate multiplier.
+    /// - 1.0 (default) = normal FSRS decay
+    /// - > 1.0 = slower decay (memories last longer)
+    /// - < 1.0 = faster decay (memories forgotten sooner)
+    /// - 0.0 = decay disabled (infinite stability, no transitions)
+    #[serde(default = "default_decay_rate_multiplier")]
+    pub decay_rate_multiplier: f64,
+}
+
+fn default_decay_rate_multiplier() -> f64 {
+    1.0
 }
 
 /// Phase boundary thresholds for FSRS decay.
@@ -116,6 +128,7 @@ impl Default for DecayConfig {
             phase_thresholds: PhaseThresholds::default(),
             permastore_threshold_days: 1500.0,
             disable_sweep: false,
+            decay_rate_multiplier: 1.0,
         }
     }
 }

@@ -15,6 +15,7 @@ use crate::graph::SharedGraph;
 use crate::model::{DecayPhase, MemoryId, NamespaceId};
 use crate::search::{EntityIndex, FlatVectorIndex, FtsIndex, QueryEngine};
 use crate::storage::RedbStorageEngine;
+use crate::time::format_timestamp;
 // Import the StorageEngine trait so its methods are in scope.
 use super::bridge;
 use crate::storage::StorageEngine as StorageEngineTrait;
@@ -30,6 +31,7 @@ pub struct McpSearchAdapter {
     embedding: Arc<dyn EmbeddingProvider>,
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
     graph: SharedGraph,
+    timezone: chrono_tz::Tz,
 }
 
 impl McpSearchAdapter {
@@ -39,12 +41,14 @@ impl McpSearchAdapter {
         embedding: Arc<dyn EmbeddingProvider>,
         storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
         graph: SharedGraph,
+        timezone: chrono_tz::Tz,
     ) -> Self {
         Self {
             query_engine,
             embedding,
             storage,
             graph,
+            timezone,
         }
     }
 }
@@ -173,6 +177,7 @@ impl bridge::SearchPipeline for McpSearchAdapter {
 
                 let metadata = crate::model::parse_structured_tags(&r.tags);
 
+                let tz = self.timezone;
                 bridge::SearchHit {
                     id: r.memory_id.to_string(),
                     summary: r.summary.unwrap_or_default(),
@@ -186,7 +191,9 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                     phase: format!("{:?}", r.phase),
                     strength: r.retrievability,
                     created_at: r.created_at,
+                    created_at_formatted: Some(format_timestamp(r.created_at, tz)),
                     last_accessed_at: r.created_at,
+                    last_accessed_at_formatted: Some(format_timestamp(r.created_at, tz)),
                     related,
                 }
             })
@@ -302,6 +309,7 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             .map(|r| {
                 let metadata = crate::model::parse_structured_tags(&r.tags);
 
+                let tz = self.timezone;
                 bridge::SearchHit {
                     id: r.memory_id.to_string(),
                     summary: r.summary.unwrap_or_default(),
@@ -315,7 +323,9 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                     phase: format!("{:?}", r.phase),
                     strength: r.retrievability,
                     created_at: r.created_at,
+                    created_at_formatted: Some(format_timestamp(r.created_at, tz)),
                     last_accessed_at: r.created_at,
+                    last_accessed_at_formatted: Some(format_timestamp(r.created_at, tz)),
                     related: Vec::new(),
                 }
             })
@@ -337,6 +347,7 @@ pub struct McpStorageAdapter {
     entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
     graph: SharedGraph,
     config: Arc<RecalldConfig>,
+    timezone: chrono_tz::Tz,
 }
 
 impl McpStorageAdapter {
@@ -350,6 +361,7 @@ impl McpStorageAdapter {
         entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
         graph: SharedGraph,
         config: Arc<RecalldConfig>,
+        timezone: chrono_tz::Tz,
     ) -> Self {
         Self {
             storage,
@@ -360,6 +372,7 @@ impl McpStorageAdapter {
             entity_index,
             graph,
             config,
+            timezone,
         }
     }
 }
@@ -640,6 +653,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             strength: record.strength,
             stability: record.stability,
             created_at: record.created_at,
+            created_at_formatted: Some(format_timestamp(record.created_at, self.timezone)),
         })
     }
 
@@ -677,6 +691,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     None
                 };
 
+                let tz = self.timezone;
                 Ok(Some(bridge::MemoryRecord {
                     id: id.to_string(),
                     namespace: ns_name,
@@ -687,7 +702,12 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     strength: record.strength,
                     stability: record.stability,
                     created_at: record.created_at,
+                    created_at_formatted: Some(format_timestamp(record.created_at, tz)),
                     last_accessed_at: record.last_accessed_at,
+                    last_accessed_at_formatted: Some(format_timestamp(
+                        record.last_accessed_at,
+                        tz,
+                    )),
                     is_permastore: record.is_permastore != 0,
                     edge_count: record.edge_count,
                 }))
@@ -754,12 +774,13 @@ impl bridge::StorageEngine for McpStorageAdapter {
 /// Adapts `RedbStorageEngine` to the MCP `NamespaceRegistry` trait.
 pub struct McpNamespaceAdapter {
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+    timezone: chrono_tz::Tz,
 }
 
 impl McpNamespaceAdapter {
     /// Create a new namespace adapter wrapping the storage engine.
-    pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>, timezone: chrono_tz::Tz) -> Self {
+        Self { storage, timezone }
     }
 }
 
@@ -773,6 +794,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         let namespaces = storage_r
             .list_namespaces()
             .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+        let tz = self.timezone;
         Ok(namespaces
             .into_iter()
             .map(|ns| bridge::NamespaceInfo {
@@ -781,6 +803,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                 embedding_dim: ns.embedding_dim as u16,
                 memory_count: 0,
                 created_at: ns.created_at,
+                created_at_formatted: Some(format_timestamp(ns.created_at, tz)),
             })
             .collect())
     }
@@ -809,6 +832,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             permastore_threshold: 1500.0,
             created_at: now,
             desired_retention: input.desired_retention.unwrap_or(0.9),
+            decay_rate_multiplier: input.decay_rate_multiplier,
         };
 
         let mut storage_w = self
@@ -825,6 +849,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             embedding_dim: ns_config.embedding_dim as u16,
             memory_count: 0,
             created_at: now,
+            created_at_formatted: Some(format_timestamp(now, self.timezone)),
         })
     }
 

@@ -47,6 +47,9 @@ pub struct DecayMetadata {
     pub last_accessed_at: i64,
     /// Whether the memory is exempt from decay sweeps.
     pub is_permastore: bool,
+    /// Namespace-specific decay rate multiplier, if set.
+    /// None means inherit from global config.
+    pub decay_rate_multiplier: Option<f32>,
 }
 
 // ── SweepConfig ─────────────────────────────────────────────────────
@@ -147,6 +150,8 @@ pub struct SweepResult {
     pub memories_scanned: u64,
     /// Memories skipped because they are permastore.
     pub permastore_skipped: u64,
+    /// Memories skipped because decay is disabled (multiplier == 0.0).
+    pub decay_disabled_skipped: u64,
     /// Phase 1 (Full) -> Phase 2 (Summary) transitions.
     pub full_to_summary: u64,
     /// Phase 2 (Summary) -> Phase 3 (Ghost) transitions.
@@ -283,6 +288,10 @@ pub struct DecaySweepRunner {
     graph: SharedGraph,
     cache: Arc<CacheManager>,
 
+    /// Global decay rate multiplier from the top-level config.
+    /// Namespace-specific multipliers override this.
+    global_decay_multiplier: f64,
+
     /// Sends shutdown signal to the background task.
     shutdown_tx: watch::Sender<bool>,
 
@@ -293,6 +302,10 @@ pub struct DecaySweepRunner {
 impl DecaySweepRunner {
     /// Create a new sweep runner. Does NOT start the background task --
     /// call `start()` separately.
+    ///
+    /// `global_decay_multiplier` is the top-level decay rate multiplier
+    /// from the application config. Namespace-specific multipliers
+    /// override this value.
     pub fn new(
         config: SweepConfig,
         decay_config: Arc<DecayConfig>,
@@ -300,6 +313,7 @@ impl DecaySweepRunner {
         storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
         graph: SharedGraph,
         cache: Arc<CacheManager>,
+        global_decay_multiplier: f64,
     ) -> Result<Self, SweepConfigError> {
         config.validate()?;
         let (shutdown_tx, _) = watch::channel(false);
@@ -310,6 +324,7 @@ impl DecaySweepRunner {
             storage,
             graph,
             cache,
+            global_decay_multiplier,
             shutdown_tx,
             trigger_notify: Arc::new(Notify::new()),
         })
@@ -331,6 +346,7 @@ impl DecaySweepRunner {
         let storage = Arc::clone(&self.storage);
         let graph = Arc::clone(&self.graph);
         let cache = Arc::clone(&self.cache);
+        let global_decay_multiplier = self.global_decay_multiplier;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let trigger_notify = Arc::clone(&self.trigger_notify);
 
@@ -345,6 +361,7 @@ impl DecaySweepRunner {
                     &storage,
                     &graph,
                     &cache,
+                    global_decay_multiplier,
                 )
                 .await;
                 Self::log_result(&result);
@@ -390,6 +407,7 @@ impl DecaySweepRunner {
                     &storage,
                     &graph,
                     &cache,
+                    global_decay_multiplier,
                 )
                 .await;
                 Self::log_result(&result);
@@ -418,6 +436,7 @@ impl DecaySweepRunner {
         info!(
             scanned = result.memories_scanned,
             permastore_skipped = result.permastore_skipped,
+            decay_disabled_skipped = result.decay_disabled_skipped,
             full_to_summary = result.full_to_summary,
             summary_to_ghost = result.summary_to_ghost,
             deletions = result.deletions,
@@ -458,6 +477,7 @@ impl DecaySweepRunner {
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
         graph: &SharedGraph,
         cache: &Arc<CacheManager>,
+        global_decay_multiplier: f64,
     ) -> SweepResult {
         let start = Instant::now();
         let now_millis = chrono::Utc::now().timestamp_millis();
@@ -474,6 +494,7 @@ impl DecaySweepRunner {
             graph,
             cache,
             now_millis,
+            global_decay_multiplier,
             &mut result,
         )
         .await;
@@ -488,6 +509,7 @@ impl DecaySweepRunner {
             graph,
             cache,
             now_millis,
+            global_decay_multiplier,
             &mut result,
         )
         .await;
@@ -502,6 +524,7 @@ impl DecaySweepRunner {
             graph,
             cache,
             now_millis,
+            global_decay_multiplier,
             &mut result,
         )
         .await;
@@ -561,6 +584,7 @@ impl DecaySweepRunner {
         graph: &SharedGraph,
         cache: &Arc<CacheManager>,
         now_millis: i64,
+        global_decay_multiplier: f64,
         result: &mut SweepResult,
     ) {
         // Get all memory IDs in this phase from the PhaseIndex.
@@ -638,10 +662,24 @@ impl DecaySweepRunner {
                 continue;
             }
 
+            // -- Get effective decay rate multiplier ---------------
+            // Namespace override > global default
+            let multiplier = meta
+                .decay_rate_multiplier
+                .map(|m| m as f64)
+                .unwrap_or(global_decay_multiplier);
+
+            // -- Decay disabled check -----------------------------
+            if multiplier == 0.0 {
+                result.decay_disabled_skipped += 1;
+                continue;
+            }
+
             // -- Calculate raw retrievability ---------------------
             let elapsed_millis = (now_millis - meta.last_accessed_at).max(0) as f64;
             let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
-            let raw_r = engine.retrievability(elapsed_days, meta.stability);
+            let raw_r =
+                engine.retrievability(elapsed_days, meta.stability, multiplier as f32);
 
             // -- Calculate connection bonus -----------------------
             let connection_bonus =

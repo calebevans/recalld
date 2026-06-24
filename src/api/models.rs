@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::MemoryId;
+use crate::model::{DecayPhase, MemoryId, NamespaceId};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Memory Endpoints
@@ -212,6 +212,84 @@ pub struct NamespaceListItem {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// List Memories Endpoint
+// ═══════════════════════════════════════════════════════════════════════
+
+/// GET /memories -- query parameters for listing memories.
+#[derive(Debug, Deserialize)]
+pub struct ListMemoriesQuery {
+    /// Filter by namespace name.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Filter by decay phase: "full", "summary", "ghost".
+    #[serde(default)]
+    pub phase: Option<String>,
+
+    /// Filter by tags (comma-separated, AND logic).
+    #[serde(default, deserialize_with = "deserialize_comma_separated")]
+    pub tags: Vec<String>,
+
+    /// Sort field: "created", "accessed", "strength", "stability".
+    #[serde(default)]
+    pub sort: Option<String>,
+
+    /// Sort order: "asc", "desc".
+    #[serde(default)]
+    pub order: Option<String>,
+
+    /// Maximum results.
+    #[serde(default)]
+    pub limit: Option<u32>,
+
+    /// Pagination offset.
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+/// Deserialize comma-separated string into `Vec<String>`.
+fn deserialize_comma_separated<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    Ok(s.map(|s| {
+        s.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    })
+    .unwrap_or_default())
+}
+
+/// GET /memories -- response body (inside ApiResponse).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListMemoriesResponse {
+    /// Matching memories.
+    pub memories: Vec<crate::serialization::MemoryResponse>,
+    /// Total count matching filters (before pagination).
+    pub total: u64,
+    /// Requested limit.
+    pub limit: u32,
+    /// Requested offset.
+    pub offset: u32,
+    /// Whether more results exist beyond this page.
+    pub has_more: bool,
+}
+
+/// Internal filter struct for the list-memories storage query.
+#[derive(Debug, Clone)]
+pub struct ListFilter {
+    /// Filter to a specific namespace.
+    pub namespace_id: Option<NamespaceId>,
+    /// Filter to a specific decay phase.
+    pub phase: Option<DecayPhase>,
+    /// Tag filter (AND logic: memory must have ALL tags).
+    pub tags: Vec<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Health & Metrics
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -275,4 +353,154 @@ pub struct ComponentHealth {
     /// Latency of the last health probe in microseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_us: Option<u64>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Health Report
+// ═══════════════════════════════════════════════════════════════════════
+
+/// GET /health/report -- query parameters.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthReportQuery {
+    /// Optional namespace name to scope the report.
+    pub namespace: Option<String>,
+}
+
+/// GET /health/report -- comprehensive decay health report.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthReport {
+    /// Namespace name (if filtered), or "all".
+    pub scope: String,
+
+    /// Basic counts.
+    pub overview: HealthOverview,
+
+    /// Predicted phase transitions by time horizon.
+    pub decay_forecast: DecayForecast,
+
+    /// Memories closest to deletion.
+    pub at_risk: Vec<AtRiskMemory>,
+
+    /// Memory age statistics.
+    pub age_distribution: AgeDistribution,
+
+    /// Storage breakdown by file.
+    pub storage: StorageBreakdown,
+
+    /// Top tags and unique tag count.
+    pub metadata: MetadataStats,
+}
+
+/// Overview section of the health report.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthOverview {
+    /// Total memory count.
+    pub total_memories: u64,
+    /// Counts by decay phase.
+    pub phase_counts: PhaseCounts,
+    /// Number of permastore memories.
+    pub permastore_count: u64,
+}
+
+/// Decay forecast with transitions bucketed by time horizon.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecayForecast {
+    /// Phase transitions expected within 7 days.
+    pub transitions_7d: TransitionCounts,
+    /// Phase transitions expected within 30 days.
+    pub transitions_30d: TransitionCounts,
+    /// Phase transitions expected within 90 days.
+    pub transitions_90d: TransitionCounts,
+}
+
+/// Count of phase transitions by type.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionCounts {
+    /// Full -> Summary transitions.
+    pub full_to_summary: u64,
+    /// Summary -> Ghost transitions.
+    pub summary_to_ghost: u64,
+    /// Ghost -> Deleted transitions.
+    pub ghost_to_deleted: u64,
+}
+
+/// A memory at risk of deletion.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AtRiskMemory {
+    /// Short UUID (first 8 chars).
+    pub id: String,
+    /// Summary text (truncated to 100 chars).
+    pub summary: String,
+    /// Current strength (0.0-1.0).
+    pub strength: f32,
+    /// Estimated days until deletion.
+    pub days_until_deletion: f32,
+    /// Current phase (always "ghost").
+    pub phase: String,
+}
+
+/// Memory age statistics.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgeDistribution {
+    /// Unix millis of oldest memory.
+    pub oldest_created_at: Option<i64>,
+    /// Unix millis of newest memory.
+    pub newest_created_at: Option<i64>,
+    /// Average age in days.
+    pub avg_age_days: f32,
+    /// Median stability in days.
+    pub median_stability: f32,
+}
+
+/// Storage breakdown by file.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageBreakdown {
+    /// Total size of data directory in bytes.
+    pub total_bytes: u64,
+    /// Size of meta.db.
+    pub meta_db_bytes: u64,
+    /// Size of edges.db.
+    pub edges_db_bytes: u64,
+    /// Size of text.log.
+    pub text_log_bytes: u64,
+    /// Per-namespace vector file sizes.
+    pub vector_files: Vec<VectorFileSize>,
+}
+
+/// Size of a single namespace's vector file.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorFileSize {
+    /// Namespace name.
+    pub namespace: String,
+    /// File size in bytes.
+    pub bytes: u64,
+}
+
+/// Tag statistics section of the health report.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataStats {
+    /// Top 10 tags by memory count.
+    pub top_tags: Vec<TagCount>,
+    /// Total unique tag count.
+    pub unique_tags: u64,
+}
+
+/// A single tag with its memory count.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagCount {
+    /// Tag string.
+    pub tag: String,
+    /// Number of memories with this tag.
+    pub count: u64,
 }

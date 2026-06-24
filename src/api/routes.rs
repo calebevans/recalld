@@ -24,6 +24,7 @@ use super::state::AppState;
 ///
 /// | Method | Path                      | Handler                  | Purpose                    |
 /// |--------|---------------------------|--------------------------|----------------------------|
+/// | GET    | /memories                 | list_memories            | List all memories (paginated) |
 /// | POST   | /memories                 | create_memory            | Create a new memory        |
 /// | GET    | /memories/:id             | get_memory               | Retrieve a single memory   |
 /// | DELETE | /memories/:id             | delete_memory            | Delete a memory            |
@@ -34,9 +35,11 @@ use super::state::AppState;
 /// | POST   | /namespaces               | create_namespace         | Create a namespace         |
 /// | GET    | /namespaces/:id/stats     | namespace_stats          | Namespace statistics       |
 /// | GET    | /health                   | health_check             | Health + subsystem status  |
+/// | GET    | /health/report            | health_report            | Decay health report        |
 /// | GET    | /metrics                  | metrics                  | Prometheus metrics export  |
 pub fn router(state: AppState, config: &ApiConfig) -> Router {
     let memory_routes = Router::new()
+        .route("/", get(handlers::list_memories))
         .route("/", post(handlers::create_memory))
         .route("/{id}", get(handlers::get_memory))
         .route("/{id}", delete(handlers::delete_memory))
@@ -53,6 +56,7 @@ pub fn router(state: AppState, config: &ApiConfig) -> Router {
 
     let ops_routes = Router::new()
         .route("/health", get(handlers::health_check))
+        .route("/health/report", get(handlers::health_report))
         .route("/metrics", get(handlers::metrics));
 
     let cors = if config.cors_permissive {
