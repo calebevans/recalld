@@ -158,7 +158,7 @@ fn collect_backup_files(data_dir: &Path) -> Result<Vec<PathBuf>, BackupError> {
     let mut files = Vec::new();
 
     // Core databases.
-    let core_files = ["meta.db", "fts.db", "edges.db", "text.log"];
+    let core_files = ["meta.db", "fts.db", "edges.db", "fulltext.dat"];
     for name in &core_files {
         let path = data_dir.join(name);
         if path.exists() {

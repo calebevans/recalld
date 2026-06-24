@@ -61,14 +61,14 @@ impl Drop for FileLock {
 /// 1. meta.db
 /// 2. fts.db
 /// 3. edges.db
-/// 4. text.log
+/// 4. fulltext.dat
 /// 5. Per-namespace vectors.dat files
 ///
 /// Returns a vec of locks that must be held until backup completes.
 pub fn lock_all_files(data_dir: &Path, force: bool) -> Result<Vec<FileLock>, BackupError> {
     let mut locks = Vec::new();
 
-    let lock_targets = ["meta.db", "fts.db", "edges.db", "text.log"];
+    let lock_targets = ["meta.db", "fts.db", "edges.db", "fulltext.dat"];
 
     for filename in &lock_targets {
         let path = data_dir.join(filename);

@@ -62,9 +62,9 @@ pub struct DiskRecord {
     pub access_history: Vec<AccessEvent>,
 
     // ── Text pointer ─────────────────────────────────────────────────
-    /// Byte offset into `text.log`. 0 = no full_text.
+    /// Byte offset into `fulltext.dat`. 0 = no full_text.
     pub text_offset: u64,
-    /// Byte length in `text.log`. 0 = no full_text.
+    /// Byte length in `fulltext.dat`. 0 = no full_text.
     pub text_length: u32,
 }
 
@@ -347,7 +347,7 @@ fn access_kind_from_u8(val: u8) -> AccessKind {
 ///
 /// Optimized for fast access, not serialization. Owns all its data
 /// (no borrows from disk pages). Does NOT contain:
-/// - `full_text` — too large to cache; loaded on demand from `text.log`.
+/// - `full_text` — too large to cache; loaded on demand from `fulltext.dat`.
 /// - `embedding` — lives in the mmap'd `vectors.dat`, managed by the OS
 ///   page cache.
 /// - `access_history` — rarely needed for queries; loaded on demand.
@@ -421,7 +421,7 @@ impl From<&Memory> for DiskRecord {
     /// Convert an API Memory to a DiskRecord for persistence.
     ///
     /// The caller must set `text_offset` and `text_length` after writing
-    /// full_text to `text.log`, and `vector_slot` after writing the
+    /// full_text to `fulltext.dat`, and `vector_slot` after writing the
     /// embedding to `vectors.dat`. This conversion initializes both to
     /// zero.
     ///
@@ -446,7 +446,7 @@ impl From<&Memory> for DiskRecord {
             summary: m.summary.clone(),
             tags: m.tags.clone(),
             access_history: m.access_history.clone().unwrap_or_default(),
-            text_offset: 0, // Must be set by caller after text.log write
+            text_offset: 0, // Must be set by caller after fulltext.dat write
             text_length: 0, // ditto
         }
     }

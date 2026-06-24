@@ -266,7 +266,7 @@ impl MetadataStore {
     /// Delete a memory record and all its secondary index entries.
     ///
     /// The caller is responsible for cleaning up vectors.dat (free list),
-    /// text.log (compaction), and edges.db separately.
+    /// fulltext.dat (compaction), and edges.db separately.
     ///
     /// # Returns
     /// The deleted `DiskRecord` (for the caller to know which vector

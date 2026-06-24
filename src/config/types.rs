@@ -44,7 +44,7 @@ pub struct StorageConfig {
     /// Maximum size (bytes) of a single vectors.dat file before warning.
     pub max_vector_file_size: u64,
 
-    /// Fraction of dead space in text.log that triggers compaction (0.0-1.0).
+    /// Fraction of dead space in fulltext.dat that triggers compaction (0.0-1.0).
     pub compaction_threshold: f64,
 
     /// Batch fsync interval in milliseconds.

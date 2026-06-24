@@ -51,7 +51,7 @@ pub struct Recalld {
     config: Arc<RecalldConfig>,
 
     // -- Storage ------------------------------------------------------
-    /// Unified storage engine (meta.db, text.log, vectors.dat, edges.db).
+    /// Unified storage engine (meta.db, fulltext.dat, vectors.dat, edges.db).
     /// Wrapped in Arc<std::sync::RwLock> because RedbStorageEngine
     /// has &mut self methods (insert_memory, delete_memory, compact,
     /// sync). Read methods use &self.

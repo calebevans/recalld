@@ -81,9 +81,9 @@ pub struct SweepConfig {
     /// before flushing to storage. Default: 256.
     pub write_batch_size: usize,
 
-    /// Dead-space ratio in text.log that triggers compaction.
+    /// Dead-space ratio in fulltext.dat that triggers compaction.
     /// When the fraction of dead (reclaimed) space exceeds this
-    /// threshold, text.log is compacted at the end of the sweep.
+    /// threshold, fulltext.dat is compacted at the end of the sweep.
     /// Default: 0.30 (30%).
     pub text_compaction_threshold: f64,
 }
@@ -166,7 +166,7 @@ pub struct SweepResult {
     /// Memories where connection bonus prevented a phase transition
     /// that raw R alone would have triggered.
     pub saved_by_connection_bonus: u64,
-    /// Whether text.log compaction was triggered.
+    /// Whether fulltext.dat compaction was triggered.
     pub compaction_triggered: bool,
     /// Wall-clock duration of the entire sweep.
     pub duration: Duration,
@@ -546,7 +546,7 @@ impl DecaySweepRunner {
 
         // -- Text.log compaction ----------------------------------
         // Only attempt compaction when this sweep actually created dead
-        // space in text.log. Dead space is created by:
+        // space in fulltext.dat. Dead space is created by:
         //   - Full -> Summary transitions (full_text pointers zeroed)
         //   - Ghost -> Deleted transitions (all text removed)
         // If neither occurred, there is no new fragmentation to compact
@@ -563,7 +563,7 @@ impl DecaySweepRunner {
                     }
                 }
                 Err(e) => {
-                    error!(error = %e, "text.log compaction failed");
+                    error!(error = %e, "fulltext.dat compaction failed");
                 }
             }
         }
@@ -1008,7 +1008,7 @@ impl DecaySweepRunner {
     /// 1. Verify summary exists (it should -- summaries are created at
     ///    memory creation time). If missing, log a warning; the memory
     ///    transitions anyway but will have no summary text.
-    /// 2. Delete full_text from text.log (zero the pointer in meta.db,
+    /// 2. Delete full_text from fulltext.dat (zero the pointer in meta.db,
     ///    mark the space as dead -- no physical deletion until compaction).
     /// 3. Update decay_phase = Summary in meta.db.
     /// 4. Update PhaseIndex bitmap (clear Full bit, set Summary bit).

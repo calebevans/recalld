@@ -41,7 +41,7 @@ pub trait StorageEngine: Send + Sync {
     /// and the optional full_text. This method:
     ///
     /// 1. Allocates a vector slot and writes the embedding.
-    /// 2. Appends full_text to text.log (if provided).
+    /// 2. Appends full_text to fulltext.dat (if provided).
     /// 3. Sets vector_slot and text pointer on the record.
     /// 4. Inserts the record into meta.db with secondary indexes.
     fn insert_memory(
@@ -68,7 +68,7 @@ pub trait StorageEngine: Send + Sync {
         slot: u32,
     ) -> Result<Option<Vec<f32>>, StorageError>;
 
-    /// Read the full text for a memory from text.log.
+    /// Read the full text for a memory from fulltext.dat.
     ///
     /// Returns `None` if the text ref points to no data.
     fn get_text(&self, text_ref: TextRef) -> Result<Option<String>, StorageError>;
@@ -178,7 +178,7 @@ pub trait StorageEngine: Send + Sync {
 
     // ── Text Compaction ─────────────────────────────────────────────
 
-    /// Run text.log compaction, reclaiming dead space from decayed
+    /// Run fulltext.dat compaction, reclaiming dead space from decayed
     /// memories. Returns compaction statistics.
     fn compact_text_log(&mut self) -> Result<CompactionResult, StorageError>;
 
@@ -250,7 +250,7 @@ pub struct RedbStorageEngine {
     meta_store: MetadataStore,
     /// Per-namespace vector files (mmap'd).
     vector_manager: VectorManager,
-    /// Append-only text log -- text.log.
+    /// Append-only text log -- fulltext.dat.
     text_store: TextStore,
     /// Graph edge storage (redb) -- edges.db.
     edge_store: EdgeStore,
@@ -265,8 +265,8 @@ impl RedbStorageEngine {
     /// 1. Acquires exclusive file lock (prevents multi-process access).
     /// 2. Opens meta.db (redb) with 16 MB read cache.
     /// 3. Opens edges.db (redb).
-    /// 4. Recovers any interrupted text.log compaction.
-    /// 5. Opens text.log.
+    /// 4. Recovers any interrupted fulltext.dat compaction.
+    /// 5. Opens fulltext.dat.
     /// 6. Opens vector files for all existing namespaces.
     /// 7. Runs startup validation (rebuilds phase index, cleans orphans).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -292,11 +292,11 @@ impl RedbStorageEngine {
         // Step 3: Open edges.db.
         let edge_store = EdgeStore::open(&db_path.join("edges.db"))?;
 
-        // Step 4: Recover any interrupted text.log compaction.
+        // Step 4: Recover any interrupted fulltext.dat compaction.
         recover_text_compaction(&db_path)?;
 
-        // Step 5: Open text.log.
-        let text_store = TextStore::open(&db_path.join("text.log"))?;
+        // Step 5: Open fulltext.dat.
+        let text_store = TextStore::open(&db_path.join("fulltext.dat"))?;
 
         // Step 6: Open vector files for each existing namespace.
         let mut vector_manager = VectorManager::new(db_path.clone());
@@ -322,7 +322,7 @@ impl RedbStorageEngine {
 
     /// Run startup validation checks:
     /// 1. Rebuild phase index from meta.db.
-    /// 2. Validate text.log header.
+    /// 2. Validate fulltext.dat header.
     /// 3. Clean up orphaned edges.
     fn startup_validation(&mut self) -> Result<(), StorageError> {
         tracing::info!("Running storage startup validation...");
@@ -330,7 +330,7 @@ impl RedbStorageEngine {
         // 1. Rebuild the phase index from meta.db ground truth.
         self.meta_store.rebuild_phase_index()?;
 
-        // 2. Validate text.log header.
+        // 2. Validate fulltext.dat header.
         self.text_store.validate_header()?;
 
         // 3. Clean up orphaned edges.
@@ -399,8 +399,8 @@ impl StorageEngine for RedbStorageEngine {
         let vector_slot = vector_store.insert_vector(embedding)?;
         record.vector_slot = vector_slot;
 
-        // 2. Append full_text to text.log if present.
-        // Note: text.log is append-only; if this succeeds but step 3
+        // 2. Append full_text to fulltext.dat if present.
+        // Note: fulltext.dat is append-only; if this succeeds but step 3
         // fails, the entry becomes orphaned dead space that compaction
         // will reclaim. No explicit rollback needed for text.
         if let Some(text) = full_text {
@@ -412,7 +412,7 @@ impl StorageEngine for RedbStorageEngine {
         // 3. Insert the completed record into meta.db.
         if let Err(e) = self.meta_store.insert(id, record) {
             // Best-effort rollback: free the vector slot so it can be
-            // reused. The text.log entry (if written) becomes orphaned
+            // reused. The fulltext.dat entry (if written) becomes orphaned
             // dead space that compaction will eventually reclaim.
             if let Some(vs) = self.vector_manager.get_mut(namespace_id) {
                 if let Err(rollback_err) = vs.free_slot(vector_slot) {
@@ -430,7 +430,7 @@ impl StorageEngine for RedbStorageEngine {
                     memory_id = %id,
                     text_offset = record.text_offset,
                     text_length = record.text_length,
-                    "Orphaned text.log entry after meta.db insert failure; \
+                    "Orphaned fulltext.dat entry after meta.db insert failure; \
                      dead space will be reclaimed by next compaction"
                 );
             }
@@ -692,7 +692,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn sync(&mut self) -> Result<(), StorageError> {
-        // Sync text.log.
+        // Sync fulltext.dat.
         self.text_store.sync_data()?;
 
         // Sync all open vector files.

@@ -83,7 +83,7 @@ pub enum StorageError {
     /// The on-disk entry length does not match the expected length.
     #[error("stored entry length mismatch at offset {offset}: expected {expected}, found {found}")]
     TextLengthMismatch {
-        /// Byte offset in text.log.
+        /// Byte offset in fulltext.dat.
         offset: u64,
         /// Expected payload length from meta.db.
         expected: u32,
@@ -96,7 +96,7 @@ pub enum StorageError {
         "CRC32 mismatch at offset {offset}: expected {expected:#010x}, computed {computed:#010x}"
     )]
     TextCrcMismatch {
-        /// Byte offset in text.log.
+        /// Byte offset in fulltext.dat.
         offset: u64,
         /// CRC32 stored in the entry header.
         expected: u32,
@@ -107,7 +107,7 @@ pub enum StorageError {
     /// The text payload is not valid UTF-8.
     #[error("invalid UTF-8 at offset {offset}: {source}")]
     InvalidUtf8 {
-        /// Byte offset in text.log.
+        /// Byte offset in fulltext.dat.
         offset: u64,
         /// The underlying UTF-8 conversion error.
         source: std::string::FromUtf8Error,

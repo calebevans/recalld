@@ -271,7 +271,7 @@ pub async fn compute_storage_breakdown(
 
     let meta_db_bytes = file_size(&db_path.join("meta.db")).unwrap_or(0);
     let edges_db_bytes = file_size(&db_path.join("edges.db")).unwrap_or(0);
-    let text_log_bytes = file_size(&db_path.join("text.log")).unwrap_or(0);
+    let text_log_bytes = file_size(&db_path.join("fulltext.dat")).unwrap_or(0);
 
     let ns_list = namespaces.list_all().await;
     let mut vector_files = Vec::new();

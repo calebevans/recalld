@@ -396,7 +396,7 @@ pub struct StorageBreakdownView {
     pub meta_db_bytes: u64,
     /// Size of edges.db.
     pub edges_db_bytes: u64,
-    /// Size of text.log.
+    /// Size of fulltext.dat.
     pub text_log_bytes: u64,
     /// Per-namespace vector file sizes.
     pub vector_files: Vec<VectorFileSizeView>,
@@ -1206,7 +1206,7 @@ impl OutputFormatter for HumanFormatter {
             Self::format_bytes(report.storage.edges_db_bytes)
         ));
         out.push_str(&format!(
-            "  text.log:    {}\n",
+            "  fulltext.dat:    {}\n",
             Self::format_bytes(report.storage.text_log_bytes)
         ));
 

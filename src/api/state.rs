@@ -64,7 +64,7 @@ pub trait SearchPipeline: Send + Sync {
     async fn embedding_provider_healthy(&self) -> bool;
 }
 
-/// Persistent storage engine (meta.db, text.log, vectors.dat, edges.db).
+/// Persistent storage engine (meta.db, fulltext.dat, vectors.dat, edges.db).
 #[async_trait::async_trait]
 pub trait StorageEngine: Send + Sync {
     /// Create a new memory record and persist it.
@@ -338,7 +338,7 @@ pub struct AppState {
     /// The search pipeline: embedding, vector search, graph expansion.
     pub search: Arc<dyn SearchPipeline>,
 
-    /// Persistent storage engine (meta.db, text.log, vectors.dat, edges.db).
+    /// Persistent storage engine (meta.db, fulltext.dat, vectors.dat, edges.db).
     pub storage: Arc<dyn StorageEngine>,
 
     /// RAM record cache (moka-backed).

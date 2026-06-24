@@ -172,7 +172,7 @@ impl MemoryResponse {
             created_at: record.created_at,
             last_accessed_at: record.last_accessed_at,
             summary: record.summary.clone(),
-            full_text: None, // loaded on demand from text.log
+            full_text: None, // loaded on demand from fulltext.dat
             tags: record.tags.clone(),
             phase: record.phase,
             strength: record.strength,

@@ -1,4 +1,4 @@
-//! Append-only text log (text.log) with CRC32C integrity and compaction.
+//! Append-only text store (fulltext.dat) with CRC32C integrity and compaction.
 //!
 //! Stores full_text payloads for memories in Phase 1 (Full). Each entry
 //! is length-prefixed with a CRC32 checksum for corruption detection.
@@ -33,7 +33,7 @@ const ENTRY_HEADER_SIZE: u64 = 8;
 /// `compact()` returns a no-op result to avoid unnecessary I/O.
 const COMPACTION_FRAGMENTATION_THRESHOLD: f64 = 0.20;
 
-/// Magic bytes identifying a text.log file.
+/// Magic bytes identifying a fulltext.dat file.
 const TEXT_LOG_MAGIC: [u8; 4] = *b"MEMT";
 
 /// Current file format version.
@@ -43,7 +43,7 @@ const TEXT_LOG_VERSION: u16 = 1;
 // TextLogHeader — 16 bytes
 // ═══════════════════════════════════════════════════════════════════════
 
-/// 16-byte file header for text.log.
+/// 16-byte file header for fulltext.dat.
 /// All multi-byte integers are little-endian.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -72,14 +72,14 @@ impl TextLogHeader {
     pub fn validate(&self) -> Result<(), StorageError> {
         if self.magic != TEXT_LOG_MAGIC {
             return Err(StorageError::InvalidMagic {
-                file: "text.log",
+                file: "fulltext.dat",
                 expected: TEXT_LOG_MAGIC,
                 found: self.magic,
             });
         }
         if self.version.get() != TEXT_LOG_VERSION {
             return Err(StorageError::UnsupportedVersion {
-                file: "text.log",
+                file: "fulltext.dat",
                 expected: TEXT_LOG_VERSION,
                 found: self.version.get(),
             });
@@ -129,11 +129,11 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), Storage
 // TextRef
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Reference to a text entry in text.log.
+/// Reference to a text entry in fulltext.dat.
 /// Stored in DiskRecord as (text_offset: u64, text_length: u32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextRef {
-    /// Byte offset from the start of text.log to the entry header
+    /// Byte offset from the start of fulltext.dat to the entry header
     /// (the `length` field, NOT the data).
     pub file_offset: u64,
     /// Byte length of the text payload (excludes the 8-byte entry header).
@@ -161,12 +161,12 @@ impl TextRef {
 /// Mapping from MemoryId to its new TextRef after compaction.
 pub type RefMapping = Vec<(MemoryId, TextRef)>;
 
-/// Statistics and results from a text.log compaction run.
+/// Statistics and results from a fulltext.dat compaction run.
 #[derive(Debug)]
 pub struct CompactionResult {
-    /// Size of the old text.log in bytes.
+    /// Size of the old fulltext.dat in bytes.
     pub old_size: u64,
-    /// Size of the new (compacted) text.log in bytes.
+    /// Size of the new (compacted) fulltext.dat in bytes.
     pub new_size: u64,
     /// Number of dead entries that were removed.
     pub entries_removed: usize,
@@ -188,14 +188,14 @@ pub struct CompactionResult {
 pub struct TextStore {
     /// Open file handle (read + write mode).
     file: File,
-    /// Absolute path to text.log on disk.
+    /// Absolute path to fulltext.dat on disk.
     path: PathBuf,
     /// Current write position (byte offset of the next append).
     write_pos: u64,
 }
 
 impl TextStore {
-    /// Open an existing text.log, or create a new one if the file
+    /// Open an existing fulltext.dat, or create a new one if the file
     /// does not exist. Validates the header and sets the write
     /// position to end-of-file.
     pub fn open(path: &Path) -> Result<TextStore, StorageError> {
@@ -207,7 +207,7 @@ impl TextStore {
             let mut header_buf = [0u8; TextLogHeader::SIZE];
             file.read_exact(&mut header_buf)?;
             let header = TextLogHeader::read_from_bytes(&header_buf)
-                .map_err(|_| StorageError::HeaderParseError { file: "text.log" })?;
+                .map_err(|_| StorageError::HeaderParseError { file: "fulltext.dat" })?;
             header.validate()?;
 
             // Set write position to end of file.
@@ -336,7 +336,7 @@ impl TextStore {
         let mut header_buf = [0u8; TextLogHeader::SIZE];
         self.file.read_exact(&mut header_buf)?;
         let header = TextLogHeader::read_from_bytes(&header_buf)
-            .map_err(|_| StorageError::HeaderParseError { file: "text.log" })?;
+            .map_err(|_| StorageError::HeaderParseError { file: "fulltext.dat" })?;
         header.validate()
     }
 
@@ -350,12 +350,12 @@ impl TextStore {
         self.write_pos
     }
 
-    /// Return the path to the text.log file.
+    /// Return the path to the fulltext.dat file.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Compact text.log by copying only live entries into a new file,
+    /// Compact fulltext.dat by copying only live entries into a new file,
     /// then atomically replacing the old file.
     ///
     /// `live_refs` contains (MemoryId, TextRef) for every DiskRecord
@@ -370,7 +370,7 @@ impl TextStore {
             .ok_or(StorageError::InvalidPath)?
             .to_path_buf();
         let marker_path = parent_dir.join(".compacting");
-        let new_path = parent_dir.join("text.log.new");
+        let new_path = parent_dir.join("fulltext.dat.new");
 
         let old_size = self.write_pos;
         let total_possible = self.count_entries_approx();
@@ -392,7 +392,7 @@ impl TextStore {
             tracing::debug!(
                 fragmentation = format!("{:.1}%", fragmentation * 100.0),
                 threshold = format!("{:.0}%", COMPACTION_FRAGMENTATION_THRESHOLD * 100.0),
-                "Skipping text.log compaction: fragmentation below threshold"
+                "Skipping fulltext.dat compaction: fragmentation below threshold"
             );
             return Ok(CompactionResult {
                 old_size,
@@ -407,14 +407,14 @@ impl TextStore {
         }
 
         // Step 1: Write marker.
-        fs::write(&marker_path, b"text.log compaction in progress\n")?;
+        fs::write(&marker_path, b"fulltext.dat compaction in progress\n")?;
         fsync_file(&marker_path)?;
         fsync_dir(&parent_dir)?;
 
         tracing::info!(
             live = live_refs.len(),
             old_size,
-            "Starting text.log compaction"
+            "Starting fulltext.dat compaction"
         );
 
         // Step 2: Create new file with header.
@@ -517,12 +517,12 @@ impl TextStore {
 // Crash Recovery
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Recover from an interrupted text.log compaction.
+/// Recover from an interrupted fulltext.dat compaction.
 ///
 /// Called once during startup validation, BEFORE opening the TextStore.
 pub fn recover_text_compaction(db_dir: &Path) -> Result<(), StorageError> {
     let marker_path = db_dir.join(".compacting");
-    let new_file_path = db_dir.join("text.log.new");
+    let new_file_path = db_dir.join("fulltext.dat.new");
 
     if !marker_path.exists() {
         // No compaction was in progress.
@@ -534,10 +534,10 @@ pub fn recover_text_compaction(db_dir: &Path) -> Result<(), StorageError> {
         marker_path.display()
     );
 
-    // If text.log.new exists, it is incomplete or un-swapped.
+    // If fulltext.dat.new exists, it is incomplete or un-swapped.
     // meta.db still has old offsets. Safe to delete .new and revert.
     if new_file_path.exists() {
-        tracing::warn!("Deleting incomplete text.log.new");
+        tracing::warn!("Deleting incomplete fulltext.dat.new");
         fs::remove_file(&new_file_path)?;
     }
 

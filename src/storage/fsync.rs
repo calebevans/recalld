@@ -1,6 +1,6 @@
 //! Filesystem sync helpers for crash safety.
 //!
-//! Shared by the text.log compaction path and the SyncManager.
+//! Shared by the fulltext.dat compaction path and the SyncManager.
 
 use std::fs::File;
 use std::io;

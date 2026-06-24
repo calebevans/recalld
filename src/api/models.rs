@@ -469,7 +469,7 @@ pub struct StorageBreakdown {
     pub meta_db_bytes: u64,
     /// Size of edges.db.
     pub edges_db_bytes: u64,
-    /// Size of text.log.
+    /// Size of fulltext.dat.
     pub text_log_bytes: u64,
     /// Per-namespace vector file sizes.
     pub vector_files: Vec<VectorFileSize>,

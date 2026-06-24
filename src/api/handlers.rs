@@ -54,7 +54,7 @@ fn health_report_cache()
 /// 2. Resolve namespace by name -> NamespaceId.
 /// 3. Generate embedding if not provided (calls embedding provider).
 /// 4. Validate embedding dimensionality against namespace config.
-/// 5. Persist to storage (meta.db, text.log, vectors.dat).
+/// 5. Persist to storage (meta.db, fulltext.dat, vectors.dat).
 /// 6. Insert into RAM cache and vector index.
 /// 7. If `parent_id` provided, create parent->child edge in graph.
 /// 8. Return 201 with the created memory.
@@ -205,7 +205,7 @@ pub async fn get_memory(
 ///
 /// Steps:
 /// 1. Parse UUID from path.
-/// 2. Remove from storage (meta.db, text.log pointer, vectors.dat slot).
+/// 2. Remove from storage (meta.db, fulltext.dat pointer, vectors.dat slot).
 /// 3. Remove from cache and vector index.
 /// 4. Clean up graph edges (both directions).
 /// 5. Return 200 with deletion confirmation.
