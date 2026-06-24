@@ -23,12 +23,34 @@ If recalld is not on your PATH, use the full path:
 {
   "mcpServers": {
     "recalld": {
-      "command": "/Users/you/.cargo/bin/recalld",
+      "command": "/Users/you/.local/bin/recalld",
       "args": ["mcp"]
     }
   }
 }
 ```
+
+#### Allowing MCP tool permissions
+
+By default, Claude Code will prompt you for approval each time an MCP tool is called. To allow recalld tools automatically, add them to your `.claude/settings.json` or `.claude/settings.local.json`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__recalld__store_memory",
+      "mcp__recalld__recall_memories",
+      "mcp__recalld__get_memory",
+      "mcp__recalld__reinforce_memory",
+      "mcp__recalld__forget_memory",
+      "mcp__recalld__find_similar_memories",
+      "mcp__recalld__create_namespace"
+    ]
+  }
+}
+```
+
+You can place this in either the global (`~/.claude/settings.json`) or project-level (`.claude/settings.json`) settings file. The `permissions.allow` array merges across both files, so you can allow the MCP tools globally and they'll work in every project.
 
 To set a custom default namespace for a project, create a `.recalld.toml` file in the project root:
 
