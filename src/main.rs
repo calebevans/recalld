@@ -153,7 +153,7 @@ enum BenchTarget {
         model: String,
 
         /// Model name for conversation ingestion (memory extraction)
-        #[arg(long, default_value = "claude-haiku-4-5")]
+        #[arg(long, default_value = "claude-sonnet-4-6")]
         ingest_model: String,
 
         /// Model name for answer judging (uses a separate model to avoid self-grading bias)
