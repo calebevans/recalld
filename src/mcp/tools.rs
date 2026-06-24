@@ -399,8 +399,7 @@ fn get_memory_def() -> ToolInfo {
     ToolInfo {
         name: "get_memory".to_string(),
         title: Some("Get Memory".to_string()),
-        description: "Retrieve a specific memory by its ID."
-            .to_string(),
+        description: "Retrieve a specific memory by its ID.".to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {

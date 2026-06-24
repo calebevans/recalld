@@ -424,8 +424,7 @@ impl<'a> FsrsEngine<'a> {
         let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
 
         // 2. Current retrievability (with decay rate multiplier)
-        let current_r =
-            self.retrievability(elapsed_days, state.stability, decay_rate_multiplier);
+        let current_r = self.retrievability(elapsed_days, state.stability, decay_rate_multiplier);
 
         // 3. Full SInc
         let full_sinc = self.stability_increase(state.stability, current_r, state.difficulty);

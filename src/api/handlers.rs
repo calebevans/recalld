@@ -35,9 +35,11 @@ const HEALTH_REPORT_CACHE_TTL_SECS: u64 = 60;
 /// `AppState` (which would require a schema change beyond the scope of
 /// this fix). The `RwLock` ensures concurrent readers don't block each
 /// other and only one writer recomputes at a time.
-fn health_report_cache() -> &'static RwLock<std::collections::HashMap<String, (Instant, HealthReport)>> {
+fn health_report_cache()
+-> &'static RwLock<std::collections::HashMap<String, (Instant, HealthReport)>> {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<RwLock<std::collections::HashMap<String, (Instant, HealthReport)>>> = OnceLock::new();
+    static CACHE: OnceLock<RwLock<std::collections::HashMap<String, (Instant, HealthReport)>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
@@ -311,9 +313,7 @@ pub async fn list_memories(
     if let Some(ref phase) = params.phase {
         if !["full", "summary", "ghost"].contains(&phase.as_str()) {
             return Err(AppError::BadRequest {
-                message: format!(
-                    "invalid phase '{phase}', must be: full, summary, ghost"
-                ),
+                message: format!("invalid phase '{phase}', must be: full, summary, ghost"),
                 field: Some("phase".into()),
             });
         }
@@ -981,8 +981,7 @@ pub async fn health_report(
     let overview = health_report_compute::compute_overview(&filtered);
     let decay_forecast =
         health_report_compute::compute_decay_forecast(&filtered, state.namespaces.as_ref());
-    let at_risk =
-        health_report_compute::compute_at_risk(&filtered, state.namespaces.as_ref());
+    let at_risk = health_report_compute::compute_at_risk(&filtered, state.namespaces.as_ref());
     let age_distribution = health_report_compute::compute_age_distribution(&filtered);
     let storage = health_report_compute::compute_storage_breakdown(
         state.storage.as_ref(),
@@ -990,12 +989,10 @@ pub async fn health_report(
         namespace_filter,
     )
     .await;
-    let metadata = health_report_compute::compute_metadata_stats(
-        state.storage.as_ref(),
-        namespace_filter,
-    )
-    .await
-    .map_err(|e| AppError::Internal { source: e })?;
+    let metadata =
+        health_report_compute::compute_metadata_stats(state.storage.as_ref(), namespace_filter)
+            .await
+            .map_err(|e| AppError::Internal { source: e })?;
 
     let report = HealthReport {
         scope: scope.clone(),

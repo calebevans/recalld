@@ -12,7 +12,7 @@ use crate::cli::client::RecalldClient;
 use crate::cli::commands::{ImportArgs, ImportFormat};
 use crate::cli::config::CliConfig;
 use crate::cli::output::{ImportDryRunResult, ImportResult, MemoryView, OutputFormatter};
-use crate::cli::{print_err, print_out, CliError};
+use crate::cli::{CliError, print_err, print_out};
 
 /// Read all memories from a JSON array file.
 ///
@@ -34,15 +34,21 @@ pub fn read_jsonl(reader: impl Read) -> Vec<(usize, crate::cli::Result<MemoryVie
         .filter_map(|(i, line)| {
             let line_num = i + 1;
             match line {
-                Err(e) => Some((line_num, Err(CliError::Other(format!("I/O error on line {line_num}: {e}"))))),
+                Err(e) => Some((
+                    line_num,
+                    Err(CliError::Other(format!(
+                        "I/O error on line {line_num}: {e}"
+                    ))),
+                )),
                 Ok(line) => {
                     let trimmed = line.trim();
                     // Skip empty lines
                     if trimmed.is_empty() {
                         return None;
                     }
-                    let result = serde_json::from_str::<MemoryView>(trimmed)
-                        .map_err(|e| CliError::Other(format!("parse error on line {line_num}: {e}")));
+                    let result = serde_json::from_str::<MemoryView>(trimmed).map_err(|e| {
+                        CliError::Other(format!("parse error on line {line_num}: {e}"))
+                    });
                     Some((line_num, result))
                 }
             }
@@ -107,9 +113,8 @@ pub async fn cmd_import(
         }
     } else {
         // Read from file.
-        let file = std::fs::File::open(&args.file).map_err(|e| {
-            CliError::Other(format!("failed to open '{}': {e}", args.file))
-        })?;
+        let file = std::fs::File::open(&args.file)
+            .map_err(|e| CliError::Other(format!("failed to open '{}': {e}", args.file)))?;
         let reader = std::io::BufReader::new(file);
         match format {
             ImportFormat::Json => {
@@ -167,11 +172,7 @@ pub async fn cmd_import(
             } else {
                 &memory.namespace
             };
-            let ns = args
-                .namespace
-                .as_deref()
-                .unwrap_or(record_ns)
-                .to_string();
+            let ns = args.namespace.as_deref().unwrap_or(record_ns).to_string();
             *ns_counts.entry(ns).or_insert(0) += 1;
 
             for tag in &memory.tags {
@@ -228,7 +229,9 @@ pub async fn cmd_import(
 
     // Progress reporting interval: every 10% (minimum 1).
     let progress_interval = std::cmp::max(total / 10, 1);
-    let is_human = fmt.error(&CliError::Other(String::new())).contains("Error:");
+    let is_human = fmt
+        .error(&CliError::Other(String::new()))
+        .contains("Error:");
 
     for (idx, (line_num, memory)) in valid.into_iter().enumerate() {
         let record_ns = if memory.namespace.is_empty() {
@@ -236,10 +239,7 @@ pub async fn cmd_import(
         } else {
             &memory.namespace
         };
-        let target_ns = args
-            .namespace
-            .as_deref()
-            .unwrap_or(record_ns);
+        let target_ns = args.namespace.as_deref().unwrap_or(record_ns);
 
         // Duplicate detection.
         if args.skip_duplicates {
@@ -292,11 +292,7 @@ pub async fn cmd_import(
                 imported += 1;
                 *ns_counts.entry(target_ns.to_string()).or_insert(0) += 1;
                 if is_human && (idx + 1) % progress_interval == 0 {
-                    print_err(&format!(
-                        "Progress: {}/{} imported\n",
-                        idx + 1,
-                        total
-                    ));
+                    print_err(&format!("Progress: {}/{} imported\n", idx + 1, total));
                 }
             }
             Err(e) => {

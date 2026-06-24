@@ -763,7 +763,12 @@ impl RelationshipGraph {
     }
 
     /// Check if an edge of a specific type exists between two node keys (either direction).
-    pub(crate) fn has_typed_edge_between(&self, a: NodeKey, b: NodeKey, edge_type: EdgeType) -> bool {
+    pub(crate) fn has_typed_edge_between(
+        &self,
+        a: NodeKey,
+        b: NodeKey,
+        edge_type: EdgeType,
+    ) -> bool {
         if let Some(node_a) = self.nodes.get(a) {
             // Check a's outgoing for edges targeting b with matching type
             for &ek in &node_a.outgoing {

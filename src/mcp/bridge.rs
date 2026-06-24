@@ -447,8 +447,9 @@ impl TimeRangeValue {
     pub fn to_millis(&self) -> Result<i64, BridgeError> {
         match self {
             TimeRangeValue::Millis(ms) => Ok(*ms),
-            TimeRangeValue::Iso8601(s) => crate::time::parse_iso8601_to_millis(s)
-                .map_err(|e| BridgeError::InvalidInput(e)),
+            TimeRangeValue::Iso8601(s) => {
+                crate::time::parse_iso8601_to_millis(s).map_err(|e| BridgeError::InvalidInput(e))
+            }
         }
     }
 }

@@ -372,8 +372,7 @@ impl QueryEngine {
             self.run_vector_search(&query_embedding, ns_config.id, fetch_k)?;
         timings.vector_search_us = vector_search_us;
 
-        let (fts_results, fts_search_us) =
-            self.run_fts_search(&query, ns_config.id, fetch_k)?;
+        let (fts_results, fts_search_us) = self.run_fts_search(&query, ns_config.id, fetch_k)?;
         timings.fts_search_us = fts_search_us;
 
         // -- Score fusion: build lookup maps --
@@ -596,9 +595,7 @@ impl QueryEngine {
                 Some(vs + fts_boost)
             }
             (Some(vs), None) => Some(vs),
-            (None, Some(fts)) => {
-                Some(FTS_ONLY_CAP * (1.0 - (-fts * FTS_ONLY_RATE).exp()))
-            }
+            (None, Some(fts)) => Some(FTS_ONLY_CAP * (1.0 - (-fts * FTS_ONLY_RATE).exp())),
             (None, None) => None,
         }
     }
@@ -623,7 +620,9 @@ impl QueryEngine {
             return Ok(());
         }
 
-        let activated = self.graph.spreading_activation(&seeds, namespace_id, graph_depth);
+        let activated = self
+            .graph
+            .spreading_activation(&seeds, namespace_id, graph_depth);
 
         let existing_ids: std::collections::HashSet<MemoryId> =
             candidates.iter().map(|c| c.record.id).collect();
@@ -727,8 +726,7 @@ impl QueryEngine {
     ) {
         use std::collections::HashSet;
 
-        let candidate_id_set: HashSet<MemoryId> =
-            candidates.iter().map(|c| c.record.id).collect();
+        let candidate_id_set: HashSet<MemoryId> = candidates.iter().map(|c| c.record.id).collect();
 
         let mut to_remove: HashSet<usize> = HashSet::new();
         let mut replacements_to_inject: Vec<(MemoryId, f32)> = Vec::new();
@@ -743,8 +741,7 @@ impl QueryEngine {
                     {
                         entry.1 = entry.1.max(candidate.composite_score);
                     } else {
-                        replacements_to_inject
-                            .push((replacement_id, candidate.composite_score));
+                        replacements_to_inject.push((replacement_id, candidate.composite_score));
                     }
                 }
             }
@@ -780,8 +777,7 @@ impl QueryEngine {
                     replacement.effective_r = effective_r;
                     replacement.entity_score = entity_score;
                     replacement.composite_score = Self::compute_composite_score(&replacement);
-                    replacement.composite_score =
-                        replacement.composite_score.max(inherited_score);
+                    replacement.composite_score = replacement.composite_score.max(inherited_score);
 
                     candidates.push(replacement);
                 }
@@ -894,7 +890,8 @@ impl QueryEngine {
                     retrievability: rec.strength,
                     effective_r: rec.decay_strength,
                     phase: rec.phase,
-                    summary: if rec.phase != DecayPhase::Ghost && rec.phase != DecayPhase::Tombstone {
+                    summary: if rec.phase != DecayPhase::Ghost && rec.phase != DecayPhase::Tombstone
+                    {
                         Some(rec.summary.clone())
                     } else {
                         None

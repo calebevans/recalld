@@ -761,10 +761,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     created_at: record.created_at,
                     created_at_formatted: Some(format_timestamp(record.created_at, tz)),
                     last_accessed_at: record.last_accessed_at,
-                    last_accessed_at_formatted: Some(format_timestamp(
-                        record.last_accessed_at,
-                        tz,
-                    )),
+                    last_accessed_at_formatted: Some(format_timestamp(record.last_accessed_at, tz)),
                     is_permastore: record.is_permastore != 0,
                     edge_count: record.edge_count,
                 }))
@@ -912,8 +909,8 @@ impl bridge::StorageEngine for McpStorageAdapter {
 
         // Step 4: Compute new retrievability (just reinforced = 1.0).
         let new_strength = 1.0_f32;
-        let is_permastore = record.is_permastore != 0
-            || new_stability >= decay_config.permastore_threshold;
+        let is_permastore =
+            record.is_permastore != 0 || new_stability >= decay_config.permastore_threshold;
 
         // Step 5: Persist the updated decay state and access event.
         {
@@ -924,11 +921,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 .update_decay_state(id, phase, new_strength, new_stability, is_permastore)
                 .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
             storage_r
-                .update_access(
-                    id,
-                    now,
-                    crate::model::AccessKind::ManualReinforcement,
-                )
+                .update_access(id, now, crate::model::AccessKind::ManualReinforcement)
                 .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
         }
 
@@ -965,7 +958,10 @@ pub struct McpNamespaceAdapter {
 
 impl McpNamespaceAdapter {
     /// Create a new namespace adapter wrapping the storage engine.
-    pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>, timezone: chrono_tz::Tz) -> Self {
+    pub fn new(
+        storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+        timezone: chrono_tz::Tz,
+    ) -> Self {
         Self { storage, timezone }
     }
 }

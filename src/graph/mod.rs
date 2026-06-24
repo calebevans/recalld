@@ -23,8 +23,8 @@ pub use structure::{
 // Re-export CS-11 activation types and functions
 pub use activation::{
     ActivationConfig, MAX_CONNECTION_BONUS, SpreadingActivationConfig, connection_bonus,
-    effective_retrievability, graph_stats, recompute_centrality,
-    spreading_activation, spreading_edge_factor,
+    effective_retrievability, graph_stats, recompute_centrality, spreading_activation,
+    spreading_edge_factor,
 };
 
 // Re-export graph rebuild from its dedicated module

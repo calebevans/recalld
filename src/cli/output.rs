@@ -980,10 +980,7 @@ impl OutputFormatter for HumanFormatter {
         out.push_str(&format!("\n{}\n", "Import complete:".green().bold()));
         out.push_str(&format!("  Imported:  {} memories\n", result.imported));
         if result.skipped > 0 {
-            out.push_str(&format!(
-                "  Skipped:   {} (duplicates)\n",
-                result.skipped
-            ));
+            out.push_str(&format!("  Skipped:   {} (duplicates)\n", result.skipped));
         }
         if result.failed > 0 {
             out.push_str(&format!("  Failed:    {}\n", result.failed));
@@ -1014,8 +1011,14 @@ impl OutputFormatter for HumanFormatter {
 
     fn import_dry_run(&self, result: &ImportDryRunResult) -> String {
         let mut out = String::new();
-        out.push_str(&format!("{}\n", "Dry run (no changes made):".yellow().bold()));
-        out.push_str(&format!("  Total records:       {}\n", result.total_records));
+        out.push_str(&format!(
+            "{}\n",
+            "Dry run (no changes made):".yellow().bold()
+        ));
+        out.push_str(&format!(
+            "  Total records:       {}\n",
+            result.total_records
+        ));
         out.push_str(&format!("  Would import:        {}\n", result.would_import));
         if result.would_skip > 0 {
             out.push_str(&format!("  Would skip:          {}\n", result.would_skip));
@@ -1234,10 +1237,7 @@ impl OutputFormatter for HumanFormatter {
             ]);
 
             for tag_count in report.metadata.top_tags.iter().take(10) {
-                tag_table.add_row(vec![
-                    Cell::new(&tag_count.tag),
-                    Cell::new(tag_count.count),
-                ]);
+                tag_table.add_row(vec![Cell::new(&tag_count.tag), Cell::new(tag_count.count)]);
             }
             out.push_str(&tag_table.to_string());
             out.push('\n');

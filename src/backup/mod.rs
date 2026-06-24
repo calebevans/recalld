@@ -70,9 +70,7 @@ pub async fn run_backup(
         .unwrap_or_else(|| PathBuf::from(&config.storage.data_dir));
 
     if !data_dir.exists() {
-        return Err(BackupError::DataDirNotFound(
-            data_dir.display().to_string(),
-        ));
+        return Err(BackupError::DataDirNotFound(data_dir.display().to_string()));
     }
 
     let archive_path = resolve_archive_path(destination)?;

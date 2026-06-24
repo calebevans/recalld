@@ -110,10 +110,7 @@ pub fn lock_all_files(data_dir: &Path, force: bool) -> Result<Vec<FileLock>, Bac
                     Ok(lock) => locks.push(lock),
                     Err(e) => {
                         if force {
-                            eprintln!(
-                                "warning: failed to lock {:?}, continuing",
-                                vectors_file
-                            );
+                            eprintln!("warning: failed to lock {:?}, continuing", vectors_file);
                         } else {
                             return Err(e);
                         }

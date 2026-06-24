@@ -303,8 +303,7 @@ impl RecalldClient {
         if let Some(ns) = namespace {
             params.push(("namespace", ns.to_string()));
         }
-        let query_pairs: Vec<(&str, &str)> =
-            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let query_pairs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
         if query_pairs.is_empty() {
             self.get("/v1/health/report").await
@@ -367,8 +366,7 @@ impl RecalldClient {
         params.push(("limit", limit.to_string()));
         params.push(("offset", offset.to_string()));
 
-        let query_pairs: Vec<(&str, &str)> =
-            params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let query_pairs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         self.get_with_query("/v1/memories", &query_pairs).await
     }
 }

@@ -133,7 +133,10 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         index.get_vector(id)
     }
 
-    fn get_embeddings_batch(&self, ids: &[MemoryId]) -> std::collections::HashMap<MemoryId, Vec<f32>> {
+    fn get_embeddings_batch(
+        &self,
+        ids: &[MemoryId],
+    ) -> std::collections::HashMap<MemoryId, Vec<f32>> {
         use crate::search::VectorIndex;
         // Acquire the lock once for the entire batch instead of
         // once per ID, amortizing the block_in_place overhead.
@@ -400,9 +403,10 @@ impl state::StorageEngine for StorageEngineAdapter {
 
                 // Filter by tags (AND logic: must have ALL)
                 if !filter.tags.is_empty()
-                    && !filter.tags.iter().all(|tag| {
-                        record.tags.iter().any(|t| t.as_str() == tag)
-                    })
+                    && !filter
+                        .tags
+                        .iter()
+                        .all(|tag| record.tags.iter().any(|t| t.as_str() == tag))
                 {
                     return false;
                 }

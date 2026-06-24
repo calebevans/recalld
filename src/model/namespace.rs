@@ -41,7 +41,6 @@ impl PhaseThresholds {
         }
         Ok(())
     }
-
 }
 
 impl Default for PhaseThresholds {

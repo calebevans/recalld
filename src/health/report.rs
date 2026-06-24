@@ -53,7 +53,11 @@ pub fn compute_overview(
 
     HealthOverview {
         total_memories: records.len() as u64,
-        phase_counts: PhaseCounts { full, summary, ghost },
+        phase_counts: PhaseCounts {
+            full,
+            summary,
+            ghost,
+        },
         permastore_count: permastore,
     }
 }

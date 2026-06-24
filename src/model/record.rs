@@ -191,8 +191,7 @@ impl DiskRecord {
         pos += 8;
 
         let phase_byte = data[pos];
-        let phase = DecayPhase::from_u8(phase_byte)
-            .ok_or(DecodeError::InvalidPhase(phase_byte))?;
+        let phase = DecayPhase::from_u8(phase_byte).ok_or(DecodeError::InvalidPhase(phase_byte))?;
         pos += 1;
 
         let strength = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());

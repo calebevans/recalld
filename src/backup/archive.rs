@@ -8,11 +8,11 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
+use zip::write::SimpleFileOptions;
 
-use super::manifest::BackupManifest;
 use super::BackupError;
+use super::manifest::BackupManifest;
 
 /// Create a zip archive containing all backup files plus the manifest.
 ///
@@ -24,8 +24,7 @@ pub fn create_archive(
     manifest: &BackupManifest,
     archive_path: &Path,
 ) -> Result<(), BackupError> {
-    let archive_file =
-        File::create(archive_path).map_err(BackupError::ArchiveCreationFailed)?;
+    let archive_file = File::create(archive_path).map_err(BackupError::ArchiveCreationFailed)?;
 
     let mut zip = zip::ZipWriter::new(archive_file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);

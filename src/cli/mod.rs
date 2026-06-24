@@ -89,10 +89,11 @@ pub async fn run(cli: Cli, config: CliConfig) -> Result<()> {
         Command::Import(args) => cmd_import(&client, &*formatter, args, &config).await,
         Command::Health(args) => {
             // Health command may override the global format flag
-            let health_fmt: Box<dyn OutputFormatter> = match args.format.clone().or(cli.format.clone()) {
-                Some(OutputFormat::Human) => Box::new(HumanFormatter),
-                _ => Box::new(JsonFormatter),
-            };
+            let health_fmt: Box<dyn OutputFormatter> =
+                match args.format.clone().or(cli.format.clone()) {
+                    Some(OutputFormat::Human) => Box::new(HumanFormatter),
+                    _ => Box::new(JsonFormatter),
+                };
             cmd_health(&client, &*health_fmt, args).await
         }
     }
@@ -293,11 +294,7 @@ async fn cmd_export(
 }
 
 /// Handle the `list` command: list memories with filters.
-async fn cmd_list(
-    client: &RecalldClient,
-    fmt: &dyn OutputFormatter,
-    args: ListArgs,
-) -> Result<()> {
+async fn cmd_list(client: &RecalldClient, fmt: &dyn OutputFormatter, args: ListArgs) -> Result<()> {
     let sort = match args.sort {
         commands::SortField::Created => "created",
         commands::SortField::Accessed => "accessed",

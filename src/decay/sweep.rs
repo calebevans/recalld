@@ -677,14 +677,8 @@ impl DecaySweepRunner {
 
                 // Flush write batch if full.
                 if pending_transitions.len() >= config.write_batch_size {
-                    Self::flush_transitions(
-                        &pending_transitions,
-                        storage,
-                        graph,
-                        cache,
-                        result,
-                    )
-                    .await;
+                    Self::flush_transitions(&pending_transitions, storage, graph, cache, result)
+                        .await;
                     pending_transitions.clear();
                 }
 
@@ -692,13 +686,7 @@ impl DecaySweepRunner {
                 // Skip if the record was not evaluated (permastore/decay-disabled).
                 if let Some(eff_r) = effective_r {
                     Self::update_record_state(
-                        *memory_id,
-                        phase,
-                        eff_r,
-                        &meta,
-                        storage,
-                        graph,
-                        result,
+                        *memory_id, phase, eff_r, &meta, storage, graph, result,
                     )
                     .await;
                 }
@@ -781,10 +769,8 @@ impl DecaySweepRunner {
         for &id in ids {
             match storage.get_record(id) {
                 Ok(Some(record)) => {
-                    let decay_rate_multiplier = ns_cache
-                        .get(&record.namespace_id)
-                        .copied()
-                        .flatten();
+                    let decay_rate_multiplier =
+                        ns_cache.get(&record.namespace_id).copied().flatten();
 
                     results.insert(
                         id,

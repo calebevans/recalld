@@ -207,7 +207,7 @@ fn request_confirmation(
 // ── Daemon shutdown ─────────────────────────────────────────────────
 
 async fn stop_daemon_if_running() -> Result<(), RestoreError> {
-    use crate::daemon::{socket_path, is_daemon_alive, DaemonClient};
+    use crate::daemon::{DaemonClient, is_daemon_alive, socket_path};
 
     let socket = socket_path();
 
@@ -255,10 +255,7 @@ fn backup_current_data(data_dir: &Path) -> Result<PathBuf, RestoreError> {
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let backup_name = format!(
         "{}.bak-{}",
-        data_dir
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy(),
+        data_dir.file_name().unwrap_or_default().to_string_lossy(),
         timestamp
     );
     let backup_dir = data_dir
@@ -272,10 +269,7 @@ fn backup_current_data(data_dir: &Path) -> Result<PathBuf, RestoreError> {
         "backing up current data"
     );
 
-    eprintln!(
-        "Backing up current data to {}",
-        backup_dir.display()
-    );
+    eprintln!("Backing up current data to {}", backup_dir.display());
 
     // Rename the directory (atomic on most filesystems).
     fs::rename(data_dir, &backup_dir)?;

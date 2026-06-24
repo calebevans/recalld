@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use recalld::config::{RecalldConfig, loader};
 use recalld::config::LoadedConfig;
+use recalld::config::{RecalldConfig, loader};
 use recalld::{Recalld, RecalldError};
 
 /// Recalld — AI memory system with biologically-inspired decay
@@ -381,9 +381,8 @@ async fn run_serve(
             system.cache().clone(),
             system.embedding().clone(),
         ));
-        let cache: Arc<dyn recalld::api::RecordCache> = Arc::new(RecordCacheAdapter::new(
-            system.cache().clone(),
-        ));
+        let cache: Arc<dyn recalld::api::RecordCache> =
+            Arc::new(RecordCacheAdapter::new(system.cache().clone()));
         let graph: Arc<dyn recalld::api::RelationshipGraph> =
             Arc::new(RelationshipGraphAdapter::new(system.graph().clone()));
         let decay: Arc<dyn recalld::api::FsrsEngine> =
@@ -473,26 +472,24 @@ fn create_direct_mcp_bridge(
 
     let tz = recalld::time::resolve_timezone(&system.config().timezone);
 
-    let search: Arc<dyn recalld::mcp::bridge::SearchPipeline> =
-        Arc::new(McpSearchAdapter::new(
-            system.query_engine().clone(),
-            system.embedding().clone(),
-            system.storage().clone(),
-            system.graph().clone(),
-            tz,
-        ));
-    let storage: Arc<dyn recalld::mcp::bridge::StorageEngine> =
-        Arc::new(McpStorageAdapter::new(
-            system.storage().clone(),
-            system.cache().clone(),
-            system.embedding().clone(),
-            system.vector_index().clone(),
-            system.fts_index().clone(),
-            system.entity_index().clone(),
-            system.graph().clone(),
-            std::sync::Arc::new(system.config().clone()),
-            tz,
-        ));
+    let search: Arc<dyn recalld::mcp::bridge::SearchPipeline> = Arc::new(McpSearchAdapter::new(
+        system.query_engine().clone(),
+        system.embedding().clone(),
+        system.storage().clone(),
+        system.graph().clone(),
+        tz,
+    ));
+    let storage: Arc<dyn recalld::mcp::bridge::StorageEngine> = Arc::new(McpStorageAdapter::new(
+        system.storage().clone(),
+        system.cache().clone(),
+        system.embedding().clone(),
+        system.vector_index().clone(),
+        system.fts_index().clone(),
+        system.entity_index().clone(),
+        system.graph().clone(),
+        std::sync::Arc::new(system.config().clone()),
+        tz,
+    ));
     let namespaces: Arc<dyn recalld::mcp::bridge::NamespaceRegistry> =
         Arc::new(McpNamespaceAdapter::new(system.storage().clone(), tz));
     let health: Arc<dyn recalld::mcp::bridge::HealthChecker> =

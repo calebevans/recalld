@@ -198,10 +198,7 @@ impl RecalldConfig {
         if self.decay.decay_rate_multiplier < 0.0 {
             errors.push(ConfigError::Validation {
                 field: "decay.decay_rate_multiplier".into(),
-                message: format!(
-                    "must be >= 0.0, got {}",
-                    self.decay.decay_rate_multiplier
-                ),
+                message: format!("must be >= 0.0, got {}", self.decay.decay_rate_multiplier),
             });
         }
 
