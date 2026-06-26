@@ -35,6 +35,18 @@ pub trait SearchPipeline: Send + Sync {
         min_score: Option<f32>,
         same_namespace: bool,
     ) -> Result<Vec<SearchHit>, BridgeError>;
+
+    /// Scan a namespace for clusters of near-duplicate memories.
+    ///
+    /// Samples up to `max_memories` from the namespace, runs pairwise
+    /// similarity checks, and groups memories whose similarity exceeds
+    /// `threshold` into clusters.
+    async fn scan_duplicates(
+        &self,
+        namespace: &str,
+        threshold: f32,
+        max_memories: usize,
+    ) -> Result<Vec<DuplicateCluster>, BridgeError>;
 }
 
 /// Storage engine interface.
@@ -55,6 +67,12 @@ pub trait StorageEngine: Send + Sync {
         id: MemoryId,
         quality: u8,
     ) -> Result<ReinforceResult, BridgeError>;
+
+    /// List memories in a namespace with pagination and optional filters.
+    async fn list_memories(
+        &self,
+        input: ListMemoriesInput,
+    ) -> Result<ListMemoriesResponse, BridgeError>;
 }
 
 /// Namespace registry interface.
@@ -189,19 +207,33 @@ pub struct SearchHit {
     pub phase: String,
     /// Current memory strength (0.0-1.0).
     pub strength: f32,
-    /// Creation timestamp in milliseconds since epoch (UTC).
-    pub created_at: i64,
-    /// Human-readable formatted creation timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at_formatted: Option<String>,
-    /// Last access timestamp in milliseconds since epoch (UTC).
-    pub last_accessed_at: i64,
-    /// Human-readable formatted last access timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_accessed_at_formatted: Option<String>,
+    /// Creation timestamp as ISO 8601 string.
+    pub created_at: String,
+    /// Last access timestamp as ISO 8601 string.
+    pub last_accessed_at: String,
     /// Related memories connected by graph edges.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<RelatedMemory>,
+}
+
+/// A cluster of near-duplicate memories found during namespace scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateCluster {
+    /// Summaries of the memories in this cluster, each with its ID and similarity score.
+    pub memories: Vec<DuplicateEntry>,
+    /// The highest pairwise similarity score within this cluster.
+    pub max_similarity: f32,
+}
+
+/// A single memory entry within a duplicate cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateEntry {
+    /// Memory ID.
+    pub id: String,
+    /// Short summary of the memory.
+    pub summary: String,
 }
 
 /// Input for storing a new memory.
@@ -249,11 +281,8 @@ pub struct StoredMemory {
     pub strength: f32,
     /// Initial stability in days.
     pub stability: f32,
-    /// Creation timestamp in milliseconds since epoch (UTC).
-    pub created_at: i64,
-    /// Human-readable formatted creation timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at_formatted: Option<String>,
+    /// Creation timestamp as ISO 8601 string.
+    pub created_at: String,
 }
 
 /// A full memory record returned by get.
@@ -276,16 +305,10 @@ pub struct MemoryRecord {
     pub strength: f32,
     /// Current stability in days.
     pub stability: f32,
-    /// Creation timestamp in milliseconds since epoch (UTC).
-    pub created_at: i64,
-    /// Human-readable formatted creation timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at_formatted: Option<String>,
-    /// Last access timestamp in milliseconds since epoch (UTC).
-    pub last_accessed_at: i64,
-    /// Human-readable formatted last access timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_accessed_at_formatted: Option<String>,
+    /// Creation timestamp as ISO 8601 string.
+    pub created_at: String,
+    /// Last access timestamp as ISO 8601 string.
+    pub last_accessed_at: String,
     /// Whether this memory is in permastore.
     pub is_permastore: bool,
     /// Number of graph edges connected to this memory.
@@ -306,6 +329,58 @@ pub struct ReinforceResult {
     pub phase: String,
     /// Whether the memory is in permastore.
     pub is_permastore: bool,
+}
+
+/// Input for listing memories with pagination and filters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListMemoriesInput {
+    /// Namespace to list memories from.
+    pub namespace: String,
+    /// Maximum number of results to return (max 200).
+    pub limit: usize,
+    /// Number of results to skip for pagination.
+    pub offset: usize,
+    /// Only return memories with ALL of these tags (AND semantics).
+    pub tags: Vec<String>,
+    /// Only return memories mentioning ALL of these entities.
+    pub entities: Vec<String>,
+    /// Lower bound timestamp in milliseconds since epoch.
+    pub time_range_start: Option<i64>,
+    /// Upper bound timestamp in milliseconds since epoch.
+    pub time_range_end: Option<i64>,
+}
+
+/// A single memory entry in a list response (lightweight, no full_text).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListMemoryEntry {
+    /// Memory ID.
+    pub id: String,
+    /// Short summary of the memory.
+    pub summary: String,
+    /// Named entities mentioned in this memory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
+    /// Topic keywords for this memory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+    /// Creation timestamp as ISO 8601 string.
+    pub created_at: String,
+}
+
+/// Response for list_memories.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListMemoriesResponse {
+    /// The memory entries for this page.
+    pub memories: Vec<ListMemoryEntry>,
+    /// Total number of memories matching the filters (before pagination).
+    pub total: u64,
+    /// The offset used for this page.
+    pub offset: usize,
+    /// The limit used for this page.
+    pub limit: usize,
 }
 
 /// Input for creating a namespace.
@@ -338,11 +413,8 @@ pub struct NamespaceInfo {
     pub embedding_dim: u16,
     /// Number of memories in this namespace.
     pub memory_count: u64,
-    /// Creation timestamp in milliseconds since epoch (UTC).
-    pub created_at: i64,
-    /// Human-readable formatted creation timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at_formatted: Option<String>,
+    /// Creation timestamp as ISO 8601 string.
+    pub created_at: String,
 }
 
 /// Namespace statistics.

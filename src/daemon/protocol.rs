@@ -81,6 +81,18 @@ pub struct ReinforceParams {
     pub quality: u8,
 }
 
+/// Parameters for the `scan_duplicates` RPC method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanDuplicatesParams {
+    /// Namespace to scan.
+    pub namespace: String,
+    /// Similarity threshold for duplicate detection.
+    pub threshold: f32,
+    /// Maximum number of memories to sample.
+    pub max_memories: usize,
+}
+
 /// Parameters for the `namespace_stats` RPC method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceStatsParams {

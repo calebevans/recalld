@@ -323,6 +323,27 @@ impl QueryEngine {
         }
     }
 
+    /// Retrieve the raw embedding vector for a memory by its ID.
+    ///
+    /// Delegates to the underlying `VectorIndexRegistry`. Returns `None`
+    /// if no embedding is found (e.g., the memory was tombstoned).
+    pub fn get_vector(&self, id: MemoryId) -> Option<Vec<f32>> {
+        self.vector_indexes.get_vector(id)
+    }
+
+    /// Search a namespace's vector index for the top-K nearest neighbors
+    /// to the given query vector.
+    ///
+    /// Delegates to the underlying `VectorIndexRegistry`.
+    pub fn vector_search(
+        &self,
+        namespace_id: NamespaceId,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Result<Vec<ScoredResult>> {
+        self.vector_indexes.search(namespace_id, query_vec, k)
+    }
+
     /// Execute the full 9-step search pipeline.
     ///
     /// # Pipeline stages

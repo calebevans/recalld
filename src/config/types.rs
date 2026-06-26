@@ -213,11 +213,11 @@ pub enum EmbeddingProvider {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            provider: EmbeddingProvider::OpenAI,
-            model_name: "text-embedding-3-small".to_string(),
+            provider: EmbeddingProvider::Ollama,
+            model_name: "embeddinggemma:latest".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            dimensions: 1536,
+            base_url: "http://localhost:11434".to_string(),
+            dimensions: 768,
             batch_size: 64,
             document_prefix: "title: none | text: ".to_string(),
             query_prefix: "task: search result | query: ".to_string(),

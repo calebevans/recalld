@@ -182,11 +182,11 @@ Embedding provider and model settings.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `provider` | string | `"openai"` | Embedding provider: `"openai"`, `"ollama"`, or `"passthrough"`. |
-| `model_name` | string | `"text-embedding-3-small"` | Model identifier (provider-specific). |
-| `api_key_env` | string | `"OPENAI_API_KEY"` | Name of the env var holding the API key (not the key itself). |
-| `base_url` | string | `"https://api.openai.com/v1"` | Base URL for the embedding API. |
-| `dimensions` | usize | `1536` | Embedding vector dimensionality. Fixed per namespace after creation. |
+| `provider` | string | `"ollama"` | Embedding provider: `"openai"`, `"ollama"`, or `"passthrough"`. |
+| `model_name` | string | `"embeddinggemma:latest"` | Model identifier (provider-specific). |
+| `api_key_env` | string | `"OPENAI_API_KEY"` | Name of the env var holding the API key (OpenAI provider only). |
+| `base_url` | string | `"http://localhost:11434"` | Base URL for the embedding API. |
+| `dimensions` | usize | `768` | Embedding vector dimensionality. Fixed per namespace after creation. |
 | `batch_size` | usize | `64` | Maximum texts per API call. |
 | `document_prefix` | string | `"title: none \| text: "` | Prefix prepended to text during memory storage. Set to `""` to disable. |
 | `query_prefix` | string | `"task: search result \| query: "` | Prefix prepended to text during search queries. Set to `""` to disable. |

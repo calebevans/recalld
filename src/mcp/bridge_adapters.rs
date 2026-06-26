@@ -191,10 +191,8 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                     emotions: metadata.emotions,
                     phase: format!("{:?}", r.phase),
                     strength: r.retrievability,
-                    created_at: r.created_at,
-                    created_at_formatted: Some(format_timestamp(r.created_at, tz)),
-                    last_accessed_at: r.last_accessed_at,
-                    last_accessed_at_formatted: Some(format_timestamp(r.last_accessed_at, tz)),
+                    created_at: format_timestamp(r.created_at, tz),
+                    last_accessed_at: format_timestamp(r.last_accessed_at, tz),
                     related,
                 }
             })
@@ -323,14 +321,178 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                     emotions: metadata.emotions,
                     phase: format!("{:?}", r.phase),
                     strength: r.retrievability,
-                    created_at: r.created_at,
-                    created_at_formatted: Some(format_timestamp(r.created_at, tz)),
-                    last_accessed_at: r.last_accessed_at,
-                    last_accessed_at_formatted: Some(format_timestamp(r.last_accessed_at, tz)),
+                    created_at: format_timestamp(r.created_at, tz),
+                    last_accessed_at: format_timestamp(r.last_accessed_at, tz),
                     related: Vec::new(),
                 }
             })
             .collect())
+    }
+
+    async fn scan_duplicates(
+        &self,
+        namespace: &str,
+        threshold: f32,
+        max_memories: usize,
+    ) -> Result<Vec<bridge::DuplicateCluster>, bridge::BridgeError> {
+        // 1. Resolve namespace to get the namespace ID.
+        let ns_config = {
+            let storage_r = self.storage.read().map_err(|e| {
+                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+            })?;
+            storage_r
+                .get_namespace_by_name(namespace)
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+                .ok_or_else(|| {
+                    bridge::BridgeError::NotFound(format!("namespace '{namespace}' not found"))
+                })?
+        };
+
+        // 2. Get memory IDs in this namespace (up to max_memories).
+        let memory_ids: Vec<MemoryId> = {
+            let storage_r = self.storage.read().map_err(|e| {
+                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+            })?;
+            let all_ids = storage_r
+                .meta_store()
+                .memories_in_namespace(ns_config.id)
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+            all_ids.into_iter().take(max_memories).collect()
+        };
+
+        if memory_ids.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        // 3. Load embeddings for all sampled memories via the vector index.
+        let mut id_embeddings: Vec<(MemoryId, Vec<f32>)> = Vec::with_capacity(memory_ids.len());
+        for &mid in &memory_ids {
+            if let Some(emb) = self.query_engine.get_vector(mid) {
+                id_embeddings.push((mid, emb));
+            }
+        }
+
+        if id_embeddings.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        // 4. Union-Find based clustering: for each memory, find similar
+        //    ones via the vector index and union those that exceed threshold.
+        let n = id_embeddings.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        // Helper: find root with path compression (iterative).
+        fn find(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]]; // path halving
+                i = parent[i];
+            }
+            i
+        }
+
+        // Helper: union two elements.
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[rb] = ra;
+            }
+        }
+
+        // Build an index from MemoryId -> position for quick lookup.
+        let id_to_idx: std::collections::HashMap<MemoryId, usize> = id_embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, (mid, _))| (*mid, i))
+            .collect();
+
+        // Track the max similarity seen per pair for cluster reporting.
+        let mut max_sim_per_cluster: std::collections::HashMap<usize, f32> =
+            std::collections::HashMap::new();
+
+        // For each memory, search for its K nearest neighbors and union
+        // those above threshold. Using K=10 is enough to find clusters
+        // without doing full O(n^2) pairwise comparison.
+        const NEIGHBORS_PER_QUERY: usize = 10;
+
+        for (i, (_mid, embedding)) in id_embeddings.iter().enumerate() {
+            let scored = self
+                .query_engine
+                .vector_search(ns_config.id, embedding, NEIGHBORS_PER_QUERY + 1)
+                .map_err(|e| bridge::BridgeError::Search(e.to_string()))?;
+
+            for result in scored {
+                // Skip self.
+                if result.memory_id == id_embeddings[i].0 {
+                    continue;
+                }
+                if result.score >= threshold {
+                    if let Some(&j) = id_to_idx.get(&result.memory_id) {
+                        union(&mut parent, i, j);
+                        // Track max similarity for the cluster.
+                        let root = find(&mut parent, i);
+                        let entry = max_sim_per_cluster.entry(root).or_insert(0.0);
+                        if result.score > *entry {
+                            *entry = result.score;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Group into clusters (only clusters with 2+ members).
+        let mut clusters_map: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            clusters_map.entry(root).or_default().push(i);
+        }
+
+        // 6. Load summaries for clustered memories and build response.
+        let mut clusters: Vec<bridge::DuplicateCluster> = Vec::new();
+
+        for (root, members) in &clusters_map {
+            if members.len() < 2 {
+                continue;
+            }
+
+            let mut entries: Vec<bridge::DuplicateEntry> = Vec::new();
+            for &idx in members {
+                let mid = id_embeddings[idx].0;
+                // Load summary from storage.
+                let summary = {
+                    let storage_r = self.storage.read().map_err(|e| {
+                        bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                    })?;
+                    storage_r
+                        .get_record(mid)
+                        .ok()
+                        .flatten()
+                        .map(|r| r.summary.clone())
+                        .unwrap_or_default()
+                };
+                entries.push(bridge::DuplicateEntry {
+                    id: mid.to_string(),
+                    summary,
+                });
+            }
+
+            let max_similarity = max_sim_per_cluster.get(root).copied().unwrap_or(0.0);
+
+            clusters.push(bridge::DuplicateCluster {
+                memories: entries,
+                max_similarity,
+            });
+        }
+
+        // Sort clusters by max_similarity descending (most likely duplicates first).
+        clusters.sort_by(|a, b| {
+            b.max_similarity
+                .partial_cmp(&a.max_similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(clusters)
     }
 }
 
@@ -678,8 +840,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             phase: "Full".to_string(),
             strength: record.strength,
             stability: record.stability,
-            created_at: record.created_at,
-            created_at_formatted: Some(format_timestamp(record.created_at, self.timezone)),
+            created_at: format_timestamp(record.created_at, self.timezone),
         })
     }
 
@@ -719,13 +880,8 @@ impl bridge::StorageEngine for McpStorageAdapter {
                         phase: "Tombstone".to_string(),
                         strength: 0.0,
                         stability: record.stability,
-                        created_at: record.created_at,
-                        created_at_formatted: Some(format_timestamp(record.created_at, tz)),
-                        last_accessed_at: record.last_accessed_at,
-                        last_accessed_at_formatted: Some(format_timestamp(
-                            record.last_accessed_at,
-                            tz,
-                        )),
+                        created_at: format_timestamp(record.created_at, tz),
+                        last_accessed_at: format_timestamp(record.last_accessed_at, tz),
                         is_permastore: false,
                         edge_count: record.edge_count,
                     }));
@@ -758,10 +914,8 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     phase: format!("{:?}", record.phase),
                     strength: record.strength,
                     stability: record.stability,
-                    created_at: record.created_at,
-                    created_at_formatted: Some(format_timestamp(record.created_at, tz)),
-                    last_accessed_at: record.last_accessed_at,
-                    last_accessed_at_formatted: Some(format_timestamp(record.last_accessed_at, tz)),
+                    created_at: format_timestamp(record.created_at, tz),
+                    last_accessed_at: format_timestamp(record.last_accessed_at, tz),
                     is_permastore: record.is_permastore != 0,
                     edge_count: record.edge_count,
                 }))
@@ -944,6 +1098,80 @@ impl bridge::StorageEngine for McpStorageAdapter {
             is_permastore,
         })
     }
+
+    async fn list_memories(
+        &self,
+        input: bridge::ListMemoriesInput,
+    ) -> Result<bridge::ListMemoriesResponse, bridge::BridgeError> {
+        // Resolve namespace name to ID.
+        let ns_config = {
+            let storage_r = self.storage.read().map_err(|e| {
+                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+            })?;
+            storage_r
+                .get_namespace_by_name(&input.namespace)
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+                .ok_or_else(|| {
+                    bridge::BridgeError::NotFound(format!(
+                        "namespace '{}' not found",
+                        input.namespace,
+                    ))
+                })?
+        };
+
+        // Build tag filters: merge explicit tags + entity/topic tags for AND semantics.
+        let mut require_tags: Vec<crate::model::Tag> = input
+            .tags
+            .iter()
+            .filter_map(|t| crate::model::Tag::new(t).ok())
+            .collect();
+        for entity in &input.entities {
+            if let Ok(tag) = crate::model::Tag::new(&format!("entity/{}", entity.to_lowercase())) {
+                require_tags.push(tag);
+            }
+        }
+
+        // Query the metadata store with filters and pagination.
+        let (page, total) = {
+            let storage_r = self.storage.read().map_err(|e| {
+                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+            })?;
+            storage_r
+                .meta_store()
+                .list_memories_filtered(
+                    ns_config.id,
+                    &require_tags,
+                    input.time_range_start,
+                    input.time_range_end,
+                    input.offset,
+                    input.limit,
+                )
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+        };
+
+        // Convert DiskRecords to ListMemoryEntry.
+        let tz = self.timezone;
+        let memories: Vec<bridge::ListMemoryEntry> = page
+            .into_iter()
+            .map(|(mid, record)| {
+                let metadata = crate::model::parse_structured_tags(&record.tags);
+                bridge::ListMemoryEntry {
+                    id: mid.to_string(),
+                    summary: record.summary,
+                    entities: metadata.entities,
+                    topics: metadata.topics,
+                    created_at: format_timestamp(record.created_at, tz),
+                }
+            })
+            .collect();
+
+        Ok(bridge::ListMemoriesResponse {
+            memories,
+            total,
+            offset: input.offset,
+            limit: input.limit,
+        })
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -984,8 +1212,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                 name: ns.name.clone(),
                 embedding_dim: ns.embedding_dim as u16,
                 memory_count: 0,
-                created_at: ns.created_at,
-                created_at_formatted: Some(format_timestamp(ns.created_at, tz)),
+                created_at: format_timestamp(ns.created_at, tz),
             })
             .collect())
     }
@@ -1030,8 +1257,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             name: input.name,
             embedding_dim: ns_config.embedding_dim as u16,
             memory_count: 0,
-            created_at: now,
-            created_at_formatted: Some(format_timestamp(now, self.timezone)),
+            created_at: format_timestamp(now, self.timezone),
         })
     }
 

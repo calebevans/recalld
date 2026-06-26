@@ -341,6 +341,27 @@ struct CategoryStats {
     correct: usize,
 }
 
+#[derive(Serialize)]
+struct ConversationResult {
+    id: String,
+    turns: usize,
+    memories_stored: usize,
+    qa_total: usize,
+    qa_correct: usize,
+    accuracy: f64,
+    ingestion_secs: f64,
+    questions: Vec<QuestionResult>,
+}
+
+#[derive(Serialize)]
+struct QuestionResult {
+    question: String,
+    gold_answer: String,
+    generated_answer: String,
+    correct: bool,
+    category: String,
+}
+
 #[derive(Default, Serialize)]
 pub struct LocomoReport {
     total_conversations: usize,
@@ -348,11 +369,15 @@ pub struct LocomoReport {
     total_turns: usize,
     total_correct: usize,
     model: String,
+    ingest_model: String,
+    judge_model: String,
+    skip_adversarial: bool,
     top_k: usize,
     categories: HashMap<String, CategoryStats>,
     avg_retrieval_ms: f64,
     avg_answer_ms: f64,
     avg_judge_ms: f64,
+    per_conversation: Vec<ConversationResult>,
 }
 
 // ── Main runner ───────────────────────────────────────────────────
@@ -367,6 +392,8 @@ pub async fn run(
     llm_url: Option<&str>,
     format: &str,
     skip_adversarial: bool,
+    parallel: usize,
+    qa_parallel: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = LlmClient::new(model.to_string(), llm_url)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -389,8 +416,9 @@ pub async fn run(
         })
         .sum();
     let total_turns: usize = conversations.iter().map(|c| c.turns.len()).sum();
+    let parallel = parallel.max(1);
     eprintln!(
-        "  {} conversations, {} QA pairs{}, {} turns",
+        "  {} conversations, {} QA pairs{}, {} turns, parallelism: {}",
         conversations.len(),
         total_qa,
         if skip_adversarial {
@@ -399,6 +427,7 @@ pub async fn run(
             ""
         },
         total_turns,
+        parallel,
     );
     eprintln!(
         "  Backend: {}    Model: {}    Ingest: {}    Judge: {}    Top-k: {}",
@@ -414,6 +443,9 @@ pub async fn run(
         total_qa,
         total_turns,
         model: model.to_string(),
+        ingest_model: ingest_model.to_string(),
+        judge_model: judge_model.to_string(),
+        skip_adversarial,
         top_k,
         ..Default::default()
     };
@@ -426,43 +458,230 @@ pub async fn run(
     let mut answer_times = Vec::new();
     let mut judge_times = Vec::new();
 
-    for (conv_idx, conv) in conversations.iter().enumerate() {
-        eprintln!(
-            "\n  Conversation {}/{} ({}, {} turns, {} QA)...",
-            conv_idx + 1,
-            conversations.len(),
-            conv.id,
-            conv.turns.len(),
-            conv.qa_pairs.len(),
-        );
+    // Wrap conversations in Arc for sharing across tasks.
+    let conversations = std::sync::Arc::new(conversations);
+    let total_convs = conversations.len();
 
-        let harness = BenchHarness::new(config).await?;
+    // Spawn all conversations but limit concurrency with a semaphore.
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel));
+    let mut join_set = tokio::task::JoinSet::new();
 
-        eprint!("    Ingesting turns...");
-        let ingest_start = Instant::now();
-        let stored = ingest_conversation(&harness, conv, &ingest_llm).await?;
-        eprintln!(
-            " done ({} memories, {:.1}s)",
-            stored,
-            ingest_start.elapsed().as_secs_f64()
-        );
+    let qa_parallel = qa_parallel.max(1);
+    for conv_idx in 0..total_convs {
+        let config = config.clone();
+        let llm = llm.clone();
+        let ingest_llm = ingest_llm.clone();
+        let judge_llm = judge_llm.clone();
+        let conversations = conversations.clone();
+        let sem = semaphore.clone();
+        let delay = conv_idx as u64;
 
-        // Evaluate QA pairs.
-        let active_qa: Vec<_> = if skip_adversarial {
-            conv.qa_pairs.iter().filter(|q| !q.is_adversarial).collect()
+        join_set.spawn(async move {
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay * 10)).await;
+            }
+            let _permit = sem.acquire().await.expect("semaphore closed");
+            run_conversation(
+                &config,
+                &conversations[conv_idx],
+                conv_idx,
+                total_convs,
+                &llm,
+                &ingest_llm,
+                &judge_llm,
+                top_k,
+                skip_adversarial,
+                qa_parallel,
+            )
+            .await
+        });
+    }
+
+    // Collect results as conversations complete.
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(conv_result)) => {
+                let _ = debug_log.write_all(&conv_result.debug_buf);
+                let _ = debug_log.flush();
+
+                retrieval_times.extend(&conv_result.retrieval_times);
+                answer_times.extend(&conv_result.answer_times);
+                judge_times.extend(&conv_result.judge_times);
+
+                for question in &conv_result.result.questions {
+                    let stats = report
+                        .categories
+                        .entry(question.category.clone())
+                        .or_default();
+                    stats.total += 1;
+                    if question.correct {
+                        stats.correct += 1;
+                        report.total_correct += 1;
+                    }
+                }
+
+                report.per_conversation.push(conv_result.result);
+            }
+            Ok(Err(e)) => {
+                eprintln!("  ERROR: conversation task failed: {e}");
+            }
+            Err(e) => {
+                eprintln!("  ERROR: conversation task panicked: {e}");
+            }
+        }
+    }
+
+    // Sort per_conversation by id for deterministic output.
+    report.per_conversation.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // Compute averages.
+    report.avg_retrieval_ms = if retrieval_times.is_empty() {
+        0.0
+    } else {
+        retrieval_times.iter().sum::<f64>() / retrieval_times.len() as f64
+    };
+    report.avg_answer_ms = if answer_times.is_empty() {
+        0.0
+    } else {
+        answer_times.iter().sum::<f64>() / answer_times.len() as f64
+    };
+    report.avg_judge_ms = if judge_times.is_empty() {
+        0.0
+    } else {
+        judge_times.iter().sum::<f64>() / judge_times.len() as f64
+    };
+
+    // Write results file.
+    let results_path = std::path::PathBuf::from("bench_results.json");
+    if let Ok(json) = serde_json::to_string_pretty(&report) {
+        if let Err(e) = std::fs::write(&results_path, json) {
+            eprintln!("  Warning: could not write results file: {e}");
         } else {
-            conv.qa_pairs.iter().collect()
-        };
+            eprintln!("  Results written to {}", results_path.display());
+        }
+    }
 
-        for (qa_idx, qa) in active_qa.iter().enumerate() {
-            let cat_name = category_name(qa.category).to_string();
+    match format {
+        "json" => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        ),
+        _ => println!("{}", format_report(&report)),
+    }
+
+    Ok(())
+}
+
+/// Internal result from running a single conversation, including data
+/// needed by the caller to merge into the global report.
+struct ConversationTaskResult {
+    result: ConversationResult,
+    debug_buf: Vec<u8>,
+    retrieval_times: Vec<f64>,
+    answer_times: Vec<f64>,
+    judge_times: Vec<f64>,
+}
+
+/// Result from a single parallel QA task.
+struct QaTaskResult {
+    /// Original index in the active_qa list, for deterministic ordering.
+    qa_idx: usize,
+    question_result: QuestionResult,
+    debug_buf: Vec<u8>,
+    retrieval_ms: f64,
+    answer_ms: f64,
+    judge_ms: f64,
+}
+
+async fn run_conversation(
+    config: &RecalldConfig,
+    conv: &Conversation,
+    conv_idx: usize,
+    total_convs: usize,
+    llm: &LlmClient,
+    ingest_llm: &LlmClient,
+    judge_llm: &LlmClient,
+    top_k: usize,
+    skip_adversarial: bool,
+    qa_parallel: usize,
+) -> Result<ConversationTaskResult, Box<dyn std::error::Error + Send + Sync>> {
+    let tag = format!("{}", conv.id);
+    let pos = format!("[{}/{}]", conv_idx + 1, total_convs);
+
+    eprintln!(
+        "  {pos} {tag}: {turns} turns, {qa} QA",
+        turns = conv.turns.len(),
+        qa = if skip_adversarial {
+            conv.qa_pairs.iter().filter(|q| !q.is_adversarial).count()
+        } else {
+            conv.qa_pairs.len()
+        },
+    );
+
+    let harness = BenchHarness::new(config).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("{pos} {tag}: harness init failed: {e}").into()
+        },
+    )?;
+
+    eprintln!("  {pos} {tag}: ingesting...");
+    let ingest_start = Instant::now();
+    let ingest_label = format!("{pos} {tag}");
+    let stored = ingest_conversation(&harness, conv, ingest_llm, &ingest_label)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("{pos} {tag}: ingestion failed: {e}").into()
+        })?;
+    let ingestion_secs = ingest_start.elapsed().as_secs_f64();
+    eprintln!(
+        "  {pos} {tag}: ingested {stored} memories in {secs:.1}s",
+        secs = ingestion_secs,
+    );
+
+    // Evaluate QA pairs concurrently.
+    let active_qa: Vec<_> = if skip_adversarial {
+        conv.qa_pairs.iter().filter(|q| !q.is_adversarial).collect()
+    } else {
+        conv.qa_pairs.iter().collect()
+    };
+
+    let qa_total = active_qa.len();
+    let harness = std::sync::Arc::new(harness);
+    let qa_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(qa_parallel));
+    let completed_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let correct_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let mut qa_join_set = tokio::task::JoinSet::new();
+
+    for (qa_idx, qa) in active_qa.iter().enumerate() {
+        let harness = harness.clone();
+        let llm = llm.clone();
+        let judge_llm = judge_llm.clone();
+        let qa_sem = qa_sem.clone();
+        let completed_count = completed_count.clone();
+        let correct_count = correct_count.clone();
+        let question = qa.question.clone();
+        let gold_answer = qa.gold_answer.clone();
+        let category = qa.category;
+        let is_adversarial = qa.is_adversarial;
+        let pos = pos.clone();
+        let tag = tag.clone();
+        let qa_total = qa_total;
+
+        qa_join_set.spawn(async move {
+            let _permit = qa_sem.acquire().await.expect("qa semaphore closed");
+
+            let cat_name = category_name(category).to_string();
+            let mut debug_buf: Vec<u8> = Vec::new();
 
             // Search.
             let search_start = Instant::now();
-            let memories =
-                search_memories(&harness, &qa.question, top_k, Some(&llm), &mut debug_log).await?;
+            let memories = search_memories(&harness, &question, top_k, Some(&llm), &mut debug_buf)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("{pos} {tag}: search failed: {e}").into()
+                })?;
             let retrieval_ms = search_start.elapsed().as_secs_f64() * 1000.0;
-            retrieval_times.push(retrieval_ms);
 
             // Collect graph context: neighbors + relationships.
             let graph_context = collect_graph_context(&harness, &memories).await;
@@ -489,84 +708,125 @@ pub async fn run(
                 .collect();
             let answer_start = Instant::now();
             let generated = llm
-                .generate_answer(&qa.question, &mem_contexts, "unknown", &graph_context)
+                .generate_answer(&question, &mem_contexts, "unknown", &graph_context)
                 .await
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let answer_ms = answer_start.elapsed().as_secs_f64() * 1000.0;
-            answer_times.push(answer_ms);
 
             // Judge (separate model to avoid self-grading bias).
             let judge_start = Instant::now();
             let result = judge_llm
-                .judge_answer(&qa.question, &qa.gold_answer, &generated, qa.is_adversarial)
+                .judge_answer(&question, &gold_answer, &generated, is_adversarial)
                 .await
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let judge_ms = judge_start.elapsed().as_secs_f64() * 1000.0;
-            judge_times.push(judge_ms);
 
             let verdict = if result.correct { "CORRECT" } else { "WRONG" };
-            let _ = writeln!(debug_log, "  Q: {}", qa.question);
-            let _ = writeln!(debug_log, "  Gold: {}", qa.gold_answer);
+            let _ = writeln!(debug_buf, "  Q: {}", question);
+            let _ = writeln!(debug_buf, "  Gold: {}", gold_answer);
             let _ = writeln!(
-                debug_log,
+                debug_buf,
                 "  Gen:  {}",
                 generated.chars().take(300).collect::<String>()
             );
-            let _ = writeln!(debug_log, "  → {} ({})", verdict, cat_name);
-            let _ = writeln!(debug_log);
-            let _ = debug_log.flush();
+            let _ = writeln!(debug_buf, "  -> {} ({})", verdict, cat_name);
+            let _ = writeln!(debug_buf);
 
-            let stats = report.categories.entry(cat_name.clone()).or_default();
-            stats.total += 1;
             if result.correct {
-                stats.correct += 1;
-                report.total_correct += 1;
+                correct_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-            if (qa_idx + 1) % 20 == 0 || qa_idx + 1 == active_qa.len() {
-                let running_acc = if report.total_qa > 0 {
-                    let evaluated = retrieval_times.len();
-                    report.total_correct as f64 / evaluated as f64 * 100.0
+            // Report progress every 20 questions or on the last one.
+            if done % 20 == 0 || done == qa_total {
+                let cur_correct = correct_count.load(std::sync::atomic::Ordering::Relaxed);
+                let running_acc = if done > 0 {
+                    cur_correct as f64 / done as f64 * 100.0
                 } else {
                     0.0
                 };
-                eprint!(
-                    "\r    QA {}/{} (running acc: {:.1}%)    ",
-                    qa_idx + 1,
-                    active_qa.len(),
-                    running_acc,
+                eprintln!(
+                    "  {pos} {tag}: QA {done}/{total} ({acc:.1}%)",
+                    total = qa_total,
+                    acc = running_acc,
                 );
             }
+
+            Ok(QaTaskResult {
+                qa_idx,
+                question_result: QuestionResult {
+                    question,
+                    gold_answer,
+                    generated_answer: generated,
+                    correct: result.correct,
+                    category: cat_name,
+                },
+                debug_buf,
+                retrieval_ms,
+                answer_ms,
+                judge_ms,
+            }) as Result<QaTaskResult, Box<dyn std::error::Error + Send + Sync>>
+        });
+    }
+
+    // Collect all QA results.
+    let mut qa_results: Vec<QaTaskResult> = Vec::with_capacity(qa_total);
+    while let Some(result) = qa_join_set.join_next().await {
+        match result {
+            Ok(Ok(qa_result)) => qa_results.push(qa_result),
+            Ok(Err(e)) => {
+                return Err(format!("{pos} {tag}: QA task failed: {e}").into());
+            }
+            Err(e) => {
+                return Err(format!("{pos} {tag}: QA task panicked: {e}").into());
+            }
         }
-        eprintln!();
     }
 
-    // Compute averages.
-    report.avg_retrieval_ms = if retrieval_times.is_empty() {
-        0.0
-    } else {
-        retrieval_times.iter().sum::<f64>() / retrieval_times.len() as f64
-    };
-    report.avg_answer_ms = if answer_times.is_empty() {
-        0.0
-    } else {
-        answer_times.iter().sum::<f64>() / answer_times.len() as f64
-    };
-    report.avg_judge_ms = if judge_times.is_empty() {
-        0.0
-    } else {
-        judge_times.iter().sum::<f64>() / judge_times.len() as f64
-    };
+    // Sort by original index for deterministic output.
+    qa_results.sort_by_key(|r| r.qa_idx);
 
-    match format {
-        "json" => println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_default()
-        ),
-        _ => println!("{}", format_report(&report)),
+    // Merge results in order.
+    let mut debug_buf: Vec<u8> = Vec::new();
+    let mut retrieval_times = Vec::new();
+    let mut answer_times = Vec::new();
+    let mut judge_times = Vec::new();
+    let mut questions = Vec::new();
+    let mut qa_correct = 0usize;
+
+    for qa_result in qa_results {
+        debug_buf.extend_from_slice(&qa_result.debug_buf);
+        retrieval_times.push(qa_result.retrieval_ms);
+        answer_times.push(qa_result.answer_ms);
+        judge_times.push(qa_result.judge_ms);
+        if qa_result.question_result.correct {
+            qa_correct += 1;
+        }
+        questions.push(qa_result.question_result);
     }
 
-    Ok(())
+    let accuracy = if qa_total > 0 {
+        qa_correct as f64 / qa_total as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(ConversationTaskResult {
+        result: ConversationResult {
+            id: conv.id.clone(),
+            turns: conv.turns.len(),
+            memories_stored: stored,
+            qa_total,
+            qa_correct,
+            accuracy,
+            ingestion_secs,
+            questions,
+        },
+        debug_buf,
+        retrieval_times,
+        answer_times,
+        judge_times,
+    })
 }
 
 // ── Ingest ────────────────────────────────────────────────────────
@@ -746,17 +1006,19 @@ async fn ingest_conversation(
     harness: &BenchHarness,
     conv: &Conversation,
     llm: &LlmClient,
+    label: &str,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut ingested_memories: Vec<(MemoryId, i64)> = Vec::new();
     let mut stored_memories: Vec<(String, String)> = Vec::new(); // (id, summary)
     let mut total_stored = 0usize;
     let mut recent_turns: Vec<String> = Vec::new();
+    let total_turns = conv.turns.len();
     const CONTEXT_WINDOW: usize = 20;
     const MEMORY_WINDOW: usize = 30;
 
     for (turn_idx, turn) in conv.turns.iter().enumerate() {
-        if turn_idx % 20 == 0 {
-            eprint!(" turn {}/{}...", turn_idx + 1, conv.turns.len());
+        if turn_idx % 50 == 0 && turn_idx > 0 {
+            eprintln!("  {label}: ingesting... {turn_idx}/{total_turns} turns");
         }
 
         let mut turn_text = format!("{}: {}", turn.speaker, turn.text);
@@ -1357,9 +1619,10 @@ pub async fn run_diagnose(
 
         let harness = BenchHarness::new(config).await?;
 
-        eprint!("    Ingesting...");
+        let diag_label = format!("[{}/{}] {}", conv_idx + 1, conversations.len(), conv.id);
+        eprintln!("    Ingesting...");
         let t0 = Instant::now();
-        let stored = ingest_conversation(&harness, conv, llm).await?;
+        let stored = ingest_conversation(&harness, conv, llm, &diag_label).await?;
         eprintln!(
             " done ({} memories, {:.1}s)",
             stored,
@@ -1596,8 +1859,8 @@ fn format_report(report: &LocomoReport) -> String {
         report.total_conversations, report.total_qa,
     ));
     out.push_str(&format!(
-        "  Model: {}    Top-k: {}    Turns: {}\n\n",
-        report.model, report.top_k, report.total_turns,
+        "  Model: {}    Ingest: {}    Judge: {}    Top-k: {}    Turns: {}\n\n",
+        report.model, report.ingest_model, report.judge_model, report.top_k, report.total_turns,
     ));
 
     out.push_str(&format!(

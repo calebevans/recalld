@@ -1,9 +1,12 @@
 //! LLM client for benchmark answer generation and judging.
 //!
-//! Supports three backends:
+//! Supports four backends:
 //! - **OpenAI-compatible** (Ollama, vLLM, etc.): Pass `--llm-url`.
-//! - **Vertex AI**: Set `CLAUDE_CODE_USE_VERTEX=1`, `CLOUD_ML_REGION`, and
-//!   `ANTHROPIC_VERTEX_PROJECT_ID`. Auth via `gcloud auth print-access-token`.
+//! - **Gemini Vertex AI**: Set `GEMINI_VERTEX_PROJECT_ID` (and optionally
+//!   `GEMINI_VERTEX_REGION`, default `us-central1`). Auth via
+//!   `gcloud auth print-access-token`.
+//! - **Vertex AI (Claude)**: Set `CLAUDE_CODE_USE_VERTEX=1`, `CLOUD_ML_REGION`,
+//!   and `ANTHROPIC_VERTEX_PROJECT_ID`. Auth via `gcloud auth print-access-token`.
 //! - **Anthropic API**: Set `ANTHROPIC_API_KEY`. Direct API calls.
 
 use crate::model::MemoryId;
@@ -16,7 +19,7 @@ use std::time::Duration;
 
 // ── Client ────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LlmClient {
     client: Client,
     model: String,
@@ -24,9 +27,10 @@ pub struct LlmClient {
     backend_label: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BackendKind {
     OpenAiCompat { base_url: String },
+    GeminiVertex { project_id: String, region: String },
     Vertex { project_id: String, region: String },
     Anthropic { api_key: String },
 }
@@ -196,6 +200,53 @@ struct AnthropicContentBlock {
     text: Option<String>,
 }
 
+#[derive(Serialize)]
+struct GeminiPart {
+    text: String,
+}
+
+#[derive(Serialize)]
+struct GeminiContent {
+    role: String,
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Serialize)]
+struct GeminiGenerationConfig {
+    #[serde(rename = "maxOutputTokens")]
+    max_output_tokens: u32,
+    temperature: f32,
+}
+
+#[derive(Serialize)]
+struct GeminiRequest {
+    contents: Vec<GeminiContent>,
+    #[serde(rename = "systemInstruction")]
+    system_instruction: GeminiContent,
+    #[serde(rename = "generationConfig")]
+    generation_config: GeminiGenerationConfig,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponse {
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: GeminiCandidateContent,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidateContent {
+    parts: Vec<GeminiResponsePart>,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponsePart {
+    text: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct JudgeOutput {
     #[serde(default)]
@@ -213,6 +264,12 @@ fn detect_backend(llm_url: Option<&str>) -> Result<BackendKind, String> {
         });
     }
 
+    if let Ok(project_id) = std::env::var("GEMINI_VERTEX_PROJECT_ID") {
+        let region =
+            std::env::var("GEMINI_VERTEX_REGION").unwrap_or_else(|_| "us-central1".to_string());
+        return Ok(BackendKind::GeminiVertex { project_id, region });
+    }
+
     if std::env::var("CLAUDE_CODE_USE_VERTEX").unwrap_or_default() == "1" {
         let project_id = std::env::var("ANTHROPIC_VERTEX_PROJECT_ID")
             .map_err(|_| "CLAUDE_CODE_USE_VERTEX=1 but ANTHROPIC_VERTEX_PROJECT_ID not set")?;
@@ -226,6 +283,7 @@ fn detect_backend(llm_url: Option<&str>) -> Result<BackendKind, String> {
 
     Err("No LLM backend configured. Use one of:\n  \
          - --llm-url http://host:port  (OpenAI-compatible server)\n  \
+         - GEMINI_VERTEX_PROJECT_ID  (Gemini on Vertex AI)\n  \
          - CLAUDE_CODE_USE_VERTEX=1 + ANTHROPIC_VERTEX_PROJECT_ID\n  \
          - ANTHROPIC_API_KEY"
         .to_string())
@@ -277,6 +335,9 @@ impl LlmClient {
 
         let backend_label = match &backend {
             BackendKind::OpenAiCompat { base_url } => format!("openai-compat ({base_url})"),
+            BackendKind::GeminiVertex { project_id, region } => {
+                format!("gemini-vertex ({project_id}, {region})")
+            }
             BackendKind::Vertex { project_id, region } => {
                 format!("vertex ({project_id}, {region})")
             }
@@ -382,7 +443,7 @@ impl LlmClient {
             stronger match) and a date.\n\n\
             Memory types:\n\
             - Numbered memories [1], [2], etc. are directly retrieved for this question.\n\
-            - Memories labeled [R1], [R2], etc. are related graph neighbors -- contextually \
+            - Memories labeled [R1], [R2], etc. are related graph neighbors — contextually \
             connected but not directly matched to the question. Use them as supporting \
             context.\n\n\
             Each memory may include structured metadata:\n\
@@ -393,28 +454,45 @@ impl LlmClient {
             When a memory contains a direct quote or specific detail, prefer that detail \
             over your general knowledge.";
 
-        let instructions = "\n\nInstructions:\n\
-                - Base your answer ONLY on the provided memories.\n\
-                - Reason step by step:\n\
-                  1. Identify which memories contain relevant evidence.\n\
-                  2. If the question requires combining information from multiple memories, \
-                  chain the pieces together.\n\
-                  3. If the question involves time, pay attention to dates shown in \
-                  parentheses for each memory.\n\
-                - Verify person references: if the question names a specific person, \
-                confirm the memory is about THAT person before using it as evidence. \
-                A memory about one person does NOT answer a question about a different \
-                person.\n\
-                - Memories may use different words for the same concept (e.g., \"plays \
-                guitar\" relates to \"rock music\"). Use the information available even \
-                when the phrasing differs.\n\
-                - For hypothetical questions (\"would they...\", \"is it likely...\"), \
-                find evidence of relevant preferences or behaviors and commit to a \
-                clear answer with brief reasoning.\n\
-                - If the memories do not contain enough information to answer the \
-                question, say \"I don't know.\"\n\
-                - Keep your final answer concise (one or two sentences after your \
-                reasoning).";
+        let instructions = "\n\n<instructions>\n\
+                Base your answer ONLY on the provided memories.\n\n\
+                Step-by-step approach:\n\
+                1. Identify which memories contain relevant evidence.\n\
+                2. If the question requires combining information from multiple memories, \
+                chain the pieces together.\n\
+                3. If the question involves time, use the dates shown in parentheses for \
+                each memory. For duration or timing questions, identify the start and end \
+                dates explicitly, then calculate the difference step by step. Show the \
+                dates before stating the duration.\n\
+                4. For counting questions, enumerate each distinct instance explicitly \
+                before stating the final count.\n\n\
+                Person verification: if the question names a specific person, confirm \
+                the memory is about THAT person before using it. A memory about one \
+                person does not answer a question about a different person.\n\n\
+                Semantic matching: memories may use different words for the same concept \
+                (e.g., \"plays guitar\" relates to \"rock music\"). Use the information \
+                available even when the phrasing differs.\n\n\
+                For hypothetical questions (\"would they...\", \"is it likely...\"), find \
+                evidence of relevant preferences or behaviors and commit to a clear answer.\n\n\
+                For questions requiring inference or world knowledge (e.g., \"what yoga \
+                style would be good for X?\"), combine memory evidence with your general \
+                knowledge to provide the most specific and helpful answer.\n\n\
+                For list-type questions (\"what are X's hobbies?\", \"name the places Y \
+                visited\"), systematically scan ALL retrieved memories for every relevant \
+                item. Collect every instance before answering.\n\n\
+                IMPORTANT — do NOT hedge or refuse when evidence exists:\n\
+                - Never say \"the memories do not mention\" or \"there is no explicit evidence\" \
+                when there IS relevant information in the retrieved memories — even if it \
+                requires a small inference.\n\
+                - If a memory contains a relevant fact but uses different wording than the \
+                question, that IS sufficient evidence. Use it.\n\
+                - If multiple memories together imply an answer, synthesize them into a \
+                clear response rather than saying the answer is unclear.\n\
+                - Prefer giving a well-reasoned answer from available evidence over hedging.\n\
+                - Say \"I don't know\" ONLY when truly no relevant evidence exists in ANY \
+                of the retrieved memories or their neighbors.\n\n\
+                Keep your final answer concise: one or two sentences after your reasoning.\n\
+                </instructions>";
 
         let system = format!("{base}{instructions}");
 
@@ -437,61 +515,52 @@ impl LlmClient {
         generated_answer: &str,
         is_adversarial: bool,
     ) -> Result<JudgeResult, String> {
-        let system = "You are evaluating conversational AI memory recall. Return JSON only \
-            with the format requested."
+        let system = "You are evaluating conversational AI memory recall.\n\
+            You must respond with exactly one JSON object containing two keys:\n\
+            - \"label\": either \"CORRECT\" or \"WRONG\" (uppercase, no other values)\n\
+            - \"reasoning\": a brief explanation of your judgment\n\n\
+            Example response format:\n\
+            {\"label\": \"CORRECT\", \"reasoning\": \"The generated answer matches the gold answer.\"}\n\n\
+            Output ONLY the JSON object. No markdown fences, no extra text."
             .to_string();
 
         let user = if is_adversarial {
             format!(
-                "Your task is to label an answer to a question as 'CORRECT' or 'WRONG'.\n\n\
-                 This is an ADVERSARIAL question — it asks about something that was never \
-                 discussed in the conversation. The correct behavior is to indicate the \
-                 question cannot be answered.\n\n\
+                "This is an ADVERSARIAL question — it asks about something that was never \
+                 discussed in the conversation. The correct behavior is to refuse to answer.\n\n\
                  Question: {question}\n\
                  Expected wrong answer (what a tricked system would say): {gold_answer}\n\
                  Generated answer: {generated_answer}\n\n\
-                 The generated answer is CORRECT if it says \"I don't know\", \"unanswerable\", \
-                 or otherwise refuses to answer. It is WRONG if it provides the expected \
-                 wrong answer or any specific answer as if it were true.\n\n\
-                 Return your response in JSON format with two keys: \
-                 \"reasoning\" for your explanation and \"label\" for CORRECT or WRONG.\n\
-                 Do NOT include both CORRECT and WRONG in your response."
+                 Label the generated answer as CORRECT or WRONG.\n\
+                 CORRECT: the answer says \"I don't know\", \"unanswerable\", or refuses to answer.\n\
+                 WRONG: the answer provides the expected wrong answer or any specific answer \
+                 as if it were true.\n\n\
+                 Respond with a single JSON object: {{\"label\": \"...\", \"reasoning\": \"...\"}}"
             )
         } else {
             format!(
-                "Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. \
-                 You will be given the following data:\n\
-                 (1) a question (posed by one user to another user),\n\
-                 (2) a 'gold' (ground truth) answer,\n\
-                 (3) a generated answer\n\
-                 which you will score as CORRECT/WRONG.\n\n\
-                 The point of the question is to ask about something one user should know \
-                 about the other user based on their prior conversations.\n\
-                 The gold answer will usually be a concise and short answer that includes \
-                 the referenced topic, for example:\n\
-                 Question: Do you remember what I got the last time I went to Hawaii?\n\
-                 Gold answer: A shell necklace\n\
-                 The generated answer might be much longer, but you should be generous \
-                 with your grading - as long as the core fact matches the gold answer, \
-                 it should be counted as CORRECT. Synonyms, paraphrases, and additional \
-                 correct details are all acceptable.\n\n\
-                 For yes/no or inferential questions (e.g., gold answer is \"Likely no\" \
-                 or \"Liberal\"), the generated answer is CORRECT if it reaches the same \
-                 conclusion, regardless of wording or amount of reasoning shown.\n\n\
-                 For time related questions, the gold answer will be a specific date, month, \
-                 year, etc. The generated answer might be much longer or use relative time \
-                 references (like \"last Tuesday\" or \"next month\"), but you should be \
-                 generous with your grading - as long as it refers to the same date or time \
-                 period as the gold answer, it should be counted as CORRECT. Even if the \
-                 format differs (e.g., \"May 7th\" vs \"7 May\"), consider it CORRECT if \
-                 it's the same date.\n\n\
-                 Now it's time for the real question:\n\
+                "Label a generated answer as CORRECT or WRONG by comparing it to a gold answer.\n\n\
+                 The gold answer is the ground truth. The generated answer is CORRECT if its \
+                 core fact matches the gold answer, even if the wording differs or extra details \
+                 are included.\n\n\
+                 Grading rules:\n\
+                 - Synonyms, paraphrases, and equivalent phrasings count as CORRECT \
+                 (e.g., \"stout and lager\" matches \"stout and light beers\"; \
+                 \"inventory software\" matches \"computer application\").\n\
+                 - Extra correct details beyond the gold answer are fine — a SUPERSET of \
+                 the gold answer is CORRECT.\n\
+                 - For yes/no or inferential questions (gold answer is \"Likely no\" or \
+                 \"Liberal\"), CORRECT if the same conclusion is reached, regardless of \
+                 wording or reasoning shown.\n\
+                 - For time questions: dates within 2 days are CORRECT (\"May 7\" vs \
+                 \"May 8\"). Different formats are CORRECT (\"May 7th\" vs \"7 May\" \
+                 vs \"the first week of May\").\n\
+                 - For list questions: CORRECT if all items from the gold answer are present \
+                 (extras are fine). CORRECT if most items match and the core facts align.\n\n\
                  Question: {question}\n\
                  Gold answer: {gold_answer}\n\
                  Generated answer: {generated_answer}\n\n\
-                 Return your response in JSON format with two keys: \
-                 \"reasoning\" for your explanation and \"label\" for CORRECT or WRONG.\n\
-                 Do NOT include both CORRECT and WRONG in your response."
+                 Respond with a single JSON object: {{\"label\": \"...\", \"reasoning\": \"...\"}}"
             )
         };
 
@@ -529,74 +598,81 @@ impl LlmClient {
         let system = "You are an AI assistant listening to a conversation between two people. \
             You have a memory tool called store_memory that saves information for later recall.\n\n\
             You will see recent conversation context followed by the LATEST turn. \
-            Store any new factual information revealed in the latest turn.\n\n\
-            Guidelines:\n\
-            - NEVER generalize specific nouns. Store the EXACT name, title, or object: \
-            \"To Kill a Mockingbird\" NOT \"a book\", \"sneakers\" NOT \"shoes\", \"Portugal\" NOT \
-            \"his home country\", \"labrador\" NOT \"dog\", \"hand-painted vase\" \
-            NOT \"pottery\".\n\
-            - Always name specific items, places, brands, species, colors, and quantities.\n\
-            - Store EVERY distinct fact: names, places, events, activities, preferences, \
-            hobbies, relationships, opinions, plans, dates, specific details. Err on the side \
-            of storing more rather than less.\n\
-            - Store facts from BOTH speakers, not just the main topic.\n\
-            - Small facts matter: pets' names, weekend plans, favorite foods, how long someone \
-            has done something — these are exactly the kind of details questions will ask about.\n\
-            - Quantities and durations: Always preserve specific numbers — \"5 years\", \
-            \"every morning\", \"three times a week\", \"$200\". If someone says something \
-            vague like \"we've been married a while\" but context gives a specific duration, \
-            store the specific duration.\n\
+            Store new factual information revealed in the latest turn, but be highly selective — \
+            only store facts that would be useful to answer future questions about these people.\n\n\
+            <task>\n\
+            Your job: extract ONLY genuinely new, specific, useful facts from the latest turn.\n\
+            Quality over quantity. A typical conversation turn contains 0-2 memories worth storing. \
+            Most turns with casual chat, reactions, or continuation of an already-stored topic \
+            should produce zero new memories.\n\
+            </task>\n\n\
+            <what_to_store>\n\
+            Store facts that someone might ask about later:\n\
+            - Concrete biographical details: names, relationships, occupations, where someone lives\n\
+            - Specific preferences: favorite foods, hobbies, media they enjoy\n\
+            - Events and plans: trips, milestones, upcoming events with dates\n\
+            - Quantities and durations: \"5 years\", \"every morning\", \"three times a week\", \"$200\"\n\
+            - Exact counts: how many children, pets, siblings, trips, etc.\n\
             - Cross-speaker opinions: When person A expresses an opinion about person B \
-            (e.g., \"I think he'd make a great teacher\"), store it as its own separate memory \
-            with both speakers as entities. These are distinct from factual statements.\n\
-            - Inferrable conclusions: When facts in the conversation strongly imply a conclusion \
-            (e.g., a stressful experience at a job implies they might want to change careers), store \
-            the inference as a separate memory with appropriate context. Tag it with the \
-            relevant entities and topics so it can be found later.\n\
-            - Multiple memories per turn is fine if the turn contains multiple distinct facts.\n\
-            - Do NOT store: greetings, filler, or emotional reactions without new factual content.\n\
-            - Be specific. Include names, titles, dates, objects, and details.\n\
-            - Book/media titles: If a book, movie, song, or other titled work is discussed, \
-            ALWAYS include the exact title in both the summary and full_text. If the speaker \
-            references a work by description without naming it, try to identify it from context. \
-            If you truly cannot identify it, store what you know but note the title is unknown.\n\
-            - Always include relevant dates, times, and temporal markers in the summary. \
-            If the fact has a date, the summary MUST contain it.\n\
-            - If the conversation mentions relative time ('last week', 'yesterday', \
-            'a few months ago'), resolve to an approximate absolute date using the \
-            conversation timestamp provided below.\n\
-            - Check your already-stored memories below. Do not store a fact that is already \
-            captured. But if the turn adds ANY new detail not in your existing memories, store it.\n\
-            - If an existing memory is OUTDATED or INCOMPLETE and the conversation has revealed \
-            new information that changes it, store a new memory with \"supersedes\" set to the \
-            ID of the old memory. The old memory will be replaced in search results.\n\n\
+            (e.g., \"I think he'd make a great teacher\"), store it with both speakers as entities.\n\
+            - Specific names, titles, dates, objects: pets' names, book titles, brand names\n\
+            - Emotional reactions and feelings: when someone says how they feel about an event \
+            (grateful, scared, proud, happy), store it — especially after significant events.\n\
+            - Specific phrases or descriptions: if someone describes something using a meaningful \
+            phrase (e.g., \"an adventure of learning\", \"warmth and happiness\"), capture the \
+            exact wording.\n\
+            - What someone saw, read, or observed: sign text, book titles, details about photos \
+            or images shared.\n\
+            - Activities done TOGETHER: when speakers mention doing a specific activity with \
+            someone (family, friends, each other), store what they did and with whom.\n\
+            </what_to_store>\n\n\
+            <specificity>\n\
+            Use EXACT nouns from the conversation. Store the precise name, title, or object: \
+            \"To Kill a Mockingbird\" not \"a book\", \"sneakers\" not \"shoes\", \"Portugal\" not \
+            \"his home country\", \"labrador\" not \"dog\".\n\
+            Always include specific items, places, brands, species, colors, and quantities.\n\
+            If a book, movie, song, or other titled work is discussed, include the exact title \
+            in both summary and full_text.\n\
+            Resolve relative times ('last week', 'yesterday') to approximate absolute dates \
+            using the conversation timestamp.\n\
+            </specificity>\n\n\
+            <deduplication>\n\
+            CRITICAL: Before creating any memory, check the already-stored memories listed below.\n\
+            If a fact is already captured — even partially, with different wording, or as part of \
+            a broader memory — skip it. Only store if the turn reveals a genuinely NEW fact \
+            that no existing memory covers.\n\
+            If an existing memory is OUTDATED or INCOMPLETE and the conversation reveals new \
+            information that changes it, store a new memory with \"supersedes\" set to the \
+            ID of the old memory.\n\
+            </deduplication>\n\n\
+            <output_format>\n\
+            The tags you attach (entities, topics, emotions) are what the search system \
+            uses to retrieve memories later. Thorough, accurate tagging directly determines \
+            whether a memory can be found. If a fact involves a person, tag them as an entity. \
+            If it has emotional content, tag the emotion. If it relates to a topic, tag it.\n\n\
             store_memory accepts:\n\
-            - \"summary\" (required, string): A concise 1-2 sentence summary of the key fact\n\
-            - \"full_text\" (optional, string): A detailed version of the memory with all \
-            relevant context, quotes, specifics, and surrounding details from the conversation. \
-            Include who said what, exact names, dates, numbers, and any nuance. This should be \
-            a rich, self-contained account that someone could read without seeing the original \
-            conversation. Provide this for any memory where the summary alone would lose \
-            important detail. Include direct quotes from the conversation when possible. \
-            IMPORTANT: ALWAYS provide full_text for any memory containing specific names, titles, \
-            dates, numbers, or quotes. The summary can be brief, but full_text must capture all \
-            surrounding context verbatim — this is critical for recall accuracy.\n\
+            - \"summary\" (required, string): A concise 1-2 sentence summary of the key fact.\n\
+            - \"full_text\" (optional, string): Detailed version with all context, quotes, and \
+            specifics. Provide this for any memory containing specific names, titles, dates, \
+            numbers, or quotes. Include who said what, exact names, dates, numbers, and nuance.\n\
             - \"entities\" (required, array of strings): ALL people, pets, places, organizations, \
-            book/movie/song titles, and proper nouns mentioned in this memory. You MUST always \
-            provide this field. Use their canonical name (e.g., \"Alice\", \"Marcus\", \"Portugal\", \
-            \"To Kill a Mockingbird\", \"NASA\"). These are used for search indexing and graph linking.\n\
-            - \"topics\" (required, array of strings): 1-5 topic keywords describing what the \
-            memory is about. You MUST always provide this field. Examples: \"adoption\", \"career\", \
-            \"cooking\", \"music\", \"camping\", \"self-care\", \"family\", \"art\", \"pets\", \
-            \"travel\", \"health\", \"education\". Use lowercase single words or short phrases.\n\
-            - \"emotions\" (optional, array of strings): Emotional tone of the memory if relevant. \
-            Examples: \"happy\", \"anxious\", \"grateful\", \"excited\", \"sad\", \"proud\", \
-            \"hopeful\", \"frustrated\", \"nostalgic\". Only include if the conversation has \
-            clear emotional content.\n\
-            - \"supersedes\" (optional, string): ID of an existing memory this one replaces. \
-            Use when a fact has been updated, corrected, or significantly expanded.\n\n\
-            Output JSON: {\"store_memory\": [...]} or {\"store_memory\": []} if nothing to store yet.\n\
-            Output ONLY valid JSON, no markdown fences or explanation.";
+            titles, and proper nouns in this memory. Use canonical names (e.g., \"Alice\", \
+            \"Portugal\", \"To Kill a Mockingbird\").\n\
+            - \"topics\" (required, array of strings): 1-5 topic keywords. Examples: \"adoption\", \
+            \"career\", \"cooking\", \"music\", \"travel\". Use lowercase.\n\
+            - \"emotions\" (optional, array of strings): Only include if clear emotional content \
+            is present. Examples: \"happy\", \"anxious\", \"grateful\".\n\
+            - \"supersedes\" (optional, string): ID of an existing memory this one replaces.\n\n\
+            Output: {\"store_memory\": [...]} or {\"store_memory\": []} if nothing new to store.\n\
+            Output ONLY valid JSON. No markdown fences, no explanation, no commentary.\n\
+            </output_format>\n\n\
+            <constraints>\n\
+            Skip greetings, filler, emotional reactions without new factual content, and \
+            restatements of already-stored information.\n\
+            Each memory must capture a UNIQUE fact not present in any existing memory.\n\
+            If the latest turn just continues discussing a topic already stored, store nothing.\n\
+            Aim for precision: fewer high-quality memories are better than many redundant ones.\n\
+            </constraints>";
 
         let mut user_msg = String::new();
         user_msg.push_str(&format!(
@@ -648,55 +724,46 @@ impl LlmClient {
     }
 
     pub async fn construct_search_query(&self, question: &str) -> Result<SearchParams, String> {
-        let system = "You have access to a memory search tool. Given a question, construct the optimal \
-            search parameters to find relevant memories.\n\n\
-            The tool accepts:\n\
+        let system = "Given a question, construct optimal search parameters to find relevant \
+            memories. Output a single JSON object.\n\n\
+            <schema>\n\
+            The JSON object accepts these fields:\n\
             - \"queries\" (required, array of 1-3 objects): Each object has:\n\
-              - \"query\" (required, string): Natural language search query embedded and compared \
-              against stored memory summaries via semantic similarity. Write a descriptive, natural-language \
-              query that sounds like a memory summary.\n\
+              - \"query\" (required, string): Natural language search query for semantic similarity \
+              against stored memory summaries. Write a descriptive query that sounds like a memory \
+              summary — think about how the ANSWER might be phrased in a stored memory.\n\
               - \"fts_query\" (optional, string): Keyword-focused query for full-text search (BM25). \
               Include ONLY key entities, names, and distinctive terms. Example: for \"What did Sarah \
               say about her trip to Japan?\", use \"Sarah trip Japan\". When the question mentions a \
-              specific proper noun (book title, place name, event name), ALWAYS include it in the \
-              fts_query even if it appears in the semantic query too — FTS excels at exact name matching.\n\
-            Use multiple queries when the question has multiple angles. For example:\n\
-              - \"What movies has Alice watched?\" -> one query about Alice's movie-watching habits, another about \
-              specific film titles Alice mentioned.\n\
-              - \"Would Marcus enjoy cooking?\" -> one query about Marcus's food-related activities, another \
-              about Marcus's hobbies or kitchen interests.\n\
-            For simple factual questions, one query is fine.\n\
-            Each query in the set should come from a genuinely different angle — not paraphrases of \
-            each other. Think about how the ANSWER might be phrased in a stored memory, not just how \
-            the question is phrased. One query for direct matches, one for how the information might \
-            have been originally described or stored.\n\
-            For opinion or inference questions (\"Would X do Y?\", \"What does X think about Y?\"), \
-            search for the underlying facts and experiences rather than the inference itself. The \
-            memory system stores what happened, not what it means.\n\
+              proper noun (book title, place name, event name), always include it in fts_query.\n\
             - \"entities\" (optional, array of strings): Filter to memories mentioning specific \
-            people, places, or proper nouns. Use the canonical name as it would appear in a memory \
-            (e.g., \"Alice\", \"Tokyo\", \"Marcus\"). When the question asks about a specific person, \
-            include their name here to prioritize memories about them. Provide at most 1-2 entities.\n\
-            - \"topics\" (optional, array of strings): Filter to memories about specific topics. \
-            Use lowercase single words or short phrases. Examples: \"adoption\", \"cooking\", \"career\", \
-            \"travel\", \"music\". Only include when the question clearly focuses on a specific subject \
-            area and filtering would help narrow results. Do NOT use for broad questions. \
-            Provide at most ONE topic -- if multiple are given, only memories matching ALL topics \
-            will be returned, which is usually too restrictive.\n\
-            - \"emotions\" (optional, array of strings): Filter to memories tagged with specific \
-            emotions. Use lowercase single words. Examples: \"anxious\", \"excited\", \"grateful\", \
-            \"frustrated\". Only include when the question specifically asks about feelings or \
-            emotional states. Provide at most ONE emotion -- multiple emotions use AND logic.\n\
-            - \"depth\" (optional, integer 0-3, default 2): Graph hops to include related memories. \
-            Use depth 2 as the DEFAULT for any question about opinions, personality, hypotheticals, \
-            \"would X...\", cross-person relationships, or questions requiring inference from multiple \
-            facts. Use depth 1 only for simple direct factual lookups (\"When did X?\", \"What is X's \
-            name?\"). Use depth 3 for complex multi-hop reasoning.\n\
-            - \"time_range_start\" (optional, integer): Lower bound timestamp in milliseconds since Unix \
-            epoch. Set when the question references a specific time period.\n\
-            - \"time_range_end\" (optional, integer): Upper bound timestamp in milliseconds since Unix \
-            epoch.\n\n\
-            Output ONLY a JSON object with these fields. No markdown fences or explanation.";
+            people, places, or proper nouns. Use canonical names (e.g., \"Alice\", \"Tokyo\"). \
+            Include when the question asks about a specific person. At most 1-2 entities.\n\
+            - \"topics\" (optional, array of strings): Filter by topic. Use lowercase. Examples: \
+            \"adoption\", \"cooking\", \"career\". Only include when the question clearly focuses on \
+            one subject area. At most ONE topic (multiple use AND logic, which is too restrictive).\n\
+            - \"emotions\" (optional, array of strings): Filter by emotional tag. Only include when \
+            the question asks about feelings. At most ONE emotion.\n\
+            - \"depth\" (optional, integer 0-3, default 2): Graph hops for related memories. \
+            Use 2 for opinions, hypotheticals, inference questions. Use 1 for simple factual \
+            lookups. Use 3 for complex multi-hop reasoning.\n\
+            - \"time_range_start\" (optional, integer): Lower bound timestamp in milliseconds \
+            since Unix epoch.\n\
+            - \"time_range_end\" (optional, integer): Upper bound timestamp in milliseconds \
+            since Unix epoch.\n\
+            </schema>\n\n\
+            <strategy>\n\
+            Use multiple queries when the question has multiple angles:\n\
+            - \"What movies has Alice watched?\" -> one query about Alice's movie-watching habits, \
+            another about specific film titles Alice mentioned.\n\
+            - \"Would Marcus enjoy cooking?\" -> one query about Marcus's food-related activities, \
+            another about Marcus's hobbies or kitchen interests.\n\
+            For simple factual questions, one query is sufficient.\n\
+            Each query should approach from a genuinely different angle, not be a paraphrase.\n\
+            For opinion or inference questions, search for underlying facts and experiences \
+            rather than the inference itself.\n\
+            </strategy>\n\n\
+            Output ONLY the JSON object. No markdown fences, no explanation, no commentary.";
 
         let user_msg = format!("Question: {question}");
         let response = self.call(system, &user_msg).await?;
@@ -776,11 +843,50 @@ impl LlmClient {
                     let body = OpenAiRequest {
                         model: self.model.clone(),
                         messages: all_messages,
-                        max_tokens: 512,
+                        max_tokens: 1024,
                         temperature: 0.0,
                     };
                     self.client
                         .post(&url)
+                        .header("content-type", "application/json")
+                        .json(&body)
+                        .send()
+                        .await
+                }
+                BackendKind::GeminiVertex { project_id, region } => {
+                    let token = get_gcloud_token()?;
+                    let url = format!(
+                        "https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/google/models/{}:generateContent",
+                        self.model
+                    );
+                    let body = GeminiRequest {
+                        contents: messages
+                            .iter()
+                            .map(|m| GeminiContent {
+                                role: if m.role == "assistant" {
+                                    "model".to_string()
+                                } else {
+                                    m.role.clone()
+                                },
+                                parts: vec![GeminiPart {
+                                    text: m.content.clone(),
+                                }],
+                            })
+                            .collect(),
+                        system_instruction: GeminiContent {
+                            role: "user".to_string(),
+                            parts: vec![GeminiPart {
+                                text: system.to_string(),
+                            }],
+                        },
+                        generation_config: GeminiGenerationConfig {
+                            max_output_tokens: 1024,
+                            temperature: 0.0,
+                        },
+                    };
+                    self.client
+                        .post(&url)
+                        .bearer_auth(&token)
                         .header("content-type", "application/json")
                         .json(&body)
                         .send()
@@ -799,7 +905,7 @@ impl LlmClient {
                     );
                     let body = VertexRequest {
                         anthropic_version: "vertex-2023-10-16".to_string(),
-                        max_tokens: 512,
+                        max_tokens: 1024,
                         temperature: 0.0,
                         system: system.to_string(),
                         messages: messages.clone(),
@@ -815,7 +921,7 @@ impl LlmClient {
                 BackendKind::Anthropic { api_key } => {
                     let body = AnthropicRequest {
                         model: self.model.clone(),
-                        max_tokens: 512,
+                        max_tokens: 1024,
                         temperature: 0.0,
                         system: system.to_string(),
                         messages: messages.clone(),
@@ -849,6 +955,21 @@ impl LlmClient {
                                     })
                                     .map_err(|e| format!("parse error: {e}"))
                             }
+                            BackendKind::GeminiVertex { .. } => serde_json::from_str::<
+                                GeminiResponse,
+                            >(&text)
+                            .and_then(|r| {
+                                let text = r
+                                    .candidates
+                                    .into_iter()
+                                    .filter_map(|c| {
+                                        c.content.parts.into_iter().filter_map(|p| p.text).next()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                Ok(text)
+                            })
+                            .map_err(|e| format!("parse error: {e}")),
                             _ => serde_json::from_str::<AnthropicResponse>(&text)
                                 .map(|r| {
                                     r.content

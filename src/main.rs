@@ -145,19 +145,19 @@ enum BenchTarget {
         data: std::path::PathBuf,
 
         /// Number of retrieved memories per question
-        #[arg(long, default_value = "30")]
+        #[arg(long, default_value = "20")]
         top_k: usize,
 
         /// Model name for answer generation and query construction
-        #[arg(long, default_value = "claude-sonnet-4-6")]
+        #[arg(long, default_value = "gemini-2.5-flash")]
         model: String,
 
         /// Model name for conversation ingestion (memory extraction)
-        #[arg(long, default_value = "claude-sonnet-4-6")]
+        #[arg(long, default_value = "gemini-2.5-flash")]
         ingest_model: String,
 
         /// Model name for answer judging (uses a separate model to avoid self-grading bias)
-        #[arg(long, default_value = "claude-haiku-4-5")]
+        #[arg(long, default_value = "gemini-2.5-flash-lite")]
         judge_model: String,
 
         /// OpenAI-compatible LLM server URL (e.g. http://host:8000).
@@ -174,6 +174,14 @@ enum BenchTarget {
         /// whether gold answer key terms appear in retrieved memories.
         #[arg(long)]
         diagnose: bool,
+
+        /// Number of conversations to evaluate in parallel
+        #[arg(long, default_value = "2")]
+        parallel: usize,
+
+        /// Number of QA pairs to evaluate in parallel within each conversation
+        #[arg(long, default_value = "4")]
+        qa_parallel: usize,
     },
 }
 
@@ -290,6 +298,8 @@ async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> 
             llm_url,
             skip_adversarial,
             diagnose,
+            parallel,
+            qa_parallel,
         } => {
             if !data.exists() {
                 eprintln!("error: dataset not found: {}", data.display());
@@ -335,6 +345,8 @@ async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> 
                 llm_url.as_deref(),
                 format,
                 skip_adversarial,
+                parallel,
+                qa_parallel,
             )
             .await
             {

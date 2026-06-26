@@ -522,6 +522,88 @@ impl MetadataStore {
 
         Ok(ids)
     }
+
+    /// List memories in a namespace with optional tag/entity/time filters,
+    /// sorted by creation date (newest first) with offset/limit pagination.
+    ///
+    /// This is a metadata-only query path that does not require embeddings.
+    /// Filters use AND semantics: a memory must match ALL provided tags
+    /// and ALL provided entities to be included.
+    ///
+    /// Returns `(matching_records, total_matching_count)` where the records
+    /// are the paginated slice and the count is the total before pagination.
+    pub fn list_memories_filtered(
+        &self,
+        namespace_id: NamespaceId,
+        require_tags: &[crate::model::Tag],
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<(MemoryId, DiskRecord)>, u64), StorageError> {
+        // Step 1: Get all memory IDs in this namespace from the index.
+        let read_txn = self.db.begin_read()?;
+        let ns_table = read_txn.open_multimap_table(NAMESPACE_INDEX)?;
+        let meta_table = read_txn.open_table(META_TABLE)?;
+
+        // Collect candidate IDs from namespace index.
+        let ns_values = ns_table.get(namespace_id.get())?;
+        let mut candidates: Vec<(MemoryId, DiskRecord)> = Vec::new();
+
+        for result in ns_values {
+            let value = result?;
+            let bytes: [u8; 16] = value.value().try_into().map_err(|_| {
+                StorageError::CorruptIndex("invalid UUID length in namespace index".into())
+            })?;
+            let mid = MemoryId::from_bytes(bytes);
+
+            // Look up the full record.
+            let Some(record_value) = meta_table.get(mid.as_bytes().as_slice())? else {
+                continue;
+            };
+            let record = DiskRecord::from_bytes(record_value.value())?;
+
+            // Skip tombstoned records.
+            if record.phase == DecayPhase::Tombstone {
+                continue;
+            }
+
+            // Apply time range filter.
+            if let Some(start) = time_range_start {
+                if record.created_at < start {
+                    continue;
+                }
+            }
+            if let Some(end) = time_range_end {
+                if record.created_at > end {
+                    continue;
+                }
+            }
+
+            // Apply tag filter (AND semantics): record must have ALL required tags.
+            if !require_tags.is_empty() {
+                let has_all = require_tags.iter().all(|rt| record.tags.contains(rt));
+                if !has_all {
+                    continue;
+                }
+            }
+
+            candidates.push((mid, record));
+        }
+
+        // Step 2: Sort by creation date, newest first.
+        // UUID v7 keys are already chronological, but we sort by created_at
+        // for correctness (handles any edge cases).
+        candidates.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at));
+
+        let total = candidates.len() as u64;
+
+        // Step 3: Apply offset/limit pagination.
+        let page: Vec<(MemoryId, DiskRecord)> =
+            candidates.into_iter().skip(offset).take(limit).collect();
+
+        Ok((page, total))
+    }
 }
 
 // ── Batch Operations for Decay Sweep (Section 7) ────────────────────

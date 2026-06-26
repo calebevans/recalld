@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use super::client::DaemonClient;
 use super::protocol;
 use crate::mcp::bridge::{
-    self, BridgeError, CreateNamespaceInput, HealthStatus, MemoryRecord, NamespaceInfo,
-    NamespaceStats, ReinforceResult, SearchHit, SearchInput, SearchPipeline, SearchResponse,
-    StoreInput, StoredMemory, SubsystemHealth,
+    self, BridgeError, CreateNamespaceInput, DuplicateCluster, HealthStatus, MemoryRecord,
+    NamespaceInfo, NamespaceStats, ReinforceResult, SearchHit, SearchInput, SearchPipeline,
+    SearchResponse, StoreInput, StoredMemory, SubsystemHealth,
 };
 use crate::model::MemoryId;
 
@@ -52,6 +52,23 @@ impl SearchPipeline for RemoteSearchAdapter {
         })
         .map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("find_similar", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
+    }
+
+    async fn scan_duplicates(
+        &self,
+        namespace: &str,
+        threshold: f32,
+        max_memories: usize,
+    ) -> Result<Vec<DuplicateCluster>, BridgeError> {
+        let params = serde_json::to_value(protocol::ScanDuplicatesParams {
+            namespace: namespace.to_string(),
+            threshold,
+            max_memories,
+        })
+        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let result = self.client.call("scan_duplicates", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
@@ -110,6 +127,17 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
         })
         .map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("reinforce_memory", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
+    }
+
+    async fn list_memories(
+        &self,
+        input: bridge::ListMemoriesInput,
+    ) -> Result<bridge::ListMemoriesResponse, BridgeError> {
+        let params =
+            serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let result = self.client.call("list_memories", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }

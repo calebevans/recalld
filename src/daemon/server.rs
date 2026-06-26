@@ -254,6 +254,15 @@ async fn dispatch(
             serde_json::to_value(results).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
+        "scan_duplicates" => {
+            let p: ScanDuplicatesParams = serde_json::from_value(params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            let results = search
+                .scan_duplicates(&p.namespace, p.threshold, p.max_memories)
+                .await?;
+            serde_json::to_value(results).map_err(|e| BridgeError::Internal(e.to_string()))
+        }
+
         "store_memory" => {
             let input: StoreInput = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;

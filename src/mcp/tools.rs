@@ -1,7 +1,8 @@
 //! MCP tool definitions and handlers for Recalld memory operations.
 //!
-//! Defines 7 tools: store_memory, recall_memories, get_memory,
-//! reinforce_memory, forget_memory, find_similar_memories, create_namespace.
+//! Defines 9 tools: store_memory, store_memories, recall_memories, get_memory,
+//! reinforce_memory, forget_memory, find_similar_memories, create_namespace,
+//! list_memories.
 
 use serde_json::json;
 
@@ -16,12 +17,14 @@ use crate::mcp::protocol::{ToolAnnotations, ToolCallResult, ToolInfo};
 pub fn tool_definitions() -> Vec<ToolInfo> {
     vec![
         store_memory_def(),
+        store_memories_def(),
         recall_memories_def(),
         get_memory_def(),
         reinforce_memory_def(),
         forget_memory_def(),
         find_similar_memories_def(),
         create_namespace_def(),
+        list_memories_def(),
     ]
 }
 
@@ -33,12 +36,14 @@ pub async fn dispatch_tool(
 ) -> ToolCallResult {
     match name {
         "store_memory" => handle_store_memory(bridge, arguments).await,
+        "store_memories" => handle_store_memories(bridge, arguments).await,
         "recall_memories" => handle_recall_memories(bridge, arguments).await,
         "get_memory" => handle_get_memory(bridge, arguments).await,
         "reinforce_memory" => handle_reinforce_memory(bridge, arguments).await,
         "forget_memory" => handle_forget_memory(bridge, arguments).await,
         "find_similar_memories" => handle_find_similar_memories(bridge, arguments).await,
         "create_namespace" => handle_create_namespace(bridge, arguments).await,
+        "list_memories" => handle_list_memories(bridge, arguments).await,
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -207,6 +212,254 @@ async fn handle_store_memory(bridge: &McpBridge, arguments: serde_json::Value) -
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Tool 1b: store_memories (batch)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn store_memories_def() -> ToolInfo {
+    ToolInfo {
+        name: "store_memories".to_string(),
+        title: Some("Store Memories (Batch)".to_string()),
+        description: "Store multiple memories in a single call. Each item has the \
+            same schema as store_memory. Returns an array of results, one per \
+            input memory. Saves round trips for bulk ingestion."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "description": "Array of memories to store (max 100 per call)",
+                    "maxItems": 100,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "summary": {
+                                "type": "string",
+                                "description": "Short description of the memory (max 2000 chars)",
+                                "maxLength": 2000
+                            },
+                            "fullText": {
+                                "type": "string",
+                                "description": "Detailed content. Removed as memory decays to ghost phase."
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Categorization tags, e.g. [\"topic/rust\", \"type/observation\"]"
+                            },
+                            "entities": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Named entities (people, places, orgs, titles) mentioned in this memory."
+                            },
+                            "topics": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Topic keywords describing what the memory is about"
+                            },
+                            "emotions": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Emotional tone if relevant"
+                            },
+                            "namespace": {
+                                "type": "string",
+                                "description": "Memory partition (default: \"default\")",
+                                "default": "default"
+                            },
+                            "parentId": {
+                                "type": "string",
+                                "description": "UUID of parent memory to create a hierarchical link"
+                            },
+                            "supersedes": {
+                                "type": "string",
+                                "description": "UUID of an older memory this one replaces"
+                            }
+                        },
+                        "required": ["summary"]
+                    }
+                }
+            },
+            "required": ["memories"]
+        }),
+        annotations: Some(ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
+    let memories_val = match arguments.get("memories") {
+        Some(v) => v,
+        None => return ToolCallResult::error("Missing required parameter: memories"),
+    };
+
+    let memories_arr = match memories_val.as_array() {
+        Some(arr) => arr,
+        None => return ToolCallResult::error("Parameter 'memories' must be an array"),
+    };
+
+    if memories_arr.is_empty() {
+        return ToolCallResult::error("Parameter 'memories' must not be empty");
+    }
+
+    if memories_arr.len() > 100 {
+        return ToolCallResult::error("Too many memories (maximum 100 per call)");
+    }
+
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(memories_arr.len());
+
+    for (index, item) in memories_arr.iter().enumerate() {
+        let summary = match item.get("summary").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                results.push(json!({
+                    "index": index,
+                    "error": "Missing required parameter: summary"
+                }));
+                continue;
+            }
+        };
+
+        if summary.len() > 2000 {
+            results.push(json!({
+                "index": index,
+                "error": "Summary exceeds maximum length of 2000 characters"
+            }));
+            continue;
+        }
+
+        let full_text = item
+            .get("fullText")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        const MAX_FULL_TEXT_BYTES: usize = 1_048_576;
+        if let Some(ref ft) = full_text {
+            if ft.len() > MAX_FULL_TEXT_BYTES {
+                results.push(json!({
+                    "index": index,
+                    "error": "fullText exceeds maximum length of 1 MB"
+                }));
+                continue;
+            }
+        }
+
+        let tags: Vec<String> = item
+            .get("tags")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let entities: Vec<String> = item
+            .get("entities")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let topics: Vec<String> = item
+            .get("topics")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let emotions: Vec<String> = item
+            .get("emotions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        if tags.len() > 64 {
+            results.push(json!({
+                "index": index,
+                "error": "Too many tags (maximum 64)"
+            }));
+            continue;
+        }
+        if entities.len() > 32 {
+            results.push(json!({
+                "index": index,
+                "error": "Too many entities (maximum 32)"
+            }));
+            continue;
+        }
+        if topics.len() > 32 {
+            results.push(json!({
+                "index": index,
+                "error": "Too many topics (maximum 32)"
+            }));
+            continue;
+        }
+        if emotions.len() > 32 {
+            results.push(json!({
+                "index": index,
+                "error": "Too many emotions (maximum 32)"
+            }));
+            continue;
+        }
+
+        let namespace = item
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| bridge.default_namespace().to_string());
+        let parent_id = item
+            .get("parentId")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .map(crate::model::MemoryId::from_uuid);
+        let supersedes = item
+            .get("supersedes")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .map(crate::model::MemoryId::from_uuid);
+
+        let input = crate::mcp::bridge::StoreInput {
+            summary,
+            full_text,
+            tags,
+            entities,
+            topics,
+            emotions,
+            namespace,
+            embedding: None,
+            initial_stability: None,
+            parent_id,
+            supersedes,
+        };
+
+        match bridge.storage.store_memory(input).await {
+            Ok(stored) => {
+                results.push(json!({
+                    "index": index,
+                    "id": stored.id,
+                    "namespace": stored.namespace,
+                    "phase": stored.phase,
+                    "strength": stored.strength,
+                    "stability": stored.stability,
+                    "createdAt": stored.created_at,
+                }));
+            }
+            Err(e) => {
+                results.push(json!({
+                    "index": index,
+                    "error": format!("Failed to store memory: {e}")
+                }));
+            }
+        }
+    }
+
+    let stored_count = results.iter().filter(|r| r.get("id").is_some()).count();
+    let error_count = results.iter().filter(|r| r.get("error").is_some()).count();
+    let response = json!({
+        "results": results,
+        "total": results.len(),
+        "stored": stored_count,
+        "errors": error_count,
+    });
+    match ToolCallResult::json(&response) {
+        Ok(r) => r,
+        Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Tool 2: recall_memories
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -217,7 +470,10 @@ fn recall_memories_def() -> ToolInfo {
         description: "Search for relevant memories using a natural language query. \
             Returns memories ranked by semantic similarity combined with memory \
             strength (well-reinforced memories rank higher). This is the primary \
-            way to retrieve context from the memory system."
+            way to retrieve context from the memory system. Use compact=true \
+            (the default) for token-efficient results containing only id, \
+            summary, fullText, entities, and topics. Set compact=false to \
+            include full metadata, graph edges, and neighbor context."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -284,6 +540,11 @@ fn recall_memories_def() -> ToolInfo {
                         { "type": "integer" },
                         { "type": "string" }
                     ]
+                },
+                "compact": {
+                    "type": "boolean",
+                    "description": "If true (default), returns only id, summary, fullText, entities, and topics per memory for token efficiency. Set to false to include full metadata (tags, score, phase, strength, timestamps, related edges) and graph neighbor context.",
+                    "default": true
                 }
             },
             "required": ["query"]
@@ -336,6 +597,10 @@ async fn handle_recall_memories(
         .and_then(|v| v.as_f64())
         .map(|f| f as f32);
     let depth = arguments.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let compact = arguments
+        .get("compact")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     // Parse time range values: accept either integer (millis) or ISO 8601 string.
     let time_range_start = match arguments.get("timeRangeStart") {
@@ -372,19 +637,53 @@ async fn handle_recall_memories(
     match bridge.search.search(input).await {
         Ok(search_response) => {
             let hit_count = search_response.hits.len();
-            let mut response = json!({
-                "memories": search_response.hits,
-                "count": hit_count,
-            });
-            if !search_response.neighbors.is_empty() {
-                response["graphContext"] = json!({
-                    "neighbors": search_response.neighbors,
-                    "neighborCount": search_response.neighbors.len(),
+            if compact {
+                // Compact mode: return only id, summary, fullText, entities, topics
+                // to minimize token usage.
+                let compact_hits: Vec<serde_json::Value> = search_response
+                    .hits
+                    .iter()
+                    .map(|hit| {
+                        let mut obj = json!({
+                            "id": hit.id,
+                            "summary": hit.summary,
+                        });
+                        if let Some(ref ft) = hit.full_text {
+                            obj["fullText"] = json!(ft);
+                        }
+                        if !hit.entities.is_empty() {
+                            obj["entities"] = json!(hit.entities);
+                        }
+                        if !hit.topics.is_empty() {
+                            obj["topics"] = json!(hit.topics);
+                        }
+                        obj
+                    })
+                    .collect();
+                let response = json!({
+                    "memories": compact_hits,
+                    "count": hit_count,
                 });
-            }
-            match ToolCallResult::json(&response) {
-                Ok(r) => r,
-                Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+                match ToolCallResult::json(&response) {
+                    Ok(r) => r,
+                    Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+                }
+            } else {
+                // Full mode: include all metadata, graph edges, and neighbor context.
+                let mut response = json!({
+                    "memories": search_response.hits,
+                    "count": hit_count,
+                });
+                if !search_response.neighbors.is_empty() {
+                    response["graphContext"] = json!({
+                        "neighbors": search_response.neighbors,
+                        "neighborCount": search_response.neighbors.len(),
+                    });
+                }
+                match ToolCallResult::json(&response) {
+                    Ok(r) => r,
+                    Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+                }
             }
         }
         Err(e) => ToolCallResult::error(format!("Search failed: {e}")),
@@ -582,34 +881,52 @@ fn find_similar_memories_def() -> ToolInfo {
         name: "find_similar_memories".to_string(),
         title: Some("Find Similar Memories".to_string()),
         description: "Find memories semantically similar to a specific existing \
-            memory. Useful for exploring related context, finding potential \
-            contradictions, or discovering duplicates."
+            memory, or scan an entire namespace for clusters of near-duplicate \
+            memories. Two modes: \"single\" (default) requires an id and finds \
+            similar memories to it; \"scan\" requires a namespace and detects \
+            clusters of near-duplicates across the namespace."
             .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["single", "scan"],
+                    "description": "Operation mode: \"single\" (default) finds memories similar to a given id; \"scan\" detects duplicate clusters across a namespace",
+                    "default": "single"
+                },
                 "id": {
                     "type": "string",
-                    "description": "Source memory UUID"
+                    "description": "Source memory UUID (required for \"single\" mode)"
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Namespace to scan for duplicates (required for \"scan\" mode, defaults to session default for \"single\" mode)"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum results (default: 10, max: 100)",
+                    "description": "Maximum results per source memory in \"single\" mode (default: 10, max: 100)",
                     "default": 10,
                     "minimum": 1,
                     "maximum": 100
                 },
                 "minScore": {
                     "type": "number",
-                    "description": "Minimum similarity threshold (0.0-1.0)"
+                    "description": "Minimum similarity threshold for \"single\" mode (0.0-1.0)"
+                },
+                "threshold": {
+                    "type": "number",
+                    "description": "Similarity threshold for \"scan\" mode duplicate detection (0.0-1.0, default: 0.85)",
+                    "default": 0.85,
+                    "minimum": 0.0,
+                    "maximum": 1.0
                 },
                 "sameNamespace": {
                     "type": "boolean",
-                    "description": "Restrict to same namespace (default: true)",
+                    "description": "Restrict to same namespace in \"single\" mode (default: true). Ignored in \"scan\" mode (scan always operates within the specified namespace).",
                     "default": true
                 }
-            },
-            "required": ["id"]
+            }
         }),
         annotations: Some(ToolAnnotations {
             read_only_hint: Some(true),
@@ -624,9 +941,32 @@ async fn handle_find_similar_memories(
     bridge: &McpBridge,
     arguments: serde_json::Value,
 ) -> ToolCallResult {
+    let mode = arguments
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("single");
+
+    match mode {
+        "single" => handle_find_similar_single(bridge, &arguments).await,
+        "scan" => handle_find_similar_scan(bridge, &arguments).await,
+        other => ToolCallResult::error(format!(
+            "Invalid mode: \"{other}\". Must be \"single\" or \"scan\"."
+        )),
+    }
+}
+
+/// Handle "single" mode: find memories similar to a given ID (original behavior).
+async fn handle_find_similar_single(
+    bridge: &McpBridge,
+    arguments: &serde_json::Value,
+) -> ToolCallResult {
     let id_str = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return ToolCallResult::error("Missing required parameter: id"),
+        None => {
+            return ToolCallResult::error(
+                "Missing required parameter: id (required for \"single\" mode)",
+            );
+        }
     };
 
     let uuid = match uuid::Uuid::parse_str(id_str) {
@@ -665,6 +1005,50 @@ async fn handle_find_similar_memories(
             }
         }
         Err(e) => ToolCallResult::error(format!("Find similar failed: {e}")),
+    }
+}
+
+/// Handle "scan" mode: detect clusters of near-duplicate memories in a namespace.
+async fn handle_find_similar_scan(
+    bridge: &McpBridge,
+    arguments: &serde_json::Value,
+) -> ToolCallResult {
+    let namespace = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| bridge.default_namespace().to_string());
+
+    let threshold = arguments
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.85) as f32;
+
+    if !(0.0..=1.0).contains(&threshold) {
+        return ToolCallResult::error("threshold must be between 0.0 and 1.0");
+    }
+
+    // Max memories to sample from the namespace (bounded to 200).
+    const MAX_SCAN_MEMORIES: usize = 200;
+
+    match bridge
+        .search
+        .scan_duplicates(&namespace, threshold, MAX_SCAN_MEMORIES)
+        .await
+    {
+        Ok(clusters) => {
+            let response = json!({
+                "namespace": namespace,
+                "threshold": threshold,
+                "clusters": clusters,
+                "clusterCount": clusters.len(),
+            });
+            match ToolCallResult::json(&response) {
+                Ok(r) => r,
+                Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+            }
+        }
+        Err(e) => ToolCallResult::error(format!("Duplicate scan failed: {e}")),
     }
 }
 
@@ -775,5 +1159,139 @@ async fn handle_create_namespace(
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
         },
         Err(e) => ToolCallResult::error(format!("Failed to create namespace: {e}")),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tool 9: list_memories
+// ═══════════════════════════════════════════════════════════════════════
+
+fn list_memories_def() -> ToolInfo {
+    ToolInfo {
+        name: "list_memories".to_string(),
+        title: Some("List Memories".to_string()),
+        description: "List all memories in a namespace with pagination and optional \
+            filters. Unlike recall_memories, this does not require a search query \
+            or embedding lookup — it returns memories sorted by creation date \
+            (newest first). Use this for browsing, auditing, or enumerating \
+            memories when you don't have a specific search query."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "Which namespace to list from (default: \"default\")",
+                    "default": "default"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results per page (default: 50, max: 200)",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 200
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Number of results to skip for pagination (default: 0)",
+                    "default": 0,
+                    "minimum": 0
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Only return memories with ALL of these tags (AND semantics)"
+                },
+                "entities": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Only return memories mentioning ALL of these entities"
+                },
+                "timeRangeStart": {
+                    "description": "Lower bound timestamp: either milliseconds since Unix epoch (integer) or ISO 8601 string. Only memories created at or after this time are returned.",
+                    "oneOf": [
+                        { "type": "integer" },
+                        { "type": "string" }
+                    ]
+                },
+                "timeRangeEnd": {
+                    "description": "Upper bound timestamp: either milliseconds since Unix epoch (integer) or ISO 8601 string. Only memories created at or before this time are returned.",
+                    "oneOf": [
+                        { "type": "integer" },
+                        { "type": "string" }
+                    ]
+                }
+            }
+        }),
+        annotations: Some(ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+async fn handle_list_memories(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
+    let namespace = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| bridge.default_namespace().to_string());
+
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as usize;
+    let limit = limit.min(200);
+
+    let offset = arguments
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let tags: Vec<String> = arguments
+        .get("tags")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let entities: Vec<String> = arguments
+        .get("entities")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    // Parse time range values: accept either integer (millis) or ISO 8601 string.
+    let time_range_start = match arguments.get("timeRangeStart") {
+        Some(v) => match crate::time::parse_time_value(v) {
+            Some(Ok(ms)) => Some(ms),
+            Some(Err(e)) => return ToolCallResult::error(format!("Invalid timeRangeStart: {e}")),
+            None => None,
+        },
+        None => None,
+    };
+    let time_range_end = match arguments.get("timeRangeEnd") {
+        Some(v) => match crate::time::parse_time_value(v) {
+            Some(Ok(ms)) => Some(ms),
+            Some(Err(e)) => return ToolCallResult::error(format!("Invalid timeRangeEnd: {e}")),
+            None => None,
+        },
+        None => None,
+    };
+
+    let input = crate::mcp::bridge::ListMemoriesInput {
+        namespace,
+        limit,
+        offset,
+        tags,
+        entities,
+        time_range_start,
+        time_range_end,
+    };
+
+    match bridge.storage.list_memories(input).await {
+        Ok(response) => match ToolCallResult::json(&response) {
+            Ok(r) => r,
+            Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+        },
+        Err(e) => ToolCallResult::error(format!("List memories failed: {e}")),
     }
 }
