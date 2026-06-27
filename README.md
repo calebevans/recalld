@@ -138,6 +138,19 @@ from the codebase.
 - **Permastore** -- memories with stability above 1500 days are exempt from decay
 - **Backup and restore** -- full data export and import for portability
 
+## Benchmark
+
+recalld is evaluated on the [LoCoMo](https://aclanthology.org/2024.acl-long.747/) benchmark (1,986 questions across 5 categories including adversarial). All results use a unified prompt with no category-specific instructions.
+
+| Model | Accuracy | Categories |
+|-------|----------|-----------|
+| Claude Sonnet 4 | 83.0% | All 5 (including adversarial) |
+| Gemini 2.5 Flash | 73.9% | All 5 (including adversarial) |
+
+In a stress test with all 10 conversations ingested into a single shared store (2,293 memories), accuracy dropped less than 1 point (73.9% to 73.2%), demonstrating retrieval precision at scale.
+
+See [docs/benchmark.md](docs/benchmark.md) for full methodology, per-category breakdowns, and reproducibility instructions.
+
 ## Usage modes
 
 **MCP server** -- Runs as a Model Context Protocol server for AI tools like Claude Code. Exposes 7 tools: `store_memory`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`. In MCP mode, recalld automatically connects to a running daemon, auto-starts one if needed, or falls back to direct (in-process) mode.
