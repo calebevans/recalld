@@ -372,6 +372,7 @@ pub struct LocomoReport {
     ingest_model: String,
     judge_model: String,
     skip_adversarial: bool,
+    stress_test: bool,
     top_k: usize,
     categories: HashMap<String, CategoryStats>,
     avg_retrieval_ms: f64,
@@ -394,6 +395,7 @@ pub async fn run(
     skip_adversarial: bool,
     parallel: usize,
     qa_parallel: usize,
+    stress_test: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = LlmClient::new(model.to_string(), llm_url)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -437,6 +439,24 @@ pub async fn run(
         judge_model,
         top_k,
     );
+
+    if stress_test {
+        return run_stress_test(
+            config,
+            &conversations,
+            top_k,
+            &llm,
+            &ingest_llm,
+            &judge_llm,
+            format,
+            skip_adversarial,
+            qa_parallel,
+            model,
+            ingest_model,
+            judge_model,
+        )
+        .await;
+    }
 
     let mut report = LocomoReport {
         total_conversations: conversations.len(),
@@ -570,6 +590,359 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+// ── Stress test runner ───────────────────────────────────────────
+
+/// Stress test: ingest ALL conversations into a single shared memory store,
+/// then evaluate ALL QA pairs against it. Tests retrieval accuracy at scale
+/// with cross-conversation noise.
+async fn run_stress_test(
+    config: &RecalldConfig,
+    conversations: &[Conversation],
+    top_k: usize,
+    llm: &LlmClient,
+    ingest_llm: &LlmClient,
+    judge_llm: &LlmClient,
+    format: &str,
+    skip_adversarial: bool,
+    qa_parallel: usize,
+    model: &str,
+    ingest_model: &str,
+    judge_model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total_convs = conversations.len();
+    let total_turns: usize = conversations.iter().map(|c| c.turns.len()).sum();
+    let total_qa: usize = conversations
+        .iter()
+        .map(|c| {
+            if skip_adversarial {
+                c.qa_pairs.iter().filter(|q| !q.is_adversarial).count()
+            } else {
+                c.qa_pairs.len()
+            }
+        })
+        .sum();
+
+    eprintln!("  [stress-test] Mode: shared memory store");
+
+    // Phase 1 — Ingest all conversations sequentially into one harness.
+    let harness = std::sync::Arc::new(BenchHarness::new(config).await?);
+    let mut total_memories = 0usize;
+
+    for (conv_idx, conv) in conversations.iter().enumerate() {
+        eprintln!(
+            "  [stress-test] Ingesting conversation {}/{} ({}, {} turns)...",
+            conv_idx + 1,
+            total_convs,
+            conv.id,
+            conv.turns.len(),
+        );
+        let label = format!("[stress-test] {}", conv.id);
+        let stored = ingest_conversation(&harness, conv, ingest_llm, &label).await?;
+        total_memories += stored;
+    }
+
+    eprintln!(
+        "  [stress-test] Ingestion complete: {} total memories from {} conversations",
+        total_memories, total_convs,
+    );
+
+    // Phase 2 — Run all QA pairs against the shared store.
+    let debug_log_path = std::path::PathBuf::from("bench_debug.log");
+    let mut debug_log = std::io::BufWriter::new(std::fs::File::create(&debug_log_path)?);
+    eprintln!("  Debug log: {}", debug_log_path.display());
+
+    // Collect all QA pairs with their conversation ID.
+    struct StressQa<'a> {
+        conv_id: &'a str,
+        question: &'a str,
+        gold_answer: &'a str,
+        category: u32,
+        is_adversarial: bool,
+    }
+
+    let mut all_qa: Vec<StressQa> = Vec::with_capacity(total_qa);
+    for conv in conversations {
+        for qa in &conv.qa_pairs {
+            if skip_adversarial && qa.is_adversarial {
+                continue;
+            }
+            all_qa.push(StressQa {
+                conv_id: &conv.id,
+                question: &qa.question,
+                gold_answer: &qa.gold_answer,
+                category: qa.category,
+                is_adversarial: qa.is_adversarial,
+            });
+        }
+    }
+
+    let qa_parallel = qa_parallel.max(1);
+    let qa_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(qa_parallel));
+    let completed_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let correct_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let qa_total = all_qa.len();
+
+    let mut qa_join_set = tokio::task::JoinSet::new();
+
+    for (qa_idx, sqa) in all_qa.iter().enumerate() {
+        let harness = harness.clone();
+        let llm = llm.clone();
+        let judge_llm = judge_llm.clone();
+        let qa_sem = qa_sem.clone();
+        let completed_count = completed_count.clone();
+        let correct_count = correct_count.clone();
+        let question = sqa.question.to_string();
+        let gold_answer = sqa.gold_answer.to_string();
+        let category = sqa.category;
+        let is_adversarial = sqa.is_adversarial;
+        let conv_id = sqa.conv_id.to_string();
+
+        qa_join_set.spawn(async move {
+            let _permit = qa_sem.acquire().await.expect("qa semaphore closed");
+
+            let cat_name = category_name(category).to_string();
+            let mut debug_buf: Vec<u8> = Vec::new();
+
+            // Search.
+            let search_start = Instant::now();
+            let memories =
+                search_memories(&harness, &question, top_k, Some(&llm), &mut debug_buf)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("[stress-test] search failed: {e}").into()
+                    })?;
+            let retrieval_ms = search_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Collect graph context.
+            let graph_context = collect_graph_context(&harness, &memories).await;
+
+            // Build memory contexts.
+            let mem_contexts: Vec<MemoryContext> = memories
+                .iter()
+                .map(|m| {
+                    let text = match &m.full_text {
+                        Some(ft) => format!("{}\nOriginal: {}", m.text, ft),
+                        None => m.text.clone(),
+                    };
+                    let metadata = crate::model::parse_structured_tags(&m.tags);
+                    MemoryContext {
+                        memory_id: m.memory_id,
+                        text,
+                        score: m.score,
+                        created_at: m.created_at,
+                        entities: metadata.entities,
+                        topics: metadata.topics,
+                        emotions: metadata.emotions,
+                    }
+                })
+                .collect();
+
+            let answer_start = Instant::now();
+            let generated = llm
+                .generate_answer(&question, &mem_contexts, "unknown", &graph_context)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let answer_ms = answer_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Judge.
+            let judge_start = Instant::now();
+            let result = judge_llm
+                .judge_answer(&question, &gold_answer, &generated, is_adversarial)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let judge_ms = judge_start.elapsed().as_secs_f64() * 1000.0;
+
+            let verdict = if result.correct { "CORRECT" } else { "WRONG" };
+            let _ = writeln!(debug_buf, "  [{}] Q: {}", conv_id, question);
+            let _ = writeln!(debug_buf, "  Gold: {}", gold_answer);
+            let _ = writeln!(
+                debug_buf,
+                "  Gen:  {}",
+                generated.chars().take(300).collect::<String>()
+            );
+            let _ = writeln!(debug_buf, "  -> {} ({})", verdict, cat_name);
+            let _ = writeln!(debug_buf);
+
+            if result.correct {
+                correct_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+            // Report progress every 100 questions or on the last one.
+            if done % 100 == 0 || done == qa_total {
+                let cur_correct = correct_count.load(std::sync::atomic::Ordering::Relaxed);
+                let running_acc = if done > 0 {
+                    cur_correct as f64 / done as f64 * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "  [stress-test] QA {done}/{total} ({acc:.1}%)",
+                    total = qa_total,
+                    acc = running_acc,
+                );
+            }
+
+            Ok(StressQaResult {
+                qa_idx,
+                conv_id,
+                question_result: QuestionResult {
+                    question,
+                    gold_answer,
+                    generated_answer: generated,
+                    correct: result.correct,
+                    category: cat_name,
+                },
+                debug_buf,
+                retrieval_ms,
+                answer_ms,
+                judge_ms,
+            }) as Result<StressQaResult, Box<dyn std::error::Error + Send + Sync>>
+        });
+    }
+
+    // Collect all QA results.
+    let mut qa_results: Vec<StressQaResult> = Vec::with_capacity(qa_total);
+    while let Some(result) = qa_join_set.join_next().await {
+        match result {
+            Ok(Ok(qa_result)) => qa_results.push(qa_result),
+            Ok(Err(e)) => {
+                eprintln!("  [stress-test] ERROR: QA task failed: {e}");
+            }
+            Err(e) => {
+                eprintln!("  [stress-test] ERROR: QA task panicked: {e}");
+            }
+        }
+    }
+
+    // Sort by original index for deterministic output.
+    qa_results.sort_by_key(|r| r.qa_idx);
+
+    // Build per-conversation results.
+    let mut conv_results: HashMap<String, ConversationResult> = HashMap::new();
+    for conv in conversations {
+        conv_results.insert(
+            conv.id.clone(),
+            ConversationResult {
+                id: conv.id.clone(),
+                turns: conv.turns.len(),
+                memories_stored: 0, // Not tracked per-conv in stress test
+                qa_total: 0,
+                qa_correct: 0,
+                accuracy: 0.0,
+                ingestion_secs: 0.0,
+                questions: Vec::new(),
+            },
+        );
+    }
+
+    let mut retrieval_times = Vec::new();
+    let mut answer_times = Vec::new();
+    let mut judge_times = Vec::new();
+    let mut report = LocomoReport {
+        total_conversations: total_convs,
+        total_qa,
+        total_turns,
+        model: model.to_string(),
+        ingest_model: ingest_model.to_string(),
+        judge_model: judge_model.to_string(),
+        skip_adversarial,
+        stress_test: true,
+        top_k,
+        ..Default::default()
+    };
+
+    for qa_result in qa_results {
+        let _ = debug_log.write_all(&qa_result.debug_buf);
+        let _ = debug_log.flush();
+
+        retrieval_times.push(qa_result.retrieval_ms);
+        answer_times.push(qa_result.answer_ms);
+        judge_times.push(qa_result.judge_ms);
+
+        let stats = report
+            .categories
+            .entry(qa_result.question_result.category.clone())
+            .or_default();
+        stats.total += 1;
+        if qa_result.question_result.correct {
+            stats.correct += 1;
+            report.total_correct += 1;
+        }
+
+        if let Some(cr) = conv_results.get_mut(&qa_result.conv_id) {
+            cr.qa_total += 1;
+            if qa_result.question_result.correct {
+                cr.qa_correct += 1;
+            }
+            cr.questions.push(qa_result.question_result);
+        }
+    }
+
+    // Finalize per-conversation accuracy.
+    for cr in conv_results.values_mut() {
+        cr.accuracy = if cr.qa_total > 0 {
+            cr.qa_correct as f64 / cr.qa_total as f64 * 100.0
+        } else {
+            0.0
+        };
+    }
+
+    report.per_conversation = {
+        let mut v: Vec<ConversationResult> = conv_results.into_values().collect();
+        v.sort_by(|a, b| a.id.cmp(&b.id));
+        v
+    };
+
+    // Compute averages.
+    report.avg_retrieval_ms = if retrieval_times.is_empty() {
+        0.0
+    } else {
+        retrieval_times.iter().sum::<f64>() / retrieval_times.len() as f64
+    };
+    report.avg_answer_ms = if answer_times.is_empty() {
+        0.0
+    } else {
+        answer_times.iter().sum::<f64>() / answer_times.len() as f64
+    };
+    report.avg_judge_ms = if judge_times.is_empty() {
+        0.0
+    } else {
+        judge_times.iter().sum::<f64>() / judge_times.len() as f64
+    };
+
+    // Write results file.
+    let results_path = std::path::PathBuf::from("bench_results.json");
+    if let Ok(json) = serde_json::to_string_pretty(&report) {
+        if let Err(e) = std::fs::write(&results_path, json) {
+            eprintln!("  Warning: could not write results file: {e}");
+        } else {
+            eprintln!("  Results written to {}", results_path.display());
+        }
+    }
+
+    match format {
+        "json" => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        ),
+        _ => println!("{}", format_report(&report)),
+    }
+
+    Ok(())
+}
+
+/// Result from a single parallel QA task in stress test mode.
+struct StressQaResult {
+    qa_idx: usize,
+    conv_id: String,
+    question_result: QuestionResult,
+    debug_buf: Vec<u8>,
+    retrieval_ms: f64,
+    answer_ms: f64,
+    judge_ms: f64,
 }
 
 /// Internal result from running a single conversation, including data
@@ -1854,9 +2227,14 @@ fn format_report(report: &LocomoReport) -> String {
         0.0
     };
 
+    let mode_label = if report.stress_test {
+        " [STRESS TEST]"
+    } else {
+        ""
+    };
     out.push_str(&format!(
-        "\n=== LoCoMo Benchmark ({} conversations, {} QA pairs) ===\n",
-        report.total_conversations, report.total_qa,
+        "\n=== LoCoMo Benchmark ({} conversations, {} QA pairs){} ===\n",
+        report.total_conversations, report.total_qa, mode_label,
     ));
     out.push_str(&format!(
         "  Model: {}    Ingest: {}    Judge: {}    Top-k: {}    Turns: {}\n\n",

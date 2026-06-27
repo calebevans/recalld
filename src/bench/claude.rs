@@ -212,10 +212,18 @@ struct GeminiContent {
 }
 
 #[derive(Serialize)]
+struct GeminiThinkingConfig {
+    #[serde(rename = "thinkingBudget")]
+    thinking_budget: u32,
+}
+
+#[derive(Serialize)]
 struct GeminiGenerationConfig {
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
     temperature: f32,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
 }
 
 #[derive(Serialize)]
@@ -882,6 +890,11 @@ impl LlmClient {
                         generation_config: GeminiGenerationConfig {
                             max_output_tokens: 1024,
                             temperature: 0.0,
+                            thinking_config: if self.model.contains("flash") {
+                                Some(GeminiThinkingConfig { thinking_budget: 0 })
+                            } else {
+                                None
+                            },
                         },
                     };
                     self.client

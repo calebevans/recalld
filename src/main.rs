@@ -145,19 +145,19 @@ enum BenchTarget {
         data: std::path::PathBuf,
 
         /// Number of retrieved memories per question
-        #[arg(long, default_value = "20")]
+        #[arg(long, default_value = "15")]
         top_k: usize,
 
         /// Model name for answer generation and query construction
-        #[arg(long, default_value = "gemini-2.5-flash")]
+        #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
 
         /// Model name for conversation ingestion (memory extraction)
-        #[arg(long, default_value = "gemini-2.5-flash")]
+        #[arg(long, default_value = "claude-sonnet-4-6")]
         ingest_model: String,
 
         /// Model name for answer judging (uses a separate model to avoid self-grading bias)
-        #[arg(long, default_value = "gemini-2.5-flash-lite")]
+        #[arg(long, default_value = "claude-haiku-4-5")]
         judge_model: String,
 
         /// OpenAI-compatible LLM server URL (e.g. http://host:8000).
@@ -182,6 +182,12 @@ enum BenchTarget {
         /// Number of QA pairs to evaluate in parallel within each conversation
         #[arg(long, default_value = "4")]
         qa_parallel: usize,
+
+        /// Stress test: ingest all conversations into a single shared memory
+        /// store, then evaluate all QA pairs against it. Tests retrieval
+        /// accuracy at scale with cross-conversation noise.
+        #[arg(long)]
+        stress_test: bool,
     },
 }
 
@@ -300,6 +306,7 @@ async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> 
             diagnose,
             parallel,
             qa_parallel,
+            stress_test,
         } => {
             if !data.exists() {
                 eprintln!("error: dataset not found: {}", data.display());
@@ -347,6 +354,7 @@ async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> 
                 skip_adversarial,
                 parallel,
                 qa_parallel,
+                stress_test,
             )
             .await
             {
