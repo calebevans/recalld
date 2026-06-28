@@ -214,7 +214,7 @@ impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
             provider: EmbeddingProvider::Ollama,
-            model_name: "embeddinggemma:latest".to_string(),
+            model_name: "embeddinggemma:300m".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
             base_url: "http://localhost:11434".to_string(),
             dimensions: 768,
@@ -304,7 +304,7 @@ impl Default for RifConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_suppression: 0.25,
+            max_suppression: 0.15,
             activation_threshold_low: 0.1,
             activation_threshold_high: 0.45,
             propagation_depth: 2,

@@ -92,7 +92,7 @@ setup_config() {
 
 [embedding]
 provider = "ollama"
-model_name = "embeddinggemma:latest"
+model_name = "embeddinggemma:300m"
 base_url = "http://localhost:11434"
 dimensions = 768
 
