@@ -1,6 +1,8 @@
 # recalld
 
-recalld is an AI memory system written in Rust that gives language models persistent, long-term memory. It uses FSRS v4.5 spaced repetition to model memory decay across phases (full, summary, ghost, tombstone), a graph layer with ACT-R spreading activation for associative recall, and a hybrid search pipeline combining vector similarity, full-text search, and graph expansion. It runs as an MCP server for AI coding tools, an HTTP API, a Unix-socket daemon, or a standalone CLI.
+recalld is an AI memory system written in Rust that gives language models persistent, long-term memory. It runs as an MCP server for AI coding tools, an HTTP API, a Unix-socket daemon, or a standalone CLI.
+
+The core is built on three subsystems: FSRS v4.5 spaced repetition to model memory decay across phases (full, summary, ghost, tombstone), a graph layer with ACT-R spreading activation for associative recall, and a hybrid search pipeline combining vector similarity, full-text search, and graph expansion.
 
 ## Quick start
 
@@ -15,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/calebevans/recalld/main/install.sh 
 Install [Ollama](https://ollama.com), then pull an embedding model:
 
 ```sh
-ollama pull embeddinggemma:latest
+ollama pull embeddinggemma:300m
 ```
 
 Create `~/.recalld/config.toml`:
@@ -23,7 +25,7 @@ Create `~/.recalld/config.toml`:
 ```toml
 [embedding]
 provider = "ollama"
-model_name = "embeddinggemma:latest"
+model_name = "embeddinggemma:300m"
 base_url = "http://localhost:11434"
 dimensions = 768
 ```
@@ -51,12 +53,14 @@ Then allow the MCP tools so Claude can use them without prompting each time. Add
   "permissions": {
     "allow": [
       "mcp__recalld__store_memory",
+      "mcp__recalld__store_memories",
       "mcp__recalld__recall_memories",
       "mcp__recalld__get_memory",
       "mcp__recalld__reinforce_memory",
       "mcp__recalld__forget_memory",
       "mcp__recalld__find_similar_memories",
-      "mcp__recalld__create_namespace"
+      "mcp__recalld__create_namespace",
+      "mcp__recalld__list_memories"
     ]
   }
 }
@@ -130,13 +134,13 @@ from the codebase.
 
 ## Features
 
-- **Spaced repetition decay** -- FSRS v4.5 governs memory strength over time; memories transition through full, summary, and ghost phases based on retrievability thresholds; tombstone is reached via explicit deletion
+- **Spaced repetition decay** -- FSRS v4.5 governs memory strength over time; memories transition through full, summary, and ghost phases based on retrievability thresholds. Explicit deletion moves memories to tombstone.
 - **Graph relationships** -- 7 edge types (parent/child, associative, causal, contradicts, entity, temporal, supersedes) with automatic linking based on similarity
 - **Hybrid search** -- SIMD-accelerated vector similarity, FTS5 full-text search, and graph expansion with score fusion
 - **Namespaces** -- isolated embedding spaces with independent decay configuration
-- **Retrieval-induced forgetting** -- accessing one memory suppresses competing memories, mirroring human recall dynamics
+- **Retrieval-induced forgetting** -- accessing one memory suppresses competing memories
 - **Permastore** -- memories with stability above 1500 days are exempt from decay
-- **Backup and restore** -- full data export and import for portability
+- **Backup and restore** -- full data export and import
 
 ## Benchmark
 
@@ -147,13 +151,13 @@ recalld is evaluated on the [LoCoMo](https://aclanthology.org/2024.acl-long.747/
 | Claude Sonnet 4 | 83.0% | All 5 (including adversarial) |
 | Gemini 2.5 Flash | 73.9% | All 5 (including adversarial) |
 
-In a stress test with all 10 conversations ingested into a single shared store (2,293 memories), accuracy dropped less than 1 point (73.9% to 73.2%), demonstrating retrieval precision at scale.
+In a stress test with all 10 conversations ingested into a single shared store (2,293 memories), accuracy dropped less than 1 point (73.9% to 73.2%).
 
 See [docs/benchmark.md](docs/benchmark.md) for full methodology, per-category breakdowns, and reproducibility instructions.
 
 ## Usage modes
 
-**MCP server** -- Runs as a Model Context Protocol server for AI tools like Claude Code. Exposes 7 tools: `store_memory`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`. In MCP mode, recalld automatically connects to a running daemon, auto-starts one if needed, or falls back to direct (in-process) mode.
+**MCP server** -- Runs as a Model Context Protocol server for AI tools like Claude Code. Exposes 9 tools: `store_memory`, `store_memories`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `list_memories`.
 
 ```sh
 recalld mcp
@@ -183,13 +187,13 @@ Available CLI commands: `store`, `recall`, `get`, `forget`, `reinforce`, `inspec
 
 ## Configuration
 
-recalld reads configuration from `recalld.toml` in the working directory or `~/.recalld/config.toml`. Per-directory overrides use `.recalld.toml` (found by walking up from the current directory), which must include a `namespace` field and can override any config section. The file is organized into sections:
+recalld reads configuration from `recalld.toml` in the working directory or `~/.recalld/config.toml`. Per-directory overrides use `.recalld.toml` (found by walking up from the current directory), which must include a `namespace` field and can override any config section.
 
 ```toml
 [embedding]
-provider = "openai"          # openai, ollama, or passthrough
-model_name = "text-embedding-3-small"
-dimensions = 1536
+provider = "ollama"          # ollama, openai, or passthrough
+model_name = "embeddinggemma:300m"
+dimensions = 768
 
 [decay]
 sweep_interval_hours = 24.0
@@ -207,7 +211,7 @@ max_auto_links = 15
 
 [rif]
 enabled = true
-max_suppression = 0.25
+max_suppression = 0.15
 ```
 
 Additional sections: `[cache]`, `[log]`.

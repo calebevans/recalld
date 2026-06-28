@@ -1,8 +1,6 @@
 # recalld User's Guide
 
-recalld is an AI memory system with biologically-inspired decay. It stores observations and facts as memories, embeds them for semantic search, and lets them decay naturally over time unless reinforced -- mimicking how human memory works.
-
-This guide covers installation, configuration, and daily use for developers integrating recalld with AI tools like Claude Code and Cursor.
+recalld is an AI memory system with spaced-repetition decay. It stores observations and facts as memories, embeds them for semantic search, and lets them decay over time unless reinforced.
 
 ---
 
@@ -72,7 +70,7 @@ recalld needs an embedding provider to convert text into vectors for semantic se
 export OPENAI_API_KEY="sk-..."
 ```
 
-3. Configure `~/.recalld/config.toml` (this is the default, so you can skip this if the defaults work):
+3. Configure `~/.recalld/config.toml`:
 
 ```toml
 [embedding]
@@ -169,7 +167,7 @@ Disk storage paths and compaction.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `data_dir` | string | `"~/.recalld/data"` | Root directory for all storage files (meta.db, vectors.dat, fulltext.dat, edges.db). |
+| `data_dir` | string | `"~/.recalld/data"` | Root directory for all storage files (meta.db, ns_\<name\>.dat per namespace, fulltext.dat, edges.db). |
 | `max_vector_file_size` | u64 | `2147483648` | Warning threshold for vectors.dat size (2 GB). |
 | `compaction_threshold` | f64 | `0.20` | Fraction of dead space in fulltext.dat that triggers compaction (0.0-1.0). |
 | `fsync_interval_ms` | u64 | `5000` | Batch fsync interval in milliseconds. |
@@ -183,7 +181,7 @@ Embedding provider and model settings.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `provider` | string | `"ollama"` | Embedding provider: `"openai"`, `"ollama"`, or `"passthrough"`. |
-| `model_name` | string | `"embeddinggemma:latest"` | Model identifier (provider-specific). |
+| `model_name` | string | `"embeddinggemma:300m"` | Model identifier (provider-specific). |
 | `api_key_env` | string | `"OPENAI_API_KEY"` | Name of the env var holding the API key (OpenAI provider only). |
 | `base_url` | string | `"http://localhost:11434"` | Base URL for the embedding API. |
 | `dimensions` | usize | `768` | Embedding vector dimensionality. Fixed per namespace after creation. |
@@ -265,7 +263,7 @@ Retrieval-Induced Forgetting. When you recall one memory, similar competing memo
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `true` | Master switch for RIF. |
-| `max_suppression` | f64 | `0.25` | Maximum fractional strength reduction per retrieval event (0.0-1.0). |
+| `max_suppression` | f64 | `0.15` | Maximum fractional stability reduction per retrieval event (0.0-1.0). |
 | `activation_threshold_low` | f64 | `0.1` | Below this activation level, no suppression occurs. |
 | `activation_threshold_high` | f64 | `0.45` | Above this activation level, strengthening occurs instead. |
 | `propagation_depth` | u32 | `2` | How many hops of neighbors to consider for RIF effects. |
@@ -381,7 +379,7 @@ The `--bind` flag sets the full address:port (e.g. `0.0.0.0:8080`). The `--port`
 
 ### As daemon
 
-The daemon runs in the background, listening on a Unix socket (`~/.recalld/socket`). MCP clients and the CLI connect to it via JSON-RPC 2.0. The daemon auto-shuts down after 30 minutes of inactivity by default.
+The daemon runs in the background, listening on a Unix socket (`~/.recalld/socket`). MCP clients connect to it via JSON-RPC 2.0. The daemon auto-shuts down after 30 minutes of inactivity by default.
 
 ```bash
 # Start in background (default)
@@ -613,7 +611,7 @@ recalld-cli status
 
 Shows counts per phase, cache stats, and uptime.
 
-### `health` -- Comprehensive health report
+### `health` -- Health report
 
 ```bash
 # Full health report
@@ -632,7 +630,7 @@ Shows decay forecast, at-risk memories, and storage breakdown.
 
 ## 6. MCP Tools Reference
 
-recalld exposes 7 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
+recalld exposes 9 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
 
 ### `store_memory`
 
@@ -649,6 +647,14 @@ Store a new memory.
 | `namespace` | string | No | Target namespace (default: `"default"`). |
 | `parentId` | string | No | UUID of parent memory to create a hierarchical link. |
 | `supersedes` | string | No | UUID of an older memory this one replaces. The old memory is deprioritized in search. |
+
+### `store_memories`
+
+Store multiple memories in a single call. Each item has the same schema as `store_memory`. Returns an array of results, one per input memory.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `memories` | array | Yes | Array of memory objects (max 100 per call). Each object has the same fields as `store_memory`. |
 
 ### `recall_memories`
 
@@ -667,6 +673,7 @@ Search memories by semantic similarity.
 | `depth` | integer | No | Graph hops to include related memories (default: 0, max: 3). |
 | `timeRangeStart` | integer or string | No | Lower bound: epoch ms (integer) or ISO 8601 string. Memories at or after this time get a relevance boost. |
 | `timeRangeEnd` | integer or string | No | Upper bound: epoch ms (integer) or ISO 8601 string. Memories at or before this time get a relevance boost. |
+| `compact` | boolean | No | If true (default), returns only id, summary, fullText, entities, and topics per memory. Set to false to include full metadata (tags, score, phase, strength, timestamps, related edges). |
 
 ### `get_memory`
 
@@ -683,7 +690,7 @@ Strengthen a memory so it decays more slowly.
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `id` | string | Yes | Memory UUID to reinforce. |
-| `quality` | integer | No | Rating 1-4: 1=forgot (weakens), 2=hard, 3=good (default), 4=easy (strongest). |
+| `quality` | integer | No | Rating 1-4: 1=forgot (minimal stability growth), 2=hard, 3=good (default), 4=easy (strongest). |
 
 ### `forget_memory`
 
@@ -695,14 +702,17 @@ Permanently delete a memory.
 
 ### `find_similar_memories`
 
-Find memories semantically similar to an existing memory.
+Find memories semantically similar to a given memory, or scan a namespace for duplicate clusters. Two modes: `single` (default) finds memories similar to one id; `scan` detects duplicate clusters across a namespace.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `id` | string | Yes | Source memory UUID. |
-| `limit` | integer | No | Maximum results (default: 10, max: 100). |
-| `minScore` | number | No | Minimum similarity threshold (0.0-1.0). |
-| `sameNamespace` | boolean | No | Restrict to same namespace (default: true). |
+| `mode` | string | No | `"single"` (default) or `"scan"`. |
+| `id` | string | Single mode | Source memory UUID. Required for single mode. |
+| `namespace` | string | Scan mode | Namespace to scan. Required for scan mode; defaults to session default for single mode. |
+| `limit` | integer | No | Maximum results per source memory in single mode (default: 10, max: 100). |
+| `minScore` | number | No | Minimum similarity threshold for single mode (0.0-1.0). |
+| `threshold` | number | No | Similarity threshold for scan mode duplicate detection (0.0-1.0, default: 0.85). |
+| `sameNamespace` | boolean | No | Restrict to same namespace in single mode (default: true). Ignored in scan mode. |
 
 ### `create_namespace`
 
@@ -715,6 +725,20 @@ Create a new memory namespace.
 | `initialStability` | number | No | Starting stability in days for new memories (default: 3.7145). |
 | `desiredRetention` | number | No | Target retention rate 0.0-1.0 (default: 0.9). |
 | `decayRateMultiplier` | number | No | Per-namespace decay rate multiplier. 1.0 = normal, 2.0 = 2x slower, 0.0 = disabled. Omit to inherit global setting. |
+
+### `list_memories`
+
+List memories in a namespace with pagination and optional filters. Unlike `recall_memories`, this does not require a search query -- it returns memories sorted by creation date (newest first).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `namespace` | string | No | Namespace to list from (default: `"default"`). |
+| `limit` | integer | No | Maximum results per page (default: 50, max: 200). |
+| `offset` | integer | No | Number of results to skip for pagination (default: 0). |
+| `tags` | string[] | No | Only return memories with ALL of these tags. |
+| `entities` | string[] | No | Only return memories mentioning ALL of these entities. |
+| `timeRangeStart` | integer or string | No | Lower bound: epoch ms (integer) or ISO 8601 string. Only memories created at or after this time are returned. |
+| `timeRangeEnd` | integer or string | No | Upper bound: epoch ms (integer) or ISO 8601 string. Only memories created at or before this time are returned. |
 
 ---
 
@@ -796,12 +820,10 @@ Tombstone is a separate phase for user-deleted memories (via `forget_memory`). G
 
 Each time a memory is reinforced, its stability increases. The FSRS algorithm calculates new stability based on the quality rating:
 
-- **1 (forgot)**: Weakens the memory.
+- **1 (forgot)**: Minimal stability growth (20% of normal increase).
 - **2 (hard)**: Small stability increase.
 - **3 (good)**: Normal stability increase (default).
 - **4 (easy)**: Largest stability increase.
-
-Memories that are consistently reinforced become increasingly resistant to decay.
 
 ### Permastore
 
@@ -887,10 +909,9 @@ recalld daemon start
 The backup archive (zip) contains all files from the data directory:
 
 - `meta.db` -- memory metadata (redb)
-- `vectors.dat` -- embedding vectors (per namespace)
+- `ns_<name>.dat` -- embedding vectors (one file per namespace, e.g. `ns_default.dat`)
 - `fulltext.dat` -- full text content (append-only)
 - `edges.db` -- relationship graph (redb)
-- Namespace subdirectories
 
 ### Restore
 

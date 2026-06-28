@@ -3,12 +3,12 @@
 
 ## 1. Overview
 
-recalld is an AI memory system written in Rust that provides biologically-inspired forgetting for LLM agents. It stores observations, facts, and context as "memories" that decay over time following the FSRS v4.5 spaced repetition model, unless reinforced by retrieval.
+recalld is an AI memory system written in Rust. It stores observations, facts, and context as "memories" that decay over time following the FSRS v4.5 spaced repetition model, unless reinforced by retrieval.
 
 ### Design goals
 
-- **Human-like memory**: memories weaken naturally over time and are strengthened by use, modeling the spacing effect and the forgetting curve from cognitive psychology.
-- **Graceful degradation**: memories do not vanish instantly. They transition through phases (Full -> Summary -> Ghost -> Removed), shedding detail progressively. Explicit user deletion produces a Tombstone (content stripped, but graph node and edges preserved for spreading activation relay).
+- **Spaced-repetition decay**: memories weaken over time and are strengthened by retrieval, following the spacing effect and forgetting curve.
+- **Phase transitions**: memories transition through phases (Full -> Summary -> Ghost -> Removed), dropping data at each step. Explicit deletion produces a Tombstone (content stripped, but graph node and edges preserved for spreading activation relay).
 - **Associative recall**: a graph of typed relationships enables spreading activation, so retrieving one memory can surface related ones.
 - **Retrieval-induced forgetting (RIF)**: retrieving a memory suppresses competing neighbors, matching the empirical RIF effect from human cognition.
 - **Pluggable embeddings**: works with OpenAI, Ollama (local), or pre-computed vectors.
@@ -136,7 +136,7 @@ Offset  Size    Field
 
 - **Reads** are zero-copy via `memmap2::Mmap` -- the OS page cache handles I/O.
 - **Writes** go through the file descriptor and the mmap is re-mapped to see new data.
-- **Slot reuse**: a free list (embedded as a linked list within freed slots) tracks available slots for reuse, preventing file growth on delete-heavy workloads.
+- **Slot reuse**: a free list (embedded as a linked list within freed slots) tracks available slots for reuse. Without it, the file would grow monotonically on delete-heavy workloads.
 - Dimensionality is fixed at namespace creation time and validated on every open.
 
 #### fulltext.dat (append-only, CRC32)
@@ -241,8 +241,10 @@ Where:
 - `R` = retrievability (probability of successful recall), range [0, 1]
 - `t` = time since last access, in days
 - `S` = stability (days until R drops to 0.9)
-- `DECAY = -0.5` (fixed population-average exponent)
+- `DECAY = -0.5` (fixed population-average exponent; the v4.5 refinement from the original DECAY=-1 was a later community contribution by Expertium)
 - `FACTOR = 19/81 ~ 0.2346` (derived from the constraint R(S, S) = 0.9)
+
+Reference: Ye, J., Su, J., & Cao, Y. (2022). "A Stochastic Shortest Path Algorithm for Optimizing Spaced Repetition Scheduling." *Proc. 28th ACM SIGKDD*. This paper introduced the FSRS framework; the specific v4.5 forgetting curve constants were refined in subsequent community iterations.
 
 When `decay_rate_multiplier` is configured:
 ```
@@ -284,7 +286,7 @@ The spacing effect is the key insight: accessing a nearly-forgotten memory (R=0.
 
 | Rating | Multiplier on (SInc - 1) | Meaning |
 |--------|-------------------------|---------|
-| 1 (forgot) | 0.2 | Substantial stability penalty |
+| 1 (forgot) | 0.2 | Substantially reduced stability growth |
 | 2 (hard) | 0.7 | Reduced growth |
 | 3 (good) | 1.0 | Standard FSRS |
 | 4 (easy) | 1.3 | Boosted growth |
@@ -412,7 +414,7 @@ Termination is signal-based (not depth-limited):
 - `min_spread = 0.005` -- increments below this are discarded.
 - `max_budget = 100` -- hard cap on nodes expanded.
 
-Convergence amplification: a memory reachable from multiple search hits accumulates activation from all paths, ranking higher than one connected to a single hit.
+Convergence amplification: a memory reachable from multiple search hits accumulates activation from all paths.
 
 **Tombstone relay**: tombstoned memories (user-deleted) are allowed to fire as relay nodes during spreading activation. Their content has been stripped, but they propagate activation through the graph, preserving relationship chain continuity. They are excluded from the output.
 
@@ -434,7 +436,7 @@ Ghost memories do not seed, receive, or relay activation.
 
 ## 7. Search Pipeline
 
-The `QueryEngine` orchestrates a 9-stage search pipeline. All subsystem dependencies are injected as trait objects, enabling testing with mocks.
+The `QueryEngine` orchestrates a 9-stage search pipeline. All subsystem dependencies are injected as trait objects. Tests substitute mock implementations for each subsystem.
 
 ```
   Query
@@ -512,7 +514,7 @@ The pipeline fetches `min(limit * 8, max(100, limit * 8))` candidates internally
 
 ## 8. Retrieval-Induced Forgetting (RIF)
 
-RIF models the empirical finding that retrieving a memory weakens similar but non-retrieved competitors. recalld implements this via the Nonmonotonic Plasticity Hypothesis, with distance decay from the SAMPL model.
+RIF models the empirical finding that retrieving a memory weakens similar but non-retrieved competitors. recalld implements this via the Nonmonotonic Plasticity Hypothesis (Ritvo et al., 2019), with distance decay inspired by SAMPL-style spreading activation. The gamma=0.3 hop-decay value is a chosen parameter, not directly taken from the SAMPL publication.
 
 **References:**
 - Anderson, M. C., Bjork, R. A., & Bjork, E. L. (1994). "Remembering can cause forgetting: Retrieval dynamics in long-term memory." *J. Exp. Psychol: Learning, Memory, and Cognition*, 20, 1063-1087.
@@ -543,7 +545,7 @@ When a memory is retrieved, the RIF engine evaluates each of its graph neighbors
      normalized = (activation - center) / half_width
      multiplier = 1.0 - max_suppression * (1 - normalized^2)
      ```
-     Peak suppression at center: `1.0 - 0.25 = 0.75` (25% stability reduction).
+     Peak suppression at center: `1.0 - 0.15 = 0.85` (15% stability reduction).
    - **High band**: linear strengthening.
      ```
      multiplier = 1.0 + max_enhancement * ((activation - high) / (1.0 - high))
@@ -554,7 +556,7 @@ When a memory is retrieved, the RIF engine evaluates each of its graph neighbors
 
 ### Per-query dedup (QueryRifContext)
 
-When a query returns multiple results that all neighbor the same memory N, the compound suppression could be excessive (e.g., `0.75^3 = 0.42`, a 58% reduction from a single query). `QueryRifContext` tracks cumulative multipliers per neighbor and caps total reduction at `max_reduction_per_query = 0.75` (at most 25% per query).
+When a query returns multiple results that all neighbor the same memory N, compound suppression could be excessive (e.g., `0.85^3 = 0.614`, a 39% reduction from a single query). `QueryRifContext` tracks cumulative multipliers per neighbor and caps total reduction at `max_reduction_per_query = 0.75` (at most 25% per query).
 
 ### Parameters
 
@@ -564,7 +566,7 @@ When a query returns multiple results that all neighbor the same memory N, the c
 | `gamma` | `0.3` | Per-hop activation decay |
 | `activation_low` | `0.10` | Below this: no effect |
 | `activation_high` | `0.45` | Above this: strengthening |
-| `max_suppression` | `0.25` | Peak stability reduction (moderate band) |
+| `max_suppression` | `0.15` | Peak stability reduction (moderate band) |
 | `max_enhancement` | `0.05` | Peak stability increase (high band) |
 | `max_hops` | `2` | Graph traversal depth |
 | `stability_floor` | `0.5` days | Hard floor after RIF |
@@ -630,7 +632,7 @@ All returned vectors must be L2-normalized (unit length). `embed()` is for docum
 
 The `CacheManager` wraps a `moka::future::Cache` with:
 
-- **Weight-based eviction**: entries are weighted by a centrality-adjusted function (high-edge-count memories are more expensive to evict because they are more useful for graph operations).
+- **Weight-based eviction**: entries are weighted by a centrality-adjusted function (high-edge-count memories cost more to evict).
 - **TinyLFU admission**: moka uses a Window-TinyLFU policy combining frequency and recency.
 - **Configurable capacity**: default 1 GB, or auto-calculated as 10% of system RAM clamped to [64 MB, 8 GB].
 - **TTI / TTL**: configurable time-to-idle (default 1 hour) and time-to-live (default 24 hours).
@@ -670,7 +672,7 @@ recalld exposes the same core functionality through three transport layers:
 
 - Runs as a subprocess of an AI agent (Claude Code, Cursor, etc.).
 - Communicates via stdin/stdout using the Model Context Protocol.
-- Exposes 7 tools: `store_memory`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`.
+- Exposes 9 tools: `store_memory`, `store_memories` (batch), `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `list_memories`.
 - Exposes memory resources for MCP resource reads.
 
 ### Daemon (Unix socket)
@@ -679,11 +681,11 @@ recalld exposes the same core functionality through three transport layers:
 - JSON-RPC 2.0 protocol.
 - Auto-shutdown after idle timeout (default 30 minutes).
 - Stale socket cleanup on startup (checks if PID is alive).
-- The CLI (`recalld-cli`) communicates exclusively through the daemon.
+- MCP clients connect to the daemon via JSON-RPC 2.0.
 
 ### CLI client (recalld-cli)
 
-- Separate binary that talks to the HTTP API server over HTTP.
+- Separate binary that communicates with the HTTP API server (default `http://localhost:7878`).
 - Commands: `store`, `recall`, `get`, `forget`, `reinforce`, `inspect`, `namespaces`, `sweep`, `status`, `export`, `import`, `list`, `health`.
 - Formatted output for terminal use.
 
@@ -728,9 +730,9 @@ The CLI `serve` subcommand also accepts shorthand env vars: `RECALLD_BIND` (comb
 | `[storage]` | `data_dir`, `compaction_threshold`, `fsync_interval_ms` | `~/.recalld/data`, 20%, 5s |
 | `[decay]` | `sweep_interval_hours`, `phase_thresholds.*`, `permastore_threshold_days`, `decay_rate_multiplier` | 24h, 0.7/0.3/0.05, 1500d, 1.0 |
 | `[cache]` | `max_capacity_bytes`, `time_to_idle_secs`, `time_to_live_secs`, `warm_file_enabled` | 1 GB, 1h, 24h, true |
-| `[embedding]` | `provider`, `model_name`, `api_key_env`, `base_url`, `dimensions`, `batch_size`, `document_prefix`, `query_prefix` | OpenAI, text-embedding-3-small, 1536 |
+| `[embedding]` | `provider`, `model_name`, `api_key_env`, `base_url`, `dimensions`, `batch_size`, `document_prefix`, `query_prefix` | Ollama, embeddinggemma:latest, 768 |
 | `[graph]` | `autolink_enabled`, `max_auto_links`, `auto_link_threshold`, `temporal_window_ms`, `max_entity_links` | true, 15, 0.50, 1h, 10 |
-| `[rif]` | `enabled`, `max_suppression`, `activation_threshold_low`, `activation_threshold_high`, `propagation_depth` | true, 0.25, 0.1, 0.45, 2 |
+| `[rif]` | `enabled`, `max_suppression`, `activation_threshold_low`, `activation_threshold_high`, `propagation_depth` | true, 0.15, 0.1, 0.45, 2 |
 | `[log]` | `level`, `format`, `file` | info, pretty, none |
 
 > **Note**: The `[rif]` TOML field names differ from the internal RIF engine field names in `src/rif/config.rs`: `activation_threshold_low` maps to `activation_low`, `activation_threshold_high` maps to `activation_high`, and `propagation_depth` maps to `max_hops`. The mapping is performed in `system.rs` during startup.

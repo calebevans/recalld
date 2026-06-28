@@ -1,8 +1,7 @@
 # Benchmark Methodology
 
 This document describes the evaluation methodology used to benchmark recalld
-against the LoCoMo dataset. It is intended to be precise, transparent, and
-reproducible.
+against the LoCoMo dataset.
 
 ## 1. Dataset
 
@@ -13,7 +12,7 @@ at ACL 2024.
 > Maharana, A., Lee, D. H., Tulyakov, S., Bansal, M., Barbieri, F., & Fang, Y.
 > (2024). Evaluating Very Long-Term Conversational Memory of LLM Agents.
 > *Proceedings of the 62nd Annual Meeting of the Association for Computational
-> Linguistics (ACL 2024)*, 13820--13837.
+> Linguistics (ACL 2024)*, 13851--13870.
 > [ACL Anthology](https://aclanthology.org/2024.acl-long.747/) |
 > [arXiv:2402.17753](https://arxiv.org/abs/2402.17753)
 
@@ -43,10 +42,6 @@ Category 5 questions ask about events that never occurred in the conversation.
 The correct response is a refusal ("I don't know" or equivalent). These are
 **included** in recalld's benchmark results. An optional `--skip-adversarial`
 flag exists for comparison purposes.
-
-Adversarial questions are included in all recalld benchmark results. The
-standard industry convention is to exclude them. The `--skip-adversarial` flag
-is available for comparison purposes.
 
 ## 2. Evaluation Pipeline
 
@@ -113,7 +108,7 @@ directly invokes `store_memory` with already-decided content.
 | Default top_k   | 15 (configurable via `--top-k`) |
 | Default graph depth | 2 (LLM can set 0--3 per query) |
 
-Retrieval uses an LLM call to decompose the question into optimized search
+Retrieval uses an LLM call to decompose the question into structured search
 parameters before searching. The `construct_search_query` method takes the
 question text and returns:
 
@@ -199,9 +194,8 @@ double quotes) and does not contain the quoted string `"WRONG"`.
 
 ### 3.1 Comparison to Other Systems
 
-Direct numeric comparisons across memory systems should be interpreted with
-caution. There is **no standardized LoCoMo evaluation protocol**. Each system
-uses different:
+There is **no standardized LoCoMo evaluation protocol**, so direct numeric
+comparisons across memory systems are unreliable. Each system uses different:
 
 - Ingestion models and prompts
 - Answer generation models and prompts
@@ -212,8 +206,9 @@ uses different:
 The Mem0/Zep dispute (documented in
 [zep-papers#5](https://github.com/getzep/zep-papers/issues/5)) demonstrated that
 methodology differences can swing reported scores by over 25 percentage points
-on the same dataset. Zep's initially reported 84% was corrected to 58.44% after
-fixing category inclusion errors and prompt normalization.
+on the same dataset. Zep's initially reported 84% was evaluated at 58.44% by
+Mem0 after fixing category inclusion errors and prompt normalization; Zep
+disputed this figure and claimed a corrected score of 75.14%.
 
 **Model configuration:**
 
@@ -222,7 +217,7 @@ fixing category inclusion errors and prompt normalization.
 | Ingestion   | `gemini-2.5-flash`   | Not disclosed for published score; open-source default is `gpt-4o-mini` |
 | Answer gen  | `gemini-2.5-flash`   | Not disclosed; open-source default is `gpt-4o` |
 | Judge       | `gemini-2.5-flash-lite` | Not disclosed; open-source default is `gpt-4o` |
-| Embeddings  | `embeddinggemma:latest` (768d, via Ollama) | `text-embedding-3-small` (1536d) |
+| Embeddings  | `embeddinggemma:300m` (768d, via Ollama) | `text-embedding-3-small` (1536d) |
 
 Mem0's published 92.5% score does not disclose which exact models were used.
 Their open-source evaluation framework notes "using a frontier model will likely
@@ -240,40 +235,24 @@ LoCoMo-specific; it describes the domain recalld operates in.
 
 The **original LoCoMo paper** used category-specific prompts for evaluation.
 recalld deliberately uses a single unified prompt, following the emerging
-industry practice advocated by LoCoMo-Plus (arXiv:2602.10715), which proposes a
-"unified-input, differentiated-judgment" paradigm.
+industry practice advocated by LoCoMo-Plus (arXiv:2602.10715), which uses a
+single input prompt with category-specific judging.
 
 ### 3.3 LLM-Augmented Retrieval
 
-recalld uses an additional LLM call per question to decompose it into optimized
+recalld uses an additional LLM call per question to decompose it into structured
 search parameters (multiple semantic queries, FTS queries, entity/topic filters,
 graph depth, time range).
 
-**Why this is not a benchmark artifact.** recalld is designed as an MCP tool for
-AI agents. In production, the calling agent (e.g., Claude Code) already reasons
-about what to search for before invoking `recall_memories` — it decides the
-query text, which entities to filter on, what graph depth to use, and whether to
-set a time range. The `construct_search_query()` call in the benchmark simulates
-this agent-side reasoning. The MCP tool schema exposes these parameters
-precisely because they are meant to be driven by an LLM. Removing this step
-would benchmark a usage pattern that does not reflect how the tool is actually
-used.
-
-**Production cost implications.** In the benchmark, `construct_search_query()`
-appears as a separate LLM call. In production, this work is done by the calling
-agent as part of normal tool use — when Claude Code decides to call
-`recall_memories`, it already reasons about what query to send, which entities to
-filter on, and what depth to use. That reasoning is part of the agent's existing
-turn, not an additional API call. The benchmark isolates this step into a
-dedicated call to simulate agent-side reasoning in a controlled way, but it does
-not represent an extra cost that production users pay beyond what their agent
-would spend anyway.
-
-**Architectural note.** In the benchmark, query construction appears as a
-separate LLM call. In production, the calling agent already reasons about what
-to search for as part of its tool use — it decides the query text, filters,
-and depth before invoking `recall_memories`. The benchmark isolates this step
-to simulate that agent-side reasoning in a controlled environment.
+recalld is an MCP tool for AI agents. In production, the calling agent (e.g.,
+Claude Code) already reasons about what to search for before invoking
+`recall_memories` -- it decides the query text, entity filters, graph depth, and
+time range. The `construct_search_query()` call in the benchmark simulates this
+agent-side reasoning. In the benchmark this appears as a separate LLM call; in
+production it is part of the agent's existing turn, not an additional API call.
+The MCP tool schema exposes these parameters precisely because they are meant to
+be driven by an LLM. Removing this step would benchmark a usage pattern that
+does not reflect how the tool is actually used.
 
 ### 3.4 Statistical Considerations
 
@@ -498,14 +477,9 @@ Wilson 95% CI: [72.4%, 76.3%]
 ## 6. Stress Test
 
 The standard LoCoMo evaluation creates an isolated memory store per
-conversation. In production, a memory system accumulates knowledge across
-many conversations, projects, and contexts. The stress test evaluates
-retrieval accuracy at scale by ingesting all 10 conversations into a
-**single shared memory store**, then running all 1,986 questions against it.
-
-This is a harder test: the retrieval pipeline must find the right memories
-among thousands of candidates, many of which share similar entities, topics,
-and phrasing from unrelated conversations.
+conversation. The stress test evaluates retrieval accuracy with a larger memory
+store by ingesting all 10 conversations into a **single shared memory store**,
+then running all 1,986 questions against it.
 
 ### Run: Gemini 2.5 Flash stress test (top-k=15, all categories)
 
@@ -536,15 +510,13 @@ and phrasing from unrelated conversations.
 | Stress test (shared store) | 2,293 total | 73.2% | -0.7 pts |
 
 With 5--10x more memories in the store, accuracy dropped by less than
-1 percentage point. Retrieval precision is maintained at scale through
-entity filtering, topic tags, and graph-based disambiguation.
+1 percentage point.
 
 ## 7. Comparison
 
-The following table is provided for context. Due to the methodological
-differences described in Section 3.1, these numbers are **not directly
-comparable**. Different models, prompts, judge configurations, and scoring
-criteria were used by each system.
+Due to the methodological differences described in Section 3.1, these numbers
+are **not directly comparable**. Different models, prompts, judge
+configurations, and scoring criteria were used by each system.
 
 | System              | Reported accuracy | Categories | Scoring method | Notes |
 |---------------------|-------------------|-----------|----------------|-------|
@@ -554,7 +526,3 @@ criteria were used by each system.
 | Human (original paper) | 87.9% F1       | 1--5 (all) | Token-level F1 | Different metric |
 | Accuracy ceiling     | ~95%             | -- | --              | Limited by ground truth errors (Penfield Labs) |
 
-**Note:** recalld evaluates on all 5 categories including adversarial (1,986
-questions). The "Categories" column indicates which categories each system
-includes in their reported score. Scores across different category sets are
-not directly comparable.

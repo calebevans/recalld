@@ -29,12 +29,14 @@ By default, Claude Code will prompt you for approval each time an MCP tool is ca
   "permissions": {
     "allow": [
       "mcp__recalld__store_memory",
+      "mcp__recalld__store_memories",
       "mcp__recalld__recall_memories",
       "mcp__recalld__get_memory",
       "mcp__recalld__reinforce_memory",
       "mcp__recalld__forget_memory",
       "mcp__recalld__find_similar_memories",
-      "mcp__recalld__create_namespace"
+      "mcp__recalld__create_namespace",
+      "mcp__recalld__list_memories"
     ]
   }
 }
@@ -58,7 +60,7 @@ Any tool that supports MCP stdio transport can use recalld. The generic configur
 - **Transport:** stdio (stdin/stdout, JSON-RPC 2.0)
 - **Args:** optional `--log-level <level>` to set log verbosity (logs go to stderr)
 
-Per-project namespace defaults are configured via a `.recalld.toml` file (see above), not CLI flags.
+Configure per-project namespace defaults in a `.recalld.toml` file (see above), not CLI flags.
 
 Example for a generic MCP client config:
 
@@ -74,7 +76,7 @@ Example for a generic MCP client config:
 
 ### store_memory
 
-Store a new observation, fact, or piece of context. The system automatically generates an embedding for semantic search. Memories decay naturally over time unless reinforced.
+Store a new observation, fact, or piece of context. The system automatically generates an embedding for semantic search. Memories decay over time unless reinforced.
 
 #### Parameters
 
@@ -118,9 +120,89 @@ Response:
 
 ---
 
+### store_memories
+
+Store multiple memories in a single call. Each item has the same schema as `store_memory`. Returns an array of results, one per input memory.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `memories` | array | yes | -- | Array of memory objects (max 100 per call). Each object has the same fields as `store_memory`. |
+
+Each object in the `memories` array accepts:
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `summary` | string | yes | -- | Short description (max 2000 chars) |
+| `fullText` | string | no | -- | Detailed content. Max 1 MB. |
+| `tags` | string[] | no | `[]` | Categorization tags. Max 64. |
+| `entities` | string[] | no | `[]` | Named entities. Max 32. |
+| `topics` | string[] | no | `[]` | Topic keywords. Max 32. |
+| `emotions` | string[] | no | `[]` | Emotional tone. Max 32. |
+| `namespace` | string | no | `"default"` | Memory partition |
+| `parentId` | string | no | -- | UUID of parent memory |
+| `supersedes` | string | no | -- | UUID of an older memory this one replaces |
+
+#### Example
+
+Request:
+
+```json
+{
+  "memories": [
+    {
+      "summary": "User prefers early returns over nested match blocks in Rust",
+      "tags": ["type/user-profile", "tech/rust"],
+      "topics": ["code-style"]
+    },
+    {
+      "summary": "Project uses PostgreSQL 15 with pgvector extension",
+      "tags": ["type/project", "tech/postgresql"],
+      "entities": ["PostgreSQL", "pgvector"],
+      "topics": ["database"]
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "results": [
+    {
+      "index": 0,
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "namespace": "default",
+      "phase": "Full",
+      "strength": 1.0,
+      "stability": 3.7145,
+      "createdAt": 1719187200000
+    },
+    {
+      "index": 1,
+      "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+      "namespace": "default",
+      "phase": "Full",
+      "strength": 1.0,
+      "stability": 3.7145,
+      "createdAt": 1719187200000
+    }
+  ],
+  "total": 2,
+  "stored": 2,
+  "errors": 0
+}
+```
+
+If individual memories fail validation (e.g., missing summary), their entry in the `results` array contains an `error` field instead of an `id`. Other memories in the batch are still stored.
+
+---
+
 ### recall_memories
 
-Search for relevant memories using natural language. Returns results ranked by semantic similarity combined with memory strength (well-reinforced memories rank higher).
+Search memories using natural language. Results are ranked by semantic similarity and memory strength.
 
 #### Parameters
 
@@ -137,6 +219,7 @@ Search for relevant memories using natural language. Returns results ranked by s
 | `depth` | integer | no | `0` | Graph hops to include related memories (0-3) |
 | `timeRangeStart` | integer or string | no | -- | Lower bound: epoch millis or ISO 8601 string |
 | `timeRangeEnd` | integer or string | no | -- | Upper bound: epoch millis or ISO 8601 string |
+| `compact` | boolean | no | `true` | If true, returns only `id`, `summary`, `fullText`, `entities`, and `topics` per memory for token efficiency. Set to false to include full metadata (tags, score, phase, strength, timestamps, related edges) and graph neighbor context. |
 
 #### Example
 
@@ -150,7 +233,23 @@ Request:
 }
 ```
 
-Response:
+Response (compact mode, the default):
+
+```json
+{
+  "memories": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "summary": "User prefers snake_case for Rust code and camelCase for TypeScript",
+      "entities": [],
+      "topics": ["coding-style"]
+    }
+  ],
+  "count": 1
+}
+```
+
+Response (compact=false):
 
 ```json
 {
@@ -188,7 +287,7 @@ Response:
 }
 ```
 
-The `graphContext` field only appears when `depth > 0` and related memories are found.
+The `graphContext` field only appears when `compact=false`, `depth > 0`, and related memories are found.
 
 ---
 
@@ -237,7 +336,7 @@ Response:
 
 ### reinforce_memory
 
-Strengthen a memory that proved useful. Increases its stability so it decays more slowly. Call this after recalling a memory that turned out to be accurate and helpful.
+Strengthen a memory. Increases its stability so it decays more slowly.
 
 #### Parameters
 
@@ -279,7 +378,7 @@ Response:
 
 ### forget_memory
 
-Permanently delete a memory. Use for incorrect, outdated, or harmful information that should be removed immediately rather than allowed to decay naturally. The memory transitions to Tombstone phase (graph edges are preserved).
+Permanently delete a memory. Use for incorrect or outdated information that should be removed immediately rather than allowed to decay. The memory transitions to Tombstone phase (graph edges are preserved).
 
 #### Parameters
 
@@ -310,18 +409,24 @@ Response:
 
 ### find_similar_memories
 
-Find memories semantically similar to a specific existing memory. Useful for exploring related context, finding contradictions, or discovering duplicates before storing new information.
+Find memories semantically similar to a given memory, or scan a namespace for duplicate clusters. Two modes:
+
+- **single** (default): requires an `id`, finds memories similar to it.
+- **scan**: requires a `namespace`, detects clusters of near-duplicate memories across the namespace.
 
 #### Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `id` | string | yes | -- | Source memory UUID |
-| `limit` | integer | no | `10` | Maximum results (1-100) |
-| `minScore` | number | no | -- | Minimum similarity threshold (0.0-1.0) |
-| `sameNamespace` | boolean | no | `true` | Restrict to same namespace |
+| `mode` | string | no | `"single"` | `"single"` or `"scan"` |
+| `id` | string | single mode | -- | Source memory UUID (required for single mode) |
+| `namespace` | string | scan mode | session default | Namespace to scan (required for scan mode; defaults to session default in single mode) |
+| `limit` | integer | no | `10` | Maximum results per source memory in single mode (1-100) |
+| `minScore` | number | no | -- | Minimum similarity threshold for single mode (0.0-1.0) |
+| `threshold` | number | no | `0.85` | Similarity threshold for scan mode duplicate detection (0.0-1.0) |
+| `sameNamespace` | boolean | no | `true` | Restrict to same namespace in single mode. Ignored in scan mode. |
 
-#### Example
+#### Example (single mode)
 
 Request:
 
@@ -355,11 +460,45 @@ Response:
 }
 ```
 
+#### Example (scan mode)
+
+Request:
+
+```json
+{
+  "mode": "scan",
+  "namespace": "default",
+  "threshold": 0.9
+}
+```
+
+Response:
+
+```json
+{
+  "namespace": "default",
+  "threshold": 0.9,
+  "clusters": [
+    [
+      {
+        "id": "a1b2c3d4-...",
+        "summary": "User prefers snake_case in Rust"
+      },
+      {
+        "id": "c3d4e5f6-...",
+        "summary": "User likes snake_case for Rust code"
+      }
+    ]
+  ],
+  "clusterCount": 1
+}
+```
+
 ---
 
 ### create_namespace
 
-Create a new memory namespace for organizing memories by domain or project. Each namespace has its own embedding space and decay configuration. Embedding dimensions are fixed after creation.
+Create a new memory namespace. Each namespace has its own embedding space and decay configuration. Embedding dimensions are fixed after creation.
 
 #### Parameters
 
@@ -393,6 +532,58 @@ Response:
   "memoryCount": 0,
   "createdAt": 1719187200000,
   "createdAtFormatted": "2025-06-24 00:00:00 UTC"
+}
+```
+
+---
+
+### list_memories
+
+List memories in a namespace with pagination and optional filters. Unlike `recall_memories`, this does not require a search query -- it returns memories sorted by creation date (newest first). Use for browsing, auditing, or enumerating memories.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `namespace` | string | no | `"default"` | Which namespace to list from |
+| `limit` | integer | no | `50` | Maximum results per page (1-200) |
+| `offset` | integer | no | `0` | Number of results to skip for pagination |
+| `tags` | string[] | no | `[]` | Only return memories with ALL of these tags |
+| `entities` | string[] | no | `[]` | Only return memories mentioning ALL of these entities |
+| `timeRangeStart` | integer or string | no | -- | Lower bound: epoch millis or ISO 8601 string |
+| `timeRangeEnd` | integer or string | no | -- | Upper bound: epoch millis or ISO 8601 string |
+
+#### Example
+
+Request:
+
+```json
+{
+  "namespace": "default",
+  "limit": 10,
+  "tags": ["type/user-profile"]
+}
+```
+
+Response:
+
+```json
+{
+  "memories": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "summary": "User prefers snake_case for Rust code and camelCase for TypeScript",
+      "namespace": "default",
+      "tags": ["type/user-profile", "tech/rust", "tech/typescript"],
+      "phase": "Full",
+      "strength": 0.95,
+      "createdAt": 1719187200000,
+      "createdAtFormatted": "2025-06-24 00:00:00 UTC"
+    }
+  ],
+  "count": 1,
+  "limit": 10,
+  "offset": 0
 }
 ```
 
@@ -461,7 +652,7 @@ Filter with tags in recall to narrow results:
 {"name": "architecture-decisions"}
 ```
 
-**Single default namespace** -- simplest approach. Works well when you have fewer than a few hundred memories or want cross-project recall.
+**Single default namespace** -- works well with fewer than a few hundred memories or when you want cross-project recall.
 
 Use `decayRateMultiplier` to tune per namespace:
 - Critical reference material: `2.0` (slower decay)
@@ -491,7 +682,7 @@ Memories that reach high stability (>1500 days) enter permastore and stop decayi
 
 ## Prompting guide
 
-To get the most out of recalld, add instructions to your AI assistant's system prompt or project instructions file (e.g., `CLAUDE.md`, `.cursorrules`). The prompt below is a complete, ready-to-use block. Copy it as-is or adapt it to your workflow.
+Add these instructions to your AI assistant's system prompt or project instructions file (e.g., `CLAUDE.md`, `.cursorrules`). Copy the block below as-is or adapt it.
 
 ### Ready-to-use prompt block
 
@@ -534,8 +725,8 @@ memory needs a `summary` (concise, 1-2 sentences) and should include
 Store memories as they arise. After every significant exchange (a decision
 is made, a preference is expressed, a project detail is learned, or a
 recommendation is accepted/rejected), store immediately. If you are unsure
-whether something is worth storing, store it. Memories decay naturally if
-they are not useful.
+whether something is worth storing, store it. Memories decay over time if
+they are not reinforced.
 
 **What NOT to store:**
 - Ephemeral task details (current branch, in-progress work, specific line
