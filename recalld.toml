@@ -4,5 +4,11 @@ model_name = "embeddinggemma:latest"
 base_url = "http://localhost:11434"
 dimensions = 768
 
+[graph]
+auto_link_threshold = 0.50
+
+[rif]
+enabled = true
+
 [decay]
 sweep_interval_hours = 24.0

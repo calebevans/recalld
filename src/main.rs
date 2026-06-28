@@ -188,6 +188,14 @@ enum BenchTarget {
         /// accuracy at scale with cross-conversation noise.
         #[arg(long)]
         stress_test: bool,
+
+        /// Override embedding model name (e.g. "qwen3-embedding:4b")
+        #[arg(long)]
+        embed_model: Option<String>,
+
+        /// Override embedding dimensions (e.g. 1536)
+        #[arg(long)]
+        embed_dims: Option<usize>,
     },
 }
 
@@ -307,7 +315,16 @@ async fn run_bench(config: RecalldConfig, target: BenchTarget, format: &str) -> 
             parallel,
             qa_parallel,
             stress_test,
+            embed_model,
+            embed_dims,
         } => {
+            let mut config = config;
+            if let Some(ref em) = embed_model {
+                config.embedding.model_name = em.clone();
+            }
+            if let Some(ed) = embed_dims {
+                config.embedding.dimensions = ed;
+            }
             if !data.exists() {
                 eprintln!("error: dataset not found: {}", data.display());
                 eprintln!("  Download it with:");

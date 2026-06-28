@@ -707,12 +707,11 @@ async fn run_stress_test(
 
             // Search.
             let search_start = Instant::now();
-            let memories =
-                search_memories(&harness, &question, top_k, Some(&llm), &mut debug_buf)
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("[stress-test] search failed: {e}").into()
-                    })?;
+            let memories = search_memories(&harness, &question, top_k, Some(&llm), &mut debug_buf)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("[stress-test] search failed: {e}").into()
+                })?;
             let retrieval_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
             // Collect graph context.
