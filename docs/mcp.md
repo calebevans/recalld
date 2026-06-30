@@ -217,8 +217,8 @@ Search memories using natural language. Results are ranked by semantic similarit
 | `emotions` | string[] | no | `[]` | Filter to memories with these emotional tones |
 | `minStrength` | number | no | -- | Minimum memory strength threshold (0.0-1.0) |
 | `depth` | integer | no | `0` | Graph hops to include related memories (0-3) |
-| `timeRangeStart` | integer or string | no | -- | Lower bound: epoch millis or ISO 8601 string |
-| `timeRangeEnd` | integer or string | no | -- | Upper bound: epoch millis or ISO 8601 string |
+| `timeRangeStart` | integer or string | no | -- | Memories created at or after this time get a relevance boost (soft ranking signal, not a hard filter). Epoch millis or ISO 8601 string |
+| `timeRangeEnd` | integer or string | no | -- | Memories created at or before this time get a relevance boost (soft ranking signal, not a hard filter). Epoch millis or ISO 8601 string |
 | `compact` | boolean | no | `true` | If true, returns only `id`, `summary`, `fullText`, `entities`, and `topics` per memory for token efficiency. Set to false to include full metadata (tags, score, phase, strength, timestamps, related edges) and graph neighbor context. |
 
 #### Example

@@ -96,8 +96,8 @@ IMPORTANT: Do not wait until the end of a conversation or until asked.
 Store memories as they arise. After every significant exchange (a decision
 is made, a preference is expressed, a project detail is learned, or a
 recommendation is accepted/rejected), store immediately. If you are unsure
-whether something is worth storing, store it. Memories decay naturally if
-they are not useful.
+whether something is worth storing, store it. Memories that aren't
+retrieved or reinforced will naturally decay over time.
 
 Do NOT store: ephemeral task details, code snippets, or anything derivable
 from the codebase.
@@ -134,7 +134,7 @@ from the codebase.
 
 ## Features
 
-- **Spaced repetition decay** -- FSRS v4.5 governs memory strength over time; memories transition through full, summary, and ghost phases based on retrievability thresholds. Explicit deletion moves memories to tombstone.
+- **Spaced repetition decay** -- FSRS v4.5 governs retrievability over time; memories transition through full, summary, and ghost phases based on retrievability thresholds. Explicit deletion moves memories to tombstone.
 - **Graph relationships** -- 7 edge types (parent/child, associative, causal, contradicts, entity, temporal, supersedes) with automatic linking based on similarity
 - **Hybrid search** -- SIMD-accelerated vector similarity, FTS5 full-text search, and graph expansion with score fusion
 - **Namespaces** -- isolated embedding spaces with independent decay configuration

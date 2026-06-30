@@ -12,7 +12,7 @@ recalld is an AI memory system written in Rust. It stores observations, facts, a
 - **Associative recall**: a graph of typed relationships enables spreading activation, so retrieving one memory can surface related ones.
 - **Retrieval-induced forgetting (RIF)**: retrieving a memory suppresses competing neighbors, matching the empirical RIF effect from human cognition.
 - **Pluggable embeddings**: works with OpenAI, Ollama (local), or pre-computed vectors.
-- **Single-process, single-binary**: no external database dependencies. All storage is file-based within a single data directory.
+- **Single-process, single-binary**: no external database dependencies. All storage uses files in a single data directory.
 
 ---
 
@@ -409,7 +409,7 @@ At query time, the search pipeline can discover related memories beyond direct v
    Accumulate on the neighbor (additive, clamped to 1.0). Push to heap if above firing threshold.
 3. **Collect**: return non-seed memories above `output_threshold`, sorted by activation.
 
-Termination is signal-based (not depth-limited):
+Termination uses signal thresholds, not depth limits:
 - `firing_threshold = 0.03` -- nodes below this are not expanded.
 - `min_spread = 0.005` -- increments below this are discarded.
 - `max_budget = 100` -- hard cap on nodes expanded.
@@ -508,7 +508,7 @@ The final ranking score depends on how the candidate was discovered:
 
 ### Over-fetching
 
-The pipeline fetches `min(limit * 8, max(100, limit * 8))` candidates internally (capped at `MAX_FETCH_K`), then filters and truncates to the user's requested `limit`. This provides sufficient headroom for filtering and RIF suppression to operate.
+The pipeline fetches `min(MAX_FETCH_K, max(100, limit * 8))` candidates internally (where `MAX_FETCH_K` = 1,600), then filters and truncates to the user's requested `limit`. This provides sufficient headroom for filtering and RIF suppression to operate.
 
 ---
 
@@ -628,11 +628,11 @@ All returned vectors must be L2-normalized (unit length). `embed()` is for docum
 
 ## 10. Caching
 
-### moka-based RAM cache
+### moka RAM cache
 
 The `CacheManager` wraps a `moka::future::Cache` with:
 
-- **Weight-based eviction**: entries are weighted by a centrality-adjusted function (high-edge-count memories cost more to evict).
+- **Weighted eviction**: entries are weighted by a centrality-adjusted function (high-edge-count memories cost more to evict).
 - **TinyLFU admission**: moka uses a Window-TinyLFU policy combining frequency and recency.
 - **Configurable capacity**: default 1 GB, or auto-calculated as 10% of system RAM clamped to [64 MB, 8 GB].
 - **TTI / TTL**: configurable time-to-idle (default 1 hour) and time-to-live (default 24 hours).
@@ -685,7 +685,7 @@ recalld exposes the same core functionality through three transport layers:
 
 ### CLI client (recalld-cli)
 
-- Separate binary that communicates with the HTTP API server (default `http://localhost:7878`).
+- Separate binary that communicates with the HTTP API server (default `http://localhost:7680`).
 - Commands: `store`, `recall`, `get`, `forget`, `reinforce`, `inspect`, `namespaces`, `sweep`, `status`, `export`, `import`, `list`, `health`.
 - Formatted output for terminal use.
 
@@ -730,7 +730,7 @@ The CLI `serve` subcommand also accepts shorthand env vars: `RECALLD_BIND` (comb
 | `[storage]` | `data_dir`, `compaction_threshold`, `fsync_interval_ms` | `~/.recalld/data`, 20%, 5s |
 | `[decay]` | `sweep_interval_hours`, `phase_thresholds.*`, `permastore_threshold_days`, `decay_rate_multiplier` | 24h, 0.7/0.3/0.05, 1500d, 1.0 |
 | `[cache]` | `max_capacity_bytes`, `time_to_idle_secs`, `time_to_live_secs`, `warm_file_enabled` | 1 GB, 1h, 24h, true |
-| `[embedding]` | `provider`, `model_name`, `api_key_env`, `base_url`, `dimensions`, `batch_size`, `document_prefix`, `query_prefix` | Ollama, embeddinggemma:latest, 768 |
+| `[embedding]` | `provider`, `model_name`, `api_key_env`, `base_url`, `dimensions`, `batch_size`, `document_prefix`, `query_prefix` | Ollama, embeddinggemma:300m, 768 |
 | `[graph]` | `autolink_enabled`, `max_auto_links`, `auto_link_threshold`, `temporal_window_ms`, `max_entity_links` | true, 15, 0.50, 1h, 10 |
 | `[rif]` | `enabled`, `max_suppression`, `activation_threshold_low`, `activation_threshold_high`, `propagation_depth` | true, 0.15, 0.1, 0.45, 2 |
 | `[log]` | `level`, `format`, `file` | info, pretty, none |

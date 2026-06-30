@@ -86,15 +86,15 @@ outputs zero or more structured memories to store.
 7. Run automatic graph linking (similarity, entity, temporal)
 
 **Graph linking** (three types, all automatic):
-- **Similarity-based**: vector cosine similarity above threshold (default 0.50),
+- **Similarity**: vector cosine similarity above threshold (default 0.50),
   up to 15 links per memory
-- **Entity-based**: links memories sharing the same named entities, up to 10
+- **Entity**: links memories sharing the same named entities, up to 10
   links per memory
 - **Temporal**: links memories within a time window (default 1 hour), up to 20
   links per memory
 
 The memory **storage pipeline** (embedding, indexing, graph linking) is the
-**same as production**. The LLM-based memory extraction from conversation turns
+**same as production**. Memory extraction from conversation turns via the LLM
 (`process_turn`) is benchmark-specific -- in production, the calling LLM client
 directly invokes `store_memory` with already-decided content.
 
@@ -261,10 +261,10 @@ alongside point estimates. For reference, at n = 1,986 (all questions):
 
 | Observed accuracy | 95% CI (Wilson) |
 |-------------------|-----------------|
-| 80%               | [77.9%, 81.9%]  |
-| 85%               | [83.1%, 86.7%]  |
-| 90%               | [88.4%, 91.4%]  |
-| 92.5%             | [91.1%, 93.7%]  |
+| 80%               | [78.2%, 81.7%]  |
+| 85%               | [83.4%, 86.5%]  |
+| 90%               | [88.6%, 91.2%]  |
+| 92.5%             | [91.3%, 93.6%]  |
 
 **Clustering.** The 1,986 questions are clustered within 10 conversations.
 Questions within a conversation share ingested context. The effective sample
@@ -317,8 +317,7 @@ or complex multi-hop reasoning chains may be truncated.
 their model identifiers. Model updates from providers may change results.
 
 **Open-domain category.** 841 of 1,986 questions (42.3%) are open-domain,
-requiring inference from facts rather than direct retrieval. Term-overlap-based
-retrieval diagnostics are misleading for this category.
+requiring inference from facts rather than direct retrieval. Retrieval diagnostics that rely on term overlap are misleading for this category.
 
 **Conversation diversity.** 10 conversations may not generalize to all
 conversational domains, relationship types, or cultural contexts.
@@ -463,7 +462,7 @@ Wilson 95% CI: [71.9%, 75.8%]
 
 **Overall accuracy: 74.4%** (1,477/1,986)
 
-Wilson 95% CI: [72.4%, 76.3%]
+Wilson 95% CI: [72.4%, 76.2%]
 
 | Category    | Correct | Total | Accuracy |
 |-------------|---------|-------|----------|

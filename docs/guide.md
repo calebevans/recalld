@@ -315,7 +315,7 @@ recalld has three run modes: MCP server (stdio), HTTP API server, and daemon.
 
 ### As MCP server (for Claude Code / Cursor)
 
-This is the most common setup. recalld runs as a stdio-based MCP server, launched by your AI tool.
+This is the most common setup. recalld runs as an MCP server over stdio, launched by your AI tool.
 
 **Claude Code:**
 
