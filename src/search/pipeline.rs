@@ -242,12 +242,12 @@ impl Candidate {
 const FTS_BOOST_CAP: f32 = 0.05;
 
 /// Rate parameter controlling how quickly FTS boost saturates.
-/// Higher values = faster saturation. At 0.5 with FTS_BOOST_CAP=0.15:
-///   FTS=1.0 -> boost ~0.059 (39% of cap)
-///   FTS=2.0 -> boost ~0.095 (63% of cap)
-///   FTS=3.0 -> boost ~0.117 (78% of cap)
-///   FTS=5.0 -> boost ~0.138 (92% of cap)
-///   FTS=8.0 -> boost ~0.147 (98% of cap)
+/// Higher values = faster saturation. At 0.5 with FTS_BOOST_CAP=0.05:
+///   FTS=1.0 -> boost ~0.020 (39% of cap)
+///   FTS=2.0 -> boost ~0.032 (63% of cap)
+///   FTS=3.0 -> boost ~0.039 (78% of cap)
+///   FTS=5.0 -> boost ~0.046 (92% of cap)
+///   FTS=8.0 -> boost ~0.049 (98% of cap)
 const FTS_BOOST_RATE: f32 = 0.5;
 
 /// Maximum relevance score for FTS-only candidates (no vector match).
@@ -255,13 +255,13 @@ const FTS_BOOST_RATE: f32 = 0.5;
 /// strong FTS-only results can compete with moderate vector hits.
 const FTS_ONLY_CAP: f32 = 0.30;
 
-/// Rate parameter for FTS-only saturating curve. At 0.3 with FTS_ONLY_CAP=0.50:
-///   FTS=1.0  -> 0.130  (26% of cap)
-///   FTS=2.0  -> 0.225  (45% of cap)
-///   FTS=3.0  -> 0.296  (59% of cap)
-///   FTS=5.0  -> 0.388  (78% of cap)
-///   FTS=8.0  -> 0.455  (91% of cap)
-///   FTS=15.0 -> 0.495  (99% of cap)
+/// Rate parameter for FTS-only saturating curve. At 0.3 with FTS_ONLY_CAP=0.30:
+///   FTS=1.0  -> 0.078  (26% of cap)
+///   FTS=2.0  -> 0.135  (45% of cap)
+///   FTS=3.0  -> 0.178  (59% of cap)
+///   FTS=5.0  -> 0.233  (78% of cap)
+///   FTS=8.0  -> 0.273  (91% of cap)
+///   FTS=15.0 -> 0.297  (99% of cap)
 const FTS_ONLY_RATE: f32 = 0.3;
 
 // ---------------------------------------------------------------------------

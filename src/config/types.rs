@@ -287,7 +287,7 @@ pub struct RifConfig {
     /// Master switch for RIF.
     pub enabled: bool,
 
-    /// Maximum fractional strength reduction per retrieval event (0.0-1.0).
+    /// Maximum fractional stability reduction per retrieval event (0.0-1.0).
     pub max_suppression: f64,
 
     /// Activation threshold below which no suppression occurs.
