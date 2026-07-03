@@ -182,6 +182,11 @@ main() {
         info "Installing recalld ${VERSION}..."
     fi
 
+    # Stop any running daemon so it picks up the new binary on next start.
+    if [ -x "${INSTALL_DIR}/recalld" ]; then
+        "${INSTALL_DIR}/recalld" daemon stop 2>/dev/null && info "Stopped running daemon" || true
+    fi
+
     download_and_install
     setup_config
     check_path
