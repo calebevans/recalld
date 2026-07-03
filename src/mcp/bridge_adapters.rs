@@ -586,7 +586,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             }
         }
 
-        // Generate embedding if not provided (summary + full_text + tags for max surface).
+        // Generate full embedding (summary + full_text + tags for max surface).
         let embedding = match input.embedding {
             Some(emb) => emb,
             None => {

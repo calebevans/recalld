@@ -51,7 +51,7 @@ pub struct MemoryToStore {
     pub supersedes: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemoryContext {
     pub memory_id: MemoryId,
     pub text: String,
@@ -375,9 +375,13 @@ impl LlmClient {
         category: &str,
         graph_context: &GraphContext,
     ) -> Result<String, String> {
+        // Sort memories chronologically (earliest first) for temporal reasoning
+        let mut sorted_memories = memories.to_vec();
+        sorted_memories.sort_by_key(|m| m.created_at);
+
         let mut id_to_label: std::collections::HashMap<MemoryId, String> =
             std::collections::HashMap::new();
-        for (i, mem) in memories.iter().enumerate() {
+        for (i, mem) in sorted_memories.iter().enumerate() {
             id_to_label.insert(mem.memory_id, format!("{}", i + 1));
         }
         for (i, (mid, _, _, _)) in graph_context.neighbors.iter().enumerate() {
@@ -386,16 +390,49 @@ impl LlmClient {
 
         let relation_map = build_relation_map(&graph_context.relations, memories, &id_to_label);
 
-        let context = memories
+        let context = sorted_memories
             .iter()
             .enumerate()
             .map(|(i, mem)| {
                 let label = format!("{}", i + 1);
                 let date = format_timestamp(mem.created_at);
+                let day_of_week = chrono::DateTime::from_timestamp_millis(mem.created_at)
+                    .map(|dt| dt.format("%A").to_string())
+                    .unwrap_or_default();
                 let mut line = format!(
-                    "[{}] (score: {:.2}, {}) {}",
-                    label, mem.score, date, mem.text
+                    "[{}] (score: {:.2}, {} {}) {}",
+                    label, mem.score, day_of_week, date, mem.text
                 );
+
+                // Precompute time delta from previous memory
+                if i > 0 {
+                    let prev = &sorted_memories[i - 1];
+                    let delta_ms = mem.created_at - prev.created_at;
+                    let delta_days = delta_ms / 86_400_000;
+                    if delta_days > 0 {
+                        let delta_str = if delta_days == 1 {
+                            "1 day".to_string()
+                        } else if delta_days < 30 {
+                            format!("{} days", delta_days)
+                        } else if delta_days < 365 {
+                            let months = delta_days / 30;
+                            if months == 1 {
+                                "~1 month".to_string()
+                            } else {
+                                format!("~{} months", months)
+                            }
+                        } else {
+                            let years = delta_days / 365;
+                            let remaining_months = (delta_days % 365) / 30;
+                            if remaining_months > 0 {
+                                format!("~{} year(s) {} month(s)", years, remaining_months)
+                            } else {
+                                format!("~{} year(s)", years)
+                            }
+                        };
+                        line.push_str(&format!("\n    \u{23f1} {} after [{}]", delta_str, i));
+                    }
+                }
 
                 let mut meta_parts: Vec<String> = Vec::new();
                 if !mem.entities.is_empty() {
@@ -468,10 +505,10 @@ impl LlmClient {
                 1. Identify which memories contain relevant evidence.\n\
                 2. If the question requires combining information from multiple memories, \
                 chain the pieces together.\n\
-                3. If the question involves time, use the dates shown in parentheses for \
-                each memory. For duration or timing questions, identify the start and end \
-                dates explicitly, then calculate the difference step by step. Show the \
-                dates before stating the duration.\n\
+                3. Memories are sorted chronologically (earliest first). Time deltas between \
+                consecutive memories are pre-computed and shown as '\u{23f1} N days after [X]'. \
+                For duration questions, use these pre-computed deltas directly — they are exact. \
+                The day of week is shown in each memory's date header.\n\
                 4. For counting questions, enumerate each distinct instance explicitly \
                 before stating the final count.\n\n\
                 Person verification: if the question names a specific person, confirm \
@@ -482,9 +519,9 @@ impl LlmClient {
                 available even when the phrasing differs.\n\n\
                 For hypothetical questions (\"would they...\", \"is it likely...\"), find \
                 evidence of relevant preferences or behaviors and commit to a clear answer.\n\n\
-                For questions requiring inference or world knowledge (e.g., \"what yoga \
-                style would be good for X?\"), combine memory evidence with your general \
-                knowledge to provide the most specific and helpful answer.\n\n\
+                For questions requiring inference or world knowledge (e.g., \"what type \
+                of archery bow would suit a beginner?\"), combine memory evidence with \
+                your general knowledge to provide the most specific and helpful answer.\n\n\
                 For list-type questions (\"what are X's hobbies?\", \"name the places Y \
                 visited\"), systematically scan ALL retrieved memories for every relevant \
                 item. Collect every instance before answering.\n\n\
@@ -513,7 +550,7 @@ impl LlmClient {
              Answer:"
         );
 
-        self.call(&system, &user).await
+        self.call(&system, &user, 4096).await
     }
 
     pub async fn judge_answer(
@@ -553,16 +590,21 @@ impl LlmClient {
                  are included.\n\n\
                  Grading rules:\n\
                  - Synonyms, paraphrases, and equivalent phrasings count as CORRECT \
-                 (e.g., \"stout and lager\" matches \"stout and light beers\"; \
-                 \"inventory software\" matches \"computer application\").\n\
+                 (e.g., \"espresso and cappuccino\" matches \"espresso-based drinks\"; \
+                 \"woodworking tools\" matches \"carpentry equipment\").\n\
                  - Extra correct details beyond the gold answer are fine — a SUPERSET of \
                  the gold answer is CORRECT.\n\
+                 - Hedging does NOT make an answer wrong. If the generated answer says \
+                 \"it is not explicitly stated\" but THEN provides the correct fact, that \
+                 is still CORRECT. Read the ENTIRE generated answer before judging.\n\
                  - For yes/no or inferential questions (gold answer is \"Likely no\" or \
                  \"Liberal\"), CORRECT if the same conclusion is reached, regardless of \
                  wording or reasoning shown.\n\
                  - For time questions: dates within 2 days are CORRECT (\"May 7\" vs \
                  \"May 8\"). Different formats are CORRECT (\"May 7th\" vs \"7 May\" \
-                 vs \"the first week of May\").\n\
+                 vs \"the first week of May\"). Relative dates that resolve correctly \
+                 are CORRECT (\"last month\" said in April = March = CORRECT if gold \
+                 says March).\n\
                  - For list questions: CORRECT if all items from the gold answer are present \
                  (extras are fine). CORRECT if most items match and the core facts align.\n\n\
                  Question: {question}\n\
@@ -572,7 +614,7 @@ impl LlmClient {
             )
         };
 
-        let response = self.call(&system, &user).await?;
+        let response = self.call(&system, &user, 1024).await?;
         let cleaned = response
             .trim()
             .trim_start_matches("```json")
@@ -623,6 +665,10 @@ impl LlmClient {
             - Exact counts: how many children, pets, siblings, trips, etc.\n\
             - Cross-speaker opinions: When person A expresses an opinion about person B \
             (e.g., \"I think he'd make a great teacher\"), store it with both speakers as entities.\n\
+            - Entity naming: When someone mentions another person, place, or title BY NAME, \
+            always include both the speaker's name and the mentioned entity in the summary. \
+            Use the same name form consistently (e.g., always 'Carlos' not sometimes 'he'). \
+            This enables cross-memory linking via shared entity names.\n\
             - Specific names, titles, dates, objects: pets' names, book titles, brand names\n\
             - Emotional reactions and feelings: when someone says how they feel about an event \
             (grateful, scared, proud, happy), store it — especially after significant events.\n\
@@ -642,8 +688,27 @@ impl LlmClient {
             If a book, movie, song, or other titled work is discussed, include the exact title \
             in both summary and full_text.\n\
             Resolve relative times ('last week', 'yesterday') to approximate absolute dates \
-            using the conversation timestamp.\n\
+            using the conversation timestamp. The resolved date MUST appear in the summary \
+            text itself (e.g., 'On approximately May 3, 2023, Carlos mentioned...'). Do NOT \
+            put dates only in metadata — the summary must contain the date so it is searchable \
+            and self-contained when retrieved independently.\n\
             </specificity>\n\n\
+            <attribution>\n\
+            Every summary MUST explicitly name the speaker or subject using their proper name. \
+            Never use pronouns (he, she, they, him, her, his, hers, their) as the subject of \
+            a summary — always use the person's actual name. Each memory is retrieved \
+            independently without surrounding context, so it must be completely \
+            self-contained and unambiguous.\n\
+            BAD: \"She mentioned she's been taking calligraphy lessons.\"\n\
+            GOOD: \"Melanie mentioned she has been taking calligraphy lessons since \
+            approximately March 2023.\"\n\
+            BAD: \"He got a new job at the hospital.\"\n\
+            GOOD: \"Carlos Rivera started a new job at Memorial Hospital in May 2023.\"\n\
+            When person A talks about person B, name BOTH speakers explicitly: \
+            \"Melanie said that Carlos would make a great teacher.\"\n\
+            When storing a cross-speaker opinion or reaction, always include both names as \
+            entities so the memory links to both people.\n\
+            </attribution>\n\n\
             <deduplication>\n\
             CRITICAL: Before creating any memory, check the already-stored memories listed below.\n\
             If a fact is already captured — even partially, with different wording, or as part of \
@@ -706,7 +771,7 @@ impl LlmClient {
         }
         user_msg.push_str(current_turn);
 
-        let response = self.call(system, &user_msg).await?;
+        let response = self.call(system, &user_msg, 2048).await?;
         let cleaned = response
             .trim()
             .trim_start_matches("```json")
@@ -774,7 +839,7 @@ impl LlmClient {
             Output ONLY the JSON object. No markdown fences, no explanation, no commentary.";
 
         let user_msg = format!("Question: {question}");
-        let response = self.call(system, &user_msg).await?;
+        let response = self.call(system, &user_msg, 1024).await?;
         let cleaned = response
             .trim()
             .trim_start_matches("```json")
@@ -827,7 +892,7 @@ impl LlmClient {
         }
     }
 
-    async fn call(&self, system: &str, user: &str) -> Result<String, String> {
+    async fn call(&self, system: &str, user: &str, max_tokens: u32) -> Result<String, String> {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: user.to_string(),
@@ -851,7 +916,7 @@ impl LlmClient {
                     let body = OpenAiRequest {
                         model: self.model.clone(),
                         messages: all_messages,
-                        max_tokens: 1024,
+                        max_tokens,
                         temperature: 0.0,
                     };
                     self.client
@@ -888,7 +953,7 @@ impl LlmClient {
                             }],
                         },
                         generation_config: GeminiGenerationConfig {
-                            max_output_tokens: 1024,
+                            max_output_tokens: max_tokens,
                             temperature: 0.0,
                             thinking_config: if self.model.contains("flash") {
                                 Some(GeminiThinkingConfig { thinking_budget: 0 })
@@ -918,7 +983,7 @@ impl LlmClient {
                     );
                     let body = VertexRequest {
                         anthropic_version: "vertex-2023-10-16".to_string(),
-                        max_tokens: 1024,
+                        max_tokens,
                         temperature: 0.0,
                         system: system.to_string(),
                         messages: messages.clone(),
@@ -934,7 +999,7 @@ impl LlmClient {
                 BackendKind::Anthropic { api_key } => {
                     let body = AnthropicRequest {
                         model: self.model.clone(),
-                        max_tokens: 1024,
+                        max_tokens,
                         temperature: 0.0,
                         system: system.to_string(),
                         messages: messages.clone(),

@@ -626,7 +626,11 @@ async fn auto_start_daemon(
     let stderr_log = log_file.try_clone()?;
 
     let mut cmd = StdCommand::new(&exe);
-    cmd.arg("daemon").arg("start").arg("--foreground");
+    cmd.arg("daemon")
+        .arg("start")
+        .arg("--foreground")
+        .arg("--idle-timeout")
+        .arg("0");
 
     // Forward config path if it was explicitly set
     if let Ok(config_path) = std::env::var("RECALLD_CONFIG") {

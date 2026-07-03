@@ -17,6 +17,7 @@ mod fts;
 
 // CS-29: Entity index for entity-based graph edges
 mod entity_index;
+pub mod entity_normalize;
 
 // CS-16: Search pipeline
 pub mod adapters;
@@ -34,6 +35,7 @@ pub use fts::FtsIndex;
 
 // --- CS-29 re-exports ---
 pub use entity_index::EntityIndex;
+pub use entity_normalize::canonicalize_entity;
 
 // --- CS-16 re-exports ---
 pub use error::SearchError;

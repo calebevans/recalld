@@ -108,21 +108,40 @@ impl EmbeddingProvider for OllamaProvider {
             input: texts.to_vec(),
         };
 
-        let response = self
-            .client
-            .post(format!("{}/api/embed", self.base_url))
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_connect() {
-                    EmbeddingError::Unavailable(
-                        "Ollama is not running. Start it with `ollama serve`".into(),
-                    )
-                } else {
-                    EmbeddingError::Network(e)
+        let url = format!("{}/api/embed", self.base_url);
+        let mut last_err = None;
+        let mut response = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+            }
+            match self.client.post(&url).json(&request_body).send().await {
+                Ok(r) => {
+                    response = Some(r);
+                    break;
                 }
-            })?;
+                Err(e) if e.is_connect() || e.is_timeout() => {
+                    warn!(attempt = attempt + 1, %e, "Ollama connection failed, retrying");
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    return Err(EmbeddingError::Network(e));
+                }
+            }
+        }
+        let response = match response {
+            Some(r) => r,
+            None => {
+                let e = last_err.unwrap();
+                return if e.is_connect() {
+                    Err(EmbeddingError::Unavailable(
+                        "Ollama is not running. Start it with `ollama serve`".into(),
+                    ))
+                } else {
+                    Err(EmbeddingError::Network(e))
+                };
+            }
+        };
 
         let status = response.status();
 

@@ -44,10 +44,12 @@ impl EntityIndex {
         }
         let mut added = false;
         for entity in entities {
-            let key = entity.to_lowercase();
-            let set = self.index.entry(key).or_default();
-            if set.insert(memory_id) {
-                added = true;
+            let canonical_forms = super::entity_normalize::canonicalize_entity(entity);
+            for key in canonical_forms {
+                let set = self.index.entry(key).or_default();
+                if set.insert(memory_id) {
+                    added = true;
+                }
             }
         }
         if added {
@@ -61,13 +63,15 @@ impl EntityIndex {
     pub fn remove(&mut self, memory_id: MemoryId, entities: &[String]) {
         let mut removed = false;
         for entity in entities {
-            let key = entity.to_lowercase();
-            if let Some(set) = self.index.get_mut(&key) {
-                if set.remove(&memory_id) {
-                    removed = true;
-                }
-                if set.is_empty() {
-                    self.index.remove(&key);
+            let canonical_forms = super::entity_normalize::canonicalize_entity(entity);
+            for key in canonical_forms {
+                if let Some(set) = self.index.get_mut(&key) {
+                    if set.remove(&memory_id) {
+                        removed = true;
+                    }
+                    if set.is_empty() {
+                        self.index.remove(&key);
+                    }
                 }
             }
         }
@@ -84,12 +88,18 @@ impl EntityIndex {
         exclude_id: MemoryId,
     ) -> Vec<(MemoryId, usize)> {
         let mut counts: HashMap<MemoryId, usize> = HashMap::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
         for entity in entities {
-            let key = entity.to_lowercase();
-            if let Some(set) = self.index.get(&key) {
-                for &mid in set {
-                    if mid != exclude_id {
-                        *counts.entry(mid).or_default() += 1;
+            let canonical_forms = super::entity_normalize::canonicalize_entity(entity);
+            for key in canonical_forms {
+                if !seen_keys.insert(key.clone()) {
+                    continue;
+                }
+                if let Some(set) = self.index.get(&key) {
+                    for &mid in set {
+                        if mid != exclude_id {
+                            *counts.entry(mid).or_default() += 1;
+                        }
                     }
                 }
             }

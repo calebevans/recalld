@@ -30,10 +30,10 @@ use super::claude::{GraphContext, LlmClient, MemoryContext, MemoryRelation};
 
 fn category_name(id: u32) -> &'static str {
     match id {
-        1 => "single-hop",
+        1 => "multi-hop",
         2 => "temporal",
-        3 => "multi-hop",
-        4 => "open-domain",
+        3 => "open-domain",
+        4 => "single-hop",
         5 => "adversarial",
         _ => "unknown",
     }
@@ -1677,7 +1677,7 @@ async fn collect_graph_context(harness: &BenchHarness, results: &[ScoredMemory])
     }
 
     const MAX_NEIGHBORS: usize = 10;
-    const FULL_TEXT_NEIGHBORS: usize = 5;
+    const FULL_TEXT_NEIGHBORS: usize = 10;
 
     let mut neighbor_weights: HashMap<MemoryId, f32> = HashMap::new();
     let mut relations: Vec<MemoryRelation> = Vec::new();

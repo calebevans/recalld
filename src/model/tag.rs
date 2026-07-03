@@ -150,11 +150,21 @@ pub fn entity_overlap(query_entities: &[String], memory_entities: &[String]) -> 
         return 0.0;
     }
 
-    let query_set: HashSet<String> = query_entities.iter().map(|e| e.to_lowercase()).collect();
-    let memory_set: HashSet<String> = memory_entities.iter().map(|e| e.to_lowercase()).collect();
+    let query_set: HashSet<String> = query_entities
+        .iter()
+        .flat_map(|e| crate::search::canonicalize_entity(e).into_iter().take(1))
+        .collect();
+    let memory_set: HashSet<String> = memory_entities
+        .iter()
+        .flat_map(|e| crate::search::canonicalize_entity(e).into_iter().take(1))
+        .collect();
 
     let intersection_count = query_set.intersection(&memory_set).count();
     let union_size = query_set.union(&memory_set).count();
+
+    if union_size == 0 {
+        return 0.0;
+    }
 
     intersection_count as f32 / union_size as f32
 }
