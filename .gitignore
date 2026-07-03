@@ -29,5 +29,5 @@ target
 /recalld_data
 .DS_Store
 *.tar.gz
-bench_debug.log
-bench_results.json
+/bench_debug.log
+/bench_results.json

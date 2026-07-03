@@ -144,14 +144,12 @@ from the codebase.
 
 ## Benchmark
 
-recalld is evaluated on the [LoCoMo](https://aclanthology.org/2024.acl-long.747/) benchmark (1,986 questions across 5 categories including adversarial). All results use a unified prompt with no category-specific instructions.
+recalld is evaluated on the [LoCoMo](https://aclanthology.org/2024.acl-long.747/) benchmark (1,986 questions across 5 categories including adversarial). All results use a single prompt for all categories, with no category routing or per-category prompt selection.
 
 | Model | Accuracy | Categories |
 |-------|----------|-----------|
-| Claude Sonnet 4 | 83.0% | All 5 (including adversarial) |
-| Gemini 2.5 Flash | 73.9% | All 5 (including adversarial) |
-
-In a stress test with all 10 conversations ingested into a single shared store (2,293 memories), accuracy dropped less than 1 point (73.9% to 73.2%).
+| Claude Sonnet 4.6 | 84.5% | All 5 (including adversarial) |
+| Gemini 2.5 Flash | 78.3% | All 5 (including adversarial) |
 
 See [docs/benchmark.md](docs/benchmark.md) for full methodology, per-category breakdowns, and reproducibility instructions.
 

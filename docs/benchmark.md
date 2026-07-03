@@ -1,8 +1,5 @@
 # Benchmark Methodology
 
-This document describes the evaluation methodology used to benchmark recalld
-against the LoCoMo dataset.
-
 ## 1. Dataset
 
 **LoCoMo** (Long-term Conversational Memory) is a benchmark for evaluating
@@ -24,13 +21,25 @@ across 5 categories.
 
 | # | Category    | Questions | % of total |
 |---|-------------|-----------|------------|
-| 1 | Single-hop  | 282       | 14.2%      |
+| 1 | Multi-hop   | 282       | 14.2%      |
 | 2 | Temporal    | 321       | 16.2%      |
-| 3 | Multi-hop   | 96        | 4.8%       |
-| 4 | Open-domain | 841       | 42.3%      |
+| 3 | Open-domain | 96        | 4.8%       |
+| 4 | Single-hop  | 841       | 42.3%      |
 | 5 | Adversarial | 446       | 22.5%      |
 |   | **Total**   | **1,986** |            |
 |   | **Non-adversarial (1--4)** | **1,540** | |
+
+> **Note on category numbering.** The LoCoMo paper's prose (Section 4.1)
+> lists categories as "single-hop, multi-hop, temporal, open-domain,
+> adversarial," but the dataset's numeric IDs follow a different order.
+> The mapping above is derived from the LoCoMo evaluation source code
+> (`task_eval/evaluation.py`), which uses distinct scoring functions per
+> category: category 1 uses sub-answer partial F1 (multi-hop), while
+> category 4 uses standard F1 (single-hop). Evidence turn counts confirm
+> this (category 1 averages 3.13 evidence turns; category 4 averages
+> 1.07). Other projects (e.g., Memobase) have independently identified
+> the same discrepancy between the paper's prose order and the code's
+> numeric IDs.
 
 Each conversation averages roughly 600 turns across up to 32 sessions.
 Conversations were generated via a machine-human pipeline grounded in personas
@@ -59,9 +68,9 @@ memories -- there is no pre-loaded knowledge.
 
 | Parameter     | Value |
 |---------------|-------|
-| Default model | `gemini-2.5-flash` (configurable via `--ingest-model`) |
+| Model | `claude-sonnet-4-6` (configurable via `--ingest-model`) |
 | Temperature   | 0.0 |
-| max_tokens    | 1024 |
+| max_tokens    | 2048 |
 | Context window | Last 20 conversation turns + last 30 stored memories |
 
 Each conversation turn is processed sequentially. For each turn, the ingestion
@@ -78,7 +87,7 @@ outputs zero or more structured memories to store.
 
 **Storage pipeline per memory:**
 1. Generate embedding from concatenation of summary + full_text + tags
-2. Insert into storage engine (SQLite-backed)
+2. Insert into storage engine (redb)
 3. Add to SIMD vector index
 4. Add to FTS5 full-text search index
 5. Add as a node in the memory graph
@@ -102,7 +111,7 @@ directly invokes `store_memory` with already-decided content.
 
 | Parameter       | Value |
 |-----------------|-------|
-| Default model   | `gemini-2.5-flash` (same instance as answer generation) |
+| Model   | Same as answer generation model (configurable via `--model`) |
 | Temperature     | 0.0 |
 | max_tokens      | 1024 |
 | Default top_k   | 15 (configurable via `--top-k`) |
@@ -130,21 +139,24 @@ depth 1.
 
 **Post-retrieval graph expansion:**
 After the search pipeline returns results, a 1-hop graph traversal collects up
-to 10 neighbor memories (sorted by edge weight descending). The top 5 neighbors
-include their full_text. All edge relationships between result memories and
+to 10 neighbor memories (sorted by edge weight descending). All 10
+neighbors include their full_text. All edge relationships between result memories and
 neighbor memories are collected and shown to the answer model.
 
 ### 2.3 Answer Generation
 
 | Parameter     | Value |
 |---------------|-------|
-| Default model | `gemini-2.5-flash` (configurable via `--model`) |
+| Model | `claude-sonnet-4-6` (configurable via `--model`) |
 | Temperature   | 0.0 |
-| max_tokens    | 1024 |
+| max_tokens    | 4096 |
 
 A **single unified prompt** is used for all question categories. The `category`
 parameter is passed as the literal string `"unknown"` and is never used in the
-prompt. There are no category-specific instructions, examples, or routing.
+prompt. There is no category routing, per-category prompt selection, or
+category-specific examples. The unified prompt includes general reasoning
+guidance (e.g., date arithmetic for temporal questions, enumeration for
+counting questions) that applies across categories.
 
 The system prompt instructs the model to:
 - Base answers only on provided memories
@@ -158,7 +170,7 @@ The system prompt instructs the model to:
 - Retrieved memories (up to `top_k`) with: relevance score, creation date,
   summary text, full_text (if present), entity/topic/emotion metadata, and
   graph link annotations
-- Graph neighbor memories (up to 10) with: summary, full_text (for top 5),
+- Graph neighbor memories (up to 10) with: summary, full_text,
   creation date, and edge relationship annotations
 
 The gold answer is **never visible** to the answer model.
@@ -167,18 +179,20 @@ The gold answer is **never visible** to the answer model.
 
 | Parameter     | Value |
 |---------------|-------|
-| Default model | `gemini-2.5-flash-lite` (configurable via `--judge-model`) |
+| Model | `claude-haiku-4-5` (configurable via `--judge-model`) |
 | Temperature   | 0.0 |
 | max_tokens    | 1024 |
 | Scoring       | Binary: CORRECT or WRONG |
 
-The judge model is deliberately different from the answer model to avoid
-self-grading bias.
+For the Gemini runs, the judge uses the same model family (`gemini-2.5-flash`)
+as the answer model but operates as a separate instance with no shared state.
+For the Claude runs, the judge uses a different model (`claude-haiku-4-5`) to
+avoid self-grading bias.
 
 **Non-adversarial judging** (categories 1--4): The prompt instructs the judge to
 be lenient -- synonyms, paraphrases, additional correct details, equivalent date
-formats, and same-conclusion answers are all accepted as CORRECT. The example
-in the prompt (Hawaii / shell necklace) is not from the LoCoMo dataset.
+formats, and same-conclusion answers are all accepted as CORRECT. Prompt examples (espresso/cappuccino, woodworking/carpentry) are drawn
+from domains absent from the LoCoMo dataset.
 
 **Adversarial judging** (category 5): Inverted scoring. CORRECT if the model
 refuses to answer or says "I don't know." WRONG if it provides any specific
@@ -212,22 +226,26 @@ disputed this figure and claimed a corrected score of 75.14%.
 
 **Model configuration:**
 
-| Component   | recalld (default)     | Mem0 (published, April 2026) |
+| Component   | recalld (CLI default)     | Mem0 (published, April 2026) |
 |-------------|----------------------|------|
-| Ingestion   | `gemini-2.5-flash`   | Not disclosed for published score; open-source default is `gpt-4o-mini` |
-| Answer gen  | `gemini-2.5-flash`   | Not disclosed; open-source default is `gpt-4o` |
-| Judge       | `gemini-2.5-flash-lite` | Not disclosed; open-source default is `gpt-4o` |
+| Ingestion   | `claude-sonnet-4-6` (Gemini runs use `gemini-2.5-flash`) | Not disclosed for published score; open-source default is `gpt-4o-mini` |
+| Answer gen  | `claude-sonnet-4-6` (Gemini runs use `gemini-2.5-flash`) | Not disclosed; open-source default is `gpt-4o` |
+| Judge       | `claude-haiku-4-5` (Gemini runs use `gemini-2.5-flash`) | Not disclosed; open-source default is `gpt-4o` |
 | Embeddings  | `embeddinggemma:300m` (768d, via Ollama) | `text-embedding-3-small` (1536d) |
 
-Mem0's published 92.5% score does not disclose which exact models were used.
-Their open-source evaluation framework notes "using a frontier model will likely
-produce higher scores."
+Mem0's published 92.5% score does not disclose which exact models were
+used for that specific result. Their evaluation framework is open-sourced
+at [github.com/mem0ai/memory-benchmarks](https://github.com/mem0ai/memory-benchmarks),
+with defaults of `gpt-4o` for answer generation and judging, and
+`gpt-4o-mini` for extraction.
 
 ### 3.2 Prompt Design
 
-All prompts (ingestion, answer generation, search query construction, judging)
-use generic examples and instructions. No LoCoMo-specific content, question
-formats, or dataset knowledge is embedded in any prompt.
+All prompts (ingestion, answer generation, search query construction,
+judging) use generic examples and instructions drawn from domains absent
+from the LoCoMo dataset (verified by searching `locomo10.json`). No
+LoCoMo-specific questions, answers, or dataset knowledge is embedded in
+any prompt.
 
 The answer generation prompt describes "long personal conversations between two
 people who are friends" -- this matches the LoCoMo format but is not
@@ -235,7 +253,7 @@ LoCoMo-specific; it describes the domain recalld operates in.
 
 The **original LoCoMo paper** used category-specific prompts for evaluation.
 recalld deliberately uses a single unified prompt, following the emerging
-industry practice advocated by LoCoMo-Plus (arXiv:2602.10715), which uses a
+industry practice advocated by LoCoMo-Plus ([arXiv:2602.10715](https://arxiv.org/abs/2602.10715)), which uses a
 single input prompt with category-specific judging.
 
 ### 3.3 LLM-Augmented Retrieval
@@ -309,15 +327,19 @@ conversation turns and last 30 stored memories. For very long conversations,
 early context may be unavailable to the ingestion model when processing later
 turns.
 
-**max_tokens truncation.** All LLM calls use `max_tokens = 1024`. Long answers
-or complex multi-hop reasoning chains may be truncated.
+**max_tokens truncation.** LLM calls use `max_tokens` of 1024--4096
+depending on call type (1024 for search query construction and judging,
+2048 for ingestion, 4096 for answer generation). Complex multi-hop
+reasoning chains may still be truncated at the lower limits.
 
 **Model version dependency.** Results depend on specific model versions
-(`gemini-2.5-flash`, `gemini-2.5-flash-lite`) which are not version-pinned beyond
+(`gemini-2.5-flash`, `claude-sonnet-4-6`) which are not version-pinned beyond
 their model identifiers. Model updates from providers may change results.
 
-**Open-domain category.** 841 of 1,986 questions (42.3%) are open-domain,
-requiring inference from facts rather than direct retrieval. Retrieval diagnostics that rely on term overlap are misleading for this category.
+**Single-hop dominance.** 841 of 1,986 questions (42.3%) are single-hop,
+making this the largest category. Single-hop questions require retrieving
+a single fact from one session, so retrieval quality is the primary
+bottleneck.
 
 **Conversation diversity.** 10 conversations may not generalize to all
 conversational domains, relationship types, or cultural contexts.
@@ -331,13 +353,14 @@ from the summary.
 ### Requirements
 
 - Rust toolchain (see `rust-toolchain.toml`)
-- One of the following LLM backends:
-  - **Gemini on Vertex AI** (default): `GEMINI_VERTEX_PROJECT_ID` + gcloud auth.
-    Optional: `GEMINI_VERTEX_REGION` (default: `us-central1`)
+- One of the following LLM backends (checked in priority order):
+  - **OpenAI-compatible**: `--llm-url http://host:port`
+  - **Gemini on Vertex AI**: `GEMINI_VERTEX_PROJECT_ID` + gcloud auth.
+    Optional: `GEMINI_VERTEX_REGION` (default: `us-central1`).
+    Requires `--model gemini-*` / `--ingest-model gemini-*` / `--judge-model gemini-*`
   - **Claude on Vertex AI**: `CLAUDE_CODE_USE_VERTEX=1` + `CLOUD_ML_REGION` +
     `ANTHROPIC_VERTEX_PROJECT_ID`
   - **Anthropic API**: `ANTHROPIC_API_KEY`
-  - **OpenAI-compatible**: `--llm-url http://host:port`
 
 ### Command
 
@@ -351,9 +374,9 @@ cargo run --features bench --release -- bench locomo
 |---------------------|-------------------------------|-------------|
 | `--data`            | `src/bench/data/locomo10.json`| Path to dataset file |
 | `--top-k`           | `15`                          | Retrieved memories per question |
-| `--model`           | `gemini-2.5-flash`            | Answer generation and query construction model |
-| `--ingest-model`    | `gemini-2.5-flash`            | Conversation ingestion model |
-| `--judge-model`     | `gemini-2.5-flash-lite`       | Answer judging model |
+| `--model`           | `claude-sonnet-4-6`           | Answer generation and query construction model |
+| `--ingest-model`    | `claude-sonnet-4-6`           | Conversation ingestion model |
+| `--judge-model`     | `claude-haiku-4-5`            | Answer judging model |
 | `--llm-url`         | *(none)*                      | OpenAI-compatible LLM server URL |
 | `--parallel`        | `2`                           | Number of conversations to evaluate concurrently |
 | `--qa-parallel`     | `4`                           | Number of QA pairs to evaluate concurrently per conversation |
@@ -368,110 +391,109 @@ cargo run --features bench --release -- bench locomo
 - The gold answer is only visible to the judge model
 - The answer model and judge model are separate instances with different models
   by default
-- Prompts contain no LoCoMo-specific examples or dataset knowledge
+- Prompt examples are drawn from domains verified absent from the dataset
 - Each conversation gets a fresh, empty recalld instance
 
 ## 5. Results
 
 Results are stored in `benchmarks/<run-name>/` with full JSON output
-(`bench_results.json`) and per-question debug logs (`bench_debug.log`).
+(`bench_results.json`) and per-question debug logs (`bench_debug.log`),
+tracked in the repository for reproducibility verification.
 
 All results include adversarial questions (all 5 categories, 1,986 total
 questions).
 
-### Run: Claude Sonnet 4 (unified prompt, top-k=15, all categories)
+### Run: Claude Sonnet 4.6 (top-k=15, all categories)
 
 **Configuration:**
 - Model (ingestion + answer gen): `claude-sonnet-4-6`
 - Judge: `claude-haiku-4-5`
 - Top-k: 15
-- Prompt: unified (no category-specific instructions)
+- Prompt: unified (no category routing or per-category selection)
 - Categories: all 5 (including adversarial)
-- Results: `benchmarks/claude-sonnet-4-6-top15-unified-full/`
+- Results: `benchmarks/claude-sonnet-4-6-top15/`
 
-**Overall accuracy: 83.0%** (1,649/1,986)
+**Overall accuracy: 84.5%** (1,678/1,986)
 
-Wilson 95% CI: [81.3%, 84.6%]
-
-### Per-category breakdown
+Wilson 95% CI: [82.8%, 86.0%]
 
 | Category    | Correct | Total | Accuracy |
 |-------------|---------|-------|----------|
-| Single-hop  | 225     | 282   | 79.8%    |
-| Temporal    | 276     | 321   | 86.0%    |
-| Multi-hop   | 71      | 96    | 74.0%    |
-| Open-domain | 689     | 841   | 81.9%    |
-| Adversarial | 388     | 446   | 87.0%    |
-| **Overall (1--5)** | **1,649** | **1,986** | **83.0%** |
+| Multi-hop   | 230     | 282   | 81.6%    |
+| Temporal    | 286     | 321   | 89.1%    |
+| Open-domain | 69      | 96    | 71.9%    |
+| Single-hop  | 711     | 841   | 84.5%    |
+| Adversarial | 382     | 446   | 85.7%    |
+| **Overall (1--5)** | **1,678** | **1,986** | **84.5%** |
 
-### Run: Claude Sonnet 4 (unified prompt, top-k=20, all categories)
+### Run: Claude Sonnet 4.6 (top-k=20, all categories)
 
 **Configuration:**
 - Model (ingestion + answer gen): `claude-sonnet-4-6`
 - Judge: `claude-haiku-4-5`
 - Top-k: 20
-- Prompt: unified (no category-specific instructions)
+- Prompt: unified (no category routing or per-category selection)
 - Categories: all 5 (including adversarial)
-- Results: `benchmarks/claude-sonnet-4-6-top20-unified-full/`
+- Results: `benchmarks/claude-sonnet-4-6-top20/`
 
-**Overall accuracy: 83.1%** (1,650/1,986)
+**Overall accuracy: 84.2%** (1,672/1,986)
 
-Wilson 95% CI: [81.4%, 84.7%]
+Wilson 95% CI: [82.5%, 85.7%]
 
 | Category    | Correct | Total | Accuracy |
 |-------------|---------|-------|----------|
-| Single-hop  | 232     | 282   | 82.3%    |
+| Multi-hop   | 229     | 282   | 81.2%    |
+| Temporal    | 283     | 321   | 88.2%    |
+| Open-domain | 67      | 96    | 69.8%    |
+| Single-hop  | 716     | 841   | 85.1%    |
+| Adversarial | 377     | 446   | 84.5%    |
+| **Overall (1--5)** | **1,672** | **1,986** | **84.2%** |
+
+### Run: Gemini 2.5 Flash (top-k=15, all categories)
+
+**Configuration:**
+- Model (ingestion + answer gen): `gemini-2.5-flash`
+- Judge: `gemini-2.5-flash`
+- Top-k: 15
+- Prompt: unified (no category routing or per-category selection)
+- Categories: all 5 (including adversarial)
+- Results: `benchmarks/gemini-2.5-flash-top15/`
+
+**Overall accuracy: 77.4%** (1,537/1,986)
+
+Wilson 95% CI: [75.5%, 79.2%]
+
+| Category    | Correct | Total | Accuracy |
+|-------------|---------|-------|----------|
+| Multi-hop   | 201     | 282   | 71.3%    |
 | Temporal    | 274     | 321   | 85.4%    |
-| Multi-hop   | 70      | 96    | 72.9%    |
-| Open-domain | 688     | 841   | 81.8%    |
-| Adversarial | 386     | 446   | 86.5%    |
-| **Overall (1--5)** | **1,650** | **1,986** | **83.1%** |
+| Open-domain | 51      | 96    | 53.1%    |
+| Single-hop  | 644     | 841   | 76.6%    |
+| Adversarial | 367     | 446   | 82.3%    |
+| **Overall (1--5)** | **1,537** | **1,986** | **77.4%** |
 
-### Run: Gemini 2.5 Flash (unified prompt, top-k=15, all categories)
-
-**Configuration:**
-- Model (all stages): `gemini-2.5-flash`
-- Judge: `gemini-2.5-flash-lite`
-- Top-k: 15
-- Prompt: unified (no category-specific instructions)
-- Categories: all 5 (including adversarial)
-- Results: `benchmarks/gemini-2.5-flash-top15-unified-full/`
-
-**Overall accuracy: 73.9%** (1,467/1,986)
-
-Wilson 95% CI: [71.9%, 75.8%]
-
-| Category    | Correct | Total | Accuracy |
-|-------------|---------|-------|----------|
-| Single-hop  | 191     | 282   | 67.7%    |
-| Temporal    | 227     | 321   | 70.7%    |
-| Multi-hop   | 41      | 96    | 42.7%    |
-| Open-domain | 642     | 841   | 76.3%    |
-| Adversarial | 366     | 446   | 82.1%    |
-| **Overall (1--5)** | **1,467** | **1,986** | **73.9%** |
-
-### Run: Gemini 2.5 Flash (unified prompt, top-k=20, all categories)
+### Run: Gemini 2.5 Flash (top-k=20, all categories)
 
 **Configuration:**
-- Model (all stages): `gemini-2.5-flash`
-- Judge: `gemini-2.5-flash-lite`
+- Model (ingestion + answer gen): `gemini-2.5-flash`
+- Judge: `gemini-2.5-flash`
 - Top-k: 20
-- Prompt: unified (no category-specific instructions)
+- Prompt: unified (no category routing or per-category selection)
 - Categories: all 5 (including adversarial)
-- Results: `benchmarks/gemini-2.5-flash-top20-unified-full/`
+- Results: `benchmarks/gemini-2.5-flash-top20/`
 
-**Overall accuracy: 74.4%** (1,477/1,986)
+**Overall accuracy: 78.3%** (1,556/1,986)
 
-Wilson 95% CI: [72.4%, 76.2%]
+Wilson 95% CI: [76.5%, 80.1%]
 
 | Category    | Correct | Total | Accuracy |
 |-------------|---------|-------|----------|
-| Single-hop  | 196     | 282   | 69.5%    |
-| Temporal    | 220     | 321   | 68.5%    |
-| Multi-hop   | 47      | 96    | 49.0%    |
-| Open-domain | 651     | 841   | 77.4%    |
-| Adversarial | 363     | 446   | 81.4%    |
-| **Overall (1--5)** | **1,477** | **1,986** | **74.4%** |
+| Multi-hop   | 210     | 282   | 74.5%    |
+| Temporal    | 266     | 321   | 82.9%    |
+| Open-domain | 52      | 96    | 54.2%    |
+| Single-hop  | 655     | 841   | 77.9%    |
+| Adversarial | 373     | 446   | 83.6%    |
+| **Overall (1--5)** | **1,556** | **1,986** | **78.3%** |
 
 ## 6. Stress Test
 
@@ -483,33 +505,56 @@ then running all 1,986 questions against it.
 ### Run: Gemini 2.5 Flash stress test (top-k=15, all categories)
 
 **Configuration:**
-- Model (all stages): `gemini-2.5-flash`
-- Judge: `gemini-2.5-flash-lite`
+- Model (ingestion + answer gen): `gemini-2.5-flash`
+- Judge: `gemini-2.5-flash`
 - Top-k: 15
-- Total memories in store: 2,293 (from all 10 conversations)
+- Total memories in store: all 10 conversations combined
 - Categories: all 5 (including adversarial)
 - Results: `benchmarks/gemini-2.5-flash-top15-stress-test/`
 
-**Overall accuracy: 73.2%** (1,453/1,986)
+**Overall accuracy: 76.8%** (1,525/1,986)
 
 | Category    | Correct | Total | Accuracy |
 |-------------|---------|-------|----------|
-| Single-hop  | 181     | 282   | 64.2%    |
-| Temporal    | 219     | 321   | 68.2%    |
-| Multi-hop   | 45      | 96    | 46.9%    |
-| Open-domain | 641     | 841   | 76.2%    |
-| Adversarial | 367     | 446   | 82.3%    |
-| **Overall (1--5)** | **1,453** | **1,986** | **73.2%** |
+| Multi-hop   | 190     | 282   | 67.4%    |
+| Temporal    | 261     | 321   | 81.3%    |
+| Open-domain | 44      | 96    | 45.8%    |
+| Single-hop  | 652     | 841   | 77.5%    |
+| Adversarial | 378     | 446   | 84.8%    |
+| **Overall (1--5)** | **1,525** | **1,986** | **76.8%** |
+
+### Run: Gemini 2.5 Flash stress test (top-k=20, all categories)
+
+**Configuration:**
+- Model (ingestion + answer gen): `gemini-2.5-flash`
+- Judge: `gemini-2.5-flash`
+- Top-k: 20
+- Total memories in store: all 10 conversations combined
+- Categories: all 5 (including adversarial)
+- Results: `benchmarks/gemini-2.5-flash-top20-stress-test/`
+
+**Overall accuracy: 78.3%** (1,555/1,986)
+
+| Category    | Correct | Total | Accuracy |
+|-------------|---------|-------|----------|
+| Multi-hop   | 202     | 282   | 71.6%    |
+| Temporal    | 277     | 321   | 86.3%    |
+| Open-domain | 51      | 96    | 53.1%    |
+| Single-hop  | 656     | 841   | 78.0%    |
+| Adversarial | 369     | 446   | 82.7%    |
+| **Overall (1--5)** | **1,555** | **1,986** | **78.3%** |
 
 ### Accuracy retention
 
-| Mode | Memories | Accuracy | Delta |
-|------|----------|----------|-------|
-| Isolated (per-conversation) | ~200--500 each | 73.9% | -- |
-| Stress test (shared store) | 2,293 total | 73.2% | -0.7 pts |
+| Mode | top-k | Accuracy | Delta |
+|------|-------|----------|-------|
+| Isolated (per-conversation) | 15 | 77.4% | -- |
+| Stress test (shared store) | 15 | 76.8% | -0.6 pts |
+| Isolated (per-conversation) | 20 | 78.3% | -- |
+| Stress test (shared store) | 20 | 78.3% | 0.0 pts |
 
-With 5--10x more memories in the store, accuracy dropped by less than
-1 percentage point.
+With all 10 conversations in a single store, accuracy dropped by less than
+1 percentage point at top-k=15, and showed no drop at top-k=20.
 
 ## 7. Comparison
 
@@ -519,7 +564,7 @@ configurations, and scoring criteria were used by each system.
 
 | System              | Reported accuracy | Categories | Scoring method | Notes |
 |---------------------|-------------------|-----------|----------------|-------|
-| recalld             | 83.0%             | 1--5 (all) | LLM-as-judge, binary | Claude Sonnet 4; unified prompt; top-k=15 |
+| recalld             | 84.5%             | 1--5 (all) | LLM-as-judge, binary | Claude Sonnet 4.6; top-k=15 |
 | Mem0 (April 2026)   | 92.5%             | 1--4 only | LLM-as-judge   | Adversarial excluded |
 | ByteRover 2.0       | 92.2%             | 1--4 only | LLM-as-judge   | Adversarial excluded |
 | Human (original paper) | 87.9% F1       | 1--5 (all) | Token-level F1 | Different metric |
