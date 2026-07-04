@@ -340,6 +340,18 @@ claude mcp add --scope project recalld -- recalld mcp
 }
 ```
 
+When running recalld in Docker or on a remote server, use the URL transport instead:
+
+```json
+{
+  "mcpServers": {
+    "recalld": {
+      "url": "http://localhost:7680/mcp"
+    }
+  }
+}
+```
+
 When launched in MCP mode, recalld automatically connects to a running daemon. If no daemon is running, it auto-starts one. If the daemon cannot be started, it falls back to direct mode (in-process storage).
 
 Logs in MCP mode go to stderr (stdout is the protocol channel). Set log level with:
