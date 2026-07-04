@@ -8,9 +8,29 @@ The core is built on three subsystems: FSRS v4.5 spaced repetition to model memo
 
 ### 1. Install
 
+**Binary:**
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/calebevans/recalld/main/install.sh | bash
 ```
+
+**Docker / Podman:**
+
+```sh
+docker run -d -p 7680:7680 \
+  -e RECALLD_EMBEDDING_BASE_URL=http://host.docker.internal:11434 \
+  -v recalld-data:/data \
+  ghcr.io/calebevans/recalld
+```
+
+Or with Docker Compose (includes Ollama):
+
+```sh
+docker compose up -d
+docker compose exec ollama ollama pull embeddinggemma:300m
+```
+
+See [Docker deployment](#docker) for details.
 
 ### 2. Set up a local embedding model
 
@@ -34,16 +54,16 @@ See [docs/guide.md](docs/guide.md#2-embedding-setup) for OpenAI and other provid
 
 ### 3. Connect to Claude Code
 
-Register recalld as an MCP server (global, available in all projects):
+**Option A: stdio transport** (recalld launches as a subprocess):
 
 ```sh
 claude mcp add --scope user recalld -- recalld mcp
 ```
 
-Or for a single project only:
+**Option B: HTTP transport** (connect to a running server or Docker container):
 
 ```sh
-claude mcp add --scope project recalld -- recalld mcp
+claude mcp add --scope user --transport http recalld http://localhost:7680/mcp
 ```
 
 Then allow the MCP tools so Claude can use them without prompting each time. Add to your `~/.claude/settings.local.json` (global) or project `.claude/settings.local.json`:
@@ -155,13 +175,13 @@ See [docs/benchmark.md](docs/benchmark.md) for full methodology, per-category br
 
 ## Usage modes
 
-**MCP server** -- Runs as a Model Context Protocol server for AI tools like Claude Code. Exposes 9 tools: `store_memory`, `store_memories`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `list_memories`.
+**MCP server (stdio)** -- Runs as a Model Context Protocol server for AI tools like Claude Code. Exposes 9 tools: `store_memory`, `store_memories`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `list_memories`.
 
 ```sh
 recalld mcp
 ```
 
-**HTTP API** -- Runs a standalone HTTP server (default `127.0.0.1:7680`).
+**HTTP API** -- Runs a standalone HTTP server (default `127.0.0.1:7680`). Also exposes an MCP endpoint at `/mcp` using the streamable HTTP transport, so MCP clients can connect via URL.
 
 ```sh
 recalld serve
@@ -215,6 +235,55 @@ max_suppression = 0.15
 Additional sections: `[cache]`, `[log]`.
 
 See [docs/guide.md](docs/guide.md) for the full configuration reference, [docs/architecture.md](docs/architecture.md) for design details, and [docs/mcp.md](docs/mcp.md) for MCP integration including a ready-to-use prompt block for your `CLAUDE.md` or system prompt.
+
+## Docker
+
+Official images are published to GHCR at `ghcr.io/calebevans/recalld` for `linux/amd64` and `linux/arm64`. All configuration is done via environment variables (no config file needed).
+
+### With your host's Ollama
+
+```sh
+docker run -d -p 7680:7680 \
+  -e RECALLD_EMBEDDING_BASE_URL=http://host.docker.internal:11434 \
+  -v recalld-data:/data \
+  ghcr.io/calebevans/recalld
+```
+
+On Linux with Podman, add `--add-host=host.docker.internal:host-gateway`.
+
+### With Docker Compose
+
+The included `compose.yaml` runs recalld alongside Ollama:
+
+```sh
+docker compose up -d
+docker compose exec ollama ollama pull embeddinggemma:300m
+```
+
+Then connect Claude Code to the MCP endpoint:
+
+```sh
+claude mcp add --scope user --transport http recalld http://localhost:7680/mcp
+```
+
+### Podman
+
+The image and `compose.yaml` are compatible with Podman:
+
+```sh
+podman run -d -p 7680:7680 \
+  -e RECALLD_EMBEDDING_BASE_URL=http://host.docker.internal:11434 \
+  --add-host=host.docker.internal:host-gateway \
+  -v recalld-data:/data \
+  ghcr.io/calebevans/recalld
+```
+
+Or with Podman Compose:
+
+```sh
+podman compose up -d
+podman compose exec ollama ollama pull embeddinggemma:300m
+```
 
 ## Building from source
 

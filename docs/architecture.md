@@ -24,7 +24,8 @@ recalld is an AI memory system written in Rust. It stores observations, facts, a
 graph TD
     subgraph API["API Layer"]
         HTTP["HTTP (axum)"]
-        MCP["MCP (stdio)"]
+        MCP_STDIO["MCP (stdio)"]
+        MCP_HTTP["MCP (HTTP /mcp)"]
         DAEMON["Daemon (UDS)"]
     end
 
@@ -49,7 +50,8 @@ graph TD
     end
 
     HTTP --> ORCH
-    MCP --> ORCH
+    MCP_STDIO --> ORCH
+    MCP_HTTP --> ORCH
     DAEMON --> ORCH
     ORCH --> SEARCH
     ORCH --> GRAPH
@@ -668,12 +670,20 @@ recalld exposes the same core functionality through three transport layers:
 - In-flight request counting for graceful shutdown with 5s drain timeout.
 - SIGINT/SIGTERM handling for clean shutdown.
 
-### MCP Server (stdio)
+### MCP Server
 
+Two transports expose the same 9 MCP tools (`store_memory`, `store_memories`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `list_memories`) and memory resources:
+
+**Stdio** (`recalld mcp`):
 - Runs as a subprocess of an AI agent (Claude Code, Cursor, etc.).
-- Communicates via stdin/stdout using the Model Context Protocol.
-- Exposes 9 tools: `store_memory`, `store_memories` (batch), `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `list_memories`.
-- Exposes memory resources for MCP resource reads.
+- Communicates via stdin/stdout using newline-delimited JSON-RPC 2.0.
+
+**HTTP** (`recalld serve`, endpoint `/mcp`):
+- Runs alongside the REST API on the same port.
+- Implements the MCP streamable HTTP transport (spec 2025-03-26).
+- Session management via `Mcp-Session-Id` header.
+- Responds with `application/json` for requests, `202 Accepted` for notifications.
+- Recommended transport for Docker containers and remote servers.
 
 ### Daemon (Unix socket)
 

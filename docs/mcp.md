@@ -4,7 +4,9 @@
 
 ### Claude Code
 
-Register recalld as an MCP server using the CLI:
+Two transport options: stdio (recalld launches as a subprocess) or HTTP (connect to a running server or Docker container).
+
+**Stdio transport** (default, launches recalld as a subprocess):
 
 ```sh
 # Global (available in all projects)
@@ -19,6 +21,14 @@ If recalld is not on your PATH, use the full path:
 ```sh
 claude mcp add --scope user recalld -- /path/to/recalld mcp
 ```
+
+**HTTP transport** (connect to a running `recalld serve` instance or Docker container):
+
+```sh
+claude mcp add --scope user --transport http recalld http://localhost:7680/mcp
+```
+
+Use the HTTP transport when running recalld in Docker, on a remote server, or as a shared service.
 
 #### Allowing MCP tool permissions
 
@@ -54,15 +64,9 @@ When recalld starts in MCP mode, it walks up from the current working directory 
 
 ### Other MCP-compatible tools
 
-Any tool that supports MCP stdio transport can use recalld. The generic configuration:
+Any MCP client can use recalld via either transport.
 
-- **Command:** `recalld mcp`
-- **Transport:** stdio (stdin/stdout, JSON-RPC 2.0)
-- **Args:** optional `--log-level <level>` to set log verbosity (logs go to stderr)
-
-Configure per-project namespace defaults in a `.recalld.toml` file (see above), not CLI flags.
-
-Example for a generic MCP client config:
+**Stdio transport** (client launches recalld as a subprocess):
 
 ```json
 {
@@ -71,6 +75,20 @@ Example for a generic MCP client config:
   "transport": "stdio"
 }
 ```
+
+Optional: add `--log-level <level>` to `args` for debug logging (logs go to stderr).
+
+**HTTP transport** (connect to a running server):
+
+```json
+{
+  "url": "http://localhost:7680/mcp"
+}
+```
+
+The HTTP endpoint is available whenever `recalld serve` is running. It implements the MCP streamable HTTP transport with session management via the `Mcp-Session-Id` header.
+
+Configure per-project namespace defaults in a `.recalld.toml` file (see above), not CLI flags.
 
 ## Available tools
 

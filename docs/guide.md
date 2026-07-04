@@ -21,7 +21,7 @@ recalld is an AI memory system with spaced-repetition decay. It stores observati
 
 ## 1. Installation
 
-Supported platforms: macOS (x86_64, aarch64), Linux (x86_64, aarch64). Windows is not supported.
+Supported platforms: macOS (x86_64, aarch64), Linux (x86_64, aarch64). Windows is not supported. Docker images support `linux/amd64` and `linux/arm64`.
 
 ### One-liner install
 
@@ -311,7 +311,7 @@ The `namespace` field is required. All other sections are optional and replace t
 
 ## 4. Running recalld
 
-recalld has three run modes: MCP server (stdio), HTTP API server, and daemon.
+recalld has four run modes: MCP server (stdio), HTTP API server, daemon, and Docker container.
 
 ### As MCP server (for Claude Code / Cursor)
 
@@ -377,6 +377,28 @@ recalld serve --log-level debug
 
 The `--bind` flag sets the full address:port (e.g. `0.0.0.0:8080`). The `--port` flag overrides only the port portion of the bind address. You can also use the `RECALLD_BIND` and `RECALLD_PORT` environment variables.
 
+#### MCP over HTTP
+
+`recalld serve` also exposes an MCP endpoint at `/mcp` using the streamable HTTP transport. MCP clients can connect via URL instead of stdio:
+
+```sh
+claude mcp add --scope user --transport http recalld http://localhost:7680/mcp
+```
+
+Or in any MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "recalld": {
+      "url": "http://localhost:7680/mcp"
+    }
+  }
+}
+```
+
+This is the recommended transport when running recalld in a Docker container, on a remote server, or as a shared service.
+
 ### As daemon
 
 The daemon runs in the background, listening on a Unix socket (`~/.recalld/socket`). MCP clients connect to it via JSON-RPC 2.0. The daemon auto-shuts down after 30 minutes of inactivity by default.
@@ -397,6 +419,55 @@ recalld daemon status
 # Stop
 recalld daemon stop
 ```
+
+### Docker / Podman
+
+Official images are published to GHCR at `ghcr.io/calebevans/recalld` for `linux/amd64` and `linux/arm64`. All configuration is done via `RECALLD_*` environment variables (no config file needed).
+
+**With your host's Ollama:**
+
+```bash
+docker run -d -p 7680:7680 \
+  -e RECALLD_EMBEDDING_BASE_URL=http://host.docker.internal:11434 \
+  -v recalld-data:/data \
+  ghcr.io/calebevans/recalld
+```
+
+On Linux with Podman, add `--add-host=host.docker.internal:host-gateway` to reach the host network.
+
+**With Docker Compose** (includes Ollama):
+
+```bash
+docker compose up -d
+docker compose exec ollama ollama pull embeddinggemma:300m
+```
+
+The `compose.yaml` in the repo root starts both recalld and Ollama with persistent volumes. To use your host's Ollama instead of a containerized one, comment out the `ollama` service and set `RECALLD_EMBEDDING_BASE_URL` to `http://host.docker.internal:11434` (see the comments in `compose.yaml`).
+
+**Connect an MCP client:**
+
+```bash
+claude mcp add --scope user --transport http recalld http://localhost:7680/mcp
+```
+
+**Building locally:**
+
+```bash
+docker build -t recalld .
+```
+
+**Key environment variables for Docker:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RECALLD_BIND` | `0.0.0.0:7680` | Bind address (set by Dockerfile) |
+| `RECALLD_STORAGE_DATA_DIR` | `/data` | Data volume mount point (set by Dockerfile) |
+| `RECALLD_EMBEDDING_BASE_URL` | `http://localhost:11434` | Ollama URL (override for Docker networking) |
+| `RECALLD_EMBEDDING_PROVIDER` | `ollama` | Embedding provider |
+| `RECALLD_EMBEDDING_MODEL_NAME` | `embeddinggemma:300m` | Embedding model |
+| `RECALLD_EMBEDDING_DIMENSIONS` | `768` | Embedding dimensions |
+
+All other `RECALLD_*` env vars from the [Configuration Reference](#3-configuration-reference) work in Docker too.
 
 ---
 

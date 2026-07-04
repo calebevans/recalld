@@ -1,0 +1,43 @@
+# Works with: docker compose, podman compose
+#
+# Quick start:
+#   docker compose up -d
+#   docker compose exec ollama ollama pull embeddinggemma:300m
+#
+# Then connect Claude Code or any MCP client to:
+#   http://localhost:7680/mcp
+#
+# To use your HOST's Ollama instead of the containerized one:
+#   1. Comment out the ollama service and depends_on below
+#   2. Set RECALLD_EMBEDDING_BASE_URL to http://host.docker.internal:11434
+#   3. Uncomment the extra_hosts line
+#
+# To build from source instead of using the published image:
+#   Replace "image: ghcr.io/calebevans/recalld" with "build: ."
+
+services:
+  recalld:
+    image: ghcr.io/calebevans/recalld
+    ports:
+      - "7680:7680"
+    volumes:
+      - recalld-data:/data
+    environment:
+      RECALLD_EMBEDDING_BASE_URL: http://ollama:11434
+      RECALLD_EMBEDDING_PROVIDER: ollama
+      RECALLD_EMBEDDING_MODEL_NAME: embeddinggemma:300m
+      RECALLD_EMBEDDING_DIMENSIONS: "768"
+    depends_on:
+      - ollama
+    # Uncomment to reach your host's Ollama (works with Docker and Podman):
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama-data:/root/.ollama
+
+volumes:
+  recalld-data:
+  ollama-data:
