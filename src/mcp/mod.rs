@@ -4,20 +4,20 @@
 //! allowing AI agents (Claude Code, Cursor, etc.) to use Recalld
 //! as their memory system via the standard MCP protocol.
 
+pub mod http_transport;
 pub mod protocol;
 pub mod server;
 pub mod transport;
-pub mod http_transport;
 
 pub mod bridge;
 pub mod bridge_adapters;
 pub mod resources;
 pub mod tools;
 
+pub use http_transport::mcp_router;
 pub use protocol::*;
 pub use server::{McpHandler, McpServer};
 pub use transport::run_stdio;
-pub use http_transport::mcp_router;
 
 use thiserror::Error;
 

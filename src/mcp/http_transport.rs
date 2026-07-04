@@ -7,12 +7,11 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
-    Json,
 };
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -134,10 +133,7 @@ async fn handle_session_message(
     }
 }
 
-async fn handle_delete(
-    State(state): State<McpHttpState>,
-    headers: HeaderMap,
-) -> Response {
+async fn handle_delete(State(state): State<McpHttpState>, headers: HeaderMap) -> Response {
     let session_id = match headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()) {
         Some(id) => id.to_string(),
         None => return StatusCode::BAD_REQUEST.into_response(),
