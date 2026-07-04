@@ -111,8 +111,16 @@ impl ApiConfig {
 ///
 /// Returns an error if the TCP listener cannot bind or the server
 /// encounters an unrecoverable I/O error.
-pub async fn serve(state: AppState, config: ApiConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let app = router(state, &config);
+pub async fn serve(
+    state: AppState,
+    config: ApiConfig,
+    extra_router: Option<axum::Router>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rest = router(state, &config);
+    let app = match extra_router {
+        Some(extra) => extra.merge(rest),
+        None => rest,
+    };
 
     let addr: SocketAddr = format!("{}:{}", config.bind_address, config.port).parse()?;
 

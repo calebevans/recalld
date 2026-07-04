@@ -282,7 +282,9 @@ async fn async_main(cli: Cli) -> ExitCode {
     };
 
     match cli.command.unwrap_or_else(default_serve_command) {
-        Command::Serve { bind, port, .. } => run_serve(loaded.config, bind, port).await,
+        Command::Serve { bind, port, .. } => {
+            run_serve(loaded.config, bind, port, loaded.default_namespace).await
+        }
         Command::Mcp { .. } => run_mcp(loaded).await,
         Command::Daemon { action } => run_daemon(loaded.config, action).await,
         Command::Backup {
@@ -389,6 +391,7 @@ async fn run_serve(
     config: RecalldConfig,
     bind: std::net::SocketAddr,
     port: Option<u16>,
+    default_namespace: String,
 ) -> ExitCode {
     let bind = if let Some(p) = port {
         std::net::SocketAddr::new(bind.ip(), p)
@@ -437,8 +440,13 @@ async fn run_serve(
         recalld::api::AppState::new(search, storage, cache, graph, decay, namespaces, metrics)
     };
 
+    // Build MCP bridge and router for the /mcp endpoint.
+    let mcp_bridge = create_direct_mcp_bridge(&system, default_namespace);
+    let mcp_handler: Arc<dyn recalld::mcp::McpHandler> = Arc::new(mcp_bridge);
+    let mcp_router = recalld::mcp::mcp_router(mcp_handler);
+
     // Start the API server (blocks until shutdown signal).
-    match recalld::api::serve(app_state, api_config).await {
+    match recalld::api::serve(app_state, api_config, Some(mcp_router)).await {
         Ok(()) => {
             tracing::info!("API server exited cleanly");
         }

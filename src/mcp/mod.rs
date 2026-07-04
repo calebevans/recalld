@@ -7,6 +7,7 @@
 pub mod protocol;
 pub mod server;
 pub mod transport;
+pub mod http_transport;
 
 pub mod bridge;
 pub mod bridge_adapters;
@@ -16,6 +17,7 @@ pub mod tools;
 pub use protocol::*;
 pub use server::{McpHandler, McpServer};
 pub use transport::run_stdio;
+pub use http_transport::mcp_router;
 
 use thiserror::Error;
 
