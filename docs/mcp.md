@@ -704,6 +704,36 @@ Add these instructions to your AI assistant's system prompt or project instructi
 
 ### Ready-to-use prompt block
 
+A concise version that covers the essential behaviors. Shorter prompts tend to get better compliance from language models.
+
+````markdown
+# Memory
+
+Use recalld MCP tools for persistent memory across sessions. Recall at
+conversation start and store as things happen — don't wait to be asked.
+
+**Recall** when: starting a conversation, making recommendations, or the
+user references a prior session. **Store** when: a decision is made, a
+preference is expressed, feedback is given, or project context is learned.
+When unsure, store it — memories decay naturally if unused.
+
+Do NOT store: ephemeral task details, code snippets, or anything derivable
+from the codebase.
+
+**Writing good memories:** `summary` should be specific and searchable
+(include names, dates, key terms). Always include `entities` (canonical
+names), `topics` (1-5 keywords), and `tags` (hierarchical:
+`type/feedback`, `project/<name>`, `tech/<name>`). Use `supersedes` when
+correcting an existing memory.
+
+**Reinforce** useful memories (quality 3-4). Weaken wrong ones (quality 1)
+and store a corrected version.
+````
+
+### Extended prompt block
+
+If you want more detailed guidance (at the cost of longer prompt length), use this expanded version.
+
 ````markdown
 # Memory
 
@@ -729,78 +759,85 @@ memory needs a `summary` (concise, 1-2 sentences) and should include
 
 **What to store:**
 - User profile: role, expertise, preferences, communication style, team
-- Feedback on your approach: what worked, what the user corrected, and WHY —
-  capture the reasoning so you can apply it to novel situations, not just
-  the specific case
+- Feedback on your approach: what worked, what the user corrected, and WHY
 - Project context: architecture decisions, tech stack choices, constraints,
   conventions that aren't obvious from the code
 - Important decisions and their rationale
 - Team and org context: who owns what, reporting structure, stakeholders
-- Cross-session context the user shares (deadlines, relationships between
-  projects, priorities)
 
 **IMPORTANT:** Do not wait until the end of a conversation or until asked.
-Store memories as they arise. After every significant exchange (a decision
-is made, a preference is expressed, a project detail is learned, or a
-recommendation is accepted/rejected), store immediately. If you are unsure
-whether something is worth storing, store it. Memories decay over time if
-they are not reinforced.
+Store memories as they arise. If you are unsure whether something is worth
+storing, store it. Memories decay over time if they are not reinforced.
 
 **What NOT to store:**
-- Ephemeral task details (current branch, in-progress work, specific line
-  numbers)
+- Ephemeral task details (current branch, in-progress work)
 - Code snippets or file contents derivable from the codebase
-- Information that can be read from project files (package.json, Cargo.toml)
-- Things already documented in project README or docs
+- Information that can be read from project files
 
 **How to write good memories:**
-- `summary`: Concise but specific. Include names, dates, and key terms that
-  make the memory findable via semantic search. Bad: "User prefers a certain
-  style." Good: "User prefers single-line error handling with early returns
-  over nested match blocks in Rust."
-- `full_text`: Provide this for any memory where the summary alone would lose
-  important nuance. Include the reasoning, context, and direct quotes when
-  relevant. This field is dropped first during memory decay, so the summary
-  must stand on its own.
-- `entities`: ALL people, projects, tools, and proper nouns mentioned. Use
-  canonical names ("Kubernetes" not "k8s", "PostgreSQL" not "postgres").
-  These power the entity graph — missing entities means missing connections.
-- `topics`: 1-5 lowercase topic keywords. Examples: "deployment", "testing",
-  "authentication", "performance", "code-style". These are used for filtering.
-- `tags`: Use hierarchical tags for consistent categorization:
-  - `type/user-profile`, `type/feedback`, `type/project`, `type/decision`
-  - `project/<name>` for project-specific memories
-  - `tech/<name>` for technology-specific context
-
-**Supersedes:** When storing a correction or update to an existing memory,
-pass the old memory's ID as `supersedes`. This deprioritizes the outdated
-memory in search results while preserving the history.
+- `summary`: Specific and searchable. Include names, dates, and key terms.
+- `full_text`: Provide when the summary alone would lose important nuance.
+- `entities`: ALL people, projects, tools, and proper nouns. Use canonical
+  names. These power the entity graph.
+- `topics`: 1-5 lowercase keywords (e.g., "deployment", "testing").
+- `tags`: Hierarchical — `type/feedback`, `project/<name>`, `tech/<name>`.
+- `supersedes`: When correcting a memory, pass the old memory's ID here.
 
 ## When to reinforce
 
-- When you recall a memory and it turns out to be accurate and useful,
-  reinforce it (quality 3-4). This strengthens it so it persists longer.
-- When a recalled memory was partially wrong or hard to find, reinforce with
-  quality 2 (hard) — it still gets strengthened, just less.
-- When a recalled memory was completely wrong, reinforce with quality 1
-  (forgot) to weaken it, then store a corrected version with `supersedes`.
+- Recalled memory was useful: reinforce with quality 3-4.
+- Recalled memory was wrong: reinforce with quality 1 (weakens it), then
+  store the corrected version with `supersedes`.
 
 ## Search strategy
 
-When searching for memories, think about how the answer might be phrased in a
-stored memory, not just how the question is phrased.
-
-- For simple factual lookups ("what editor does the user prefer?"), a single
-  query with depth 1 is sufficient.
-- For questions requiring inference or combining facts ("would this user
-  prefer approach A or B?"), use depth 2 and search for the underlying
-  preferences and past decisions rather than the inference itself.
-- For broad context gathering ("what do I know about this project?"), use
-  depth 2-3 to traverse the memory graph.
-- When a query involves specific names or terms, include them in the search
-  even if they seem redundant — the full-text search index excels at exact
-  name matching.
+- Simple factual lookup: single query, depth 1.
+- Inference or combining facts: depth 2.
+- Broad context: depth 2-3.
+- Specific names or terms: include them in the query.
 ````
+
+### Reinforcing memory usage with hooks
+
+Prompt instructions tell the model *how* to use memory, but models don't always follow instructions consistently -- especially long ones competing with other system prompt content. Hooks provide a per-turn nudge that's harder to ignore.
+
+Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) are shell commands that run in response to lifecycle events. Their stdout is injected into the conversation context. Two hooks work well for memory:
+
+- **`UserPromptSubmit`** -- runs before the model responds to each user message. A good place to remind the model that memory tools are available.
+- **`Stop`** -- runs after the model finishes a turn. A good place to prompt for storing new memories.
+
+Add to your `~/.claude/settings.json` (or project `.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Could any stored memories be useful here? recalld tools: recall_memories, store_memory, reinforce_memory.'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Anything from this exchange worth remembering for next time? (store_memory)'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+These hooks are deliberately suggestive rather than commanding -- the model decides whether memories are relevant on each turn. This avoids unnecessary memory operations on simple tasks while ensuring the model doesn't forget that memory tools exist.
+
+**Tuning the wording:** If you find the model using memory too aggressively, soften the hooks (e.g., just list available tools). If it's still too sparse, make them more directive (e.g., "You MUST check recall_memories before responding").
 
 ### Adapting the prompt
 

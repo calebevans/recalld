@@ -93,64 +93,61 @@ Add the following to your `CLAUDE.md` (or equivalent prompt file) so your AI ass
 ````markdown
 # Memory
 
-Use the recalld MCP tools (`store_memory`, `recall_memories`, `get_memory`,
-`reinforce_memory`, `forget_memory`, `find_similar_memories`) for persistent
-memory across sessions.
+Use recalld MCP tools for persistent memory across sessions. Recall at
+conversation start and store as things happen — don't wait to be asked.
 
-## When to recall (proactive)
-
-- At the START of every conversation, recall memories relevant to the current
-  project or topic to establish context. Do not wait to be asked.
-- Before making recommendations, check for past preferences or decisions.
-- When the user references something from a previous conversation.
-
-## When to store (proactive)
-
-- User profile: role, expertise, preferences, communication style
-- Feedback on your approach: what worked, what was corrected, and WHY
-- Project context: architecture decisions, constraints, conventions not
-  obvious from the code
-- Important decisions and their rationale
-
-IMPORTANT: Do not wait until the end of a conversation or until asked.
-Store memories as they arise. After every significant exchange (a decision
-is made, a preference is expressed, a project detail is learned, or a
-recommendation is accepted/rejected), store immediately. If you are unsure
-whether something is worth storing, store it. Memories that aren't
-retrieved or reinforced will naturally decay over time.
+**Recall** when: starting a conversation, making recommendations, or the
+user references a prior session. **Store** when: a decision is made, a
+preference is expressed, feedback is given, or project context is learned.
+When unsure, store it — memories decay naturally if unused.
 
 Do NOT store: ephemeral task details, code snippets, or anything derivable
 from the codebase.
 
-## How to write good memories
+**Writing good memories:** `summary` should be specific and searchable
+(include names, dates, key terms). Always include `entities` (canonical
+names), `topics` (1-5 keywords), and `tags` (hierarchical:
+`type/feedback`, `project/<name>`, `tech/<name>`). Use `supersedes` when
+correcting an existing memory.
 
-- `summary`: Specific and searchable. Include names, dates, and key terms.
-  Bad: "User prefers a certain style." Good: "User prefers early returns
-  over nested match blocks in Rust."
-- `full_text`: Provide for any memory where the summary loses nuance.
-  Include reasoning, context, and direct quotes.
-- `entities`: ALL people, projects, tools, and proper nouns. Use canonical
-  names. These power the graph — missing entities means missing connections.
-- `topics`: 1-5 lowercase keywords (e.g., "deployment", "testing").
-- `tags`: Hierarchical — `type/feedback`, `type/project`, `project/<name>`,
-  `tech/<name>`.
-- `supersedes`: When correcting a memory, pass the old memory's ID here.
-
-## When to reinforce
-
-- Recalled memory was useful: reinforce with quality 3-4.
-- Recalled memory was wrong: reinforce with quality 1 (weakens it), then
-  store the corrected version with `supersedes`.
-
-## Search strategy
-
-- Simple factual lookup: single query, depth 1.
-- Inference or combining facts: depth 2, search for underlying facts rather
-  than the inference itself.
-- Broad context: depth 2-3.
-- Specific names or terms: include them in the query — full-text search
-  excels at exact matching.
+**Reinforce** useful memories (quality 3-4). Weaken wrong ones (quality 1)
+and store a corrected version.
 ````
+
+### 5. Improve memory usage with hooks (optional)
+
+Prompt instructions alone may not be enough to get consistent memory usage. Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) can inject gentle reminders on every turn so your assistant doesn't forget that memory tools are available.
+
+Add to your `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Could any stored memories be useful here? recalld tools: recall_memories, store_memory, reinforce_memory.'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Anything from this exchange worth remembering for next time? (store_memory)'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+These hooks are suggestive, not mandatory -- the model decides whether memories are relevant on each turn. The `UserPromptSubmit` hook nudges recall before responding, and the `Stop` hook nudges storage after finishing a task.
 
 ## Features
 
