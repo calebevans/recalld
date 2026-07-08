@@ -1,8 +1,8 @@
 //! MCP tool definitions and handlers for Recalld memory operations.
 //!
-//! Defines 9 tools: store_memory, store_memories, recall_memories, get_memory,
+//! Defines 10 tools: store_memory, store_memories, recall_memories, get_memory,
 //! reinforce_memory, forget_memory, find_similar_memories, create_namespace,
-//! list_memories.
+//! namespace_stats, list_memories.
 
 use serde_json::json;
 
@@ -24,6 +24,7 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
         forget_memory_def(),
         find_similar_memories_def(),
         create_namespace_def(),
+        namespace_stats_def(),
         list_memories_def(),
     ]
 }
@@ -43,6 +44,7 @@ pub async fn dispatch_tool(
         "forget_memory" => handle_forget_memory(bridge, arguments).await,
         "find_similar_memories" => handle_find_similar_memories(bridge, arguments).await,
         "create_namespace" => handle_create_namespace(bridge, arguments).await,
+        "namespace_stats" => handle_namespace_stats(bridge, arguments).await,
         "list_memories" => handle_list_memories(bridge, arguments).await,
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
     }
@@ -1163,7 +1165,58 @@ async fn handle_create_namespace(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Tool 9: list_memories
+// Tool 9: namespace_stats
+// ═══════════════════════════════════════════════════════════════════════
+
+fn namespace_stats_def() -> ToolInfo {
+    ToolInfo {
+        name: "namespace_stats".to_string(),
+        title: Some("Namespace Stats".to_string()),
+        description: "Get statistics for a memory namespace including total memory count, \
+            phase breakdown (full/summary/ghost), permastore count, average strength, \
+            edge count, and vector storage size. Use this to check how many memories \
+            exist or monitor namespace health."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "Namespace name to get stats for (default: \"default\")",
+                    "default": "default"
+                }
+            }
+        }),
+        annotations: Some(ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+async fn handle_namespace_stats(
+    bridge: &McpBridge,
+    arguments: serde_json::Value,
+) -> ToolCallResult {
+    let namespace = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| bridge.default_namespace().to_string());
+
+    match bridge.namespaces.namespace_stats(&namespace).await {
+        Ok(stats) => match ToolCallResult::json(&stats) {
+            Ok(r) => r,
+            Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+        },
+        Err(e) => ToolCallResult::error(format!("Failed to get namespace stats: {e}")),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tool 10: list_memories
 // ═══════════════════════════════════════════════════════════════════════
 
 fn list_memories_def() -> ToolInfo {
