@@ -104,6 +104,11 @@ pub trait StorageEngine: Send + Sync {
     /// Health probe: returns `true` if the storage engine can read/write.
     async fn ping(&self) -> bool;
 
+    /// Load the full_text for a memory from fulltext.dat.
+    ///
+    /// Returns `Ok(None)` if the memory has no full_text or doesn't exist.
+    async fn get_full_text(&self, id: MemoryId) -> Result<Option<String>, StorageError>;
+
     /// Iterate all records in creation order.
     async fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError>;
 

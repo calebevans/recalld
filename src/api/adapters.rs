@@ -419,6 +419,30 @@ impl state::StorageEngine for StorageEngineAdapter {
         Ok(filtered)
     }
 
+    async fn get_full_text(
+        &self,
+        id: MemoryId,
+    ) -> Result<Option<String>, crate::storage::StorageError> {
+        let storage_r = self.storage.read().map_err(|e| {
+            crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("storage lock poisoned: {e}"),
+            ))
+        })?;
+        let record = match storage_r.get_record(id)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if record.text_length == 0 {
+            return Ok(None);
+        }
+        let text_ref = crate::storage::TextRef {
+            file_offset: record.text_offset,
+            length: record.text_length,
+        };
+        storage_r.get_text(text_ref)
+    }
+
     async fn ping(&self) -> bool {
         self.storage.read().is_ok()
     }

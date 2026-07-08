@@ -145,7 +145,8 @@ pub async fn create_memory(
         .index_memory(memory.id, &embedding, ns.id)
         .await;
 
-    let response = MemoryResponse::from_cached(&memory, ns.name.clone());
+    let mut response = MemoryResponse::from_cached(&memory, ns.name.clone());
+    response.full_text = req.full_text;
     let took = start.elapsed().as_micros() as u64;
 
     Ok((
@@ -192,7 +193,8 @@ pub async fn get_memory(
         .name_for(record.namespace_id)
         .unwrap_or_else(|| "unknown".to_string());
 
-    let response = MemoryResponse::from_cached(&record, ns_name);
+    let mut response = MemoryResponse::from_cached(&record, ns_name);
+    response.full_text = state.storage.get_full_text(memory_id).await.unwrap_or(None);
     let took = start.elapsed().as_micros() as u64;
 
     Ok(Json(ApiResponse {
@@ -409,17 +411,17 @@ pub async fn list_memories(
     // Apply pagination
     let page_records: Vec<_> = records.into_iter().skip(offset).take(limit).collect();
 
-    // Convert to MemoryResponse objects
-    let memories: Vec<MemoryResponse> = page_records
-        .into_iter()
-        .map(|record| {
-            let ns_name = state
-                .namespaces
-                .name_for(record.namespace_id)
-                .unwrap_or_else(|| "unknown".to_string());
-            MemoryResponse::from_cached(&record, ns_name)
-        })
-        .collect();
+    // Convert to MemoryResponse objects, loading full_text from storage
+    let mut memories: Vec<MemoryResponse> = Vec::with_capacity(page_records.len());
+    for record in page_records {
+        let ns_name = state
+            .namespaces
+            .name_for(record.namespace_id)
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut mem = MemoryResponse::from_cached(&record, ns_name);
+        mem.full_text = state.storage.get_full_text(record.id).await.unwrap_or(None);
+        memories.push(mem);
+    }
 
     let has_more = (offset + memories.len()) < total as usize;
 
@@ -543,27 +545,27 @@ pub async fn search_memories(
         std::collections::HashMap::new()
     };
 
-    // Convert to API response
-    let hits: Vec<SearchHit> = results
-        .into_iter()
-        .map(|r| {
-            let ns_name = state
-                .namespaces
-                .name_for(r.memory.namespace_id)
-                .unwrap_or_else(|| "unknown".to_string());
-            let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
-            if req.include_embeddings {
-                mem.embedding = embeddings.get(&r.memory.id).cloned();
-            }
-            // Note: access_history is not held in CachedRecord (too
-            // large for the hot cache). If req.include_history is true,
-            // a full load from storage would be needed. Deferred to v2.
-            SearchHit {
-                memory: mem,
-                score: r.score,
-            }
-        })
-        .collect();
+    // Convert to API response, loading full_text from storage
+    let mut hits: Vec<SearchHit> = Vec::with_capacity(results.len());
+    for r in results {
+        let ns_name = state
+            .namespaces
+            .name_for(r.memory.namespace_id)
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
+        mem.full_text = state
+            .storage
+            .get_full_text(r.memory.id)
+            .await
+            .unwrap_or(None);
+        if req.include_embeddings {
+            mem.embedding = embeddings.get(&r.memory.id).cloned();
+        }
+        hits.push(SearchHit {
+            memory: mem,
+            score: r.score,
+        });
+    }
 
     let total = hits.len() as u64;
     let took = start.elapsed().as_micros() as u64;
@@ -636,26 +638,32 @@ pub async fn find_similar(
         std::collections::HashMap::new()
     };
 
-    // Exclude source memory from results
-    let hits: Vec<SearchHit> = results
+    // Exclude source memory from results, loading full_text from storage
+    let filtered: Vec<_> = results
         .into_iter()
         .filter(|r| r.memory.id != memory_id)
         .take(limit)
-        .map(|r| {
-            let ns_name = state
-                .namespaces
-                .name_for(r.memory.namespace_id)
-                .unwrap_or_else(|| "unknown".to_string());
-            let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
-            if req.include_embeddings {
-                mem.embedding = embeddings.get(&r.memory.id).cloned();
-            }
-            SearchHit {
-                memory: mem,
-                score: r.score,
-            }
-        })
         .collect();
+    let mut hits: Vec<SearchHit> = Vec::with_capacity(filtered.len());
+    for r in filtered {
+        let ns_name = state
+            .namespaces
+            .name_for(r.memory.namespace_id)
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
+        mem.full_text = state
+            .storage
+            .get_full_text(r.memory.id)
+            .await
+            .unwrap_or(None);
+        if req.include_embeddings {
+            mem.embedding = embeddings.get(&r.memory.id).cloned();
+        }
+        hits.push(SearchHit {
+            memory: mem,
+            score: r.score,
+        });
+    }
 
     let total = hits.len() as u64;
     let took = start.elapsed().as_micros() as u64;
