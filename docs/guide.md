@@ -33,7 +33,7 @@ This downloads the latest release binary for your platform and places it on your
 
 ### Build from source
 
-Requires Rust 1.87 or later. For local embeddings (no API key needed), you will also need [Ollama](https://ollama.com) -- see [Section 2](#2-embedding-setup).
+Requires Rust 1.94 or later. For local embeddings (no API key needed), you will also need [Ollama](https://ollama.com) -- see [Section 2](#2-embedding-setup).
 
 ```bash
 git clone https://github.com/calebevans/recalld.git
@@ -58,7 +58,7 @@ recalld-cli health
 
 ## 2. Embedding Setup
 
-recalld needs an embedding provider to convert text into vectors for semantic search. You must configure one before storing memories. Two options: OpenAI (remote API) or Ollama (local).
+recalld needs an embedding provider to convert text into vectors for semantic search. You must configure one before storing memories. Three options: OpenAI (remote API), Ollama (local), or AWS Bedrock.
 
 ### Option A: OpenAI (remote)
 
@@ -116,6 +116,35 @@ base_url = "http://localhost:11434"
 dimensions = 768
 ```
 
+### Option C: AWS Bedrock
+
+Requires the `bedrock` cargo feature (`cargo build --features bedrock`). Pre-built release binaries include this feature. Authentication uses the standard AWS credential chain (environment variables, `~/.aws/credentials`, IAM roles).
+
+1. Enable the embedding model in your AWS account via the [Bedrock console](https://console.aws.amazon.com/bedrock/).
+
+2. Configure your AWS credentials:
+
+```bash
+export AWS_ACCESS_KEY_ID="AKIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-east-1"
+```
+
+3. Configure `~/.recalld/config.toml`:
+
+```toml
+[embedding]
+provider = "bedrock"
+model_name = "amazon.titan-embed-text-v2:0"
+dimensions = 1024
+region = "us-east-1"
+```
+
+Supported model families:
+
+- **Amazon Titan Text Embeddings V2** (`amazon.titan-embed-text-v2:0`): dimensions 256, 512, or 1024. Single text per API call; batch requests are parallelized automatically.
+- **Cohere Embed v3** (`cohere.embed-english-v3`, `cohere.embed-multilingual-v3`): 1024 dimensions. Native batching up to 96 texts per call with asymmetric retrieval support.
+
 ### Choosing dimensions and models
 
 | Model | Provider | Dimensions | Notes |
@@ -125,6 +154,8 @@ dimensions = 768
 | `nomic-embed-text` | Ollama | 768 | Good local option. No API costs. |
 | `mxbai-embed-large` | Ollama | 1024 | Better quality, more RAM. |
 | `embeddinggemma` | Ollama | 768 | Google's model via Ollama. |
+| `amazon.titan-embed-text-v2:0` | Bedrock | 256/512/1024 | AWS managed, no infra to run. |
+| `cohere.embed-english-v3` | Bedrock | 1024 | Native batching, asymmetric retrieval. |
 
 Tradeoffs:
 
@@ -180,16 +211,17 @@ Embedding provider and model settings.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `provider` | string | `"ollama"` | Embedding provider: `"openai"`, `"ollama"`, or `"passthrough"`. |
+| `provider` | string | `"ollama"` | Embedding provider: `"openai"`, `"ollama"`, `"bedrock"`, or `"passthrough"`. |
 | `model_name` | string | `"embeddinggemma:300m"` | Model identifier (provider-specific). |
 | `api_key_env` | string | `"OPENAI_API_KEY"` | Name of the env var holding the API key (OpenAI provider only). |
-| `base_url` | string | `"http://localhost:11434"` | Base URL for the embedding API. |
+| `base_url` | string | `"http://localhost:11434"` | Base URL for the embedding API (not used by Bedrock). |
 | `dimensions` | usize | `768` | Embedding vector dimensionality. Fixed per namespace after creation. |
 | `batch_size` | usize | `64` | Maximum texts per API call. |
+| `region` | string | `"us-east-1"` | AWS region for the Bedrock provider. Ignored by other providers. |
 | `document_prefix` | string | `"title: none \| text: "` | Prefix prepended to text during memory storage. Set to `""` to disable. |
 | `query_prefix` | string | `"task: search result \| query: "` | Prefix prepended to text during search queries. Set to `""` to disable. |
 
-Env vars: `RECALLD_EMBEDDING_PROVIDER`, `RECALLD_EMBEDDING_MODEL_NAME`, `RECALLD_EMBEDDING_API_KEY_ENV`, `RECALLD_EMBEDDING_BASE_URL`, `RECALLD_EMBEDDING_DIMENSIONS`, `RECALLD_EMBEDDING_BATCH_SIZE`
+Env vars: `RECALLD_EMBEDDING_PROVIDER`, `RECALLD_EMBEDDING_MODEL_NAME`, `RECALLD_EMBEDDING_API_KEY_ENV`, `RECALLD_EMBEDDING_BASE_URL`, `RECALLD_EMBEDDING_DIMENSIONS`, `RECALLD_EMBEDDING_BATCH_SIZE`, `RECALLD_EMBEDDING_REGION`
 
 > **Note:** `document_prefix` and `query_prefix` can only be set via the TOML config file, not via environment variables.
 
@@ -475,9 +507,10 @@ docker build -t recalld .
 | `RECALLD_BIND` | `0.0.0.0:7680` | Bind address (set by Dockerfile) |
 | `RECALLD_STORAGE_DATA_DIR` | `/data` | Data volume mount point (set by Dockerfile) |
 | `RECALLD_EMBEDDING_BASE_URL` | `http://localhost:11434` | Ollama URL (override for Docker networking) |
-| `RECALLD_EMBEDDING_PROVIDER` | `ollama` | Embedding provider |
+| `RECALLD_EMBEDDING_PROVIDER` | `ollama` | Embedding provider (`ollama`, `openai`, `bedrock`) |
 | `RECALLD_EMBEDDING_MODEL_NAME` | `embeddinggemma:300m` | Embedding model |
 | `RECALLD_EMBEDDING_DIMENSIONS` | `768` | Embedding dimensions |
+| `RECALLD_EMBEDDING_REGION` | `us-east-1` | AWS region (Bedrock only) |
 
 All other `RECALLD_*` env vars from the [Configuration Reference](#3-configuration-reference) work in Docker too.
 

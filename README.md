@@ -206,7 +206,7 @@ recalld reads configuration from `recalld.toml` in the working directory or `~/.
 
 ```toml
 [embedding]
-provider = "ollama"          # ollama, openai, or passthrough
+provider = "ollama"          # ollama, openai, bedrock, or passthrough
 model_name = "embeddinggemma:300m"
 dimensions = 768
 
@@ -284,7 +284,7 @@ podman compose exec ollama ollama pull embeddinggemma:300m
 
 ## Building from source
 
-Requires Rust 1.87 or later.
+Requires Rust 1.94 or later.
 
 ```sh
 git clone https://github.com/calebevans/recalld.git
