@@ -47,6 +47,9 @@ pub struct EmbeddingConfig {
     /// apply (OpenAI: 30s, Ollama: 120s).
     pub timeout_secs: Option<u64>,
 
+    /// AWS region for Bedrock provider. If None, defaults to "us-east-1".
+    pub region: Option<String>,
+
     /// Whether to wrap the provider in a CachedProvider. Default: false.
     #[serde(default)]
     pub cache_embeddings: bool,
@@ -70,6 +73,9 @@ pub enum ProviderType {
     Ollama,
     /// Pre-computed embeddings supplied by the caller.
     Passthrough,
+    /// AWS Bedrock (Titan Embeddings, Cohere Embed).
+    #[cfg(feature = "bedrock")]
+    Bedrock,
 }
 
 /// Construct the appropriate provider from configuration.
@@ -85,7 +91,7 @@ pub enum ProviderType {
 /// before delegating. Since the prefixed text (e.g., "search_document: X"
 /// vs "search_query: X") is what reaches the cache, document and query
 /// embeddings of the same raw text produce different cache keys.
-pub fn build_provider(
+pub async fn build_provider(
     config: &EmbeddingConfig,
     document_prefix: &str,
     query_prefix: &str,
@@ -144,6 +150,30 @@ pub fn build_provider(
             );
 
             Box::new(PassthroughProvider::new(config.dimensions))
+        }
+
+        #[cfg(feature = "bedrock")]
+        ProviderType::Bedrock => {
+            let region = config
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string());
+
+            let provider = crate::embedding::bedrock::BedrockProvider::new(
+                config.model.clone(),
+                config.dimensions,
+                region,
+            )
+            .await?;
+
+            info!(
+                provider = "bedrock",
+                model = %config.model,
+                dimensions = config.dimensions,
+                "Built Bedrock embedding provider"
+            );
+
+            Box::new(provider)
         }
     };
 

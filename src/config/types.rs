@@ -183,6 +183,10 @@ pub struct EmbeddingConfig {
     /// Maximum number of texts to embed in a single API call.
     pub batch_size: usize,
 
+    /// AWS region for Bedrock provider.
+    #[serde(default = "default_bedrock_region")]
+    pub region: String,
+
     /// Prefix prepended to text before embedding during memory ingest.
     /// Applied by PrefixedProvider to every `embed()` / `embed_batch()` call.
     ///
@@ -198,6 +202,10 @@ pub struct EmbeddingConfig {
     pub query_prefix: String,
 }
 
+fn default_bedrock_region() -> String {
+    "us-east-1".to_string()
+}
+
 /// Supported embedding providers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -208,6 +216,8 @@ pub enum EmbeddingProvider {
     Ollama,
     /// Pre-computed embeddings supplied by the caller.
     Passthrough,
+    /// AWS Bedrock (Titan Embeddings, Cohere Embed).
+    Bedrock,
 }
 
 impl Default for EmbeddingConfig {
@@ -219,6 +229,7 @@ impl Default for EmbeddingConfig {
             base_url: "http://localhost:11434".to_string(),
             dimensions: 768,
             batch_size: 64,
+            region: default_bedrock_region(),
             document_prefix: "title: none | text: ".to_string(),
             query_prefix: "task: search result | query: ".to_string(),
         }

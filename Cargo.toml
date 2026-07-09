@@ -23,6 +23,7 @@ path = "src/lib.rs"
 [features]
 default = []
 bench = []
+bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime"]
 
 [dependencies]
 # ── Async runtime & networking ────────────────────────────────────
@@ -82,6 +83,10 @@ async-trait = "0.1"
 
 # ── Full-text search ─────────────────────────────────────────────
 rusqlite    = { version = "0.35", features = ["bundled"] }
+
+# ── AWS (Bedrock embedding provider, optional) ──────────────────
+aws-config  = { version = "1.1", features = ["behavior-version-latest"], optional = true }
+aws-sdk-bedrockruntime = { version = "1", optional = true }
 
 # ── Misc ─────────────────────────────────────────────────────────
 rand        = "0.8"

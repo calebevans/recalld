@@ -263,10 +263,18 @@ impl RecalldConfig {
         }
         if self.embedding.base_url.is_empty()
             && self.embedding.provider != EmbeddingProvider::Passthrough
+            && self.embedding.provider != EmbeddingProvider::Bedrock
         {
             errors.push(ConfigError::Validation {
                 field: "embedding.base_url".into(),
                 message: "must not be empty".into(),
+            });
+        }
+        if self.embedding.provider == EmbeddingProvider::Bedrock && self.embedding.region.is_empty()
+        {
+            errors.push(ConfigError::Validation {
+                field: "embedding.region".into(),
+                message: "must not be empty when provider is bedrock".into(),
             });
         }
 

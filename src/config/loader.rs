@@ -416,10 +416,11 @@ fn apply_env_overrides(config: &mut RecalldConfig) -> std::result::Result<(), Ve
             "openai" => config.embedding.provider = EmbeddingProvider::OpenAI,
             "ollama" => config.embedding.provider = EmbeddingProvider::Ollama,
             "passthrough" => config.embedding.provider = EmbeddingProvider::Passthrough,
+            "bedrock" => config.embedding.provider = EmbeddingProvider::Bedrock,
             _ => errors.push(ConfigError::EnvVarInvalid {
                 var: "RECALLD_EMBEDDING_PROVIDER".into(),
                 message: format!(
-                    "'{}' is not a valid provider (openai, ollama, passthrough)",
+                    "'{}' is not a valid provider (openai, ollama, bedrock, passthrough)",
                     val
                 ),
             }),
@@ -441,6 +442,7 @@ fn apply_env_overrides(config: &mut RecalldConfig) -> std::result::Result<(), Ve
         config.embedding.batch_size,
         usize
     );
+    env_override_string!("RECALLD_EMBEDDING_REGION", config.embedding.region);
 
     // --- Graph ---
     env_override!(
@@ -564,12 +566,13 @@ pub fn generate_default_config() -> String {
 # warm_file_enabled = true
 
 [embedding]
-# provider = "openai"                # "openai", "ollama", or "passthrough"
+# provider = "openai"                # "openai", "ollama", "bedrock", or "passthrough"
 # model_name = "text-embedding-3-small"
 # api_key_env = "OPENAI_API_KEY"     # env var holding the key (NOT the key itself)
 # base_url = "https://api.openai.com/v1"
 # dimensions = 1536
 # batch_size = 64
+# region = "us-east-1"               # AWS region (bedrock only)
 
 [graph]
 # max_auto_links = 15

@@ -12,6 +12,9 @@ mod passthrough;
 mod prefix;
 mod provider;
 
+#[cfg(feature = "bedrock")]
+mod bedrock;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -21,6 +24,9 @@ pub use openai::OpenAIProvider;
 pub use passthrough::PassthroughProvider;
 pub use prefix::PrefixedProvider;
 pub use provider::{EmbeddingConfig, ProviderType, build_provider};
+
+#[cfg(feature = "bedrock")]
+pub use bedrock::BedrockProvider;
 
 /// Errors that can occur during embedding operations.
 #[derive(Debug, Error)]
