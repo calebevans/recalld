@@ -2,7 +2,7 @@
 name = "recalld"
 version = "0.1.6"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.94"
 description = "AI memory system"
 license = ""
 default-run = "recalld"
