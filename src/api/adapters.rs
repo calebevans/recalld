@@ -232,15 +232,33 @@ impl state::StorageEngine for StorageEngineAdapter {
             text_length: 0,
         };
 
-        {
-            let mut storage_w = self.storage.write().map_err(|e| {
+        let storage = self.storage.clone();
+        let embedding_vec = embedding.to_vec();
+        let full_text_owned = full_text.map(|s| s.to_string());
+
+        let record = tokio::task::spawn_blocking(move || {
+            let mut storage_w = storage.write().map_err(|e| {
                 crate::storage::StorageError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("storage lock poisoned: {e}"),
                 ))
             })?;
-            storage_w.insert_memory(id, namespace_id, &mut record, embedding, full_text)?;
-        }
+            storage_w.insert_memory(
+                id,
+                namespace_id,
+                &mut record,
+                &embedding_vec,
+                full_text_owned.as_deref(),
+            )?;
+            Ok::<_, crate::storage::StorageError>(record)
+        })
+        .await
+        .map_err(|e| {
+            crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("blocking task join error: {e}"),
+            ))
+        })??;
 
         let cached = CachedRecord::from(&record);
         self.cache.insert(id, cached.clone()).await;
@@ -248,22 +266,38 @@ impl state::StorageEngine for StorageEngineAdapter {
     }
 
     async fn get_record(&self, id: MemoryId) -> Option<DiskRecord> {
-        let storage_r = self.storage.read().ok()?;
-        storage_r.get_record(id).ok().flatten()
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage.read().ok()?;
+            storage_r.get_record(id).ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, crate::storage::StorageError> {
-        // Read the existing record to get namespace and vector slot info,
-        // and to short-circuit if already tombstoned or missing.
-        let existing_record = {
-            let storage_r = self.storage.read().map_err(|e| {
-                crate::storage::StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("storage lock poisoned: {e}"),
-                ))
-            })?;
-            storage_r.get_record(id)?
-        };
+        let storage = self.storage.clone();
+
+        let existing_record = tokio::task::spawn_blocking({
+            let storage = storage.clone();
+            move || {
+                let storage_r = storage.read().map_err(|e| {
+                    crate::storage::StorageError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("storage lock poisoned: {e}"),
+                    ))
+                })?;
+                storage_r.get_record(id)
+            }
+        })
+        .await
+        .map_err(|e| {
+            crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("blocking task join error: {e}"),
+            ))
+        })??;
 
         let Some(existing_record) = existing_record else {
             return Ok(false);
@@ -273,35 +307,46 @@ impl state::StorageEngine for StorageEngineAdapter {
             return Ok(false);
         }
 
-        // Tombstone the record (preserves graph edges).
-        {
-            let storage_r = self.storage.read().map_err(|e| {
-                crate::storage::StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("storage lock poisoned: {e}"),
-                ))
-            })?;
-            storage_r.tombstone_memory(id)?;
-        }
-
-        // Free the vector slot on disk.
-        {
-            let mut storage_w = self.storage.write().map_err(|e| {
-                crate::storage::StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("storage lock poisoned: {e}"),
-                ))
-            })?;
-            let ns_id = NamespaceId::new(existing_record.namespace_id);
-            if let Err(e) = storage_w.free_vector_slot(ns_id, existing_record.vector_slot) {
-                tracing::warn!(
-                    memory_id = %id,
-                    vector_slot = existing_record.vector_slot,
-                    %e,
-                    "vector slot free failed (non-fatal)"
-                );
+        // Tombstone the record and free the vector slot in a single blocking task.
+        tokio::task::spawn_blocking({
+            let storage = storage.clone();
+            move || {
+                {
+                    let storage_r = storage.read().map_err(|e| {
+                        crate::storage::StorageError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("storage lock poisoned: {e}"),
+                        ))
+                    })?;
+                    storage_r.tombstone_memory(id)?;
+                }
+                {
+                    let mut storage_w = storage.write().map_err(|e| {
+                        crate::storage::StorageError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("storage lock poisoned: {e}"),
+                        ))
+                    })?;
+                    let ns_id = NamespaceId::new(existing_record.namespace_id);
+                    if let Err(e) = storage_w.free_vector_slot(ns_id, existing_record.vector_slot) {
+                        tracing::warn!(
+                            memory_id = %id,
+                            vector_slot = existing_record.vector_slot,
+                            %e,
+                            "vector slot free failed (non-fatal)"
+                        );
+                    }
+                }
+                Ok::<_, crate::storage::StorageError>(())
             }
-        }
+        })
+        .await
+        .map_err(|e| {
+            crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("blocking task join error: {e}"),
+            ))
+        })??;
 
         self.cache.invalidate(id).await;
         Ok(true)
@@ -311,178 +356,238 @@ impl state::StorageEngine for StorageEngineAdapter {
         &self,
         namespace_id: NamespaceId,
     ) -> Result<state::NamespaceStats, crate::storage::StorageError> {
-        let storage_r = self.storage.read().map_err(|e| {
+        let storage = self.storage.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("storage lock poisoned: {e}"),
+                ))
+            })?;
+
+            let all_records = storage_r.scan_all()?;
+
+            let mut memory_count: u64 = 0;
+            let mut phase_1_count: u64 = 0;
+            let mut phase_2_count: u64 = 0;
+            let mut phase_3_count: u64 = 0;
+            let mut permastore_count: u64 = 0;
+            let mut strength_sum: f64 = 0.0;
+            let mut edge_count: u64 = 0;
+
+            for (_id, record) in &all_records {
+                if NamespaceId::new(record.namespace_id) != namespace_id {
+                    continue;
+                }
+                memory_count += 1;
+
+                match record.phase {
+                    DecayPhase::Full => phase_1_count += 1,
+                    DecayPhase::Summary => phase_2_count += 1,
+                    DecayPhase::Ghost => phase_3_count += 1,
+                    DecayPhase::Tombstone => {}
+                }
+
+                if record.is_permastore != 0 {
+                    permastore_count += 1;
+                }
+
+                strength_sum += record.decay_strength as f64;
+                edge_count += record.edge_count as u64;
+            }
+
+            let avg_strength = if memory_count > 0 {
+                (strength_sum / memory_count as f64) as f32
+            } else {
+                0.0
+            };
+
+            Ok(state::NamespaceStats {
+                memory_count,
+                phase_1_count,
+                phase_2_count,
+                phase_3_count,
+                permastore_count,
+                avg_strength,
+                edge_count,
+            })
+        })
+        .await
+        .map_err(|e| {
             crate::storage::StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("storage lock poisoned: {e}"),
+                format!("blocking task join error: {e}"),
             ))
-        })?;
-
-        let all_records = storage_r.scan_all()?;
-
-        let mut memory_count: u64 = 0;
-        let mut phase_1_count: u64 = 0;
-        let mut phase_2_count: u64 = 0;
-        let mut phase_3_count: u64 = 0;
-        let mut permastore_count: u64 = 0;
-        let mut strength_sum: f64 = 0.0;
-        let mut edge_count: u64 = 0;
-
-        for (_id, record) in &all_records {
-            if NamespaceId::new(record.namespace_id) != namespace_id {
-                continue;
-            }
-            memory_count += 1;
-
-            match record.phase {
-                DecayPhase::Full => phase_1_count += 1,
-                DecayPhase::Summary => phase_2_count += 1,
-                DecayPhase::Ghost => phase_3_count += 1,
-                DecayPhase::Tombstone => {} // tombstones are not counted in phase stats
-            }
-
-            if record.is_permastore != 0 {
-                permastore_count += 1;
-            }
-
-            strength_sum += record.decay_strength as f64;
-            edge_count += record.edge_count as u64;
-        }
-
-        let avg_strength = if memory_count > 0 {
-            (strength_sum / memory_count as f64) as f32
-        } else {
-            0.0
-        };
-
-        Ok(state::NamespaceStats {
-            memory_count,
-            phase_1_count,
-            phase_2_count,
-            phase_3_count,
-            permastore_count,
-            avg_strength,
-            edge_count,
-        })
+        })?
     }
 
     async fn list_memories(
         &self,
         filter: &crate::api::models::ListFilter,
     ) -> Result<Vec<CachedRecord>, crate::storage::StorageError> {
-        let storage_r = self.storage.read().map_err(|e| {
+        let storage = self.storage.clone();
+        let filter = filter.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("storage lock poisoned: {e}"),
+                ))
+            })?;
+
+            let all_records = storage_r.scan_all()?;
+
+            let filtered: Vec<CachedRecord> = all_records
+                .into_iter()
+                .filter(|(_id, record)| {
+                    if record.phase == DecayPhase::Tombstone {
+                        return false;
+                    }
+                    if let Some(ns_id) = filter.namespace_id {
+                        if NamespaceId::new(record.namespace_id) != ns_id {
+                            return false;
+                        }
+                    }
+                    if let Some(phase) = filter.phase {
+                        if record.phase != phase {
+                            return false;
+                        }
+                    }
+                    if !filter.tags.is_empty()
+                        && !filter
+                            .tags
+                            .iter()
+                            .all(|tag| record.tags.iter().any(|t| t.as_str() == tag))
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .map(|(_id, disk_record)| CachedRecord::from(&disk_record))
+                .collect();
+
+            Ok(filtered)
+        })
+        .await
+        .map_err(|e| {
             crate::storage::StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("storage lock poisoned: {e}"),
+                format!("blocking task join error: {e}"),
             ))
-        })?;
-
-        let all_records = storage_r.scan_all()?;
-
-        let filtered: Vec<CachedRecord> = all_records
-            .into_iter()
-            .filter(|(_id, record)| {
-                // Exclude tombstoned records from listings.
-                if record.phase == DecayPhase::Tombstone {
-                    return false;
-                }
-
-                // Filter by namespace
-                if let Some(ns_id) = filter.namespace_id {
-                    if NamespaceId::new(record.namespace_id) != ns_id {
-                        return false;
-                    }
-                }
-
-                // Filter by phase
-                if let Some(phase) = filter.phase {
-                    if record.phase != phase {
-                        return false;
-                    }
-                }
-
-                // Filter by tags (AND logic: must have ALL)
-                if !filter.tags.is_empty()
-                    && !filter
-                        .tags
-                        .iter()
-                        .all(|tag| record.tags.iter().any(|t| t.as_str() == tag))
-                {
-                    return false;
-                }
-
-                true
-            })
-            .map(|(_id, disk_record)| CachedRecord::from(&disk_record))
-            .collect();
-
-        Ok(filtered)
+        })?
     }
 
     async fn get_full_text(
         &self,
         id: MemoryId,
     ) -> Result<Option<String>, crate::storage::StorageError> {
-        let storage_r = self.storage.read().map_err(|e| {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("storage lock poisoned: {e}"),
+                ))
+            })?;
+            let record = match storage_r.get_record(id)? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            if record.text_length == 0 {
+                return Ok(None);
+            }
+            let text_ref = crate::storage::TextRef {
+                file_offset: record.text_offset,
+                length: record.text_length,
+            };
+            storage_r.get_text(text_ref)
+        })
+        .await
+        .map_err(|e| {
             crate::storage::StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("storage lock poisoned: {e}"),
+                format!("blocking task join error: {e}"),
             ))
-        })?;
-        let record = match storage_r.get_record(id)? {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-        if record.text_length == 0 {
-            return Ok(None);
-        }
-        let text_ref = crate::storage::TextRef {
-            file_offset: record.text_offset,
-            length: record.text_length,
-        };
-        storage_r.get_text(text_ref)
+        })?
     }
 
     async fn ping(&self) -> bool {
-        self.storage.read().is_ok()
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || storage.read().is_ok())
+            .await
+            .unwrap_or(false)
     }
 
     async fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, crate::storage::StorageError> {
-        let storage_r = self.storage.read().map_err(|e| {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("storage lock poisoned: {e}"),
+                ))
+            })?;
+            storage_r.scan_all()
+        })
+        .await
+        .map_err(|e| {
             crate::storage::StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("storage lock poisoned: {e}"),
+                format!("blocking task join error: {e}"),
             ))
-        })?;
-        storage_r.scan_all()
+        })?
     }
 
     async fn scan_phase_records(
         &self,
         phase: DecayPhase,
     ) -> Result<Vec<(MemoryId, DiskRecord)>, crate::storage::StorageError> {
-        let storage_r = self.storage.read().map_err(|e| {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("storage lock poisoned: {e}"),
+                ))
+            })?;
+            storage_r.scan_phase_records(phase)
+        })
+        .await
+        .map_err(|e| {
             crate::storage::StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("storage lock poisoned: {e}"),
+                format!("blocking task join error: {e}"),
             ))
-        })?;
-        storage_r.scan_phase_records(phase)
+        })?
     }
 
     async fn list_tags(&self) -> Result<Vec<(String, u64)>, crate::storage::StorageError> {
-        let storage_r = self.storage.read().map_err(|e| {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("storage lock poisoned: {e}"),
+                ))
+            })?;
+            storage_r.list_tags()
+        })
+        .await
+        .map_err(|e| {
             crate::storage::StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("storage lock poisoned: {e}"),
+                format!("blocking task join error: {e}"),
             ))
-        })?;
-        storage_r.list_tags()
+        })?
     }
 
     fn storage_path(&self) -> PathBuf {
-        let storage_r = self.storage.read().expect("storage lock not poisoned");
-        storage_r.db_path().to_path_buf()
+        tokio::task::block_in_place(|| {
+            let storage_r = self.storage.read().expect("storage lock not poisoned");
+            storage_r.db_path().to_path_buf()
+        })
     }
 }
 
@@ -613,9 +718,13 @@ impl FsrsEngineAdapter {
 impl state::FsrsEngine for FsrsEngineAdapter {
     async fn record_access(&self, id: MemoryId, kind: AccessKind) {
         let now = chrono::Utc::now().timestamp_millis();
-        if let Ok(storage_r) = self.storage.read() {
-            let _ = storage_r.update_access(id, now, kind);
-        }
+        let storage = self.storage.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(storage_r) = storage.read() {
+                let _ = storage_r.update_access(id, now, kind);
+            }
+        })
+        .await;
     }
 
     async fn reinforce(
@@ -661,56 +770,67 @@ impl NamespaceRegistryAdapter {
 #[async_trait]
 impl state::NamespaceRegistry for NamespaceRegistryAdapter {
     fn resolve(&self, name: &str) -> Option<NamespaceConfig> {
-        let storage_r = self.storage.read().ok()?;
-        storage_r.get_namespace_by_name(name).ok().flatten()
+        tokio::task::block_in_place(|| {
+            let storage_r = self.storage.read().ok()?;
+            storage_r.get_namespace_by_name(name).ok().flatten()
+        })
     }
 
     fn get_by_id(&self, id: u32) -> Option<NamespaceConfig> {
-        let storage_r = self.storage.read().ok()?;
-        storage_r.get_namespace(NamespaceId::new(id)).ok().flatten()
+        tokio::task::block_in_place(|| {
+            let storage_r = self.storage.read().ok()?;
+            storage_r.get_namespace(NamespaceId::new(id)).ok().flatten()
+        })
     }
 
     fn name_for(&self, id: NamespaceId) -> Option<String> {
-        let storage_r = self.storage.read().ok()?;
-        storage_r
-            .get_namespace(id)
-            .ok()
-            .flatten()
-            .map(|ns| ns.name.clone())
+        tokio::task::block_in_place(|| {
+            let storage_r = self.storage.read().ok()?;
+            storage_r
+                .get_namespace(id)
+                .ok()
+                .flatten()
+                .map(|ns| ns.name.clone())
+        })
     }
 
     async fn list_all(&self) -> Vec<state::NamespaceListInfo> {
-        let storage_r = match self.storage.read() {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        let storage = self.storage.clone();
 
-        let namespaces = match storage_r.list_namespaces() {
-            Ok(ns) => ns,
-            Err(_) => return Vec::new(),
-        };
+        tokio::task::spawn_blocking(move || {
+            let storage_r = match storage.read() {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
 
-        // Count memories per namespace in a single scan.
-        let mut counts = std::collections::HashMap::<u32, u64>::new();
-        if let Ok(all_records) = storage_r.scan_all() {
-            for (_id, record) in &all_records {
-                *counts.entry(record.namespace_id).or_default() += 1;
-            }
-        }
+            let namespaces = match storage_r.list_namespaces() {
+                Ok(ns) => ns,
+                Err(_) => return Vec::new(),
+            };
 
-        namespaces
-            .into_iter()
-            .map(|ns| {
-                let memory_count = counts.get(&ns.id.get()).copied().unwrap_or(0);
-                state::NamespaceListInfo {
-                    id: ns.id.get(),
-                    name: ns.name.clone(),
-                    embedding_dim: ns.embedding_dim,
-                    memory_count,
-                    created_at: ns.created_at,
+            let mut counts = std::collections::HashMap::<u32, u64>::new();
+            if let Ok(all_records) = storage_r.scan_all() {
+                for (_id, record) in &all_records {
+                    *counts.entry(record.namespace_id).or_default() += 1;
                 }
-            })
-            .collect()
+            }
+
+            namespaces
+                .into_iter()
+                .map(|ns| {
+                    let memory_count = counts.get(&ns.id.get()).copied().unwrap_or(0);
+                    state::NamespaceListInfo {
+                        id: ns.id.get(),
+                        name: ns.name.clone(),
+                        embedding_dim: ns.embedding_dim,
+                        memory_count,
+                        created_at: ns.created_at,
+                    }
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn create(
@@ -722,7 +842,7 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
     ) -> Result<NamespaceConfig, Box<dyn std::error::Error + Send + Sync>> {
         let now = chrono::Utc::now().timestamp_millis();
         let ns_config = NamespaceConfig {
-            id: NamespaceId::UNSET, // will be assigned by storage
+            id: NamespaceId::UNSET,
             name: name.to_string(),
             embedding_dim,
             initial_stability,
@@ -733,17 +853,28 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
             desired_retention,
             decay_rate_multiplier: None,
         };
-        let mut storage_w = self.storage.write().map_err(|e| {
+
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage_w = storage.write().map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("storage lock poisoned: {e}"),
+                )) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+            let assigned_id = storage_w.create_namespace(&ns_config)?;
+            Ok(NamespaceConfig {
+                id: assigned_id,
+                ..ns_config
+            })
+        })
+        .await
+        .map_err(|e| {
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("storage lock poisoned: {e}"),
+                format!("blocking task join error: {e}"),
             )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-        let assigned_id = storage_w.create_namespace(&ns_config)?;
-        Ok(NamespaceConfig {
-            id: assigned_id,
-            ..ns_config
-        })
+        })?
     }
 }
 

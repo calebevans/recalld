@@ -122,18 +122,18 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             .map_err(|e| bridge::BridgeError::Search(e.to_string()))?;
 
         let full_texts: std::collections::HashMap<crate::model::MemoryId, String> = {
-            let mut storage_w = self.storage.write().map_err(|e| {
+            let storage_r = self.storage.read().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
             })?;
             let mut map = std::collections::HashMap::new();
             for r in &response.results {
-                if let Ok(Some(disk)) = storage_w.get_record(r.memory_id) {
+                if let Ok(Some(disk)) = storage_r.get_record(r.memory_id) {
                     if disk.text_length > 0 {
                         let text_ref = crate::storage::TextRef {
                             file_offset: disk.text_offset,
                             length: disk.text_length,
                         };
-                        if let Ok(Some(text)) = storage_w.get_text(text_ref) {
+                        if let Ok(Some(text)) = storage_r.get_text(text_ref) {
                             map.insert(r.memory_id, text);
                         }
                     }
@@ -250,14 +250,14 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             .collect();
 
         let neighbors: Vec<bridge::NeighborMemory> = {
-            let mut storage_w = self.storage.write().map_err(|e| {
+            let storage_r = self.storage.read().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
             })?;
 
             sorted
                 .into_iter()
                 .filter_map(|(mid, weight, edge_type, connected_to)| {
-                    let disk = storage_w.get_record(mid).ok()??;
+                    let disk = storage_r.get_record(mid).ok()??;
                     if disk.summary.is_empty() {
                         return None;
                     }
@@ -266,7 +266,7 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                             file_offset: disk.text_offset,
                             length: disk.text_length,
                         };
-                        storage_w.get_text(text_ref).ok().flatten()
+                        storage_r.get_text(text_ref).ok().flatten()
                     } else {
                         None
                     };
@@ -634,21 +634,32 @@ impl bridge::StorageEngine for McpStorageAdapter {
             text_length: 0,
         };
 
-        // Insert into storage.
-        {
-            let mut storage_w = self.storage.write().map_err(|e| {
-                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-            })?;
-            storage_w
-                .insert_memory(
-                    memory_id,
-                    ns_config.id,
-                    &mut record,
-                    &embedding,
-                    input.full_text.as_deref(),
-                )
-                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
-        }
+        // Insert into storage (on blocking thread to avoid starving the async runtime).
+        let record = {
+            let storage = self.storage.clone();
+            let embedding_clone = embedding.clone();
+            let full_text_clone = input.full_text.clone();
+            let ns_id = ns_config.id;
+            tokio::task::spawn_blocking(move || {
+                let mut storage_w = storage.write().map_err(|e| {
+                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                })?;
+                storage_w
+                    .insert_memory(
+                        memory_id,
+                        ns_id,
+                        &mut record,
+                        &embedding_clone,
+                        full_text_clone.as_deref(),
+                    )
+                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+                Ok::<_, bridge::BridgeError>(record)
+            })
+            .await
+            .map_err(|e| {
+                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
+            })??
+        };
 
         // Insert into cache.
         let cached = crate::model::CachedRecord::from(&record);
@@ -848,22 +859,19 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         id: MemoryId,
     ) -> Result<Option<bridge::MemoryRecord>, bridge::BridgeError> {
-        let mut storage_w = self
+        let storage_r = self
             .storage
-            .write()
+            .read()
             .map_err(|e| bridge::BridgeError::Internal(format!("storage lock poisoned: {e}")))?;
 
-        let disk_record = storage_w
+        let disk_record = storage_r
             .get_record(id)
             .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
 
         match disk_record {
             Some(record) => {
-                // Tombstoned memories: return a record with empty content
-                // and phase "Tombstone" so callers know it was deleted but
-                // its graph connections are preserved.
                 if record.phase == DecayPhase::Tombstone {
-                    let ns_name = storage_w
+                    let ns_name = storage_r
                         .get_namespace(NamespaceId::new(record.namespace_id))
                         .ok()
                         .flatten()
@@ -887,7 +895,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     }));
                 }
 
-                let ns_name = storage_w
+                let ns_name = storage_r
                     .get_namespace(NamespaceId::new(record.namespace_id))
                     .ok()
                     .flatten()
@@ -899,7 +907,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                         file_offset: record.text_offset,
                         length: record.text_length,
                     };
-                    storage_w.get_text(text_ref).ok().flatten()
+                    storage_r.get_text(text_ref).ok().flatten()
                 } else {
                     None
                 };
@@ -931,48 +939,63 @@ impl bridge::StorageEngine for McpStorageAdapter {
 
         // 1. Read the current record to get tags for entity index cleanup.
         let existing_record = {
-            let storage_r = self.storage.read().map_err(|e| {
-                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-            })?;
-            storage_r
-                .get_record(id)
-                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || {
+                let storage_r = storage.read().map_err(|e| {
+                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                })?;
+                storage_r
+                    .get_record(id)
+                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))
+            })
+            .await
+            .map_err(|e| {
+                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
+            })??
         };
 
         let Some(existing_record) = existing_record else {
             return Ok(false);
         };
 
-        // Short-circuit if already tombstoned to avoid redundant work.
         if existing_record.phase == DecayPhase::Tombstone {
             return Ok(false);
         }
 
-        // 2. Tombstone the record in storage: clear content fields,
-        //    set phase to Tombstone. The record remains in meta.db.
+        // 2. Tombstone the record and free the vector slot.
         {
-            let storage_r = self.storage.read().map_err(|e| {
-                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-            })?;
-            storage_r
-                .tombstone_memory(id)
-                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
-        }
-
-        // 2b. Free the vector slot on disk so it can be reused.
-        {
-            let mut storage_w = self.storage.write().map_err(|e| {
-                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-            })?;
-            let ns_id = NamespaceId::new(existing_record.namespace_id);
-            if let Err(e) = storage_w.free_vector_slot(ns_id, existing_record.vector_slot) {
-                tracing::warn!(
-                    memory_id = %id,
-                    vector_slot = existing_record.vector_slot,
-                    %e,
-                    "vector slot free failed (non-fatal)"
-                );
-            }
+            let storage = self.storage.clone();
+            let vector_slot = existing_record.vector_slot;
+            let namespace_id = existing_record.namespace_id;
+            tokio::task::spawn_blocking(move || {
+                {
+                    let storage_r = storage.read().map_err(|e| {
+                        bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                    })?;
+                    storage_r
+                        .tombstone_memory(id)
+                        .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+                }
+                {
+                    let mut storage_w = storage.write().map_err(|e| {
+                        bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                    })?;
+                    let ns_id = NamespaceId::new(namespace_id);
+                    if let Err(e) = storage_w.free_vector_slot(ns_id, vector_slot) {
+                        tracing::warn!(
+                            memory_id = %id,
+                            vector_slot,
+                            %e,
+                            "vector slot free failed (non-fatal)"
+                        );
+                    }
+                }
+                Ok::<_, bridge::BridgeError>(())
+            })
+            .await
+            .map_err(|e| {
+                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
+            })??;
         }
 
         // 3. Invalidate cache entry.
@@ -1316,7 +1339,10 @@ impl McpHealthAdapter {
 #[async_trait]
 impl bridge::HealthChecker for McpHealthAdapter {
     async fn check_health(&self) -> bridge::HealthStatus {
-        let storage_ok = self.storage.read().is_ok();
+        let storage = self.storage.clone();
+        let storage_ok = tokio::task::spawn_blocking(move || storage.read().is_ok())
+            .await
+            .unwrap_or(false);
         let subsystems = vec![bridge::SubsystemHealth {
             name: "storage".to_string(),
             status: if storage_ok { "ok" } else { "error" }.to_string(),

@@ -43,14 +43,19 @@ impl StorageNamespaceResolver {
 #[async_trait]
 impl NamespaceResolver for StorageNamespaceResolver {
     async fn resolve(&self, name: &str) -> Result<NamespaceConfig> {
-        let storage_r = self
-            .storage
-            .read()
-            .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
-        storage_r
-            .get_namespace_by_name(name)
-            .map_err(|e| SearchError::Internal(e.to_string()))?
-            .ok_or_else(|| SearchError::NamespaceNotFound(name.to_string()))
+        let storage = self.storage.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage
+                .read()
+                .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
+            storage_r
+                .get_namespace_by_name(&name)
+                .map_err(|e| SearchError::Internal(e.to_string()))?
+                .ok_or_else(|| SearchError::NamespaceNotFound(name))
+        })
+        .await
+        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
     }
 }
 
@@ -227,30 +232,40 @@ impl StorageMetadataAdapter {
 #[async_trait]
 impl MetadataStore for StorageMetadataAdapter {
     async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
-        let storage_r = self
-            .storage
-            .read()
-            .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
-        storage_r
-            .get_record(*id)
-            .map(|opt| opt.map(|disk| CachedRecord::from(&disk)))
-            .map_err(|e| SearchError::MetadataError(e.to_string()))
+        let storage = self.storage.clone();
+        let id = *id;
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage
+                .read()
+                .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
+            storage_r
+                .get_record(id)
+                .map(|opt| opt.map(|disk| CachedRecord::from(&disk)))
+                .map_err(|e| SearchError::MetadataError(e.to_string()))
+        })
+        .await
+        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
     }
 
     async fn get_batch(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>> {
-        let storage_r = self
-            .storage
-            .read()
-            .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
-        let mut results = Vec::with_capacity(ids.len());
-        for id in ids {
-            match storage_r.get_record(*id) {
-                Ok(Some(disk)) => results.push(CachedRecord::from(&disk)),
-                Ok(None) => {} // silently skip missing
-                Err(e) => return Err(SearchError::MetadataError(e.to_string())),
+        let storage = self.storage.clone();
+        let ids = ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage
+                .read()
+                .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
+            let mut results = Vec::with_capacity(ids.len());
+            for id in &ids {
+                match storage_r.get_record(*id) {
+                    Ok(Some(disk)) => results.push(CachedRecord::from(&disk)),
+                    Ok(None) => {}
+                    Err(e) => return Err(SearchError::MetadataError(e.to_string())),
+                }
             }
-        }
-        Ok(results)
+            Ok(results)
+        })
+        .await
+        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
     }
 }
 
@@ -347,27 +362,36 @@ impl StorageAccessRecorder {
 impl AccessRecorder for StorageAccessRecorder {
     async fn record_access(&self, id: MemoryId, kind: AccessKind) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        let storage_r = self
-            .storage
-            .read()
-            .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
-        storage_r
-            .update_access(id, now, kind)
-            .map_err(|e| SearchError::Internal(e.to_string()))
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage
+                .read()
+                .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
+            storage_r
+                .update_access(id, now, kind)
+                .map_err(|e| SearchError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
     }
 
     async fn record_access_batch(&self, accesses: &[(MemoryId, AccessKind)]) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        let storage_r = self
-            .storage
-            .read()
-            .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
-        for (id, kind) in accesses {
-            storage_r
-                .update_access(*id, now, *kind)
-                .map_err(|e| SearchError::Internal(e.to_string()))?;
-        }
-        Ok(())
+        let storage = self.storage.clone();
+        let accesses = accesses.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage
+                .read()
+                .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
+            for (id, kind) in &accesses {
+                storage_r
+                    .update_access(*id, now, *kind)
+                    .map_err(|e| SearchError::Internal(e.to_string()))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
     }
 }
 

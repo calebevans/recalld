@@ -216,12 +216,18 @@ pub(crate) async fn persist_edges(
 
     // Step 1: Persist edges to edges.db.
     {
-        let storage_r = storage
-            .read()
-            .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
-        storage_r
-            .batch_add_edges(persisted_edges)
-            .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
+        let storage = storage.clone();
+        let edges_owned = persisted_edges.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage
+                .read()
+                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
+            storage_r
+                .batch_add_edges(&edges_owned)
+                .map_err(|e| AutoLinkError::Storage(e.to_string()))
+        })
+        .await
+        .map_err(|e| AutoLinkError::Storage(format!("blocking task join error: {e}")))??;
     }
 
     // Step 2: Write-lock graph for edge insertion.
@@ -248,10 +254,16 @@ pub(crate) async fn persist_edges(
             .unwrap_or(0);
         let new_count = current_count + edges_created as u16;
         {
-            let storage_r = storage
-                .read()
-                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
-            let _ = storage_r.update_edge_count(new_memory_id, new_count);
+            let storage = storage.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let storage_r = storage.read().map_err(|e| {
+                    AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}"))
+                })?;
+                storage_r
+                    .update_edge_count(new_memory_id, new_count)
+                    .map_err(|e| AutoLinkError::Storage(e.to_string()))
+            })
+            .await;
         }
         cache.update_edge_count(new_memory_id, new_count).await;
     }
