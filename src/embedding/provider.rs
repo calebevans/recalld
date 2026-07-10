@@ -74,7 +74,6 @@ pub enum ProviderType {
     /// Pre-computed embeddings supplied by the caller.
     Passthrough,
     /// AWS Bedrock (Titan Embeddings, Cohere Embed).
-    #[cfg(feature = "bedrock")]
     Bedrock,
 }
 
@@ -152,7 +151,6 @@ pub async fn build_provider(
             Box::new(PassthroughProvider::new(config.dimensions))
         }
 
-        #[cfg(feature = "bedrock")]
         ProviderType::Bedrock => {
             let region = config
                 .region

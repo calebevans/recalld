@@ -212,22 +212,7 @@ impl Recalld {
                     crate::config::EmbeddingProvider::Passthrough => {
                         embedding::ProviderType::Passthrough
                     }
-                    crate::config::EmbeddingProvider::Bedrock => {
-                        #[cfg(feature = "bedrock")]
-                        {
-                            embedding::ProviderType::Bedrock
-                        }
-                        #[cfg(not(feature = "bedrock"))]
-                        {
-                            return Err(RecalldError::Init {
-                                step: "create_embedding_provider",
-                                message: "Bedrock provider requires the 'bedrock' feature. \
-                                          Rebuild with: cargo build --features bedrock"
-                                    .into(),
-                                source: None,
-                            });
-                        }
-                    }
+                    crate::config::EmbeddingProvider::Bedrock => embedding::ProviderType::Bedrock,
                 },
                 dimensions: config.embedding.dimensions,
                 model: config.embedding.model_name.clone(),
