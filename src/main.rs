@@ -399,19 +399,19 @@ async fn run_serve(
         bind
     };
 
+    // Build ApiConfig from loaded config before `config` is consumed by Recalld::new.
+    let api_config = recalld::api::ApiConfig {
+        bind_address: bind.ip().to_string(),
+        port: bind.port(),
+        ..recalld::api::ApiConfig::from_server_config(&config.server)
+    };
+
     let system = match Recalld::new(config).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "startup failed");
             return ExitCode::FAILURE;
         }
-    };
-
-    // Build AppState from Recalld subsystems via API adapters.
-    let api_config = recalld::api::ApiConfig {
-        bind_address: bind.ip().to_string(),
-        port: bind.port(),
-        ..recalld::api::ApiConfig::default()
     };
 
     let app_state = {
