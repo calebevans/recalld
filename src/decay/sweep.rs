@@ -552,30 +552,49 @@ impl DecaySweepRunner {
         // If neither occurred, there is no new fragmentation to compact
         // and we skip the expensive write-lock + I/O entirely.
         if result.deletions > 0 || result.full_to_summary > 0 {
-            let mut storage_w = storage.write().unwrap_or_else(|e| {
-                error!("storage lock poisoned during compaction check: {e}");
-                e.into_inner()
-            });
-            match storage_w.compact_text_log() {
-                Ok(cr) => {
+            let storage_clone = Arc::clone(storage);
+            let compaction_result = tokio::task::spawn_blocking(move || {
+                let mut storage_w = storage_clone.write().unwrap_or_else(|e| {
+                    error!("storage lock poisoned during compaction check: {e}");
+                    e.into_inner()
+                });
+                storage_w.compact_text_log()
+            })
+            .await;
+            match compaction_result {
+                Ok(Ok(cr)) => {
                     if cr.entries_removed > 0 {
                         result.compaction_triggered = true;
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!(error = %e, "fulltext.dat compaction failed");
+                }
+                Err(e) => {
+                    error!(error = %e, "compaction task panicked");
                 }
             }
         }
 
         // -- Persist updated phase bitmaps ------------------------
         {
-            let storage_r = storage.read().unwrap_or_else(|e| {
-                error!("storage lock poisoned during phase index persist: {e}");
-                e.into_inner()
-            });
-            if let Err(e) = storage_r.persist_phase_index() {
-                error!(error = %e, "failed to persist phase bitmap index");
+            let storage_clone = Arc::clone(storage);
+            let persist_result = tokio::task::spawn_blocking(move || {
+                let storage_r = storage_clone.read().unwrap_or_else(|e| {
+                    error!("storage lock poisoned during phase index persist: {e}");
+                    e.into_inner()
+                });
+                storage_r.persist_phase_index()
+            })
+            .await;
+            match persist_result {
+                Ok(Err(e)) => {
+                    error!(error = %e, "failed to persist phase bitmap index");
+                }
+                Err(e) => {
+                    error!(error = %e, "phase index persist task panicked");
+                }
+                _ => {}
             }
         }
 
@@ -608,7 +627,7 @@ impl DecaySweepRunner {
         result: &mut SweepResult,
     ) {
         // Get all memory IDs in this phase from the PhaseIndex.
-        let memory_ids = Self::load_phase_ids(phase, storage);
+        let memory_ids = Self::load_phase_ids(phase, storage).await;
         let memory_ids = match memory_ids {
             Some(ids) => ids,
             None => return,
@@ -624,11 +643,20 @@ impl DecaySweepRunner {
         for chunk in memory_ids.chunks(config.write_batch_size) {
             // Batch-load metadata for this chunk under a single lock.
             let (meta_batch, meta_errors) = {
-                let storage_r = storage.read().unwrap_or_else(|e| {
-                    error!("storage lock poisoned: {e}");
-                    e.into_inner()
-                });
-                Self::load_metadata_batch(&*storage_r, chunk)
+                let storage_clone = Arc::clone(storage);
+                let chunk_owned = chunk.to_vec();
+                tokio::task::spawn_blocking(move || {
+                    let storage_r = storage_clone.read().unwrap_or_else(|e| {
+                        error!("storage lock poisoned: {e}");
+                        e.into_inner()
+                    });
+                    Self::load_metadata_batch(&*storage_r, &chunk_owned)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    error!(error = %e, "metadata batch load task panicked");
+                    (HashMap::new(), Vec::new())
+                })
             };
 
             // Record batch-load errors.
@@ -705,40 +733,48 @@ impl DecaySweepRunner {
     ///
     /// Tries the PhaseIndex bitmap first, falls back to a full table scan.
     /// Returns `None` if both lookups fail (the phase is skipped).
-    fn load_phase_ids(
+    async fn load_phase_ids(
         phase: DecayPhase,
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     ) -> Option<Vec<MemoryId>> {
-        let storage_r = storage.read().unwrap_or_else(|e| {
-            error!("storage lock poisoned: {e}");
-            e.into_inner()
-        });
-        match storage_r.ids_in_phase(phase) {
-            Ok(ids) => Some(ids),
-            Err(e) => {
-                warn!(
-                    phase = ?phase,
-                    error = %e,
-                    "PhaseIndex lookup failed, falling back to full table scan"
-                );
-                match storage_r.scan_phase_records(phase) {
-                    Ok(records) => Some(
-                        records
-                            .into_iter()
-                            .map(|(id, _): (MemoryId, _)| id)
-                            .collect(),
-                    ),
-                    Err(e2) => {
-                        error!(
-                            phase = ?phase,
-                            error = %e2,
-                            "full table scan also failed, skipping phase"
-                        );
-                        None
+        let storage_clone = Arc::clone(storage);
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage_clone.read().unwrap_or_else(|e| {
+                error!("storage lock poisoned: {e}");
+                e.into_inner()
+            });
+            match storage_r.ids_in_phase(phase) {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    warn!(
+                        phase = ?phase,
+                        error = %e,
+                        "PhaseIndex lookup failed, falling back to full table scan"
+                    );
+                    match storage_r.scan_phase_records(phase) {
+                        Ok(records) => Some(
+                            records
+                                .into_iter()
+                                .map(|(id, _): (MemoryId, _)| id)
+                                .collect(),
+                        ),
+                        Err(e2) => {
+                            error!(
+                                phase = ?phase,
+                                error = %e2,
+                                "full table scan also failed, skipping phase"
+                            );
+                            None
+                        }
                     }
                 }
             }
-        }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            error!(error = %e, "load_phase_ids task panicked");
+            None
+        })
     }
 
     /// Load decay metadata for a batch of memory IDs in a single pass.
@@ -887,22 +923,39 @@ impl DecaySweepRunner {
     ) {
         // Update decay_strength in metadata regardless of transition.
         {
-            let storage_r = storage.read().unwrap_or_else(|e| {
-                error!("storage lock poisoned: {e}");
-                e.into_inner()
-            });
-            if let Err(e) = storage_r.update_decay_state(
-                memory_id,
-                phase,
-                effective_r,
-                meta.stability,
-                meta.is_permastore,
-            ) {
-                result.errors.push(SweepRecordError {
+            let storage_clone = Arc::clone(storage);
+            let stability = meta.stability;
+            let is_permastore = meta.is_permastore;
+            let update_result = tokio::task::spawn_blocking(move || {
+                let storage_r = storage_clone.read().unwrap_or_else(|e| {
+                    error!("storage lock poisoned: {e}");
+                    e.into_inner()
+                });
+                storage_r.update_decay_state(
                     memory_id,
                     phase,
-                    error: format!("failed to update decay_strength: {e}"),
-                });
+                    effective_r,
+                    stability,
+                    is_permastore,
+                )
+            })
+            .await;
+            match update_result {
+                Ok(Err(e)) => {
+                    result.errors.push(SweepRecordError {
+                        memory_id,
+                        phase,
+                        error: format!("failed to update decay_strength: {e}"),
+                    });
+                }
+                Err(e) => {
+                    result.errors.push(SweepRecordError {
+                        memory_id,
+                        phase,
+                        error: format!("update decay_strength task panicked: {e}"),
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -1023,11 +1076,6 @@ impl DecaySweepRunner {
         has_summary: bool,
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     ) -> Result<PhaseTransition, SweepError> {
-        let storage_r = storage
-            .read()
-            .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
-
-        // Safety net: verify summary exists before deleting full_text.
         if !has_summary {
             warn!(
                 id = %memory_id,
@@ -1036,16 +1084,23 @@ impl DecaySweepRunner {
             );
         }
 
-        // Update phase in meta.db + PhaseIndex bitmap.
-        storage_r
-            .update_decay_state(
-                memory_id,
-                DecayPhase::Summary,
-                effective_r,
-                stability,
-                is_permastore,
-            )
-            .map_err(|e| SweepError::Storage(e.to_string()))?;
+        let storage_clone = Arc::clone(storage);
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage_clone
+                .read()
+                .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
+            storage_r
+                .update_decay_state(
+                    memory_id,
+                    DecayPhase::Summary,
+                    effective_r,
+                    stability,
+                    is_permastore,
+                )
+                .map_err(|e| SweepError::Storage(e.to_string()))
+        })
+        .await
+        .map_err(|e| SweepError::Storage(format!("transition task panicked: {e}")))??;
 
         Ok(PhaseTransition::Summarized {
             id: memory_id,
@@ -1072,19 +1127,23 @@ impl DecaySweepRunner {
         is_permastore: bool,
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     ) -> Result<PhaseTransition, SweepError> {
-        let storage_r = storage
-            .read()
-            .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
-
-        storage_r
-            .update_decay_state(
-                memory_id,
-                DecayPhase::Ghost,
-                effective_r,
-                stability,
-                is_permastore,
-            )
-            .map_err(|e| SweepError::Storage(e.to_string()))?;
+        let storage_clone = Arc::clone(storage);
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage_clone
+                .read()
+                .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
+            storage_r
+                .update_decay_state(
+                    memory_id,
+                    DecayPhase::Ghost,
+                    effective_r,
+                    stability,
+                    is_permastore,
+                )
+                .map_err(|e| SweepError::Storage(e.to_string()))
+        })
+        .await
+        .map_err(|e| SweepError::Storage(format!("transition task panicked: {e}")))??;
 
         Ok(PhaseTransition::Ghosted {
             id: memory_id,
@@ -1124,24 +1183,32 @@ impl DecaySweepRunner {
             );
         } // write lock released
 
-        // 2. Remove edge records from storage.
+        // 2. Remove edge records and metadata via spawn_blocking.
         {
-            let storage_r = storage
-                .read()
-                .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
-            let _ = storage_r
-                .remove_all_edges(memory_id)
-                .map_err(|e| SweepError::Storage(e.to_string()))?;
-        }
-
-        // 3. Remove metadata record (must acquire write lock for delete_memory).
-        {
-            let mut storage_w = storage
-                .write()
-                .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
-            storage_w
-                .delete_memory(memory_id)
-                .map_err(|e| SweepError::Storage(e.to_string()))?;
+            let storage_clone = Arc::clone(storage);
+            tokio::task::spawn_blocking(move || {
+                // Remove edges.
+                {
+                    let storage_r = storage_clone
+                        .read()
+                        .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
+                    storage_r
+                        .remove_all_edges(memory_id)
+                        .map_err(|e| SweepError::Storage(e.to_string()))?;
+                }
+                // Delete metadata record (requires write lock).
+                {
+                    let mut storage_w = storage_clone
+                        .write()
+                        .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
+                    storage_w
+                        .delete_memory(memory_id)
+                        .map_err(|e| SweepError::Storage(e.to_string()))?;
+                }
+                Ok::<_, SweepError>(())
+            })
+            .await
+            .map_err(|e| SweepError::Storage(format!("deletion task panicked: {e}")))??;
         }
 
         Ok(PhaseTransition::Deleted {
