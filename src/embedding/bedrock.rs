@@ -185,7 +185,18 @@ impl BedrockProvider {
             .load()
             .await;
 
-        let client = Client::new(&sdk_config);
+        let bedrock_config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
+            .timeout_config(
+                aws_sdk_bedrockruntime::config::timeout::TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(30))
+                    .operation_attempt_timeout(Duration::from_secs(10))
+                    .read_timeout(Duration::from_secs(10))
+                    .build(),
+            )
+            .retry_config(aws_sdk_bedrockruntime::config::retry::RetryConfig::disabled())
+            .build();
+
+        let client = Client::from_conf(bedrock_config);
 
         Ok(Self {
             client,

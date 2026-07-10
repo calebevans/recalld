@@ -130,6 +130,7 @@ pub async fn create_memory(
             &req.tags,
             &embedding,
             req.initial_stability,
+            req.created_at,
         )
         .await?;
 

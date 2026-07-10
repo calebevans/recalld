@@ -203,20 +203,22 @@ impl state::StorageEngine for StorageEngineAdapter {
         tags: &[String],
         embedding: &[f32],
         initial_stability: Option<f32>,
+        created_at: Option<i64>,
     ) -> Result<CachedRecord, crate::storage::StorageError> {
         use crate::model::Tag;
         use crate::model::record::DiskRecord;
 
         let id = MemoryId::new();
         let now = chrono::Utc::now().timestamp_millis();
+        let ts = created_at.unwrap_or(now);
         let parsed_tags: Vec<Tag> = tags.iter().filter_map(|t| Tag::new(t).ok()).collect();
 
         let mut record = DiskRecord {
             version: DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: namespace_id.get(),
-            created_at: now,
-            last_accessed_at: now,
+            created_at: ts,
+            last_accessed_at: ts,
             phase: DecayPhase::Full,
             strength: 1.0,
             decay_strength: 1.0,

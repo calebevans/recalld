@@ -76,6 +76,7 @@ pub trait StorageEngine: Send + Sync {
         tags: &[String],
         embedding: &[f32],
         initial_stability: Option<f32>,
+        created_at: Option<i64>,
     ) -> Result<CachedRecord, StorageError>;
 
     /// Delete a memory by ID. Returns `true` if it existed.

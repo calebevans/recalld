@@ -52,6 +52,11 @@ pub struct CreateMemoryApiRequest {
     /// edge from `parent_id` to the new memory.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parent_id: Option<MemoryId>,
+
+    /// Optional creation timestamp (epoch milliseconds). If provided,
+    /// the memory is backdated to this time instead of using the current time.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub created_at: Option<i64>,
 }
 
 /// Default namespace name for request types.
