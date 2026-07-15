@@ -39,7 +39,7 @@ impl StorageEngine for WarmingStorageAdapter {
         match storage_r.get_record(id) {
             Ok(Some(disk)) => Ok(Some(CachedRecord::from(&disk))),
             Ok(None) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("{}", e)),
+            Err(e) => Err(anyhow::Error::from(e)),
         }
     }
 
@@ -55,7 +55,7 @@ impl StorageEngine for WarmingStorageAdapter {
         match storage_r.get_vector(namespace_id, vector_slot) {
             Ok(Some(v)) => Ok(v),
             Ok(None) => Err(anyhow::anyhow!("vector not found")),
-            Err(e) => Err(anyhow::anyhow!("{}", e)),
+            Err(e) => Err(anyhow::Error::from(e)),
         }
     }
 
@@ -69,7 +69,7 @@ impl StorageEngine for WarmingStorageAdapter {
             .map_err(|e| anyhow::anyhow!("storage lock poisoned: {e}"))?;
         storage_r
             .get_outgoing_edges(id)
-            .map_err(|e| anyhow::anyhow!("{}", e))
+            .map_err(anyhow::Error::from)
     }
 }
 
@@ -99,6 +99,6 @@ impl EdgeStore for StorageEdgeAdapter {
             .map_err(|e| anyhow::anyhow!("storage lock poisoned: {e}"))?;
         storage_r
             .get_outgoing_edges(id)
-            .map_err(|e| anyhow::anyhow!("{}", e))
+            .map_err(anyhow::Error::from)
     }
 }

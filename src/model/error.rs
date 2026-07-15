@@ -30,7 +30,7 @@ pub enum TagError {
 // ValidationError
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Errors from `Memory::validate()` and `CreateMemory` validation.
+/// Errors from `Memory::validate()` and memory creation validation.
 ///
 /// Each variant carries a machine-readable `code()` suitable for the
 /// JSON error response `"error"` field, plus a human-readable message

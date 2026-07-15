@@ -61,14 +61,6 @@ impl Tag {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    /// Wrap an already-validated, lowercased tag string without
-    /// re-running validation. Used by the binary decoder (CS-02)
-    /// where tags were validated at write time. **Not public** —
-    /// only the serialization layer should call this.
-    pub(crate) fn from_trusted(s: String) -> Self {
-        Tag(s)
-    }
 }
 
 impl Deref for Tag {

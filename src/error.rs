@@ -103,20 +103,3 @@ pub enum RecalldError {
 
 /// Convenience alias used at the system level.
 pub type Result<T> = std::result::Result<T, RecalldError>;
-
-impl RecalldError {
-    /// Map this error to an HTTP status code for the API response.
-    pub fn status_code(&self) -> u16 {
-        match self {
-            Self::Config(_) => 400,
-            Self::NotReady { .. } => 503,
-            Self::Timeout { .. } => 503,
-            _ => 500,
-        }
-    }
-
-    /// Determine whether the caller should retry the operation.
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Timeout { .. } | Self::NotReady { .. })
-    }
-}
