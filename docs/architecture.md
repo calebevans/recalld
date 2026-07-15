@@ -44,7 +44,7 @@ graph TD
 
     subgraph STORE["Storage Engine"]
         META["meta.db"]
-        VEC["vectors.dat"]
+        VEC["&lt;ns&gt;/vectors.dat"]
         TXT["fulltext.dat"]
         EDGES["edges.db"]
     end
@@ -90,7 +90,7 @@ Shutdown is the reverse: signal background tasks, drain in-flight requests (5s t
 
 ### Core storage files
 
-All data lives in a single directory (default: `~/.recalld/data/`). An exclusive file lock (`recalld.lock`) prevents multi-process access. There are four primary data files (meta.db, vectors.dat, fulltext.dat, edges.db) plus the FTS5 index (fts.db) and the lock file.
+All data lives in a single directory (default: `~/.recalld/data/`). An exclusive file lock (`recalld.lock`) prevents multi-process access. There are four primary data stores (meta.db, `<namespace>/vectors.dat`, fulltext.dat, edges.db) plus the FTS5 index (fts.db) and the lock file.
 
 ```
 ~/.recalld/data/
@@ -98,8 +98,8 @@ All data lives in a single directory (default: `~/.recalld/data/`). An exclusive
   meta.db             # redb B+tree -- memory records + secondary indexes
   fulltext.dat            # append-only CRC32 log -- full_text payloads
   edges.db            # redb B+tree -- graph edge persistence
-  ns_default.dat      # mmap'd vector file for "default" namespace
-  ns_work.dat         # mmap'd vector file for "work" namespace (example)
+  default/vectors.dat # mmap'd vector file for "default" namespace
+  work/vectors.dat    # mmap'd vector file for "work" namespace (example)
   fts.db              # SQLite FTS5 full-text search index
 ```
 
@@ -122,7 +122,7 @@ Configured with a 16 MB read cache covering top B+tree levels.
 
 #### vectors.dat (per-namespace, mmap)
 
-Each namespace gets its own memory-mapped vector file (`ns_<name>.dat`). Vectors are stored in fixed-size slots for O(1) random access.
+Each namespace gets its own subdirectory containing a memory-mapped `vectors.dat` file (e.g., `default/vectors.dat`, `work/vectors.dat`). Vectors are stored in fixed-size slots for O(1) random access.
 
 **File format:**
 
@@ -174,10 +174,10 @@ Persists graph edges separately from memory records. Composite keys enable effic
 
 Both directions are stored for O(1) neighbor lookups in either direction. Orphaned edges (referencing deleted memories) are cleaned up on startup.
 
-### Why four files
+### Why four stores
 
 - **meta.db**: needs transactions, range scans, secondary indexes -> embedded B+tree (redb).
-- **vectors.dat**: needs zero-copy reads of large float arrays, O(1) slot access -> mmap.
+- **`<ns>/vectors.dat`**: needs zero-copy reads of large float arrays, O(1) slot access -> mmap (one file per namespace).
 - **fulltext.dat**: large variable-length blobs, append-only pattern -> log-structured file.
 - **edges.db**: could live in meta.db, but separated to avoid write amplification -- edges are written frequently (auto-linking) while metadata records are written infrequently after creation.
 

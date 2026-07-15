@@ -46,6 +46,7 @@ By default, Claude Code will prompt you for approval each time an MCP tool is ca
       "mcp__recalld__forget_memory",
       "mcp__recalld__find_similar_memories",
       "mcp__recalld__create_namespace",
+      "mcp__recalld__namespace_stats",
       "mcp__recalld__list_memories"
     ]
   }
@@ -131,8 +132,7 @@ Response:
   "phase": "Full",
   "strength": 1.0,
   "stability": 3.7145,
-  "createdAt": 1719187200000,
-  "createdAtFormatted": "2025-06-24 00:00:00 UTC"
+  "createdAt": "2025-06-24 00:00:00 UTC"
 }
 ```
 
@@ -196,7 +196,7 @@ Response:
       "phase": "Full",
       "strength": 1.0,
       "stability": 3.7145,
-      "createdAt": 1719187200000
+      "createdAt": "2025-06-24 00:00:00 UTC"
     },
     {
       "index": 1,
@@ -205,7 +205,7 @@ Response:
       "phase": "Full",
       "strength": 1.0,
       "stability": 3.7145,
-      "createdAt": 1719187200000
+      "createdAt": "2025-06-24 00:00:00 UTC"
     }
   ],
   "total": 2,
@@ -281,10 +281,8 @@ Response (compact=false):
       "topics": ["coding-style"],
       "phase": "Full",
       "strength": 0.95,
-      "createdAt": 1719187200000,
-      "createdAtFormatted": "2025-06-24 00:00:00 UTC",
-      "lastAccessedAt": 1719273600000,
-      "lastAccessedAtFormatted": "2025-06-25 00:00:00 UTC"
+      "createdAt": "2025-06-24 00:00:00 UTC",
+      "lastAccessedAt": "2025-06-25 00:00:00 UTC"
     }
   ],
   "count": 1,
@@ -341,10 +339,8 @@ Response:
   "phase": "Full",
   "strength": 0.95,
   "stability": 12.4,
-  "createdAt": 1719187200000,
-  "createdAtFormatted": "2025-06-24 00:00:00 UTC",
-  "lastAccessedAt": 1719273600000,
-  "lastAccessedAtFormatted": "2025-06-25 00:00:00 UTC",
+  "createdAt": "2025-06-24 00:00:00 UTC",
+  "lastAccessedAt": "2025-06-25 00:00:00 UTC",
   "isPermastore": false,
   "edgeCount": 3
 }
@@ -470,8 +466,8 @@ Response:
       "tags": ["type/project", "tech/rust"],
       "phase": "Full",
       "strength": 0.88,
-      "createdAt": 1719100800000,
-      "lastAccessedAt": 1719187200000
+      "createdAt": "2025-06-23 00:00:00 UTC",
+      "lastAccessedAt": "2025-06-24 00:00:00 UTC"
     }
   ],
   "count": 1
@@ -497,16 +493,19 @@ Response:
   "namespace": "default",
   "threshold": 0.9,
   "clusters": [
-    [
-      {
-        "id": "a1b2c3d4-...",
-        "summary": "User prefers snake_case in Rust"
-      },
-      {
-        "id": "c3d4e5f6-...",
-        "summary": "User likes snake_case for Rust code"
-      }
-    ]
+    {
+      "memories": [
+        {
+          "id": "a1b2c3d4-...",
+          "summary": "User prefers snake_case in Rust"
+        },
+        {
+          "id": "c3d4e5f6-...",
+          "summary": "User likes snake_case for Rust code"
+        }
+      ],
+      "maxSimilarity": 0.92
+    }
   ],
   "clusterCount": 1
 }
@@ -548,8 +547,47 @@ Response:
   "name": "work-project",
   "embeddingDim": 1536,
   "memoryCount": 0,
-  "createdAt": 1719187200000,
-  "createdAtFormatted": "2025-06-24 00:00:00 UTC"
+  "createdAt": "2025-06-24 00:00:00 UTC"
+}
+```
+
+---
+
+### namespace_stats
+
+Get statistics for a memory namespace including total memory count, phase breakdown (full/summary/ghost), permastore count, average strength, edge count, and vector storage size. Use this to check how many memories exist or monitor namespace health.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `namespace` | string | no | `"default"` | Namespace name to get stats for |
+
+#### Example
+
+Request:
+
+```json
+{
+  "namespace": "default"
+}
+```
+
+Response:
+
+```json
+{
+  "namespace": "default",
+  "totalMemories": 42,
+  "phases": {
+    "full": 30,
+    "summary": 8,
+    "ghost": 4
+  },
+  "permastoreCount": 3,
+  "averageStrength": 0.72,
+  "edgeCount": 156,
+  "vectorStorageBytes": 1048576
 }
 ```
 
@@ -591,15 +629,12 @@ Response:
     {
       "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
       "summary": "User prefers snake_case for Rust code and camelCase for TypeScript",
-      "namespace": "default",
-      "tags": ["type/user-profile", "tech/rust", "tech/typescript"],
-      "phase": "Full",
-      "strength": 0.95,
-      "createdAt": 1719187200000,
-      "createdAtFormatted": "2025-06-24 00:00:00 UTC"
+      "entities": ["TypeScript"],
+      "topics": ["coding-style"],
+      "createdAt": "2025-06-24 00:00:00 UTC"
     }
   ],
-  "count": 1,
+  "total": 1,
   "limit": 10,
   "offset": 0
 }
