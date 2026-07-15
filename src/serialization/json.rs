@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::model::decay::DecayPhase;
 use crate::model::id::MemoryId;
 use crate::model::memory::AccessEvent;
+use crate::model::parse_structured_tags;
 use crate::model::record::CachedRecord;
 use crate::model::tag::Tag;
-use crate::model::parse_structured_tags;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Response Wrappers

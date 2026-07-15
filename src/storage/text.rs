@@ -516,10 +516,7 @@ impl TextStore {
         // Determine new write position from file size.
         self.write_pos = self.file.seek(SeekFrom::End(0))?;
 
-        tracing::info!(
-            new_size = self.write_pos,
-            "Text.log compaction finalized"
-        );
+        tracing::info!(new_size = self.write_pos, "Text.log compaction finalized");
 
         Ok(())
     }

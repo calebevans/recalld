@@ -497,7 +497,17 @@ impl DecaySweepRunner {
         cache: &Arc<CacheManager>,
         global_decay_multiplier: f64,
     ) -> SweepResult {
-        Self::execute_sweep_at(config, decay_config, activation_config, storage, graph, cache, global_decay_multiplier, None).await
+        Self::execute_sweep_at(
+            config,
+            decay_config,
+            activation_config,
+            storage,
+            graph,
+            cache,
+            global_decay_multiplier,
+            None,
+        )
+        .await
     }
 
     #[instrument(skip_all)]
@@ -1237,12 +1247,8 @@ impl DecaySweepRunner {
             // Resolve the bridge's NodeKey endpoints to MemoryIds
             // while the graph lock is still held.
             bridge_to_persist = removal_result.bridge_created.and_then(|bridge| {
-                let source_id = graph_w
-                    .get_node_by_key(bridge.source)
-                    .map(|n| n.memory_id);
-                let target_id = graph_w
-                    .get_node_by_key(bridge.target)
-                    .map(|n| n.memory_id);
+                let source_id = graph_w.get_node_by_key(bridge.source).map(|n| n.memory_id);
+                let target_id = graph_w.get_node_by_key(bridge.target).map(|n| n.memory_id);
                 match (source_id, target_id) {
                     (Some(src), Some(tgt)) => Some(crate::storage::edges::PersistedEdge {
                         source: src,

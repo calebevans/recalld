@@ -533,8 +533,14 @@ impl StorageEngine for RedbStorageEngine {
         stability: f32,
         is_permastore: bool,
     ) -> Result<(), StorageError> {
-        self.meta_store
-            .update_decay_state(id, phase, strength, decay_strength, stability, is_permastore)
+        self.meta_store.update_decay_state(
+            id,
+            phase,
+            strength,
+            decay_strength,
+            stability,
+            is_permastore,
+        )
     }
 
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {

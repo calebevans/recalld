@@ -116,13 +116,7 @@ impl PhaseIndex {
     }
 
     /// Move a memory between phases.
-    pub fn transition(
-        &mut self,
-        namespace_id: u32,
-        slot: u32,
-        from: DecayPhase,
-        to: DecayPhase,
-    ) {
+    pub fn transition(&mut self, namespace_id: u32, slot: u32, from: DecayPhase, to: DecayPhase) {
         let ns = self
             .namespaces
             .entry(namespace_id)
@@ -239,8 +233,7 @@ impl PhaseIndex {
                 "phase index v2 truncated at namespace count".into(),
             ));
         }
-        let ns_count =
-            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let ns_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         let mut namespaces = HashMap::with_capacity(ns_count);
@@ -263,9 +256,8 @@ impl PhaseIndex {
                         label, ns_id
                     )));
                 }
-                let size = u32::from_le_bytes(
-                    data[offset..offset + 4].try_into().unwrap(),
-                ) as usize;
+                let size =
+                    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
 
                 if offset + size > data.len() {
@@ -274,15 +266,13 @@ impl PhaseIndex {
                         label, ns_id
                     )));
                 }
-                let bitmap = RoaringBitmap::deserialize_from(
-                    &data[offset..offset + size],
-                )
-                .map_err(|e| {
-                    StorageError::CorruptIndex(format!(
-                        "invalid roaring bitmap for '{}' in ns {}: {}",
-                        label, ns_id, e
-                    ))
-                })?;
+                let bitmap = RoaringBitmap::deserialize_from(&data[offset..offset + size])
+                    .map_err(|e| {
+                        StorageError::CorruptIndex(format!(
+                            "invalid roaring bitmap for '{}' in ns {}: {}",
+                            label, ns_id, e
+                        ))
+                    })?;
                 offset += size;
                 bitmaps.push(bitmap);
             }

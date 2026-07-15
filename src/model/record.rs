@@ -477,4 +477,3 @@ impl From<&DiskRecord> for CachedRecord {
         }
     }
 }
-

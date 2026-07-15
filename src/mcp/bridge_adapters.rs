@@ -1017,7 +1017,9 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
 
                 let Some(existing_record) = existing else {
-                    return Ok::<Option<crate::model::record::DiskRecord>, bridge::BridgeError>(None);
+                    return Ok::<Option<crate::model::record::DiskRecord>, bridge::BridgeError>(
+                        None,
+                    );
                 };
 
                 if existing_record.phase == DecayPhase::Tombstone {
@@ -1161,12 +1163,8 @@ impl bridge::StorageEngine for McpStorageAdapter {
         // Step 4: Use FSRS to compute new stability based on quality rating.
         let decay_config = crate::decay::DecayConfig::default();
         let engine = crate::decay::FsrsEngine::new(&decay_config);
-        let new_stability = engine.review_stability(
-            record.stability,
-            elapsed_days,
-            quality,
-            ns_decay_multiplier,
-        );
+        let new_stability =
+            engine.review_stability(record.stability, elapsed_days, quality, ns_decay_multiplier);
 
         // Step 5: Compute new retrievability (just reinforced = 1.0).
         let new_strength = 1.0_f32;
@@ -1181,7 +1179,14 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
                 })?;
                 storage_r
-                    .update_decay_state(id, phase, new_strength, new_strength, new_stability, is_permastore)
+                    .update_decay_state(
+                        id,
+                        phase,
+                        new_strength,
+                        new_strength,
+                        new_stability,
+                        is_permastore,
+                    )
                     .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
                 storage_r
                     .update_access(id, now, crate::model::AccessKind::ManualReinforcement)

@@ -198,7 +198,13 @@ pub async fn create_memory(
     // --- Graph node (Issue 11: must happen before edges) ---
     let _ = state
         .graph
-        .add_node(memory.id, ns.id, crate::model::DecayPhase::Full, 1.0, memory.vector_slot)
+        .add_node(
+            memory.id,
+            ns.id,
+            crate::model::DecayPhase::Full,
+            1.0,
+            memory.vector_slot,
+        )
         .await;
 
     // --- Parent edge ---
@@ -219,7 +225,9 @@ pub async fn create_memory(
     }
 
     // --- Autolink, entity-link, temporal-link (Issue 12) ---
-    let created_at = req.created_at.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let created_at = req
+        .created_at
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
     state
         .graph
         .perform_post_creation_links(
@@ -919,7 +927,8 @@ pub async fn create_namespace(
     // Validate name format
     if req.name.is_empty() || req.name.len() > NAMESPACE_NAME_MAX_BYTES {
         return Err(AppError::BadRequest {
-            message: format!("namespace name must be 1-{NAMESPACE_NAME_MAX_BYTES} characters").into(),
+            message: format!("namespace name must be 1-{NAMESPACE_NAME_MAX_BYTES} characters")
+                .into(),
             field: Some("name".into()),
         });
     }
@@ -1354,7 +1363,13 @@ pub async fn batch_store(
         // Graph node
         let _ = state
             .graph
-            .add_node(memory.id, ns.id, crate::model::DecayPhase::Full, 1.0, memory.vector_slot)
+            .add_node(
+                memory.id,
+                ns.id,
+                crate::model::DecayPhase::Full,
+                1.0,
+                memory.vector_slot,
+            )
             .await;
 
         // Supersedes edge

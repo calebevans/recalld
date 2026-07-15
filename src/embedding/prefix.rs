@@ -287,10 +287,7 @@ mod tests {
     #[async_trait::async_trait]
     impl EmbeddingProvider for AsymmetricMockProvider {
         async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("embed", text.to_string()));
+            self.calls.lock().unwrap().push(("embed", text.to_string()));
             Ok(vec![1.0; self.dims])
         }
 
@@ -322,11 +319,8 @@ mod tests {
     #[tokio::test]
     async fn test_embed_query_delegates_to_inner_embed_query() {
         let (mock, calls) = AsymmetricMockProvider::new(4);
-        let provider = PrefixedProvider::new(
-            Box::new(mock),
-            "doc: ".to_string(),
-            "query: ".to_string(),
-        );
+        let provider =
+            PrefixedProvider::new(Box::new(mock), "doc: ".to_string(), "query: ".to_string());
         provider.embed_query("hello").await.unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -337,11 +331,8 @@ mod tests {
     #[tokio::test]
     async fn test_embed_delegates_to_inner_embed() {
         let (mock, calls) = AsymmetricMockProvider::new(4);
-        let provider = PrefixedProvider::new(
-            Box::new(mock),
-            "doc: ".to_string(),
-            "query: ".to_string(),
-        );
+        let provider =
+            PrefixedProvider::new(Box::new(mock), "doc: ".to_string(), "query: ".to_string());
         provider.embed("hello").await.unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -352,11 +343,7 @@ mod tests {
     #[tokio::test]
     async fn test_embed_query_empty_prefix_delegates_to_inner_embed_query() {
         let (mock, calls) = AsymmetricMockProvider::new(4);
-        let provider = PrefixedProvider::new(
-            Box::new(mock),
-            "doc: ".to_string(),
-            "".to_string(),
-        );
+        let provider = PrefixedProvider::new(Box::new(mock), "doc: ".to_string(), "".to_string());
         provider.embed_query("hello").await.unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);

@@ -78,6 +78,13 @@ pub fn update_decay_state(
     is_permastore: bool,
 ) -> Result<(), SweepError> {
     storage
-        .update_decay_state(id, phase, strength, decay_strength, stability, is_permastore)
+        .update_decay_state(
+            id,
+            phase,
+            strength,
+            decay_strength,
+            stability,
+            is_permastore,
+        )
         .map_err(|e| SweepError::Storage(e.to_string()))
 }

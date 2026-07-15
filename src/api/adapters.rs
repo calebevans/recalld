@@ -15,8 +15,8 @@ use crate::config::RecalldConfig;
 use crate::embedding::EmbeddingProvider;
 use crate::graph::SharedGraph;
 use crate::model::{
-    AccessKind, CachedRecord, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId,
-    Tag, parse_structured_tags,
+    AccessKind, CachedRecord, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId, Tag,
+    parse_structured_tags,
 };
 use crate::search::{EntityIndex, FlatVectorIndex, FtsIndex};
 use crate::storage::RedbStorageEngine;
@@ -125,8 +125,8 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             query_mode: crate::search::QueryMode::default(),
             graph_depth: (query.graph_depth as u8).min(3),
             time_range_start: query.time_range_start, // Issue 3: pass time range
-            time_range_end: query.time_range_end,      // Issue 3: pass time range
-            entities: query.entities.clone(),           // Issue 4: pass entities
+            time_range_end: query.time_range_end,     // Issue 3: pass time range
+            entities: query.entities.clone(),         // Issue 4: pass entities
         };
         let response = self.query_engine.search(pipeline_query).await?;
         Ok(response
@@ -612,16 +612,14 @@ impl state::StorageEngine for StorageEngineAdapter {
                     format!("storage lock poisoned: {e}"),
                 ))
             })?;
-            storage_r
-                .meta_store()
-                .list_memories_filtered(
-                    namespace_id,
-                    &tags_owned,
-                    time_range_start,
-                    time_range_end,
-                    offset,
-                    limit,
-                )
+            storage_r.meta_store().list_memories_filtered(
+                namespace_id,
+                &tags_owned,
+                time_range_start,
+                time_range_end,
+                offset,
+                limit,
+            )
         })
         .await
         .map_err(|e| {
@@ -1031,9 +1029,9 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         let record = {
             let storage = self.storage.clone();
             tokio::task::spawn_blocking(move || {
-                let storage_r = storage.read().map_err(|e| {
-                    format!("storage lock poisoned: {e}")
-                })?;
+                let storage_r = storage
+                    .read()
+                    .map_err(|e| format!("storage lock poisoned: {e}"))?;
                 storage_r
                     .get_record(id)
                     .map_err(|e| e.to_string())?
@@ -1055,9 +1053,9 @@ impl state::FsrsEngine for FsrsEngineAdapter {
             let storage = self.storage.clone();
             let ns_id = record.namespace_id;
             tokio::task::spawn_blocking(move || {
-                let storage_r = storage.read().map_err(|e| {
-                    format!("storage lock poisoned: {e}")
-                })?;
+                let storage_r = storage
+                    .read()
+                    .map_err(|e| format!("storage lock poisoned: {e}"))?;
                 let multiplier = storage_r
                     .get_namespace(NamespaceId::new(ns_id))
                     .ok()
@@ -1078,12 +1076,8 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         // Step 4: Use FSRS to compute new stability based on quality rating.
         let decay_config = crate::decay::DecayConfig::default();
         let engine = crate::decay::FsrsEngine::new(&decay_config);
-        let new_stability = engine.review_stability(
-            record.stability,
-            elapsed_days,
-            quality,
-            ns_decay_multiplier,
-        );
+        let new_stability =
+            engine.review_stability(record.stability, elapsed_days, quality, ns_decay_multiplier);
 
         // Step 5: Compute new retrievability (just reinforced = 1.0).
         let new_strength = 1.0_f32;
@@ -1094,11 +1088,18 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         {
             let storage = self.storage.clone();
             tokio::task::spawn_blocking(move || {
-                let storage_r = storage.read().map_err(|e| {
-                    format!("storage lock poisoned: {e}")
-                })?;
+                let storage_r = storage
+                    .read()
+                    .map_err(|e| format!("storage lock poisoned: {e}"))?;
                 storage_r
-                    .update_decay_state(id, phase, new_strength, new_strength, new_stability, is_permastore)
+                    .update_decay_state(
+                        id,
+                        phase,
+                        new_strength,
+                        new_strength,
+                        new_stability,
+                        is_permastore,
+                    )
                     .map_err(|e| e.to_string())?;
                 storage_r
                     .update_access(id, now, crate::model::AccessKind::ManualReinforcement)

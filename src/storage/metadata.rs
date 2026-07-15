@@ -185,10 +185,7 @@ impl MetadataStore {
         // 4. Update in-memory phase bitmap (always Phase::Full for new
         //    records).
         {
-            let mut pi = self
-                .phase_index
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
             pi.insert(record.namespace_id, record.vector_slot);
         }
 
@@ -244,10 +241,7 @@ impl MetadataStore {
 
         // Update phase bitmap if phase changed.
         if old_phase != phase {
-            let mut pi = self
-                .phase_index
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
             pi.transition(record.namespace_id, record.vector_slot, old_phase, phase);
         }
 
@@ -340,11 +334,12 @@ impl MetadataStore {
 
         // 4. Remove from in-memory phase bitmap.
         {
-            let mut pi = self
-                .phase_index
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            pi.remove(deleted_record.namespace_id, deleted_record.vector_slot, deleted_record.phase);
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+            pi.remove(
+                deleted_record.namespace_id,
+                deleted_record.vector_slot,
+                deleted_record.phase,
+            );
         }
 
         Ok(Some(deleted_record))
@@ -410,10 +405,7 @@ impl MetadataStore {
         // Tombstoned records are not tracked in the bitmap since their
         // vector slots are freed.
         {
-            let mut pi = self
-                .phase_index
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
             pi.remove(old_namespace_id, old_vector_slot, old_phase);
         }
 
@@ -426,10 +418,7 @@ impl MetadataStore {
     /// lookup per matching slot to resolve vector_slot -> MemoryId.
     pub fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError> {
         let ns_slots: Vec<(u32, u32)> = {
-            let pi = self
-                .phase_index
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
+            let pi = self.phase_index.read().unwrap_or_else(|e| e.into_inner());
             pi.all_slots_in_phase(phase)
         };
 
@@ -469,10 +458,7 @@ impl MetadataStore {
         // Use (namespace_id, vector_slot) pairs for lookup to avoid
         // cross-namespace collisions.
         let ns_slots: std::collections::HashSet<(u32, u32)> = {
-            let pi = self
-                .phase_index
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
+            let pi = self.phase_index.read().unwrap_or_else(|e| e.into_inner());
             pi.all_slots_in_phase(phase).into_iter().collect()
         };
 
@@ -718,13 +704,15 @@ impl MetadataStore {
 
         // Phase 3: Update in-memory phase bitmap.
         {
-            let mut pi = self
-                .phase_index
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
             for (_, record, old_phase) in &updates {
                 if *old_phase != record.phase {
-                    pi.transition(record.namespace_id, record.vector_slot, *old_phase, record.phase);
+                    pi.transition(
+                        record.namespace_id,
+                        record.vector_slot,
+                        *old_phase,
+                        record.phase,
+                    );
                 }
             }
 
@@ -759,10 +747,7 @@ impl MetadataStore {
     /// Called periodically (end of decay sweep, graceful shutdown).
     pub fn persist_phase_index(&self) -> Result<(), StorageError> {
         let bytes = {
-            let pi = self
-                .phase_index
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
+            let pi = self.phase_index.read().unwrap_or_else(|e| e.into_inner());
             pi.to_bytes()
         };
         let write_txn = self.db.begin_write()?;
@@ -803,10 +788,7 @@ impl MetadataStore {
         write_txn.commit()?;
 
         // Replace the in-memory copy.
-        *self
-            .phase_index
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = rebuilt;
+        *self.phase_index.write().unwrap_or_else(|e| e.into_inner()) = rebuilt;
 
         Ok(())
     }

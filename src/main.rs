@@ -197,7 +197,6 @@ enum BenchTarget {
         #[arg(long)]
         embed_dims: Option<usize>,
     },
-
 }
 
 /// Default `Command::Serve` used when the user invokes `recalld` with no
@@ -440,14 +439,13 @@ async fn run_serve(
                 system.cache().clone(),
                 Arc::new(system.config().clone()),
             ));
-        let decay: Arc<dyn recalld::api::FsrsEngine> =
-            Arc::new(FsrsEngineAdapter::new(
-                system.storage().clone(),
-                system.cache().clone(),
-                system.graph().clone(),
-                Arc::new(system.config().clone()),
-                true,
-            ));
+        let decay: Arc<dyn recalld::api::FsrsEngine> = Arc::new(FsrsEngineAdapter::new(
+            system.storage().clone(),
+            system.cache().clone(),
+            system.graph().clone(),
+            Arc::new(system.config().clone()),
+            true,
+        ));
         let namespaces: Arc<dyn recalld::api::NamespaceRegistry> =
             Arc::new(NamespaceRegistryAdapter::new(system.storage().clone()));
         let metrics: Arc<dyn recalld::api::MetricsCollector> = Arc::new(NoopMetricsCollector);
