@@ -306,13 +306,15 @@ fn parse_dataset(path: &Path) -> Result<Vec<Conversation>, Box<dyn std::error::E
 
 // ── Benchmark harness ─────────────────────────────────────────────
 
-struct BenchHarness {
-    system: Recalld,
-    _temp_dir: tempfile::TempDir,
+pub(super) struct BenchHarness {
+    pub(super) system: Recalld,
+    _temp_dir: Option<tempfile::TempDir>,
 }
 
 impl BenchHarness {
-    async fn new(base_config: &RecalldConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(super) async fn new(
+        base_config: &RecalldConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = tempfile::TempDir::new()?;
 
         let mut config = base_config.clone();
@@ -328,8 +330,33 @@ impl BenchHarness {
 
         Ok(Self {
             system,
-            _temp_dir: temp_dir,
+            _temp_dir: Some(temp_dir),
         })
+    }
+
+    pub(super) async fn new_persistent(
+        base_config: &RecalldConfig,
+        dir: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(dir)?;
+        let mut config = base_config.clone();
+        config.storage.data_dir = dir
+            .to_str()
+            .ok_or("cache dir path is not valid UTF-8")?
+            .to_string();
+        config.decay.sweep_interval_hours = 999_999.0;
+        config.decay.disable_sweep = true;
+        let system = Recalld::new(config).await?;
+        Ok(Self {
+            system,
+            _temp_dir: None,
+        })
+    }
+
+    pub(super) fn has_memories(&self) -> bool {
+        let storage = self.system.storage();
+        let guard = storage.read().expect("storage lock poisoned");
+        guard.count().unwrap_or(0) > 0
     }
 }
 
@@ -1203,7 +1230,7 @@ async fn run_conversation(
 
 // ── Ingest ────────────────────────────────────────────────────────
 
-async fn store_single_memory(
+pub(super) async fn store_single_memory(
     harness: &BenchHarness,
     summary: &str,
     full_text: Option<&str>,
@@ -1465,16 +1492,16 @@ async fn ingest_conversation(
 // ── Search ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct ScoredMemory {
-    memory_id: MemoryId,
-    text: String,
-    full_text: Option<String>,
-    score: f32,
-    created_at: i64,
-    tags: Vec<crate::model::Tag>,
+pub(super) struct ScoredMemory {
+    pub(super) memory_id: MemoryId,
+    pub(super) text: String,
+    pub(super) full_text: Option<String>,
+    pub(super) score: f32,
+    pub(super) created_at: i64,
+    pub(super) tags: Vec<crate::model::Tag>,
 }
 
-fn load_full_texts(
+pub(super) fn load_full_texts(
     harness: &BenchHarness,
     results: Vec<crate::search::PipelineSearchResult>,
 ) -> Result<Vec<ScoredMemory>, Box<dyn std::error::Error>> {
@@ -1517,7 +1544,7 @@ fn load_full_texts(
     Ok(scored)
 }
 
-async fn search_memories(
+pub(super) async fn search_memories(
     harness: &BenchHarness,
     question: &str,
     top_k: usize,
@@ -1552,7 +1579,7 @@ async fn search_memories(
                         params.queries,
                         params.entities,
                         tags,
-                        params.depth.min(3) as u8,
+                        params.depth.min(2) as u8,
                         params.time_range_start,
                         params.time_range_end,
                     )
@@ -1604,11 +1631,7 @@ async fn search_memories(
             let _ = writeln!(debug_log, "  FTS[{}]:   {:?}", qi + 1, fq);
         }
 
-        let per_query_limit = if queries.len() > 1 {
-            top_k / 2 + 5
-        } else {
-            top_k
-        };
+        let per_query_limit = top_k;
         let filter = PipelineSearchFilter {
             require_tags: require_tags.clone(),
             ..PipelineSearchFilter::default()
@@ -1662,12 +1685,115 @@ async fn search_memories(
         );
     }
 
+    // Iterative retrieval: up to 2 follow-up rounds.
+    if let Some(llm) = search_llm {
+        for round in 1..=1 {
+            let summaries: String = results
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let snippet: String = r.text.chars().take(150).collect();
+                    format!("[{}] {}", i + 1, snippet)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            match llm.construct_followup_query(question, &summaries).await {
+                Ok(Some(followup)) => {
+                    let _ = writeln!(debug_log, "  -- Follow-up round {round} --");
+                    let followup_tags: Vec<crate::model::Tag> = followup
+                        .entities
+                        .iter()
+                        .filter_map(|e| {
+                            crate::model::Tag::new(format!("entity/{}", e.to_lowercase())).ok()
+                        })
+                        .collect();
+
+                    let mut followup_merged: HashMap<MemoryId, ScoredMemory> =
+                        results.iter().map(|r| (r.memory_id, r.clone())).collect();
+                    let prev_count = followup_merged.len();
+
+                    for (qi, bq) in followup.queries.iter().enumerate() {
+                        let _ =
+                            writeln!(debug_log, "  FU{round}-Query[{}]: {:?}", qi + 1, bq.query);
+                        if let Some(ref fq) = bq.fts_query {
+                            let _ = writeln!(debug_log, "  FU{round}-FTS[{}]:   {:?}", qi + 1, fq);
+                        }
+                        let filter = PipelineSearchFilter {
+                            require_tags: followup_tags.clone(),
+                            ..PipelineSearchFilter::default()
+                        };
+                        let query = SearchQuery {
+                            text: Some(bq.query.clone()),
+                            fts_query: bq.fts_query.clone(),
+                            namespace: "default".to_string(),
+                            filter,
+                            limit: top_k,
+                            min_score: 0.0,
+                            include_ghosts: false,
+                            query_mode: QueryMode::EmbeddingPlusMetadata,
+                            graph_depth: 2,
+                            time_range_start: None,
+                            time_range_end: None,
+                            entities: followup.entities.clone(),
+                        };
+                        if let Ok(response) = harness.system.query_engine().search(query).await {
+                            if let Ok(new_results) = load_full_texts(harness, response.results) {
+                                for r in new_results {
+                                    followup_merged
+                                        .entry(r.memory_id)
+                                        .and_modify(|existing| {
+                                            if r.score > existing.score {
+                                                *existing = r.clone();
+                                            }
+                                        })
+                                        .or_insert(r);
+                                }
+                            }
+                        }
+                    }
+
+                    let new_unique = followup_merged.len() - prev_count;
+                    results = followup_merged.into_values().collect();
+                    results.sort_by(|a, b| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    results.truncate(top_k);
+
+                    let _ = writeln!(
+                        debug_log,
+                        "  Follow-up round {round}: {new_unique} new, {} total after merge",
+                        results.len()
+                    );
+
+                    if new_unique == 0 {
+                        let _ = writeln!(debug_log, "  No new results, stopping follow-ups");
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = writeln!(debug_log, "  Follow-up round {round}: not needed");
+                    break;
+                }
+                Err(e) => {
+                    let _ = writeln!(debug_log, "  Follow-up round {round}: error: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
     Ok(results)
 }
 
 /// Collect graph context: 1-hop neighbor summaries + edge relationships
 /// between all memories (results and neighbors).
-async fn collect_graph_context(harness: &BenchHarness, results: &[ScoredMemory]) -> GraphContext {
+pub(super) async fn collect_graph_context(
+    harness: &BenchHarness,
+    results: &[ScoredMemory],
+) -> GraphContext {
     let result_ids: HashSet<MemoryId> = results.iter().map(|m| m.memory_id).collect();
 
     // Build label map for results.
