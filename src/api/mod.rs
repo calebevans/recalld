@@ -33,7 +33,7 @@ pub use state::{
 // Re-export API-layer supporting types.
 pub use state::{
     NamespaceListInfo, NamespaceStats, QueryInput, ReinforceResult, ResolvedSearchResult,
-    SearchFilter, SearchQuery,
+    SearchQuery,
 };
 
 use std::net::SocketAddr;

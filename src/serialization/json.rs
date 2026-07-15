@@ -13,6 +13,7 @@ use crate::model::id::MemoryId;
 use crate::model::memory::AccessEvent;
 use crate::model::record::CachedRecord;
 use crate::model::tag::Tag;
+use crate::model::parse_structured_tags;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Response Wrappers
@@ -43,45 +44,6 @@ pub struct ApiError {
     /// The request field that caused the error, if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
-}
-
-/// Paginated response wrapper for list endpoints.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PaginatedResponse<T: Serialize> {
-    /// The page of results.
-    pub data: Vec<T>,
-    /// Total number of records matching the query.
-    pub total: u64,
-    /// Offset into the full result set.
-    pub offset: u64,
-    /// Maximum number of results per page.
-    pub limit: u64,
-
-    /// Server-side processing time in microseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub took_us: Option<u64>,
-}
-
-/// Pagination query parameters (deserialized from query string).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PaginationParams {
-    /// Offset into the result set. Default: 0.
-    #[serde(default = "default_offset")]
-    pub offset: u64,
-
-    /// Maximum results to return. Default: 50.
-    #[serde(default = "default_limit")]
-    pub limit: u64,
-}
-
-fn default_offset() -> u64 {
-    0
-}
-
-fn default_limit() -> u64 {
-    50
 }
 
 /// Response wrapper for search results, including relevance scores.
@@ -137,6 +99,15 @@ pub struct MemoryResponse {
 
     /// Validated tags attached to this memory.
     pub tags: Vec<Tag>,
+    /// Named entities extracted from tags (entity/ prefix).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
+    /// Topics extracted from tags (topic/ prefix).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+    /// Emotions extracted from tags (emotion/ prefix).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emotions: Vec<String>,
     /// Current decay phase.
     pub phase: DecayPhase,
     /// Raw FSRS retrievability R, in [0.0, 1.0].
@@ -166,6 +137,7 @@ impl MemoryResponse {
     /// resolved namespace name. Embedding and access history
     /// are set to `None` -- the caller populates them if requested.
     pub fn from_cached(record: &CachedRecord, namespace_name: String) -> Self {
+        let metadata = parse_structured_tags(&record.tags);
         Self {
             id: record.id,
             namespace: namespace_name,
@@ -174,6 +146,9 @@ impl MemoryResponse {
             summary: record.summary.clone(),
             full_text: None, // loaded on demand from fulltext.dat
             tags: record.tags.clone(),
+            entities: metadata.entities,
+            topics: metadata.topics,
+            emotions: metadata.emotions,
             phase: record.phase,
             strength: record.strength,
             decay_strength: record.decay_strength,
@@ -224,25 +199,6 @@ fn default_namespace() -> String {
     "default".to_string()
 }
 
-/// PATCH /memories/{id} -- Update mutable fields.
-/// Only provided fields are updated; omitted fields are untouched.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateMemoryRequest {
-    /// Replace the summary.
-    #[serde(default)]
-    pub summary: Option<String>,
-
-    /// Replace tags entirely (not additive).
-    #[serde(default)]
-    pub tags: Option<Vec<String>>,
-
-    /// Force a manual reinforcement (equivalent to an access
-    /// with AccessKind::ManualReinforcement).
-    #[serde(default)]
-    pub reinforce: Option<bool>,
-}
-
 /// POST /search -- Search for memories.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -264,6 +220,18 @@ pub struct SearchRequest {
     #[serde(default)]
     pub tags: Vec<String>,
 
+    /// Named entities to filter by (converted to entity/ tags).
+    #[serde(default)]
+    pub entities: Vec<String>,
+
+    /// Topics to filter by (converted to topic/ tags).
+    #[serde(default)]
+    pub topics: Vec<String>,
+
+    /// Emotions to filter by (converted to emotion/ tags).
+    #[serde(default)]
+    pub emotions: Vec<String>,
+
     /// Minimum decay strength to include in results.
     #[serde(default)]
     pub min_strength: Option<f32>,
@@ -276,6 +244,14 @@ pub struct SearchRequest {
     /// matches only, 1 = direct neighbors, etc.). Default: 0.
     #[serde(default)]
     pub depth: u8,
+
+    /// Optional inclusive lower bound for temporal filtering (millis since epoch).
+    #[serde(default)]
+    pub time_range_start: Option<i64>,
+
+    /// Optional inclusive upper bound for temporal filtering (millis since epoch).
+    #[serde(default)]
+    pub time_range_end: Option<i64>,
 
     /// Whether to include the embedding vectors in results.
     /// Default: false (saves bandwidth).
@@ -300,7 +276,9 @@ pub struct NamespaceRequest {
     pub name: String,
 
     /// Embedding dimensionality. Fixed at creation time.
-    pub embedding_dim: u32,
+    /// When omitted, defaults to the same dimensions as the 'default' namespace.
+    #[serde(default)]
+    pub embedding_dim: Option<u32>,
 
     /// Initial stability for new memories in this namespace (days).
     #[serde(default = "default_initial_stability")]
@@ -309,6 +287,12 @@ pub struct NamespaceRequest {
     /// Desired retention rate. Default: 0.9.
     #[serde(default = "default_desired_retention")]
     pub desired_retention: f32,
+
+    /// Decay rate multiplier for this namespace.
+    /// None = inherit from global config.
+    /// Some(1.0) = normal, Some(0.0) = disabled, Some(2.0) = 2x slower decay.
+    #[serde(default)]
+    pub decay_rate_multiplier: Option<f32>,
 }
 
 fn default_initial_stability() -> f32 {

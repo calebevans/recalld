@@ -352,12 +352,11 @@ impl VectorIndex for FlatVectorIndex {
         }
 
         // Extract results sorted by descending score.
-        // `into_sorted_vec()` returns ascending order (by min-heap's reversed Ord),
-        // and `.rev()` flips it to descending — no additional sort needed.
+        // `into_sorted_vec()` returns ascending order by the reversed Ord,
+        // which is already descending by actual score — no additional sort needed.
         let results: Vec<VectorSearchResult> = heap
             .into_sorted_vec()
             .into_iter()
-            .rev()
             .map(|se| VectorSearchResult {
                 id: self.entries[se.index].id,
                 score: se.score,

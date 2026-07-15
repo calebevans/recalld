@@ -197,6 +197,7 @@ enum BenchTarget {
         #[arg(long)]
         embed_dims: Option<usize>,
     },
+
 }
 
 /// Default `Command::Serve` used when the user invokes `recalld` with no
@@ -421,18 +422,32 @@ async fn run_serve(
             system.query_engine().clone(),
             system.embedding().clone(),
             system.vector_index().clone(),
+            system.fts_index().clone(),
+            system.entity_index().clone(),
         ));
         let storage: Arc<dyn recalld::api::StorageEngine> = Arc::new(StorageEngineAdapter::new(
             system.storage().clone(),
             system.cache().clone(),
-            system.embedding().clone(),
         ));
         let cache: Arc<dyn recalld::api::RecordCache> =
             Arc::new(RecordCacheAdapter::new(system.cache().clone()));
         let graph: Arc<dyn recalld::api::RelationshipGraph> =
-            Arc::new(RelationshipGraphAdapter::new(system.graph().clone()));
+            Arc::new(RelationshipGraphAdapter::new(
+                system.graph().clone(),
+                system.vector_index().clone(),
+                system.entity_index().clone(),
+                system.storage().clone(),
+                system.cache().clone(),
+                Arc::new(system.config().clone()),
+            ));
         let decay: Arc<dyn recalld::api::FsrsEngine> =
-            Arc::new(FsrsEngineAdapter::new(system.storage().clone(), true));
+            Arc::new(FsrsEngineAdapter::new(
+                system.storage().clone(),
+                system.cache().clone(),
+                system.graph().clone(),
+                Arc::new(system.config().clone()),
+                true,
+            ));
         let namespaces: Arc<dyn recalld::api::NamespaceRegistry> =
             Arc::new(NamespaceRegistryAdapter::new(system.storage().clone()));
         let metrics: Arc<dyn recalld::api::MetricsCollector> = Arc::new(NoopMetricsCollector);

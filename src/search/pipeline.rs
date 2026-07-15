@@ -91,6 +91,10 @@ pub trait MetadataStore: Send + Sync {
     async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>>;
     /// Batch load multiple records. Missing IDs are silently skipped.
     async fn get_batch(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>>;
+    /// Scan all records in storage. Used by MetadataOnly queries.
+    async fn scan_all(&self) -> Result<Vec<CachedRecord>> {
+        Ok(Vec::new())
+    }
 }
 
 /// RIF processor -- applies retrieval-induced forgetting.
@@ -486,7 +490,7 @@ impl QueryEngine {
 
         // -- Stage 5: Apply Filters (entity overlap + metadata filters) ---
         let stage_start = Instant::now();
-        self.apply_filters(&mut candidates, &query, &query_entities);
+        self.apply_filters(&mut candidates, &query, &query_entities, ns_config.id);
         timings.apply_filters_us = stage_start.elapsed().as_micros() as u64;
 
         // -- Stage 6: Calculate Effective R --------------------------------
@@ -662,6 +666,7 @@ impl QueryEngine {
         candidates: &mut Vec<Candidate>,
         query: &SearchQuery,
         query_entities: &[String],
+        namespace_id: NamespaceId,
     ) {
         // Entity overlap scoring.
         if !query_entities.is_empty() {
@@ -671,8 +676,8 @@ impl QueryEngine {
             }
         }
 
-        // Metadata filters (ghost, min_score, tags, phase, strength).
-        candidates.retain(|c| Self::passes_filters(c, query));
+        // Metadata filters (namespace, ghost, min_score, tags, phase, strength).
+        candidates.retain(|c| Self::passes_filters(c, query, namespace_id));
     }
 
     /// Stage 7: Apply retrieval-induced forgetting suppressions.
@@ -880,13 +885,17 @@ impl QueryEngine {
         let result_ids: Vec<MemoryId> = filtered.iter().map(|s| s.memory_id).collect();
         let records = self.load_records(&result_ids).await?;
 
-        let results: Vec<SearchResult> = records
+        // Build a lookup map so we can iterate `filtered` (which preserves
+        // descending similarity order from the vector search) instead of
+        // `records` (whose order is scrambled by cache-hit / disk-load batching).
+        let record_map: std::collections::HashMap<MemoryId, &CachedRecord> =
+            records.iter().map(|r| (r.id, r)).collect();
+
+        let results: Vec<SearchResult> = filtered
             .iter()
-            .filter_map(|rec| {
-                let score = filtered
-                    .iter()
-                    .find(|s| s.memory_id == rec.id)
-                    .map(|s| s.score);
+            .filter_map(|scored| {
+                let rec = record_map.get(&scored.memory_id)?;
+                let score = Some(scored.score);
                 Some(SearchResult {
                     memory_id: rec.id,
                     created_at: rec.created_at,
@@ -968,10 +977,7 @@ impl QueryEngine {
         filter: &SearchFilter,
         max_results: usize,
     ) -> Result<Vec<CachedRecord>> {
-        // Use get_batch with an empty slice to signal a full scan.
-        // The MetadataStore adapter can implement a storage-level scan
-        // path here; for now we return whatever the store provides.
-        let all_records = self.meta_store.get_batch(&[]).await?;
+        let all_records = self.meta_store.scan_all().await?;
 
         // Apply client-side filtering for namespace and query filters.
         let filtered: Vec<CachedRecord> = all_records
@@ -1031,8 +1037,19 @@ impl QueryEngine {
     }
 
     /// Check if a candidate passes all query filters.
-    fn passes_filters(candidate: &Candidate, query: &SearchQuery) -> bool {
+    fn passes_filters(
+        candidate: &Candidate,
+        query: &SearchQuery,
+        namespace_id: NamespaceId,
+    ) -> bool {
         let record = &candidate.record;
+
+        // Namespace filter: discard candidates from other namespaces.
+        // Entity recall and graph expansion can inject cross-namespace
+        // candidates; this gate ensures they never reach the results.
+        if record.namespace_id != namespace_id {
+            return false;
+        }
 
         // Tombstone filter: always exclude tombstoned memories from
         // search results. Their content has been stripped; they only

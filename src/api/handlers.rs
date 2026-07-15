@@ -19,6 +19,7 @@ use super::errors::AppError;
 use super::models::*;
 use super::state::{AppState, QueryInput, SearchQuery};
 use crate::health::report as health_report_compute;
+use crate::model::constants::NAMESPACE_NAME_MAX_BYTES;
 use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
 use crate::serialization::{
@@ -101,7 +102,28 @@ pub async fn create_memory(
             id: req.namespace.clone(),
         })?;
 
-    // --- Embedding ---
+    // --- Merge entities/topics/emotions into tags (Issue 8) ---
+    let mut merged_tags = req.tags.clone();
+    for entity in &req.entities {
+        let tag = format!("entity/{}", entity.to_lowercase());
+        if !merged_tags.contains(&tag) {
+            merged_tags.push(tag);
+        }
+    }
+    for topic in &req.topics {
+        let tag = format!("topic/{}", topic.to_lowercase());
+        if !merged_tags.contains(&tag) {
+            merged_tags.push(tag);
+        }
+    }
+    for emotion in &req.emotions {
+        let tag = format!("emotion/{}", emotion.to_lowercase());
+        if !merged_tags.contains(&tag) {
+            merged_tags.push(tag);
+        }
+    }
+
+    // --- Embedding (Issue 9: embed summary + full_text + tags) ---
     let embedding = match req.embedding {
         Some(ref vec) => {
             if vec.len() != ns.embedding_dim as usize {
@@ -117,33 +139,97 @@ pub async fn create_memory(
             }
             vec.clone()
         }
-        None => state.search.embed_text(&req.summary, ns.id).await?,
+        None => {
+            // Build embedding text from summary + full_text + tags (matches MCP)
+            let mut embed_text = match &req.full_text {
+                Some(ft) => format!("{}\n\n{}", req.summary, ft),
+                None => req.summary.clone(),
+            };
+            if !merged_tags.is_empty() {
+                embed_text = format!("{} {}", embed_text, merged_tags.join(" "));
+            }
+            state.search.embed_text(&embed_text, ns.id).await?
+        }
     };
 
     // --- Persist ---
+    // Resolve initial stability: use caller-provided value, or fall back
+    // to the namespace's configured initial_stability (matching the MCP
+    // reference implementation).
+    let resolved_stability = req.initial_stability.unwrap_or(ns.initial_stability);
     let memory = state
         .storage
         .create_memory(
             ns.id,
             &req.summary,
             req.full_text.as_deref(),
-            &req.tags,
+            &merged_tags,
             &embedding,
-            req.initial_stability,
+            Some(resolved_stability),
             req.created_at,
         )
         .await?;
-
-    // --- Parent edge ---
-    if let Some(parent_id) = req.parent_id {
-        state.graph.add_edge(parent_id, memory.id, "parent").await?;
-    }
 
     // --- Cache + vector index ---
     state.cache.insert(&memory).await;
     state
         .search
         .index_memory(memory.id, &embedding, ns.id)
+        .await;
+
+    // --- FTS5 indexing (Issue 10) ---
+    state
+        .search
+        .fts_add(
+            ns.id,
+            memory.id,
+            &req.summary,
+            req.full_text.as_deref(),
+            &merged_tags,
+        )
+        .await;
+
+    // --- Entity index (Issue 10) ---
+    state
+        .search
+        .entity_index_add(memory.id, &req.entities)
+        .await;
+
+    // --- Graph node (Issue 11: must happen before edges) ---
+    let _ = state
+        .graph
+        .add_node(memory.id, ns.id, crate::model::DecayPhase::Full, 1.0, memory.vector_slot)
+        .await;
+
+    // --- Parent edge ---
+    if let Some(parent_id) = req.parent_id {
+        state.graph.add_edge(parent_id, memory.id, "parent").await?;
+    }
+
+    // --- Supersedes edge (Issue 8) ---
+    if let Some(old_id) = req.supersedes {
+        if let Err(e) = state.graph.add_edge(memory.id, old_id, "supersedes").await {
+            tracing::warn!(
+                memory_id = %memory.id,
+                superseded = %old_id,
+                %e,
+                "supersedes edge failed (non-fatal)"
+            );
+        }
+    }
+
+    // --- Autolink, entity-link, temporal-link (Issue 12) ---
+    let created_at = req.created_at.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    state
+        .graph
+        .perform_post_creation_links(
+            memory.id,
+            ns.id,
+            &embedding,
+            &merged_tags,
+            &req.entities,
+            created_at,
+        )
         .await;
 
     let mut response = MemoryResponse::from_cached(&memory, ns.name.clone());
@@ -220,11 +306,34 @@ pub async fn delete_memory(
 
     let memory_id = parse_memory_id(&id)?;
 
+    // Read record first for entity index cleanup (Issue 14)
+    let existing_record = state.storage.get_record(memory_id).await;
+
     let existed = state.storage.delete_memory(memory_id).await?;
     if existed {
         state.cache.remove(memory_id).await;
         state.search.remove_from_index(memory_id).await;
-        state.graph.remove_all_edges(memory_id).await?;
+
+        // Issue 14: Clean up FTS5 index
+        state.search.fts_remove(memory_id).await;
+
+        // Issue 14: Clean up entity index
+        if let Some(ref record) = existing_record {
+            let metadata = crate::model::parse_structured_tags(&record.tags);
+            state
+                .search
+                .entity_index_remove(memory_id, &metadata.entities)
+                .await;
+        }
+
+        // Issue 13: Tombstone the graph node instead of removing it
+        if let Err(e) = state.graph.tombstone_node(memory_id).await {
+            tracing::warn!(
+                memory_id = %memory_id,
+                %e,
+                "graph tombstone failed (non-fatal)"
+            );
+        }
     }
 
     let took = start.elapsed().as_micros() as u64;
@@ -356,25 +465,87 @@ pub async fn list_memories(
         None
     };
 
-    // Convert phase string to DecayPhase enum
+    // Issue 19: Use list_memories_filtered() for server-side pagination when namespace is given.
+    // Build require_tags from tags + entities (Issue 21).
+    let mut require_tags: Vec<crate::model::Tag> = params
+        .tags
+        .iter()
+        .filter_map(|t| crate::model::Tag::new(t).ok())
+        .collect();
+    for entity in &params.entities {
+        if let Ok(tag) = crate::model::Tag::new(&format!("entity/{}", entity.to_lowercase())) {
+            require_tags.push(tag);
+        }
+    }
+
+    if let Some(ns_id) = namespace_id {
+        // Server-side filtered pagination (Issue 19)
+        let (page, total) = state
+            .storage
+            .list_memories_filtered(
+                ns_id,
+                &require_tags,
+                params.time_range_start,
+                params.time_range_end,
+                offset,
+                limit,
+            )
+            .await?;
+
+        let mut memories: Vec<MemoryResponse> = Vec::with_capacity(page.len());
+        for (mid, record) in page {
+            let ns_name = state
+                .namespaces
+                .name_for(NamespaceId::new(record.namespace_id))
+                .unwrap_or_else(|| "unknown".to_string());
+            let cached = crate::model::CachedRecord::from(&record);
+            let mut mem = MemoryResponse::from_cached(&cached, ns_name);
+            mem.full_text = state.storage.get_full_text(mid).await.unwrap_or(None);
+            memories.push(mem);
+        }
+
+        let has_more = (offset + memories.len()) < total as usize;
+
+        let response = ListMemoriesResponse {
+            memories,
+            total,
+            limit: limit as u32,
+            offset: offset as u32,
+            has_more,
+        };
+
+        let took = start.elapsed().as_micros() as u64;
+
+        return Ok(Json(ApiResponse {
+            data: response,
+            took_us: Some(took),
+        }));
+    }
+
+    // Fallback: no namespace specified, use in-memory filtering
     let phase_filter = params.phase.as_ref().map(|p| match p.as_str() {
         "full" => crate::model::DecayPhase::Full,
         "summary" => crate::model::DecayPhase::Summary,
         "ghost" => crate::model::DecayPhase::Ghost,
-        _ => crate::model::DecayPhase::Full, // unreachable due to validation above
+        _ => crate::model::DecayPhase::Full,
     });
 
-    // Build filter struct
     let filter = ListFilter {
         namespace_id,
         phase: phase_filter,
-        tags: params.tags,
+        tags: {
+            let mut all_tags = params.tags;
+            for entity in &params.entities {
+                all_tags.push(format!("entity/{}", entity.to_lowercase()));
+            }
+            all_tags
+        },
+        time_range_start: params.time_range_start,
+        time_range_end: params.time_range_end,
     };
 
-    // Get filtered records from storage
     let mut records = state.storage.list_memories(&filter).await?;
 
-    // Sort in memory
     match (sort_field, order) {
         ("created", "asc") => records.sort_by_key(|r| r.created_at),
         ("created", "desc") => {
@@ -404,15 +575,13 @@ pub async fn list_memories(
                 .partial_cmp(&a.stability)
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
-        _ => {} // unreachable
+        _ => {}
     }
 
     let total = records.len() as u64;
 
-    // Apply pagination
     let page_records: Vec<_> = records.into_iter().skip(offset).take(limit).collect();
 
-    // Convert to MemoryResponse objects, loading full_text from storage
     let mut memories: Vec<MemoryResponse> = Vec::with_capacity(page_records.len());
     for record in page_records {
         let ns_name = state
@@ -515,7 +684,21 @@ pub async fn search_memories(
         }
     }
 
-    // Build internal query
+    // Merge entities/topics/emotions into tag filters (matching create_memory behaviour)
+    let mut include_tags = req.tags.clone();
+    for topic in &req.topics {
+        let tag = format!("topic/{}", topic.to_lowercase());
+        if !include_tags.contains(&tag) {
+            include_tags.push(tag);
+        }
+    }
+    for emotion in &req.emotions {
+        let tag = format!("emotion/{}", emotion.to_lowercase());
+        if !include_tags.contains(&tag) {
+            include_tags.push(tag);
+        }
+    }
+
     let query_input = if let Some(ref text) = req.query {
         Some(QueryInput::Text(text.clone()))
     } else {
@@ -527,13 +710,17 @@ pub async fn search_memories(
     let search_query = SearchQuery {
         query: query_input.unwrap_or(QueryInput::Text(String::new())),
         namespace_id: ns.id,
+        namespace_name: ns.name.clone(),
         k: limit,
-        include_tags: req.tags.clone(),
+        include_tags,
         exclude_tags: vec![],
         decay_phases: None,
         min_score: req.min_strength,
         graph_depth: req.depth as usize,
         apply_rif: true,
+        time_range_start: req.time_range_start,
+        time_range_end: req.time_range_end,
+        entities: req.entities.clone(),
     };
 
     let results = state.search.search(search_query).await?;
@@ -615,11 +802,17 @@ pub async fn find_similar(
 
     let limit = req.limit.min(100) as usize;
 
+    let ns_name = state
+        .namespaces
+        .name_for(source.namespace_id)
+        .unwrap_or_else(|| "default".to_string());
+
     // Search using source embedding, requesting limit+1 to account
     // for the source memory appearing in its own results.
     let search_query = SearchQuery {
         query: QueryInput::Vector(source_embedding),
         namespace_id: source.namespace_id,
+        namespace_name: ns_name,
         k: limit + 1,
         include_tags: vec![],
         exclude_tags: vec![],
@@ -627,6 +820,9 @@ pub async fn find_similar(
         min_score: req.min_score,
         graph_depth: 0,
         apply_rif: false,
+        time_range_start: None,
+        time_range_end: None,
+        entities: vec![],
     };
 
     let results = state.search.search(search_query).await?;
@@ -721,9 +917,9 @@ pub async fn create_namespace(
     let start = Instant::now();
 
     // Validate name format
-    if req.name.is_empty() || req.name.len() > 64 {
+    if req.name.is_empty() || req.name.len() > NAMESPACE_NAME_MAX_BYTES {
         return Err(AppError::BadRequest {
-            message: "namespace name must be 1-64 characters".into(),
+            message: format!("namespace name must be 1-{NAMESPACE_NAME_MAX_BYTES} characters").into(),
             field: Some("name".into()),
         });
     }
@@ -740,12 +936,14 @@ pub async fn create_namespace(
         });
     }
 
-    // Validate embedding dimensions
-    if req.embedding_dim == 0 || req.embedding_dim > 8192 {
-        return Err(AppError::BadRequest {
-            message: "embedding_dim must be between 1 and 8192".into(),
-            field: Some("embeddingDim".into()),
-        });
+    // Validate embedding dimensions if provided
+    if let Some(dim) = req.embedding_dim {
+        if dim == 0 || dim > 8192 {
+            return Err(AppError::BadRequest {
+                message: "embedding_dim must be between 1 and 8192".into(),
+                field: Some("embeddingDim".into()),
+            });
+        }
     }
 
     // Create namespace (registry checks for duplicates)
@@ -756,6 +954,7 @@ pub async fn create_namespace(
             req.embedding_dim,
             req.initial_stability,
             req.desired_retention,
+            req.decay_rate_multiplier,
         )
         .await
         .map_err(|_e| AppError::Conflict {
@@ -1027,6 +1226,332 @@ pub async fn health_report(
     }))
 }
 
+/// POST /memories/batch -- batch create memories (Issue 16).
+///
+/// Creates multiple memories in sequence. Each memory goes through the
+/// same validation and creation pipeline as the single-create endpoint.
+pub async fn batch_store(
+    State(state): State<AppState>,
+    Json(req): Json<BatchStoreRequest>,
+) -> Result<(StatusCode, Json<ApiResponse<BatchStoreResponse>>), AppError> {
+    let start = Instant::now();
+
+    if req.memories.is_empty() {
+        return Err(AppError::BadRequest {
+            message: "memories array must not be empty".into(),
+            field: Some("memories".into()),
+        });
+    }
+
+    if req.memories.len() > 100 {
+        return Err(AppError::BadRequest {
+            message: "batch size exceeds 100".into(),
+            field: Some("memories".into()),
+        });
+    }
+
+    let mut created = Vec::with_capacity(req.memories.len());
+
+    for mem_req in req.memories {
+        // Validate
+        if mem_req.summary.is_empty() {
+            continue;
+        }
+
+        let ns = match state.namespaces.resolve(&mem_req.namespace) {
+            Some(ns) => ns,
+            None => continue,
+        };
+
+        // Merge entities/topics/emotions into tags
+        let mut merged_tags = mem_req.tags.clone();
+        for entity in &mem_req.entities {
+            let tag = format!("entity/{}", entity.to_lowercase());
+            if !merged_tags.contains(&tag) {
+                merged_tags.push(tag);
+            }
+        }
+        for topic in &mem_req.topics {
+            let tag = format!("topic/{}", topic.to_lowercase());
+            if !merged_tags.contains(&tag) {
+                merged_tags.push(tag);
+            }
+        }
+        for emotion in &mem_req.emotions {
+            let tag = format!("emotion/{}", emotion.to_lowercase());
+            if !merged_tags.contains(&tag) {
+                merged_tags.push(tag);
+            }
+        }
+
+        // Embedding
+        let embedding = match mem_req.embedding {
+            Some(ref vec) => {
+                if vec.len() != ns.embedding_dim as usize {
+                    continue;
+                }
+                vec.clone()
+            }
+            None => {
+                let mut embed_text = match &mem_req.full_text {
+                    Some(ft) => format!("{}\n\n{}", mem_req.summary, ft),
+                    None => mem_req.summary.clone(),
+                };
+                if !merged_tags.is_empty() {
+                    embed_text = format!("{} {}", embed_text, merged_tags.join(" "));
+                }
+                match state.search.embed_text(&embed_text, ns.id).await {
+                    Ok(emb) => emb,
+                    Err(_) => continue,
+                }
+            }
+        };
+
+        // Persist — resolve initial stability from namespace config (matching MCP)
+        let resolved_stability = mem_req.initial_stability.unwrap_or(ns.initial_stability);
+        let memory = match state
+            .storage
+            .create_memory(
+                ns.id,
+                &mem_req.summary,
+                mem_req.full_text.as_deref(),
+                &merged_tags,
+                &embedding,
+                Some(resolved_stability),
+                mem_req.created_at,
+            )
+            .await
+        {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Cache + index
+        state.cache.insert(&memory).await;
+        state
+            .search
+            .index_memory(memory.id, &embedding, ns.id)
+            .await;
+
+        // FTS
+        state
+            .search
+            .fts_add(
+                ns.id,
+                memory.id,
+                &mem_req.summary,
+                mem_req.full_text.as_deref(),
+                &merged_tags,
+            )
+            .await;
+
+        // Entity index
+        state
+            .search
+            .entity_index_add(memory.id, &mem_req.entities)
+            .await;
+
+        // Graph node
+        let _ = state
+            .graph
+            .add_node(memory.id, ns.id, crate::model::DecayPhase::Full, 1.0, memory.vector_slot)
+            .await;
+
+        // Supersedes edge
+        if let Some(old_id) = mem_req.supersedes {
+            let _ = state.graph.add_edge(memory.id, old_id, "supersedes").await;
+        }
+
+        // Post-creation links
+        let created_at = mem_req
+            .created_at
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        state
+            .graph
+            .perform_post_creation_links(
+                memory.id,
+                ns.id,
+                &embedding,
+                &merged_tags,
+                &mem_req.entities,
+                created_at,
+            )
+            .await;
+
+        created.push(BatchStoreResult {
+            id: memory.id,
+            namespace: ns.name.clone(),
+        });
+    }
+
+    let total = created.len() as u64;
+    let took = start.elapsed().as_micros() as u64;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse {
+            data: BatchStoreResponse { created, total },
+            took_us: Some(took),
+        }),
+    ))
+}
+
+/// POST /namespaces/:name/duplicates -- scan for duplicate memories (Issue 16).
+///
+/// Uses vector similarity to find clusters of near-duplicate memories
+/// within a namespace.
+pub async fn scan_duplicates(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<ScanDuplicatesRequest>,
+) -> Result<Json<ApiResponse<ScanDuplicatesResponse>>, AppError> {
+    let start = Instant::now();
+
+    let ns = state
+        .namespaces
+        .resolve(&name)
+        .ok_or_else(|| AppError::NotFound {
+            resource: "namespace",
+            id: name.clone(),
+        })?;
+
+    let threshold = req.threshold.clamp(0.0, 1.0);
+    let max_memories = req.max_memories.min(10_000);
+
+    // Get memory IDs in this namespace
+    let filter = ListFilter {
+        namespace_id: Some(ns.id),
+        phase: None,
+        tags: vec![],
+        time_range_start: None,
+        time_range_end: None,
+    };
+    let records = state.storage.list_memories(&filter).await?;
+    let memory_ids: Vec<MemoryId> = records.iter().take(max_memories).map(|r| r.id).collect();
+
+    if memory_ids.len() < 2 {
+        let took = start.elapsed().as_micros() as u64;
+        return Ok(Json(ApiResponse {
+            data: ScanDuplicatesResponse {
+                clusters: vec![],
+                total: 0,
+            },
+            took_us: Some(took),
+        }));
+    }
+
+    // Load embeddings
+    let embeddings = state.search.get_embeddings_batch(&memory_ids);
+    let id_embeddings: Vec<(MemoryId, Vec<f32>)> = memory_ids
+        .into_iter()
+        .filter_map(|mid| embeddings.get(&mid).map(|emb| (mid, emb.clone())))
+        .collect();
+
+    if id_embeddings.len() < 2 {
+        let took = start.elapsed().as_micros() as u64;
+        return Ok(Json(ApiResponse {
+            data: ScanDuplicatesResponse {
+                clusters: vec![],
+                total: 0,
+            },
+            took_us: Some(took),
+        }));
+    }
+
+    // Union-Find based clustering
+    let n = id_embeddings.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    }
+
+    let mut max_sim: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+
+    // Compare each memory's embedding against its nearest neighbors
+    for (i, (mid_i, _emb_i)) in id_embeddings.iter().enumerate() {
+        // Find similar via the search pipeline's get_embedding + manual cosine
+        if let Some(emb) = state.search.get_embedding(*mid_i) {
+            // Use pairwise comparison within the loaded set
+            for (j, (_mid_j, emb_j)) in id_embeddings.iter().enumerate() {
+                if i >= j {
+                    continue;
+                }
+                let score = crate::search::dot_product_simd(&emb, emb_j);
+                if score >= threshold {
+                    union(&mut parent, i, j);
+                    let root = find(&mut parent, i);
+                    let entry = max_sim.entry(root).or_insert(0.0);
+                    if score > *entry {
+                        *entry = score;
+                    }
+                }
+            }
+        }
+    }
+
+    // Group into clusters
+    let mut clusters_map: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        clusters_map.entry(root).or_default().push(i);
+    }
+
+    let mut clusters: Vec<DuplicateCluster> = Vec::new();
+    for (root, members) in &clusters_map {
+        if members.len() < 2 {
+            continue;
+        }
+        let entries: Vec<DuplicateEntry> = members
+            .iter()
+            .map(|&idx| {
+                let mid = id_embeddings[idx].0;
+                let summary = records
+                    .iter()
+                    .find(|r| r.id == mid)
+                    .map(|r| r.summary.clone())
+                    .unwrap_or_default();
+                DuplicateEntry {
+                    id: mid.to_string(),
+                    summary,
+                }
+            })
+            .collect();
+        let max_similarity = max_sim.get(root).copied().unwrap_or(0.0);
+        clusters.push(DuplicateCluster {
+            memories: entries,
+            max_similarity,
+        });
+    }
+
+    clusters.sort_by(|a, b| {
+        b.max_similarity
+            .partial_cmp(&a.max_similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let total = clusters.len() as u64;
+    let took = start.elapsed().as_micros() as u64;
+
+    Ok(Json(ApiResponse {
+        data: ScanDuplicatesResponse { clusters, total },
+        took_us: Some(took),
+    }))
+}
+
 /// GET /metrics -- Prometheus exposition format.
 ///
 /// Returns `text/plain` with metrics lines. Not JSON.
@@ -1051,4 +1576,35 @@ pub async fn metrics(
         )],
         output,
     ))
+}
+
+/// POST /decay/sweep -- trigger an immediate decay sweep.
+///
+/// Accepts an optional `as_of` field (milliseconds since epoch) to run
+/// the sweep as if the current time were the given timestamp. This is
+/// used by the replay driver to simulate time-appropriate decay during
+/// historical seeding.
+pub async fn trigger_decay_sweep(
+    State(state): State<AppState>,
+    Json(req): Json<TriggerSweepRequest>,
+) -> Result<Json<ApiResponse<TriggerSweepResponse>>, AppError> {
+    let result = state
+        .decay
+        .trigger_sweep(req.as_of)
+        .await
+        .map_err(|e| AppError::Internal {
+            source: format!("sweep failed: {e}").into(),
+        })?;
+
+    Ok(Json(ApiResponse {
+        data: TriggerSweepResponse {
+            memories_scanned: result.memories_scanned,
+            full_to_summary: result.full_to_summary,
+            summary_to_ghost: result.summary_to_ghost,
+            deletions: result.deletions,
+            saved_by_connection_bonus: result.saved_by_connection_bonus,
+            duration_ms: result.duration.as_millis() as u64,
+        },
+        took_us: Some(result.duration.as_micros() as u64),
+    }))
 }

@@ -48,6 +48,24 @@ pub struct CreateMemoryApiRequest {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub initial_stability: Option<f32>,
 
+    /// Named entities (e.g., person/place/org names). Merged into tags
+    /// as `entity/<name>` entries.
+    #[serde(default)]
+    pub entities: Vec<String>,
+
+    /// Topics. Merged into tags as `topic/<name>` entries.
+    #[serde(default)]
+    pub topics: Vec<String>,
+
+    /// Emotions. Merged into tags as `emotion/<name>` entries.
+    #[serde(default)]
+    pub emotions: Vec<String>,
+
+    /// Optional ID of a memory this one supersedes. Creates a
+    /// supersedes edge from the new memory to the old memory.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supersedes: Option<MemoryId>,
+
     /// Optional parent memory ID. If provided, creates a parent->child
     /// edge from `parent_id` to the new memory.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -132,11 +150,6 @@ pub struct FindSimilarRequest {
     #[serde(default)]
     pub min_score: Option<f32>,
 
-    /// Whether to search only within the same namespace as the source
-    /// memory. Default: `true`.
-    #[serde(default = "default_same_namespace")]
-    pub same_namespace: bool,
-
     /// Whether to include embedding vectors in results. Default: `false`.
     #[serde(default)]
     pub include_embeddings: bool,
@@ -145,11 +158,6 @@ pub struct FindSimilarRequest {
 /// Default limit for similar-memories queries.
 fn default_similar_limit() -> u32 {
     10
-}
-
-/// Default for `same_namespace` filter.
-fn default_same_namespace() -> bool {
-    true
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -235,6 +243,18 @@ pub struct ListMemoriesQuery {
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
     pub tags: Vec<String>,
 
+    /// Filter by entities (comma-separated, AND logic). Converted to entity/ tags.
+    #[serde(default, deserialize_with = "deserialize_comma_separated")]
+    pub entities: Vec<String>,
+
+    /// Optional inclusive lower bound for temporal filtering (millis since epoch).
+    #[serde(default)]
+    pub time_range_start: Option<i64>,
+
+    /// Optional inclusive upper bound for temporal filtering (millis since epoch).
+    #[serde(default)]
+    pub time_range_end: Option<i64>,
+
     /// Sort field: "created", "accessed", "strength", "stability".
     #[serde(default)]
     pub sort: Option<String>,
@@ -292,6 +312,10 @@ pub struct ListFilter {
     pub phase: Option<DecayPhase>,
     /// Tag filter (AND logic: memory must have ALL tags).
     pub tags: Vec<String>,
+    /// Optional inclusive lower bound for temporal filtering (millis since epoch).
+    pub time_range_start: Option<i64>,
+    /// Optional inclusive upper bound for temporal filtering (millis since epoch).
+    pub time_range_end: Option<i64>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -465,7 +489,7 @@ pub struct AgeDistribution {
 }
 
 /// Storage breakdown by file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageBreakdown {
     /// Total size of data directory in bytes.
@@ -508,4 +532,112 @@ pub struct TagCount {
     pub tag: String,
     /// Number of memories with this tag.
     pub count: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Batch Store Endpoint (Issue 16)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// POST /memories/batch -- batch create memories.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchStoreRequest {
+    /// List of memories to create.
+    pub memories: Vec<CreateMemoryApiRequest>,
+}
+
+/// POST /memories/batch -- response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchStoreResponse {
+    /// Created memory IDs.
+    pub created: Vec<BatchStoreResult>,
+    /// Total number successfully created.
+    pub total: u64,
+}
+
+/// Result for a single batch store item.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchStoreResult {
+    /// Created memory ID.
+    pub id: MemoryId,
+    /// Namespace name.
+    pub namespace: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Scan Duplicates Endpoint (Issue 16)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// POST /namespaces/:name/duplicates -- scan for duplicate memories.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanDuplicatesRequest {
+    /// Similarity threshold (0.0 to 1.0). Default: 0.85.
+    #[serde(default = "default_duplicate_threshold")]
+    pub threshold: f32,
+
+    /// Maximum memories to scan. Default: 500.
+    #[serde(default = "default_max_scan")]
+    pub max_memories: usize,
+}
+
+fn default_duplicate_threshold() -> f32 {
+    0.85
+}
+
+fn default_max_scan() -> usize {
+    500
+}
+
+/// POST /namespaces/:name/duplicates -- response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanDuplicatesResponse {
+    /// Clusters of similar memories.
+    pub clusters: Vec<DuplicateCluster>,
+    /// Total clusters found.
+    pub total: u64,
+}
+
+/// A cluster of duplicate/near-duplicate memories.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateCluster {
+    /// Memories in this cluster.
+    pub memories: Vec<DuplicateEntry>,
+    /// Maximum similarity score within the cluster.
+    pub max_similarity: f32,
+}
+
+/// A single memory entry in a duplicate cluster.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateEntry {
+    /// Memory ID.
+    pub id: String,
+    /// Memory summary.
+    pub summary: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Decay sweep
+// ═══════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerSweepRequest {
+    pub as_of: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerSweepResponse {
+    pub memories_scanned: u64,
+    pub full_to_summary: u64,
+    pub summary_to_ghost: u64,
+    pub deletions: u64,
+    pub saved_by_connection_bonus: u64,
+    pub duration_ms: u64,
 }

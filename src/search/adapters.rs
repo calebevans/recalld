@@ -267,6 +267,24 @@ impl MetadataStore for StorageMetadataAdapter {
         .await
         .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
     }
+
+    async fn scan_all(&self) -> Result<Vec<CachedRecord>> {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage
+                .read()
+                .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
+            let all = storage_r
+                .scan_all()
+                .map_err(|e| SearchError::MetadataError(e.to_string()))?;
+            Ok(all
+                .iter()
+                .map(|(_id, disk)| CachedRecord::from(disk))
+                .collect())
+        })
+        .await
+        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
+    }
 }
 
 // ── RifProcessor ───────────────────────────────────────────────────
@@ -486,10 +504,10 @@ impl GraphReader for SharedGraphReader {
 ///
 /// The EntityIndex is shared across all namespaces. The adapter
 /// accepts a `namespace_id` parameter but does not filter by it
-/// in v1 because the entity index does not track which namespace
-/// a memory belongs to. Namespace filtering happens later in the
-/// pipeline when CachedRecords are loaded and the filter stage
-/// discards records from other namespaces.
+/// because the entity index does not track which namespace a
+/// memory belongs to. Namespace filtering happens in the pipeline's
+/// `passes_filters` stage, which checks each candidate's
+/// `CachedRecord::namespace_id` against the query namespace.
 pub struct SharedEntityIndexReader {
     entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
 }

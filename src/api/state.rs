@@ -62,6 +62,25 @@ pub trait SearchPipeline: Send + Sync {
 
     /// Check whether the embedding provider is healthy.
     async fn embedding_provider_healthy(&self) -> bool;
+
+    /// Add a memory to the FTS5 full-text search index.
+    async fn fts_add(
+        &self,
+        namespace_id: NamespaceId,
+        memory_id: MemoryId,
+        summary: &str,
+        full_text: Option<&str>,
+        tags: &[String],
+    );
+
+    /// Remove a memory from the FTS5 full-text search index.
+    async fn fts_remove(&self, memory_id: MemoryId);
+
+    /// Add a memory to the entity index for entity-based linking.
+    async fn entity_index_add(&self, memory_id: MemoryId, entities: &[String]);
+
+    /// Remove a memory from the entity index.
+    async fn entity_index_remove(&self, memory_id: MemoryId, entities: &[String]);
 }
 
 /// Persistent storage engine (meta.db, fulltext.dat, vectors.dat, edges.db).
@@ -102,6 +121,20 @@ pub trait StorageEngine: Send + Sync {
         filter: &crate::api::models::ListFilter,
     ) -> Result<Vec<CachedRecord>, StorageError>;
 
+    /// List memories with server-side filtering and pagination.
+    ///
+    /// Returns `(matching_records, total_count)` where the records
+    /// are the paginated slice and the count is total before pagination.
+    async fn list_memories_filtered(
+        &self,
+        namespace_id: NamespaceId,
+        require_tags: &[crate::model::tag::Tag],
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<(MemoryId, DiskRecord)>, u64), StorageError>;
+
     /// Health probe: returns `true` if the storage engine can read/write.
     async fn ping(&self) -> bool;
 
@@ -123,7 +156,7 @@ pub trait StorageEngine: Send + Sync {
     async fn list_tags(&self) -> Result<Vec<(String, u64)>, StorageError>;
 
     /// Return the database directory path for file-size computation.
-    fn storage_path(&self) -> PathBuf;
+    fn storage_path(&self) -> Result<PathBuf, StorageError>;
 }
 
 /// RAM record cache (moka-backed).
@@ -164,8 +197,32 @@ pub trait RelationshipGraph: Send + Sync {
         edge_type: &str,
     ) -> Result<(), GraphError>;
 
-    /// Remove all edges (both directions) for a memory.
-    async fn remove_all_edges(&self, id: MemoryId) -> Result<(), GraphError>;
+    /// Tombstone a memory's graph node (set phase to Tombstone, strength to 0).
+    /// Unlike full removal, this preserves the node and edges for graph traversal.
+    async fn tombstone_node(&self, id: MemoryId) -> Result<(), GraphError>;
+
+    /// Add a node to the relationship graph for a newly created memory.
+    async fn add_node(
+        &self,
+        id: MemoryId,
+        namespace_id: NamespaceId,
+        phase: crate::model::decay::DecayPhase,
+        strength: f32,
+        vector_slot: u32,
+    ) -> Result<(), GraphError>;
+
+    /// Perform autolink, entity-link, and temporal-link for a newly created memory.
+    /// This is a composite operation that discovers and creates edges to similar,
+    /// entity-related, and temporally-adjacent memories.
+    async fn perform_post_creation_links(
+        &self,
+        memory_id: MemoryId,
+        namespace_id: NamespaceId,
+        embedding: &[f32],
+        tags: &[String],
+        entities: &[String],
+        created_at: i64,
+    );
 }
 
 /// FSRS decay engine for reinforcement and strength recalculation.
@@ -186,6 +243,12 @@ pub trait FsrsEngine: Send + Sync {
 
     /// Return the time of the last completed decay sweep, if any.
     fn last_sweep_time(&self) -> Option<std::time::Instant>;
+
+    /// Trigger an immediate decay sweep, optionally at a simulated time.
+    async fn trigger_sweep(
+        &self,
+        as_of_millis: Option<i64>,
+    ) -> Result<crate::decay::SweepResult, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Namespace registry: name <-> id mapping, config lookup.
@@ -207,9 +270,10 @@ pub trait NamespaceRegistry: Send + Sync {
     async fn create(
         &self,
         name: &str,
-        embedding_dim: u32,
+        embedding_dim: Option<u32>,
         initial_stability: f32,
         desired_retention: f32,
+        decay_rate_multiplier: Option<f32>,
     ) -> Result<NamespaceConfig, Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -238,6 +302,8 @@ pub struct SearchQuery {
     pub query: QueryInput,
     /// Target namespace for the search.
     pub namespace_id: NamespaceId,
+    /// Target namespace name (passed to pipeline for namespace-scoped search).
+    pub namespace_name: String,
     /// Maximum number of results to return.
     pub k: usize,
     /// Tag inclusion filter (AND semantics).
@@ -252,6 +318,12 @@ pub struct SearchQuery {
     pub graph_depth: usize,
     /// Whether to apply retrieval-induced forgetting.
     pub apply_rif: bool,
+    /// Optional inclusive lower bound for temporal filtering (millis since epoch).
+    pub time_range_start: Option<i64>,
+    /// Optional inclusive upper bound for temporal filtering (millis since epoch).
+    pub time_range_end: Option<i64>,
+    /// Named entities for entity overlap scoring.
+    pub entities: Vec<String>,
 }
 
 /// Search query input: either natural-language text or a pre-computed
@@ -262,15 +334,6 @@ pub enum QueryInput {
     Text(String),
     /// Pre-computed embedding vector.
     Vector(Vec<f32>),
-}
-
-/// Search filter parameters for the similar-memories endpoint.
-#[derive(Debug, Clone, Default)]
-pub struct SearchFilter {
-    /// Optional namespace restriction.
-    pub namespace_id: Option<NamespaceId>,
-    /// Minimum score threshold.
-    pub min_score: Option<f32>,
 }
 
 /// A single resolved search result with its similarity score.

@@ -50,6 +50,7 @@ pub fn router(state: AppState, config: &ApiConfig) -> Router {
     let memory_routes = Router::new()
         .route("/", get(handlers::list_memories))
         .route("/", post(handlers::create_memory))
+        .route("/batch", post(handlers::batch_store))
         .route("/{id}", get(handlers::get_memory))
         .route("/{id}", delete(handlers::delete_memory))
         .route("/{id}/reinforce", post(handlers::reinforce_memory));
@@ -61,12 +62,14 @@ pub fn router(state: AppState, config: &ApiConfig) -> Router {
     let namespace_routes = Router::new()
         .route("/", get(handlers::list_namespaces))
         .route("/", post(handlers::create_namespace))
-        .route("/{id}/stats", get(handlers::namespace_stats));
+        .route("/{id}/stats", get(handlers::namespace_stats))
+        .route("/{name}/duplicates", post(handlers::scan_duplicates));
 
     let ops_routes = Router::new()
         .route("/health", get(handlers::health_check))
         .route("/health/report", get(handlers::health_report))
-        .route("/metrics", get(handlers::metrics));
+        .route("/metrics", get(handlers::metrics))
+        .route("/decay/sweep", post(handlers::trigger_decay_sweep));
 
     let cors = if config.cors_permissive {
         CorsLayer::permissive()
