@@ -746,7 +746,7 @@ Shows decay forecast, at-risk memories, and storage breakdown.
 
 ## 6. MCP Tools Reference
 
-recalld exposes 9 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
+recalld exposes 10 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
 
 ### `store_memory`
 
@@ -841,6 +841,14 @@ Create a new memory namespace.
 | `initialStability` | number | No | Starting stability in days for new memories (default: 3.7145). |
 | `desiredRetention` | number | No | Target retention rate 0.0-1.0 (default: 0.9). |
 | `decayRateMultiplier` | number | No | Per-namespace decay rate multiplier. 1.0 = normal, 2.0 = 2x slower, 0.0 = disabled. Omit to inherit global setting. |
+
+### `namespace_stats`
+
+Get statistics for a memory namespace including total memory count, phase breakdown (full/summary/ghost), permastore count, average strength, edge count, and vector storage size.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `namespace` | string | No | Namespace name to get stats for (default: `"default"`). |
 
 ### `list_memories`
 

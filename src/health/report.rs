@@ -267,7 +267,13 @@ pub async fn compute_storage_breakdown(
     namespaces: &dyn NamespaceRegistry,
     namespace_filter: Option<NamespaceId>,
 ) -> StorageBreakdown {
-    let db_path = storage.storage_path();
+    let db_path = match storage.storage_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%e, "failed to read storage path for breakdown");
+            return StorageBreakdown::default();
+        }
+    };
 
     let meta_db_bytes = file_size(&db_path.join("meta.db")).unwrap_or(0);
     let edges_db_bytes = file_size(&db_path.join("edges.db")).unwrap_or(0);

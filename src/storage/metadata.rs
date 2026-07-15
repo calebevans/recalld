@@ -14,6 +14,7 @@ use redb::{
     TableDefinition,
 };
 
+use crate::model::constants::ACCESS_HISTORY_MAX;
 use crate::model::{
     AccessEvent, AccessKind, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId,
 };
@@ -184,8 +185,8 @@ impl MetadataStore {
         // 4. Update in-memory phase bitmap (always Phase::Full for new
         //    records).
         {
-            let mut pi = self.phase_index.write().unwrap();
-            pi.insert(record.vector_slot);
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+            pi.insert(record.namespace_id, record.vector_slot);
         }
 
         Ok(())
@@ -208,14 +209,20 @@ impl MetadataStore {
 
     /// Update the decay fields of a single memory record.
     ///
-    /// Read-modify-write: loads the existing record, patches the four
-    /// decay fields, re-serializes, and writes back. If the phase
+    /// Read-modify-write: loads the existing record, patches the five
+    /// decay fields (phase, strength, decay_strength, stability,
+    /// is_permastore), re-serializes, and writes back. If the phase
     /// changed, the phase bitmap index is updated.
+    ///
+    /// `strength` is the raw FSRS retrievability R(t,S).
+    /// `decay_strength` is the effective retrievability including
+    /// connection bonus.
     pub fn update_decay_state(
         &self,
         id: MemoryId,
         phase: DecayPhase,
         strength: f32,
+        decay_strength: f32,
         stability: f32,
         is_permastore: bool,
     ) -> Result<(), StorageError> {
@@ -225,6 +232,7 @@ impl MetadataStore {
             old_phase = Some(record.phase);
             record.phase = phase;
             record.strength = strength;
+            record.decay_strength = decay_strength;
             record.stability = stability;
             record.is_permastore = if is_permastore { 1 } else { 0 };
         })?;
@@ -233,17 +241,41 @@ impl MetadataStore {
 
         // Update phase bitmap if phase changed.
         if old_phase != phase {
-            let mut pi = self.phase_index.write().unwrap();
-            pi.transition(record.vector_slot, old_phase, phase);
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+            pi.transition(record.namespace_id, record.vector_slot, old_phase, phase);
         }
 
+        Ok(())
+    }
+
+    /// Zero the full_text pointer on a memory record.
+    ///
+    /// Called during Full -> Summary phase transitions to mark the
+    /// text data in fulltext.dat as dead space reclaimable by
+    /// compaction. Does not modify fulltext.dat itself.
+    pub fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.update_record(&id, |record| {
+            record.text_offset = 0;
+            record.text_length = 0;
+        })?;
+        Ok(())
+    }
+
+    /// Clear the summary field on a memory record.
+    ///
+    /// Called during Summary -> Ghost phase transitions. After this,
+    /// only the embedding and relationship edges remain.
+    pub fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.update_record(&id, |record| {
+            record.summary = String::new();
+        })?;
         Ok(())
     }
 
     /// Record a new access event on a memory.
     ///
     /// Updates `last_accessed_at` and appends to the access history
-    /// ring buffer (capped at 32 entries; drops oldest if full).
+    /// ring buffer (capped at ACCESS_HISTORY_MAX entries; drops oldest if full).
     pub fn update_access(
         &self,
         id: MemoryId,
@@ -254,7 +286,7 @@ impl MetadataStore {
             record.last_accessed_at = timestamp;
 
             let event = AccessEvent { timestamp, kind };
-            if record.access_history.len() >= 32 {
+            if record.access_history.len() >= ACCESS_HISTORY_MAX {
                 record.access_history.remove(0);
             }
             record.access_history.push(event);
@@ -302,8 +334,12 @@ impl MetadataStore {
 
         // 4. Remove from in-memory phase bitmap.
         {
-            let mut pi = self.phase_index.write().unwrap();
-            pi.remove(deleted_record.vector_slot, deleted_record.phase);
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+            pi.remove(
+                deleted_record.namespace_id,
+                deleted_record.vector_slot,
+                deleted_record.phase,
+            );
         }
 
         Ok(Some(deleted_record))
@@ -327,6 +363,7 @@ impl MetadataStore {
         let old_phase;
         let old_tags;
         let old_vector_slot;
+        let old_namespace_id;
         {
             let mut meta = write_txn.open_table(META_TABLE)?;
             let mut record = {
@@ -339,6 +376,7 @@ impl MetadataStore {
             old_phase = record.phase;
             old_tags = record.tags.clone();
             old_vector_slot = record.vector_slot;
+            old_namespace_id = record.namespace_id;
 
             // Strip content fields.
             record.summary = String::new();
@@ -367,8 +405,8 @@ impl MetadataStore {
         // Tombstoned records are not tracked in the bitmap since their
         // vector slots are freed.
         {
-            let mut pi = self.phase_index.write().unwrap();
-            pi.remove(old_vector_slot, old_phase);
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+            pi.remove(old_namespace_id, old_vector_slot, old_phase);
         }
 
         Ok(())
@@ -379,16 +417,18 @@ impl MetadataStore {
     /// Uses the in-memory roaring bitmap index. Requires a META_TABLE
     /// lookup per matching slot to resolve vector_slot -> MemoryId.
     pub fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError> {
-        let slots: Vec<u32> = {
-            let pi = self.phase_index.read().unwrap();
-            pi.bitmap(phase).iter().collect()
+        let ns_slots: Vec<(u32, u32)> = {
+            let pi = self.phase_index.read().unwrap_or_else(|e| e.into_inner());
+            pi.all_slots_in_phase(phase)
         };
 
-        if slots.is_empty() {
+        if ns_slots.is_empty() {
             return Ok(Vec::new());
         }
 
-        let slot_set: std::collections::HashSet<u32> = slots.into_iter().collect();
+        // Use (namespace_id, vector_slot) pairs for lookup to avoid
+        // cross-namespace collisions.
+        let slot_set: std::collections::HashSet<(u32, u32)> = ns_slots.into_iter().collect();
         let mut ids = Vec::new();
 
         let read_txn = self.db.begin_read()?;
@@ -396,7 +436,7 @@ impl MetadataStore {
         for result in table.iter()? {
             let (key_bytes, value) = result?;
             let record = DiskRecord::from_bytes(value.value())?;
-            if slot_set.contains(&record.vector_slot) {
+            if slot_set.contains(&(record.namespace_id, record.vector_slot)) {
                 let uuid = uuid::Uuid::from_slice(key_bytes.value())
                     .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
                 ids.push(MemoryId::from_uuid(uuid));
@@ -415,28 +455,30 @@ impl MetadataStore {
         &self,
         phase: DecayPhase,
     ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
-        let slots: std::collections::HashSet<u32> = {
-            let pi = self.phase_index.read().unwrap();
-            pi.bitmap(phase).iter().collect()
+        // Use (namespace_id, vector_slot) pairs for lookup to avoid
+        // cross-namespace collisions.
+        let ns_slots: std::collections::HashSet<(u32, u32)> = {
+            let pi = self.phase_index.read().unwrap_or_else(|e| e.into_inner());
+            pi.all_slots_in_phase(phase).into_iter().collect()
         };
 
-        if slots.is_empty() {
+        if ns_slots.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut results = Vec::with_capacity(slots.len());
+        let mut results = Vec::with_capacity(ns_slots.len());
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
 
         for result in table.iter()? {
             let (key_bytes, value) = result?;
             let record = DiskRecord::from_bytes(value.value())?;
-            if slots.contains(&record.vector_slot) {
+            if ns_slots.contains(&(record.namespace_id, record.vector_slot)) {
                 let uuid = uuid::Uuid::from_slice(key_bytes.value())
                     .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
                 results.push((MemoryId::from_uuid(uuid), record));
             }
-            if results.len() == slots.len() {
+            if results.len() == ns_slots.len() {
                 break;
             }
         }
@@ -662,10 +704,15 @@ impl MetadataStore {
 
         // Phase 3: Update in-memory phase bitmap.
         {
-            let mut pi = self.phase_index.write().unwrap();
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
             for (_, record, old_phase) in &updates {
                 if *old_phase != record.phase {
-                    pi.transition(record.vector_slot, *old_phase, record.phase);
+                    pi.transition(
+                        record.namespace_id,
+                        record.vector_slot,
+                        *old_phase,
+                        record.phase,
+                    );
                 }
             }
 
@@ -700,7 +747,7 @@ impl MetadataStore {
     /// Called periodically (end of decay sweep, graceful shutdown).
     pub fn persist_phase_index(&self) -> Result<(), StorageError> {
         let bytes = {
-            let pi = self.phase_index.read().unwrap();
+            let pi = self.phase_index.read().unwrap_or_else(|e| e.into_inner());
             pi.to_bytes()
         };
         let write_txn = self.db.begin_write()?;
@@ -724,7 +771,7 @@ impl MetadataStore {
         for result in table.iter()? {
             let (_, value) = result?;
             let record = DiskRecord::from_bytes(value.value())?;
-            slot_phases.push((record.vector_slot, record.phase));
+            slot_phases.push((record.namespace_id, record.vector_slot, record.phase));
         }
         drop(table);
         drop(read_txn);
@@ -741,7 +788,7 @@ impl MetadataStore {
         write_txn.commit()?;
 
         // Replace the in-memory copy.
-        *self.phase_index.write().unwrap() = rebuilt;
+        *self.phase_index.write().unwrap_or_else(|e| e.into_inner()) = rebuilt;
 
         Ok(())
     }

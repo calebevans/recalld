@@ -31,7 +31,7 @@ pub use self::decay::DecayPhase;
 pub use self::edge::EdgeType;
 pub use self::error::{DecodeError, TagError, ValidationError};
 pub use self::id::{MemoryId, NamespaceId};
-pub use self::memory::{AccessEvent, AccessKind, CreateMemory, Memory};
+pub use self::memory::{AccessEvent, AccessKind, Memory};
 pub use self::namespace::{NamespaceConfig, PhaseThresholds};
 pub use self::record::{CachedRecord, DiskRecord};
 pub use self::tag::{StructuredMetadata, Tag, entity_overlap, parse_structured_tags};

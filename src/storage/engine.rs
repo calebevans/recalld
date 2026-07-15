@@ -15,6 +15,7 @@ use crate::model::{
 };
 use crate::storage::edges::{EdgeStore, PersistedEdge, cleanup_orphaned_edges};
 use crate::storage::error::StorageError;
+use crate::storage::fsync::{fsync_dir, fsync_file};
 use crate::storage::metadata::MetadataStore;
 use crate::storage::text::{CompactionResult, TextRef, TextStore, recover_text_compaction};
 use crate::storage::vectors::VectorManager;
@@ -92,14 +93,31 @@ pub trait StorageEngine: Send + Sync {
     // ── Decay State ─────────────────────────────────────────────────
 
     /// Update the decay state of a single memory.
+    ///
+    /// `strength` is the raw FSRS retrievability R(t,S).
+    /// `decay_strength` is the effective retrievability including
+    /// connection bonus.
     fn update_decay_state(
         &self,
         id: MemoryId,
         phase: DecayPhase,
         strength: f32,
+        decay_strength: f32,
         stability: f32,
         is_permastore: bool,
     ) -> Result<(), StorageError>;
+
+    /// Zero the full_text pointer on a memory record.
+    ///
+    /// Called during Full -> Summary phase transitions to mark the
+    /// text data in fulltext.dat as dead space reclaimable by
+    /// compaction.
+    fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError>;
+
+    /// Clear the summary field on a memory record.
+    ///
+    /// Called during Summary -> Ghost phase transitions.
+    fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError>;
 
     /// Return the IDs of all memories currently in the given phase.
     fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError>;
@@ -409,6 +427,19 @@ impl StorageEngine for RedbStorageEngine {
             record.text_length = text_ref.length;
         }
 
+        // 2b. Fsync vector and text data before the meta.db commit.
+        // meta.db (redb) fsyncs internally on commit, so without this
+        // step a crash could leave meta.db pointing to unflushed vector
+        // or text data. Vectors have no integrity check, so stale/zero
+        // data would be silently used for similarity search. Text has
+        // CRC protection but would still fail reads until rewritten.
+        if let Some(vs) = self.vector_manager.get(namespace_id) {
+            vs.sync()?;
+        }
+        if full_text.is_some() {
+            self.text_store.sync_data()?;
+        }
+
         // 3. Insert the completed record into meta.db.
         if let Err(e) = self.meta_store.insert(id, record) {
             // Best-effort rollback: free the vector slot so it can be
@@ -498,11 +529,26 @@ impl StorageEngine for RedbStorageEngine {
         id: MemoryId,
         phase: DecayPhase,
         strength: f32,
+        decay_strength: f32,
         stability: f32,
         is_permastore: bool,
     ) -> Result<(), StorageError> {
-        self.meta_store
-            .update_decay_state(id, phase, strength, stability, is_permastore)
+        self.meta_store.update_decay_state(
+            id,
+            phase,
+            strength,
+            decay_strength,
+            stability,
+            is_permastore,
+        )
+    }
+
+    fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.meta_store.strip_full_text(id)
+    }
+
+    fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.meta_store.strip_summary(id)
     }
 
     fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError> {
@@ -618,29 +664,60 @@ impl StorageEngine for RedbStorageEngine {
             }
         }
 
-        // Run compaction.
-        let result = self.text_store.compact(&live_refs)?;
+        // Phase 1: Write new file with only live entries.
+        // This creates fulltext.dat.new and the .compacting marker,
+        // but does NOT rename or remove the marker.
+        let (result, compacted) = self.text_store.compact_write_new_file(&live_refs)?;
 
-        // Update meta.db with new text offsets.
-        let updates: Vec<(MemoryId, DiskRecord)> = result
-            .new_refs
-            .iter()
-            .map(|(id, new_ref)| {
-                // Find the original record and update its text pointer.
-                let original = all_records
-                    .iter()
-                    .find(|(rid, _)| rid == id)
-                    .map(|(_, r)| r)
-                    .expect("compaction ref must match a record");
-                let mut updated = original.clone();
-                updated.text_offset = new_ref.file_offset;
-                updated.text_length = new_ref.length;
-                (*id, updated)
-            })
-            .collect();
+        if compacted {
+            // Phase 2: Update meta.db with new text offsets BEFORE
+            // renaming the file. This ensures that if we crash after
+            // the meta.db commit but before the rename, recovery can
+            // detect the .compaction-meta-committed marker and complete
+            // the rename. Without this ordering, a crash after the
+            // rename but before the meta.db update would leave stale
+            // offsets pointing into a compacted file, corrupting all
+            // text reads.
+            let updates: Vec<(MemoryId, DiskRecord)> = result
+                .new_refs
+                .iter()
+                .map(|(id, new_ref)| {
+                    // Find the original record and update its text pointer.
+                    let original = all_records
+                        .iter()
+                        .find(|(rid, _)| rid == id)
+                        .map(|(_, r)| r)
+                        .expect("compaction ref must match a record");
+                    let mut updated = original.clone();
+                    updated.text_offset = new_ref.file_offset;
+                    updated.text_length = new_ref.length;
+                    (*id, updated)
+                })
+                .collect();
 
-        if !updates.is_empty() {
-            self.meta_store.batch_update_records(&updates)?;
+            if !updates.is_empty() {
+                self.meta_store.batch_update_records(&updates)?;
+            }
+
+            // Write a committed marker so recovery knows meta.db has
+            // already been updated with new offsets. If we crash after
+            // this but before the rename, recovery will complete the
+            // rename instead of rolling back.
+            let committed_marker = self.db_path.join(".compaction-meta-committed");
+            std::fs::write(&committed_marker, b"meta.db offsets committed\n")?;
+            fsync_file(&committed_marker)?;
+            fsync_dir(&self.db_path)?;
+
+            // Phase 3: Atomically swap the files and clean up markers.
+            self.text_store.compact_finalize()?;
+
+            tracing::info!(
+                old_size = result.old_size,
+                new_size = result.new_size,
+                removed = result.entries_removed,
+                kept = result.entries_kept,
+                "Text.log compaction complete"
+            );
         }
 
         Ok(result)

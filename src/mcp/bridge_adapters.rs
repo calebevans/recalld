@@ -1000,16 +1000,49 @@ impl bridge::StorageEngine for McpStorageAdapter {
         // preserve the graph node and edges so relationship chains
         // remain intact for spreading activation traversal.
 
-        // 1. Read the current record to get tags for entity index cleanup.
+        // 1. Read, check, tombstone, and free the vector slot atomically
+        //    under a single write lock to prevent TOCTOU races. Without
+        //    this, two concurrent deletes could both read the record as
+        //    non-tombstoned, both tombstone it, and both free the same
+        //    vector slot -- corrupting the free list.
         let existing_record = {
             let storage = self.storage.clone();
             tokio::task::spawn_blocking(move || {
-                let storage_r = storage.read().map_err(|e| {
+                let mut storage_w = storage.write().map_err(|e| {
                     bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
                 })?;
-                storage_r
+
+                let existing = storage_w
                     .get_record(id)
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))
+                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+
+                let Some(existing_record) = existing else {
+                    return Ok::<Option<crate::model::record::DiskRecord>, bridge::BridgeError>(
+                        None,
+                    );
+                };
+
+                if existing_record.phase == DecayPhase::Tombstone {
+                    return Ok(None);
+                }
+
+                // Tombstone the record.
+                storage_w
+                    .tombstone_memory(id)
+                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+
+                // Free the vector slot.
+                let ns_id = NamespaceId::new(existing_record.namespace_id);
+                if let Err(e) = storage_w.free_vector_slot(ns_id, existing_record.vector_slot) {
+                    tracing::warn!(
+                        memory_id = %id,
+                        vector_slot = existing_record.vector_slot,
+                        %e,
+                        "vector slot free failed (non-fatal)"
+                    );
+                }
+
+                Ok(Some(existing_record))
             })
             .await
             .map_err(|e| {
@@ -1021,50 +1054,10 @@ impl bridge::StorageEngine for McpStorageAdapter {
             return Ok(false);
         };
 
-        if existing_record.phase == DecayPhase::Tombstone {
-            return Ok(false);
-        }
-
-        // 2. Tombstone the record and free the vector slot.
-        {
-            let storage = self.storage.clone();
-            let vector_slot = existing_record.vector_slot;
-            let namespace_id = existing_record.namespace_id;
-            tokio::task::spawn_blocking(move || {
-                {
-                    let storage_r = storage.read().map_err(|e| {
-                        bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-                    })?;
-                    storage_r
-                        .tombstone_memory(id)
-                        .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
-                }
-                {
-                    let mut storage_w = storage.write().map_err(|e| {
-                        bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-                    })?;
-                    let ns_id = NamespaceId::new(namespace_id);
-                    if let Err(e) = storage_w.free_vector_slot(ns_id, vector_slot) {
-                        tracing::warn!(
-                            memory_id = %id,
-                            vector_slot,
-                            %e,
-                            "vector slot free failed (non-fatal)"
-                        );
-                    }
-                }
-                Ok::<_, bridge::BridgeError>(())
-            })
-            .await
-            .map_err(|e| {
-                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
-            })??;
-        }
-
-        // 3. Invalidate cache entry.
+        // 2. Invalidate cache entry.
         self.cache.invalidate(id).await;
 
-        // 4. Remove from FTS5 index.
+        // 3. Remove from FTS5 index.
         {
             let fts = self.fts_index.lock().await;
             if let Err(e) = fts.remove(id) {
@@ -1076,7 +1069,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             }
         }
 
-        // 5. Remove from vector index.
+        // 4. Remove from vector index.
         {
             use crate::search::VectorIndex;
             let mut vi = self.vector_index.write().await;
@@ -1089,7 +1082,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             }
         }
 
-        // 6. Remove from entity index.
+        // 5. Remove from entity index.
         {
             let metadata = crate::model::parse_structured_tags(&existing_record.tags);
             if !metadata.entities.is_empty() {
@@ -1098,7 +1091,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             }
         }
 
-        // 7. Update graph node phase to Tombstone (keep node and edges).
+        // 6. Update graph node phase to Tombstone (keep node and edges).
         {
             let mut graph_w = self.graph.write().await;
             let _ = graph_w.update_node_state(id, DecayPhase::Tombstone, 0.0);
@@ -1139,27 +1132,46 @@ impl bridge::StorageEngine for McpStorageAdapter {
 
         let phase = record.phase;
 
-        // Step 2: Compute elapsed days since last access.
+        // Step 2: Look up the namespace's decay rate multiplier.
+        let ns_decay_multiplier = {
+            let storage = self.storage.clone();
+            let ns_id = record.namespace_id;
+            let global_multiplier = self.config.decay.decay_rate_multiplier;
+            tokio::task::spawn_blocking(move || {
+                let storage_r = storage.read().map_err(|e| {
+                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                })?;
+                let multiplier = storage_r
+                    .get_namespace(NamespaceId::new(ns_id))
+                    .ok()
+                    .flatten()
+                    .and_then(|ns| ns.decay_rate_multiplier)
+                    .unwrap_or(global_multiplier as f32);
+                Ok::<f32, bridge::BridgeError>(multiplier)
+            })
+            .await
+            .map_err(|e| {
+                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
+            })??
+        };
+
+        // Step 3: Compute elapsed days since last access.
         let now = chrono::Utc::now().timestamp_millis();
         let elapsed_millis = (now - record.last_accessed_at).max(0) as f64;
         let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
 
-        // Step 3: Use FSRS to compute new stability based on quality rating.
+        // Step 4: Use FSRS to compute new stability based on quality rating.
         let decay_config = crate::decay::DecayConfig::default();
         let engine = crate::decay::FsrsEngine::new(&decay_config);
-        let new_stability = engine.review_stability(
-            record.stability,
-            elapsed_days,
-            quality,
-            1.0, // default decay rate multiplier
-        );
+        let new_stability =
+            engine.review_stability(record.stability, elapsed_days, quality, ns_decay_multiplier);
 
-        // Step 4: Compute new retrievability (just reinforced = 1.0).
+        // Step 5: Compute new retrievability (just reinforced = 1.0).
         let new_strength = 1.0_f32;
         let is_permastore =
             record.is_permastore != 0 || new_stability >= decay_config.permastore_threshold;
 
-        // Step 5: Persist the updated decay state and access event.
+        // Step 6: Persist the updated decay state and access event.
         {
             let storage = self.storage.clone();
             tokio::task::spawn_blocking(move || {
@@ -1167,7 +1179,14 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
                 })?;
                 storage_r
-                    .update_decay_state(id, phase, new_strength, new_stability, is_permastore)
+                    .update_decay_state(
+                        id,
+                        phase,
+                        new_strength,
+                        new_strength,
+                        new_stability,
+                        is_permastore,
+                    )
                     .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
                 storage_r
                     .update_access(id, now, crate::model::AccessKind::ManualReinforcement)
@@ -1179,7 +1198,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             })??;
         }
 
-        // Step 6: Update cache.
+        // Step 7: Update cache.
         if let Some(existing) = self.cache.get(id).await {
             let mut updated = (*existing).clone();
             updated.stability = new_stability;
@@ -1349,7 +1368,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                 id: NamespaceId::UNSET,
                 name: input_name.clone(),
                 embedding_dim: dim,
-                initial_stability: initial_stability.unwrap_or(3.7),
+                initial_stability: initial_stability.unwrap_or(3.7145),
                 default_difficulty: 5.0,
                 phase_thresholds: crate::model::namespace::PhaseThresholds::default(),
                 permastore_threshold: 1500.0,
@@ -1387,25 +1406,67 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             let storage_r = storage.read().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
             })?;
-            let _ns = storage_r
+            let ns = storage_r
                 .get_namespace_by_name(&ns_name)
                 .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
                 .ok_or_else(|| {
                     bridge::BridgeError::NotFound(format!("namespace '{ns_name}' not found"))
                 })?;
 
+            // Compute real stats by scanning all records in the namespace.
+            let all_records = storage_r
+                .scan_all()
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+
+            let mut memory_count: u64 = 0;
+            let mut full_count: u64 = 0;
+            let mut summary_count: u64 = 0;
+            let mut ghost_count: u64 = 0;
+            let mut permastore_count: u64 = 0;
+            let mut strength_sum: f64 = 0.0;
+            let mut edge_count: u64 = 0;
+
+            for (_id, record) in &all_records {
+                if NamespaceId::new(record.namespace_id) != ns.id {
+                    continue;
+                }
+                memory_count += 1;
+
+                match record.phase {
+                    DecayPhase::Full => full_count += 1,
+                    DecayPhase::Summary => summary_count += 1,
+                    DecayPhase::Ghost => ghost_count += 1,
+                    DecayPhase::Tombstone => {}
+                }
+
+                if record.is_permastore != 0 {
+                    permastore_count += 1;
+                }
+
+                strength_sum += record.decay_strength as f64;
+                edge_count += record.edge_count as u64;
+            }
+
+            let avg_strength = if memory_count > 0 {
+                (strength_sum / memory_count as f64) as f32
+            } else {
+                0.0
+            };
+
+            let vector_bytes = memory_count * ns.embedding_dim as u64 * 4;
+
             Ok(bridge::NamespaceStats {
                 name: ns_name,
-                memory_count: 0,
+                memory_count,
                 phase_counts: bridge::PhaseCounts {
-                    full: 0,
-                    summary: 0,
-                    ghost: 0,
+                    full: full_count,
+                    summary: summary_count,
+                    ghost: ghost_count,
                 },
-                permastore_count: 0,
-                avg_strength: 0.0,
-                edge_count: 0,
-                vector_bytes: 0,
+                permastore_count,
+                avg_strength,
+                edge_count,
+                vector_bytes,
             })
         })
         .await

@@ -213,6 +213,11 @@ pub fn connection_bonus(
 
     // Optional 2-hop with decay
     if config.include_2hop {
+        // Collect 1-hop keys so we can skip them at hop-2 (already counted)
+        let hop1_keys: HashSet<NodeKey> = hop1.iter().map(|(k, _)| *k).collect();
+        // Track best contribution per 2-hop node to dedup across paths
+        let mut hop2_best: HashMap<NodeKey, f32> = HashMap::new();
+
         for (neighbor_key, _) in &hop1 {
             if let Some(neighbor_node) = graph.nodes.get(*neighbor_key) {
                 let hop2 = collect_neighbor_contributions(
@@ -226,9 +231,19 @@ pub fn connection_bonus(
                     if hop2_key == node_key {
                         continue;
                     }
-                    bonus += contribution * config.scale * HOP_2_DECAY;
+                    // Skip if hop-2 was already counted as a 1-hop neighbor
+                    if hop1_keys.contains(&hop2_key) {
+                        continue;
+                    }
+                    // Dedup: keep the max contribution across different 1-hop paths
+                    let entry = hop2_best.entry(hop2_key).or_insert(0.0_f32);
+                    *entry = entry.max(contribution);
                 }
             }
+        }
+
+        for (_, contribution) in &hop2_best {
+            bonus += contribution * config.scale * HOP_2_DECAY;
         }
     }
 

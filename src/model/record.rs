@@ -477,31 +477,3 @@ impl From<&DiskRecord> for CachedRecord {
         }
     }
 }
-
-impl CachedRecord {
-    /// Hydrate into an API `Memory` struct for returning to callers.
-    ///
-    /// The `namespace_name` must be resolved by the caller from the
-    /// namespace registry. Fields not held in the cache (`full_text`,
-    /// `embedding`, `access_history`) are set to `None`.
-    pub fn to_memory(&self, namespace_name: String) -> Memory {
-        Memory {
-            id: self.id,
-            namespace: namespace_name,
-            created_at: self.created_at,
-            last_accessed_at: self.last_accessed_at,
-            summary: self.summary.clone(),
-            full_text: None, // loaded on demand
-            tags: self.tags.clone(),
-            phase: self.phase,
-            strength: self.strength,
-            decay_strength: self.decay_strength,
-            stability: self.stability,
-            difficulty: self.difficulty,
-            is_permastore: self.is_permastore,
-            edge_count: self.edge_count,
-            embedding: None,      // lives in mmap'd vectors.dat
-            access_history: None, // loaded on demand
-        }
-    }
-}

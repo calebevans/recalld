@@ -7,6 +7,5 @@ mod json;
 
 pub use json::{
     ApiError, ApiResponse, CreateMemoryRequest, MemoryResponse, NamespaceRequest,
-    NamespaceResponse, PaginatedResponse, PaginationParams, SearchHit, SearchRequest,
-    SearchResponse, UpdateMemoryRequest,
+    NamespaceResponse, SearchHit, SearchRequest, SearchResponse,
 };

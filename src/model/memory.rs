@@ -1,5 +1,5 @@
-//! Memory record types: the public API representation, creation request,
-//! access events, and access kind classification.
+//! Memory record types: the public API representation, access events,
+//! and access kind classification.
 
 use serde::{Deserialize, Serialize};
 
@@ -185,110 +185,6 @@ impl Memory {
                 created: self.created_at,
                 accessed: self.last_accessed_at,
             });
-        }
-
-        Ok(())
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// CreateMemory — API request body
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Request body for creating a new memory.
-///
-/// Tags arrive as raw strings and are validated into `Tag` values on the
-/// server side.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateMemory {
-    /// Target namespace name. Defaults to `"default"`.
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
-
-    /// Short description. Required, max 2000 bytes.
-    pub summary: String,
-
-    /// Full content. Optional, max 1 MiB.
-    #[serde(default)]
-    pub full_text: Option<String>,
-
-    /// Raw tag strings. Validated into `Tag` values server-side.
-    #[serde(default)]
-    pub tags: Vec<String>,
-
-    /// Pre-computed embedding. If omitted, the server generates one.
-    #[serde(default)]
-    pub embedding: Option<Vec<f32>>,
-
-    /// Explicit initial stability override (days).
-    /// Must be in [0.01, 36500.0]. Uses namespace default if omitted.
-    #[serde(default)]
-    pub initial_stability: Option<f32>,
-}
-
-/// Default namespace name for `CreateMemory`.
-fn default_namespace() -> String {
-    "default".to_string()
-}
-
-impl CreateMemory {
-    /// Validate the request body. This checks content limits and tag
-    /// format only — namespace existence and embedding dimensions
-    /// require external context and are checked by the API layer.
-    pub fn validate(&self) -> Result<(), ValidationError> {
-        // Summary
-        if self.summary.is_empty() {
-            return Err(ValidationError::SummaryEmpty);
-        }
-        if self.summary.len() > SUMMARY_MAX_BYTES {
-            return Err(ValidationError::SummaryTooLong {
-                len: self.summary.len(),
-                max: SUMMARY_MAX_BYTES,
-            });
-        }
-
-        // Full text
-        if let Some(ref ft) = self.full_text {
-            if ft.len() > FULL_TEXT_MAX_BYTES {
-                return Err(ValidationError::FullTextTooLong {
-                    len: ft.len(),
-                    max: FULL_TEXT_MAX_BYTES,
-                });
-            }
-        }
-
-        // Tags: count
-        if self.tags.len() > MAX_TAGS {
-            return Err(ValidationError::TooManyTags {
-                count: self.tags.len(),
-                max: MAX_TAGS,
-            });
-        }
-
-        // Tags: format (attempt to construct each)
-        for raw in &self.tags {
-            Tag::new(raw.as_str()).map_err(ValidationError::from)?;
-        }
-
-        // Embedding: finite check
-        if let Some(ref emb) = self.embedding {
-            for (i, &val) in emb.iter().enumerate() {
-                if !val.is_finite() {
-                    return Err(ValidationError::NonFiniteEmbedding { index: i });
-                }
-            }
-        }
-
-        // Stability override
-        if let Some(s) = self.initial_stability {
-            if !(STABILITY_FLOOR..=STABILITY_CEILING).contains(&s) {
-                return Err(ValidationError::InvalidStability {
-                    value: s,
-                    min: STABILITY_FLOOR,
-                    max: STABILITY_CEILING,
-                });
-            }
         }
 
         Ok(())

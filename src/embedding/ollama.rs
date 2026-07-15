@@ -70,22 +70,6 @@ impl OllamaProvider {
 
         Ok(())
     }
-
-    /// List available models on the Ollama instance.
-    pub async fn list_models(&self) -> Result<Vec<String>, EmbeddingError> {
-        let response = self
-            .client
-            .get(format!("{}/api/tags", self.base_url))
-            .send()
-            .await?;
-
-        let tags: TagsResponse = response
-            .json()
-            .await
-            .map_err(|e| EmbeddingError::InvalidResponse(e.to_string()))?;
-
-        Ok(tags.models.into_iter().map(|m| m.name).collect())
-    }
 }
 
 #[async_trait::async_trait]
@@ -175,6 +159,15 @@ impl EmbeddingProvider for OllamaProvider {
             "Ollama embedding request succeeded"
         );
 
+        // Validate the number of returned embeddings matches the input count.
+        if body.embeddings.len() != texts.len() {
+            return Err(EmbeddingError::InvalidResponse(format!(
+                "expected {} embeddings, got {}",
+                texts.len(),
+                body.embeddings.len()
+            )));
+        }
+
         // Validate every returned vector's dimensionality.
         for embedding in &body.embeddings {
             if embedding.len() != self.dim {
@@ -217,27 +210,4 @@ struct EmbedResponse {
 #[derive(Deserialize)]
 struct OllamaErrorResponse {
     error: String,
-}
-
-#[derive(Deserialize)]
-struct TagsResponse {
-    models: Vec<ModelInfo>,
-}
-
-#[derive(Deserialize)]
-struct ModelInfo {
-    name: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    details: ModelDetails,
-}
-
-#[derive(Default, Deserialize)]
-struct ModelDetails {
-    #[serde(default)]
-    #[allow(dead_code)]
-    family: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    parameter_size: String,
 }
