@@ -140,6 +140,15 @@ impl EmbeddingProvider for CachedProvider {
         if !miss_texts.is_empty() {
             let miss_embeddings = self.inner.embed_batch(&miss_texts).await?;
 
+            // Validate the provider returned exactly one embedding per input.
+            if miss_embeddings.len() != miss_texts.len() {
+                return Err(EmbeddingError::InvalidResponse(format!(
+                    "provider returned {} embeddings for {} inputs",
+                    miss_embeddings.len(),
+                    miss_texts.len()
+                )));
+            }
+
             // Step 4: Insert into cache and place into results.
             for (j, embedding) in miss_embeddings.into_iter().enumerate() {
                 let original_index = miss_indices[j];
@@ -149,7 +158,8 @@ impl EmbeddingProvider for CachedProvider {
             }
         }
 
-        // Step 5: Unwrap all results (every slot is now Some).
+        // Step 5: Unwrap all results (every slot is now Some after
+        // cache hits + validated miss embeddings filled all positions).
         Ok(results.into_iter().map(|r| r.unwrap()).collect())
     }
 

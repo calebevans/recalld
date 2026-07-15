@@ -84,11 +84,13 @@ impl OpenAIProvider {
     /// Retries on:
     ///   - 429 (rate limit): up to MAX_RETRIES, exponential backoff + jitter
     ///   - 500/502/503 (server error): up to MAX_RETRIES, exponential backoff
+    ///   - Network errors (connect failures, timeouts): up to MAX_RETRIES
     ///
     /// Does NOT retry on:
     ///   - 400 (bad request): returns RequestFailed immediately
     ///   - 401/403 (auth): returns Unavailable immediately
     ///   - 404 (model not found): returns ModelNotFound immediately
+    ///   - Non-transient network errors (e.g., invalid URL): returns immediately
     async fn request_with_retry(
         &self,
         texts: &[&str],
@@ -104,14 +106,32 @@ impl OpenAIProvider {
         const MAX_RETRIES: u32 = 5;
 
         for attempt in 0..=MAX_RETRIES {
-            let response = self
+            let response = match self
                 .client
                 .post(format!("{}/v1/embeddings", self.base_url))
                 .header("Authorization", format!("Bearer {}", self.api_key.expose()))
                 .header("Content-Type", "application/json")
                 .json(&request_body)
                 .send()
-                .await?;
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) if e.is_connect() || e.is_timeout() => {
+                    if attempt == MAX_RETRIES {
+                        return Err(EmbeddingError::Network(e));
+                    }
+                    warn!(
+                        model = %self.model,
+                        attempt = attempt + 1,
+                        %e,
+                        "OpenAI connection failed, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(60));
+                    continue;
+                }
+                Err(e) => return Err(EmbeddingError::Network(e)),
+            };
 
             let status = response.status();
 
@@ -240,6 +260,15 @@ impl EmbeddingProvider for OpenAIProvider {
             // guarantee output order matches input order.
             let mut data = response.data;
             data.sort_by_key(|d| d.index);
+
+            // Validate the number of returned embeddings matches the chunk size.
+            if data.len() != chunk.len() {
+                return Err(EmbeddingError::InvalidResponse(format!(
+                    "expected {} embeddings, got {}",
+                    chunk.len(),
+                    data.len()
+                )));
+            }
 
             for item in data {
                 if item.embedding.len() != self.dim {

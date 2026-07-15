@@ -255,6 +255,15 @@ impl BedrockProvider {
         let response: CohereResponse = serde_json::from_slice(&response_bytes)
             .map_err(|e| EmbeddingError::InvalidResponse(e.to_string()))?;
 
+        // Validate the number of returned embeddings matches the input count.
+        if response.embeddings.len() != texts.len() {
+            return Err(EmbeddingError::InvalidResponse(format!(
+                "expected {} embeddings, got {}",
+                texts.len(),
+                response.embeddings.len()
+            )));
+        }
+
         for embedding in &response.embeddings {
             if embedding.len() != self.dim {
                 return Err(EmbeddingError::DimensionMismatch {

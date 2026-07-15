@@ -79,10 +79,10 @@ impl EmbeddingProvider for PrefixedProvider {
 
     async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         if self.query_prefix.is_empty() {
-            self.inner.embed(text).await
+            self.inner.embed_query(text).await
         } else {
             let prefixed = Self::prefixed(&self.query_prefix, text);
-            self.inner.embed(&prefixed).await
+            self.inner.embed_query(&prefixed).await
         }
     }
 
@@ -262,5 +262,105 @@ mod tests {
         let (mock2, _) = MockProvider::new(4);
         let p2 = PrefixedProvider::new(Box::new(mock2), "".to_string(), "".to_string());
         assert!(!p2.has_query_prefix());
+    }
+
+    /// Mock provider that distinguishes embed() from embed_query()
+    /// by recording which method was called.
+    struct AsymmetricMockProvider {
+        calls: Arc<Mutex<Vec<(&'static str, String)>>>,
+        dims: usize,
+    }
+
+    impl AsymmetricMockProvider {
+        fn new(dims: usize) -> (Self, Arc<Mutex<Vec<(&'static str, String)>>>) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    calls: calls.clone(),
+                    dims,
+                },
+                calls,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for AsymmetricMockProvider {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("embed", text.to_string()));
+            Ok(vec![1.0; self.dims])
+        }
+
+        async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("embed_query", text.to_string()));
+            Ok(vec![2.0; self.dims])
+        }
+
+        async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            let mut calls = self.calls.lock().unwrap();
+            for text in texts {
+                calls.push(("embed_batch", text.to_string()));
+            }
+            Ok(texts.iter().map(|_| vec![1.0; self.dims]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        fn model_name(&self) -> &str {
+            "asymmetric-mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embed_query_delegates_to_inner_embed_query() {
+        let (mock, calls) = AsymmetricMockProvider::new(4);
+        let provider = PrefixedProvider::new(
+            Box::new(mock),
+            "doc: ".to_string(),
+            "query: ".to_string(),
+        );
+        provider.embed_query("hello").await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "embed_query");
+        assert_eq!(calls[0].1, "query: hello");
+    }
+
+    #[tokio::test]
+    async fn test_embed_delegates_to_inner_embed() {
+        let (mock, calls) = AsymmetricMockProvider::new(4);
+        let provider = PrefixedProvider::new(
+            Box::new(mock),
+            "doc: ".to_string(),
+            "query: ".to_string(),
+        );
+        provider.embed("hello").await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "embed");
+        assert_eq!(calls[0].1, "doc: hello");
+    }
+
+    #[tokio::test]
+    async fn test_embed_query_empty_prefix_delegates_to_inner_embed_query() {
+        let (mock, calls) = AsymmetricMockProvider::new(4);
+        let provider = PrefixedProvider::new(
+            Box::new(mock),
+            "doc: ".to_string(),
+            "".to_string(),
+        );
+        provider.embed_query("hello").await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "embed_query");
+        assert_eq!(calls[0].1, "hello");
     }
 }
