@@ -309,52 +309,6 @@ impl RelationshipGraph {
         Ok(key)
     }
 
-    /// Remove a node and ALL its edges. Returns the removed edges
-    /// so the caller can delete them from edges.db.
-    ///
-    /// This is the simple removal path (no bridging). For ghost
-    /// deletion with pass-through bridging, use
-    /// `remove_memory_with_bridging`.
-    pub fn remove_node(&mut self, memory_id: MemoryId) -> Result<Vec<GraphEdge>, GraphError> {
-        let node_key = self.resolve_key(memory_id)?;
-
-        let node = self
-            .nodes
-            .get(node_key)
-            .ok_or(GraphError::MemoryNotFound(memory_id))?;
-
-        // Collect all edge keys before mutating
-        let edge_keys: Vec<EdgeKey> = node
-            .outgoing
-            .iter()
-            .chain(node.incoming.iter())
-            .copied()
-            .collect();
-
-        let mut removed_edges = Vec::with_capacity(edge_keys.len());
-
-        for ek in edge_keys {
-            if let Some(edge) = self.edges.remove(ek) {
-                // Remove this edge key from the OTHER node's lists
-                let other_key = if edge.source == node_key {
-                    edge.target
-                } else {
-                    edge.source
-                };
-                if let Some(other_node) = self.nodes.get_mut(other_key) {
-                    other_node.outgoing.retain(|k| *k != ek);
-                    other_node.incoming.retain(|k| *k != ek);
-                }
-                removed_edges.push(edge);
-            }
-        }
-
-        self.nodes.remove(node_key);
-        self.id_index.remove(&memory_id);
-
-        Ok(removed_edges)
-    }
-
     /// Update a node's cached decay state. Called by decay sweeps
     /// after recomputing R(t,S) and checking phase transitions.
     pub fn update_node_state(
@@ -670,8 +624,10 @@ impl RelationshipGraph {
                 let predecessor = in_edge.source;
                 let successor = out_edge.target;
 
-                // Only bridge if no edge already exists and weight is sufficient
-                let edge_exists = self.edge_exists_between_keys(predecessor, successor);
+                // Only bridge if no edge of the same type already exists (either direction)
+                // and weight is sufficient
+                let edge_exists =
+                    self.has_typed_edge_between(predecessor, successor, in_edge.edge_type);
 
                 if !edge_exists && bridge_weight > 0.1 {
                     let bridge = GraphEdge {
@@ -734,20 +690,6 @@ impl RelationshipGraph {
             removed_edges,
             bridge_created,
         }
-    }
-
-    /// Check if any edge exists from source to target (forward direction only).
-    fn edge_exists_between_keys(&self, source: NodeKey, target: NodeKey) -> bool {
-        if let Some(source_node) = self.nodes.get(source) {
-            for &ek in &source_node.outgoing {
-                if let Some(edge) = self.edges.get(ek) {
-                    if edge.target == target {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 }
 

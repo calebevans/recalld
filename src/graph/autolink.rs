@@ -31,41 +31,6 @@ pub const DEFAULT_MAX_LINKS: usize = 15;
 pub const TAG_THRESHOLD_ADJUSTMENT: f32 = 0.05;
 
 // ═══════════════════════════════════════════════════════════════════════
-// AutoLinkThresholds
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Default similarity thresholds by embedding model family.
-///
-/// These are starting points -- the actual threshold is stored in
-/// namespace configuration and tunable at runtime.
-///
-/// Thresholds are NOT portable across models. Score distributions
-/// vary significantly (ada-002 compresses scores upward; MiniLM
-/// spreads them wide). See Spec 05 section 3.2.
-pub struct AutoLinkThresholds;
-
-impl AutoLinkThresholds {
-    /// Return the recommended threshold for a model family.
-    /// Falls back to 0.60 for unknown models.
-    pub fn default_for_model(model_name: &str) -> f32 {
-        let lower = model_name.to_lowercase();
-        if lower.contains("ada-002") {
-            0.79
-        } else if lower.contains("text-embedding-3-small")
-            || lower.contains("text-embedding-3-large")
-        {
-            0.50
-        } else if lower.contains("minilm") || lower.contains("all-minilm") {
-            0.60
-        } else if lower.contains("nomic-embed") {
-            0.60
-        } else {
-            0.60 // conservative default
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // AutoLinkCandidate
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -194,11 +159,17 @@ pub enum AutoLinkError {
 // persist_edges — shared helper for edge persistence + graph insertion
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Persist a batch of edges to storage, insert them into the in-memory
-/// graph, and update the edge count on the source memory.
+/// Insert edges into the in-memory graph, persist accepted edges to
+/// storage, and update the edge count on the source memory.
 ///
 /// This helper consolidates the boilerplate that was previously duplicated
 /// across `perform_autolink`, `perform_entity_link`, and `perform_temporal_link`.
+///
+/// Edges are validated in the graph FIRST, and only edges that the graph
+/// accepts are persisted to storage. This prevents the TOCTOU race where
+/// edges written to storage before graph validation could be rejected by
+/// the graph but survive in edges.db, getting loaded back on restart
+/// without the bidirectional duplicate check.
 ///
 /// # Returns
 ///
@@ -214,39 +185,45 @@ pub(crate) async fn persist_edges(
         return Ok(0);
     }
 
-    // Step 1: Persist edges to edges.db.
+    // Step 1: Write-lock graph for edge insertion. Validate edges in the
+    // graph first, collecting only the ones that succeed.
+    let accepted_edges: Vec<PersistedEdge> = {
+        let mut graph_w = graph.write().await;
+        let mut accepted = Vec::with_capacity(persisted_edges.len());
+        for pe in persisted_edges {
+            match graph_w.add_edge(pe.source, pe.target, pe.edge_type, pe.weight, true) {
+                Ok(_) => accepted.push(pe.clone()),
+                Err(crate::graph::GraphError::EdgeExists(_, _)) => {}
+                Err(crate::graph::GraphError::MemoryNotFound(_)) => {}
+                Err(e) => return Err(AutoLinkError::Graph(e)),
+            }
+        }
+        accepted
+    };
+
+    let edges_created = accepted_edges.len();
+
+    if edges_created == 0 {
+        return Ok(0);
+    }
+
+    // Step 2: Persist only accepted edges to edges.db.
     {
         let storage = storage.clone();
-        let edges_owned = persisted_edges.to_vec();
         tokio::task::spawn_blocking(move || {
             let storage_r = storage
                 .read()
                 .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
             storage_r
-                .batch_add_edges(&edges_owned)
+                .batch_add_edges(&accepted_edges)
                 .map_err(|e| AutoLinkError::Storage(e.to_string()))
         })
         .await
         .map_err(|e| AutoLinkError::Storage(format!("blocking task join error: {e}")))??;
     }
 
-    // Step 2: Write-lock graph for edge insertion.
-    let edges_created = {
-        let mut graph_w = graph.write().await;
-        let mut created = 0usize;
-        for pe in persisted_edges {
-            match graph_w.add_edge(pe.source, pe.target, pe.edge_type, pe.weight, true) {
-                Ok(_) => created += 1,
-                Err(crate::graph::GraphError::EdgeExists(_, _)) => {}
-                Err(crate::graph::GraphError::MemoryNotFound(_)) => {}
-                Err(e) => return Err(AutoLinkError::Graph(e)),
-            }
-        }
-        created
-    };
-
     // Step 3: Additive edge_count update.
-    if edges_created > 0 {
+    {
         let current_count = cache
             .get(new_memory_id)
             .await
@@ -255,7 +232,7 @@ pub(crate) async fn persist_edges(
         let new_count = current_count + edges_created as u16;
         {
             let storage = storage.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 let storage_r = storage.read().map_err(|e| {
                     AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}"))
                 })?;
@@ -263,7 +240,24 @@ pub(crate) async fn persist_edges(
                     .update_edge_count(new_memory_id, new_count)
                     .map_err(|e| AutoLinkError::Storage(e.to_string()))
             })
-            .await;
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        memory_id = %new_memory_id,
+                        error = %e,
+                        "Failed to update edge count in storage; cache is correct but on-disk record may be stale"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %new_memory_id,
+                        error = %e,
+                        "Edge count update task panicked; cache is correct but on-disk record may be stale"
+                    );
+                }
+            }
         }
         cache.update_edge_count(new_memory_id, new_count).await;
     }

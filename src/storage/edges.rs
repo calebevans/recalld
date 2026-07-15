@@ -226,33 +226,6 @@ impl EdgeStore {
         Ok(())
     }
 
-    /// Remove a single edge from both forward and reverse indexes.
-    ///
-    /// Returns `Ok(true)` if the edge existed and was removed,
-    /// `Ok(false)` if the edge was not found.
-    pub fn remove_edge(
-        &self,
-        source: MemoryId,
-        target: MemoryId,
-        edge_type: EdgeType,
-    ) -> Result<bool, StorageError> {
-        let fwd_key = encode_forward_key(&source, edge_type, &target);
-        let rev_key = encode_reverse_key(&target, edge_type, &source);
-
-        let write_txn = self.db.begin_write()?;
-        let removed;
-        {
-            let mut fwd = write_txn.open_table(FORWARD_EDGES)?;
-            let mut rev = write_txn.open_table(REVERSE_EDGES)?;
-
-            removed = fwd.remove(fwd_key.as_slice())?.is_some();
-            rev.remove(rev_key.as_slice())?;
-        }
-        write_txn.commit()?;
-
-        Ok(removed)
-    }
-
     /// Return all outgoing edges from `source` (any edge type).
     ///
     /// Prefix scan on the first 16 bytes of the forward index key.
@@ -307,37 +280,6 @@ impl EdgeStore {
         }
 
         Ok(results)
-    }
-
-    /// Return all outgoing edges of a specific type from `source`.
-    ///
-    /// Uses a 17-byte prefix: [source_uuid: 16][edge_type: 1].
-    pub fn get_outgoing_of_type(
-        &self,
-        source: MemoryId,
-        edge_type: EdgeType,
-    ) -> Result<Vec<MemoryId>, StorageError> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(FORWARD_EDGES)?;
-
-        let mut start = [0u8; EDGE_KEY_SIZE];
-        start[0..16].copy_from_slice(source.as_bytes());
-        start[16] = edge_type.as_u8();
-
-        let mut end = [0u8; EDGE_KEY_SIZE];
-        end[0..16].copy_from_slice(source.as_bytes());
-        end[16] = edge_type.as_u8();
-        end[17..33].fill(0xFF);
-
-        let mut targets = Vec::new();
-        for entry in table.range(start.as_slice()..=end.as_slice())? {
-            let (key_guard, _) = entry?;
-            let key = key_guard.value();
-            let target = MemoryId::from_bytes(key[17..33].try_into().unwrap());
-            targets.push(target);
-        }
-
-        Ok(targets)
     }
 
     /// Remove all edges where `memory_id` appears as source or target.

@@ -37,8 +37,8 @@ pub use crate::storage::PersistedEdge;
 
 // Re-export CS-11 auto-link types and functions
 pub use autolink::{
-    AutoLinkCandidate, AutoLinkError, AutoLinkThresholds, DEFAULT_MAX_LINKS, THRESHOLD_HARD_FLOOR,
-    auto_link, perform_autolink, perform_entity_link, perform_temporal_link,
+    AutoLinkCandidate, AutoLinkError, DEFAULT_MAX_LINKS, THRESHOLD_HARD_FLOOR, auto_link,
+    perform_autolink, perform_entity_link, perform_temporal_link,
 };
 
 use std::sync::Arc;
