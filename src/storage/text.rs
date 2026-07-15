@@ -361,15 +361,21 @@ impl TextStore {
         &self.path
     }
 
-    /// Compact fulltext.dat by copying only live entries into a new file,
-    /// then atomically replacing the old file.
+    /// Phase 1 of fulltext.dat compaction: write a new file containing
+    /// only live entries, but do NOT rename or remove the marker.
     ///
-    /// `live_refs` contains (MemoryId, TextRef) for every DiskRecord
-    /// that still has a live text pointer.
-    pub fn compact(
+    /// The caller must update meta.db with the new offsets from the
+    /// returned `CompactionResult`, then call [`compact_finalize`] to
+    /// atomically swap the files. This two-phase approach ensures that
+    /// meta.db offsets are always consistent with the active fulltext.dat.
+    ///
+    /// Returns `(result, compacted)` where `compacted` is `true` if a
+    /// new file was written (fragmentation above threshold) and
+    /// `compact_finalize()` must be called afterwards.
+    pub fn compact_write_new_file(
         &mut self,
         live_refs: &[(MemoryId, TextRef)],
-    ) -> Result<CompactionResult, StorageError> {
+    ) -> Result<(CompactionResult, bool), StorageError> {
         let parent_dir = self
             .path
             .parent()
@@ -400,16 +406,19 @@ impl TextStore {
                 threshold = format!("{:.0}%", COMPACTION_FRAGMENTATION_THRESHOLD * 100.0),
                 "Skipping fulltext.dat compaction: fragmentation below threshold"
             );
-            return Ok(CompactionResult {
-                old_size,
-                new_size: old_size,
-                entries_removed: 0,
-                entries_kept: live_refs.len(),
-                new_refs: live_refs
-                    .iter()
-                    .map(|&(id, text_ref)| (id, text_ref))
-                    .collect(),
-            });
+            return Ok((
+                CompactionResult {
+                    old_size,
+                    new_size: old_size,
+                    entries_removed: 0,
+                    entries_kept: live_refs.len(),
+                    new_refs: live_refs
+                        .iter()
+                        .map(|&(id, text_ref)| (id, text_ref))
+                        .collect(),
+                },
+                false,
+            ));
         }
 
         // Step 1: Write marker.
@@ -462,20 +471,6 @@ impl TextStore {
         new_file.sync_all()?;
         drop(new_file);
 
-        // Step 5: Atomic rename.
-        fs::rename(&new_path, &self.path)?;
-
-        // Step 6: Fsync directory.
-        fsync_dir(&parent_dir)?;
-
-        // Step 7: Remove marker.
-        let _ = fs::remove_file(&marker_path);
-        fsync_dir(&parent_dir)?;
-
-        // Step 8: Reopen file handle.
-        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        self.write_pos = new_write_pos;
-
         let entries_removed = total_possible.saturating_sub(live_refs.len());
 
         let result = CompactionResult {
@@ -486,15 +481,47 @@ impl TextStore {
             new_refs,
         };
 
+        Ok((result, true))
+    }
+
+    /// Phase 2 of fulltext.dat compaction: atomically rename the new
+    /// file over the old one, remove markers, and reopen the file handle.
+    ///
+    /// Must only be called after `compact_write_new_file` returned
+    /// `compacted = true` AND the caller has persisted updated offsets
+    /// to meta.db.
+    pub fn compact_finalize(&mut self) -> Result<(), StorageError> {
+        let parent_dir = self
+            .path
+            .parent()
+            .ok_or(StorageError::InvalidPath)?
+            .to_path_buf();
+        let marker_path = parent_dir.join(".compacting");
+        let committed_marker_path = parent_dir.join(".compaction-meta-committed");
+        let new_path = parent_dir.join("fulltext.dat.new");
+
+        // Step 1: Atomic rename fulltext.dat.new -> fulltext.dat.
+        fs::rename(&new_path, &self.path)?;
+
+        // Step 2: Fsync directory to persist the rename.
+        fsync_dir(&parent_dir)?;
+
+        // Step 3: Remove markers.
+        let _ = fs::remove_file(&committed_marker_path);
+        let _ = fs::remove_file(&marker_path);
+        fsync_dir(&parent_dir)?;
+
+        // Step 4: Reopen file handle with updated contents.
+        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        // Determine new write position from file size.
+        self.write_pos = self.file.seek(SeekFrom::End(0))?;
+
         tracing::info!(
-            old_size = result.old_size,
-            new_size = result.new_size,
-            removed = result.entries_removed,
-            kept = result.entries_kept,
-            "Text.log compaction complete"
+            new_size = self.write_pos,
+            "Text.log compaction finalized"
         );
 
-        Ok(result)
+        Ok(())
     }
 
     /// Approximate entry count by scanning forward from header.
@@ -526,9 +553,23 @@ impl TextStore {
 /// Recover from an interrupted fulltext.dat compaction.
 ///
 /// Called once during startup validation, BEFORE opening the TextStore.
+///
+/// Handles two compaction states using marker files:
+///
+/// - `.compacting` alone (no `.compaction-meta-committed`):
+///   meta.db has NOT been updated with new offsets yet. Delete the
+///   incomplete `fulltext.dat.new` and revert to the original file.
+///
+/// - `.compacting` AND `.compaction-meta-committed`:
+///   meta.db HAS been updated with new offsets. Complete the rename
+///   of `fulltext.dat.new` -> `fulltext.dat` so the file matches
+///   the committed offsets. If the rename already happened (no .new
+///   file), just clean up the markers.
 pub fn recover_text_compaction(db_dir: &Path) -> Result<(), StorageError> {
     let marker_path = db_dir.join(".compacting");
+    let committed_marker_path = db_dir.join(".compaction-meta-committed");
     let new_file_path = db_dir.join("fulltext.dat.new");
+    let fulltext_path = db_dir.join("fulltext.dat");
 
     if !marker_path.exists() {
         // No compaction was in progress.
@@ -540,15 +581,33 @@ pub fn recover_text_compaction(db_dir: &Path) -> Result<(), StorageError> {
         marker_path.display()
     );
 
-    // If fulltext.dat.new exists, it is incomplete or un-swapped.
-    // meta.db still has old offsets. Safe to delete .new and revert.
-    if new_file_path.exists() {
-        tracing::warn!("Deleting incomplete fulltext.dat.new");
-        fs::remove_file(&new_file_path)?;
+    if committed_marker_path.exists() {
+        // meta.db has already been updated with new offsets.
+        // We must complete the rename so fulltext.dat matches.
+        if new_file_path.exists() {
+            tracing::warn!(
+                "meta.db offsets committed; completing rename of fulltext.dat.new -> fulltext.dat"
+            );
+            fs::rename(&new_file_path, &fulltext_path)?;
+            fsync_dir(db_dir)?;
+        } else {
+            // Rename already happened before crash; just clean up markers.
+            tracing::info!(
+                "meta.db offsets committed and rename already complete; cleaning up markers"
+            );
+        }
+    } else {
+        // meta.db has NOT been updated. Safe to delete .new and revert
+        // to the original fulltext.dat with its original offsets.
+        if new_file_path.exists() {
+            tracing::warn!("Deleting incomplete fulltext.dat.new");
+            fs::remove_file(&new_file_path)?;
+        }
     }
 
-    // Remove the marker.
-    fs::remove_file(&marker_path)?;
+    // Remove all markers.
+    let _ = fs::remove_file(&committed_marker_path);
+    let _ = fs::remove_file(&marker_path);
     fsync_dir(db_dir)?;
 
     tracing::info!("Compaction recovery complete");
