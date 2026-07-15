@@ -28,6 +28,7 @@ pub use sweep::{
     DecaySweepRunner, PhaseTransition, SweepConfig, SweepConfigError, SweepRecordError, SweepResult,
 };
 
+use crate::model::constants::ACCESS_HISTORY_MAX;
 use crate::model::{AccessEvent, DecayPhase, MemoryId};
 
 /// Mutable decay-related fields on a memory record.
@@ -76,15 +77,12 @@ pub struct DecayState {
 }
 
 impl DecayState {
-    /// Maximum number of access events retained in the history ring buffer.
-    pub const MAX_ACCESS_HISTORY: usize = 32;
-
     /// Push an access event into the bounded history ring buffer.
     ///
-    /// If the buffer is full (>= MAX_ACCESS_HISTORY), the oldest entry
+    /// If the buffer is full (>= ACCESS_HISTORY_MAX), the oldest entry
     /// is removed before pushing.
     pub fn push_access(&mut self, event: AccessEvent) {
-        if self.access_history.len() >= Self::MAX_ACCESS_HISTORY {
+        if self.access_history.len() >= ACCESS_HISTORY_MAX {
             self.access_history.remove(0);
         }
         self.access_history.push(event);

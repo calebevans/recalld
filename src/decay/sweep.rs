@@ -265,6 +265,9 @@ pub enum SweepError {
 struct PendingTransition {
     memory_id: MemoryId,
     from_phase: DecayPhase,
+    /// Raw FSRS retrievability (without connection bonus).
+    raw_r: f32,
+    /// Effective retrievability (with connection bonus).
     effective_r: f32,
     /// FSRS stability from the scan-time metadata snapshot.
     stability: f32,
@@ -485,7 +488,7 @@ impl DecaySweepRunner {
     ///    in the same sweep.
     /// 2. The cheapest operations (phase 3 records are smallest) run first.
     #[instrument(skip_all)]
-    async fn execute_sweep(
+    pub(crate) async fn execute_sweep(
         config: &SweepConfig,
         decay_config: &DecayConfig,
         activation_config: &ActivationConfig,
@@ -494,8 +497,22 @@ impl DecaySweepRunner {
         cache: &Arc<CacheManager>,
         global_decay_multiplier: f64,
     ) -> SweepResult {
+        Self::execute_sweep_at(config, decay_config, activation_config, storage, graph, cache, global_decay_multiplier, None).await
+    }
+
+    #[instrument(skip_all)]
+    pub(crate) async fn execute_sweep_at(
+        config: &SweepConfig,
+        decay_config: &DecayConfig,
+        activation_config: &ActivationConfig,
+        storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+        graph: &SharedGraph,
+        cache: &Arc<CacheManager>,
+        global_decay_multiplier: f64,
+        as_of_millis: Option<i64>,
+    ) -> SweepResult {
         let start = Instant::now();
-        let now_millis = chrono::Utc::now().timestamp_millis();
+        let now_millis = as_of_millis.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         let engine = FsrsEngine::new(decay_config);
         let mut result = SweepResult::default();
 
@@ -689,7 +706,7 @@ impl DecaySweepRunner {
                 };
 
                 // Evaluate this record for a possible phase transition.
-                let effective_r = Self::evaluate_record(
+                let retrievability = Self::evaluate_record(
                     *memory_id,
                     phase,
                     &meta,
@@ -710,11 +727,12 @@ impl DecaySweepRunner {
                     pending_transitions.clear();
                 }
 
-                // Update decay_strength in storage and sync graph state.
-                // Skip if the record was not evaluated (permastore/decay-disabled).
-                if let Some(eff_r) = effective_r {
+                // Update strength and decay_strength in storage and sync
+                // graph state. Skip if the record was not evaluated
+                // (permastore/decay-disabled).
+                if let Some((raw_r, eff_r)) = retrievability {
                     Self::update_record_state(
-                        *memory_id, phase, eff_r, &meta, storage, graph, result,
+                        *memory_id, phase, raw_r, eff_r, &meta, storage, graph, result,
                     )
                     .await;
                 }
@@ -837,9 +855,9 @@ impl DecaySweepRunner {
     /// retrievability, and pushes a `PendingTransition` if the
     /// effective R falls below the phase threshold.
     ///
-    /// Returns `Some(effective_r)` if the record was evaluated (not
-    /// skipped), or `None` if the record was skipped (permastore or
-    /// decay disabled).
+    /// Returns `Some((raw_r, effective_r))` if the record was evaluated
+    /// (not skipped), or `None` if the record was skipped (permastore
+    /// or decay disabled).
     #[allow(clippy::too_many_arguments)]
     async fn evaluate_record(
         memory_id: MemoryId,
@@ -852,7 +870,7 @@ impl DecaySweepRunner {
         global_decay_multiplier: f64,
         pending_transitions: &mut Vec<PendingTransition>,
         result: &mut SweepResult,
-    ) -> Option<f32> {
+    ) -> Option<(f32, f32)> {
         // -- Permastore exemption ---------------------------------
         if meta.is_permastore {
             result.permastore_skipped += 1;
@@ -896,6 +914,7 @@ impl DecaySweepRunner {
             pending_transitions.push(PendingTransition {
                 memory_id,
                 from_phase: phase,
+                raw_r,
                 effective_r,
                 stability: meta.stability,
                 is_permastore: meta.is_permastore,
@@ -907,21 +926,27 @@ impl DecaySweepRunner {
             result.saved_by_connection_bonus += 1;
         }
 
-        Some(effective_r)
+        Some((raw_r, effective_r))
     }
 
-    /// Update a record's decay_strength in storage and sync the
-    /// graph node state after evaluation.
+    /// Update a record's strength and decay_strength in storage and
+    /// sync the graph node state after evaluation.
+    ///
+    /// `raw_r` is the FSRS retrievability without connection bonus
+    /// (written to `record.strength`).
+    /// `effective_r` is the retrievability with connection bonus
+    /// (written to `record.decay_strength` and synced to graph).
     async fn update_record_state(
         memory_id: MemoryId,
         phase: DecayPhase,
+        raw_r: f32,
         effective_r: f32,
         meta: &DecayMetadata,
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
         graph: &SharedGraph,
         result: &mut SweepResult,
     ) {
-        // Update decay_strength in metadata regardless of transition.
+        // Update strength and decay_strength in metadata regardless of transition.
         {
             let storage_clone = Arc::clone(storage);
             let stability = meta.stability;
@@ -934,6 +959,7 @@ impl DecaySweepRunner {
                 storage_r.update_decay_state(
                     memory_id,
                     phase,
+                    raw_r,
                     effective_r,
                     stability,
                     is_permastore,
@@ -945,14 +971,14 @@ impl DecaySweepRunner {
                     result.errors.push(SweepRecordError {
                         memory_id,
                         phase,
-                        error: format!("failed to update decay_strength: {e}"),
+                        error: format!("failed to update decay state: {e}"),
                     });
                 }
                 Err(e) => {
                     result.errors.push(SweepRecordError {
                         memory_id,
                         phase,
-                        error: format!("update decay_strength task panicked: {e}"),
+                        error: format!("update decay state task panicked: {e}"),
                     });
                 }
                 _ => {}
@@ -1000,6 +1026,7 @@ impl DecaySweepRunner {
                 DecayPhase::Full => {
                     Self::transition_full_to_summary(
                         t.memory_id,
+                        t.raw_r,
                         t.effective_r,
                         t.stability,
                         t.is_permastore,
@@ -1011,6 +1038,7 @@ impl DecaySweepRunner {
                 DecayPhase::Summary => {
                     Self::transition_summary_to_ghost(
                         t.memory_id,
+                        t.raw_r,
                         t.effective_r,
                         t.stability,
                         t.is_permastore,
@@ -1070,6 +1098,7 @@ impl DecaySweepRunner {
     /// the scan-time metadata snapshot so we avoid re-reading the record.
     async fn transition_full_to_summary(
         memory_id: MemoryId,
+        raw_r: f32,
         effective_r: f32,
         stability: f32,
         is_permastore: bool,
@@ -1089,14 +1118,23 @@ impl DecaySweepRunner {
             let storage_r = storage_clone
                 .read()
                 .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
+
+            // Update decay state: phase -> Summary, with raw and effective R.
             storage_r
                 .update_decay_state(
                     memory_id,
                     DecayPhase::Summary,
+                    raw_r,
                     effective_r,
                     stability,
                     is_permastore,
                 )
+                .map_err(|e| SweepError::Storage(e.to_string()))?;
+
+            // Zero the full_text pointer so the text data becomes dead
+            // space reclaimable by compaction.
+            storage_r
+                .strip_full_text(memory_id)
                 .map_err(|e| SweepError::Storage(e.to_string()))
         })
         .await
@@ -1122,6 +1160,7 @@ impl DecaySweepRunner {
     /// metadata snapshot so we avoid re-reading the record.
     async fn transition_summary_to_ghost(
         memory_id: MemoryId,
+        raw_r: f32,
         effective_r: f32,
         stability: f32,
         is_permastore: bool,
@@ -1132,14 +1171,23 @@ impl DecaySweepRunner {
             let storage_r = storage_clone
                 .read()
                 .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
+
+            // Update decay state: phase -> Ghost, with raw and effective R.
             storage_r
                 .update_decay_state(
                     memory_id,
                     DecayPhase::Ghost,
+                    raw_r,
                     effective_r,
                     stability,
                     is_permastore,
                 )
+                .map_err(|e| SweepError::Storage(e.to_string()))?;
+
+            // Clear the summary field -- Ghost phase retains only
+            // the embedding and relationship edges.
+            storage_r
+                .strip_summary(memory_id)
                 .map_err(|e| SweepError::Storage(e.to_string()))
         })
         .await
@@ -1172,22 +1220,56 @@ impl DecaySweepRunner {
         graph: &SharedGraph,
     ) -> Result<PhaseTransition, SweepError> {
         // 1. Remove all edges via the graph's bridging-aware deletion.
-        //    Acquires a WRITE lock on the graph.
+        //    Acquires a WRITE lock on the graph. If a bridge edge is
+        //    created, resolve its NodeKey endpoints to MemoryIds while
+        //    the lock is held (NodeKeys are not valid after release).
+        let bridge_to_persist: Option<crate::storage::edges::PersistedEdge>;
         {
             let mut graph_w = graph.write().await;
             let removal_result = graph_w.remove_memory_with_bridging(memory_id);
             debug!(
                 id = %memory_id,
                 edges_removed = removal_result.removed_edges.len(),
+                bridge_created = removal_result.bridge_created.is_some(),
                 "removed edges with bridging"
             );
+
+            // Resolve the bridge's NodeKey endpoints to MemoryIds
+            // while the graph lock is still held.
+            bridge_to_persist = removal_result.bridge_created.and_then(|bridge| {
+                let source_id = graph_w
+                    .get_node_by_key(bridge.source)
+                    .map(|n| n.memory_id);
+                let target_id = graph_w
+                    .get_node_by_key(bridge.target)
+                    .map(|n| n.memory_id);
+                match (source_id, target_id) {
+                    (Some(src), Some(tgt)) => Some(crate::storage::edges::PersistedEdge {
+                        source: src,
+                        target: tgt,
+                        edge_type: bridge.edge_type,
+                        weight: bridge.weight,
+                        auto_created: bridge.auto_created,
+                        created_at: bridge.created_at as u64,
+                    }),
+                    _ => {
+                        warn!(
+                            id = %memory_id,
+                            "bridge edge created but source/target nodes \
+                             not found in graph; skipping persistence"
+                        );
+                        None
+                    }
+                }
+            });
         } // write lock released
 
-        // 2. Remove edge records and metadata via spawn_blocking.
+        // 2. Remove old edge records, persist bridge, and delete
+        //    metadata via spawn_blocking.
         {
             let storage_clone = Arc::clone(storage);
             tokio::task::spawn_blocking(move || {
-                // Remove edges.
+                // Remove edges for the deleted memory.
                 {
                     let storage_r = storage_clone
                         .read()
@@ -1195,6 +1277,20 @@ impl DecaySweepRunner {
                     storage_r
                         .remove_all_edges(memory_id)
                         .map_err(|e| SweepError::Storage(e.to_string()))?;
+
+                    // Persist the bridge edge if one was created.
+                    if let Some(ref bridge) = bridge_to_persist {
+                        storage_r
+                            .batch_add_edges(&[bridge.clone()])
+                            .map_err(|e| SweepError::Storage(e.to_string()))?;
+                        tracing::debug!(
+                            source = %bridge.source,
+                            target = %bridge.target,
+                            edge_type = ?bridge.edge_type,
+                            weight = bridge.weight,
+                            "persisted bridge edge to edges.db"
+                        );
+                    }
                 }
                 // Delete metadata record (requires write lock).
                 {

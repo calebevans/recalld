@@ -73,10 +73,11 @@ pub fn update_decay_state(
     id: MemoryId,
     phase: DecayPhase,
     strength: f32,
+    decay_strength: f32,
     stability: f32,
     is_permastore: bool,
 ) -> Result<(), SweepError> {
     storage
-        .update_decay_state(id, phase, strength, stability, is_permastore)
+        .update_decay_state(id, phase, strength, decay_strength, stability, is_permastore)
         .map_err(|e| SweepError::Storage(e.to_string()))
 }

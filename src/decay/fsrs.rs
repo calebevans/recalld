@@ -134,18 +134,25 @@ const W6: f32 = 0.75;
 #[allow(dead_code)]
 const W7: f32 = 0.6;
 
-/// FSRS v4.5 default parameters w11-w14.
+/// FSRS v4.5 default parameters w11-w14 (post-lapse stability formula).
 ///
-/// w11-w13: Stability-after-failure formula (not used -- Recalld
-///   has no failure signal; all accesses are treated as successful recall).
-/// w14: Scaling factor in FSRS-5 difficulty update (not used in v4.5 mode).
-#[allow(dead_code)]
+/// Used by `review_stability` when quality = 1 (forgot) to compute
+/// post-lapse stability via the FSRS v4.5 formula:
+///
+/// ```text
+/// S'_f = w11 * D^(-w12) * ((S + 1)^w13 - 1) * e^(w14 * (1 - R))
+/// ```
+///
+/// With default values (w12 = 0.0, w14 = 0.0), this simplifies to:
+///   S'_f = w11 * ((S + 1)^w13 - 1)
+///
+/// This produces an absolute stability value that replaces (rather than
+/// multiplies) the old stability, modeling the empirical finding that
+/// failing to recall a memory resets it to a low-but-nonzero stability
+/// that depends on how strong the memory was before the lapse.
 const W11: f32 = 1.2;
-#[allow(dead_code)]
 const W12: f32 = 0.0;
-#[allow(dead_code)]
 const W13: f32 = 0.3261;
-#[allow(dead_code)]
 const W14: f32 = 0.0;
 
 /// FSRS v4.5 default parameters w15-w19.
@@ -590,23 +597,29 @@ impl<'a> FsrsEngine<'a> {
     /// update without requiring a full `DecayState`.
     ///
     /// Quality ratings map to FSRS behavior:
-    /// - 1 (forgot): stability decreases (lapse — uses the SInc formula
-    ///   with a penalty factor to reduce stability)
+    /// - 1 (forgot): stability decreases (lapse — uses the FSRS v4.5
+    ///   post-lapse formula to compute a new, lower stability)
     /// - 2 (hard): moderate stability increase
     /// - 3 (good): standard stability increase (default FSRS recall)
     /// - 4 (easy): strongest stability increase
     ///
-    /// The core FSRS recall formula is:
+    /// For quality 2-4, the core FSRS recall formula is:
     /// ```text
     /// SInc = e^W8 * (11 - D) * S^(-W9) * (e^(W10 * (1 - R)) - 1) + 1
     /// new_stability = old_stability * SInc
     /// ```
     ///
     /// For quality != 3 (Good), a grade multiplier adjusts SInc:
-    /// - Quality 1 (forgot): multiplier = 0.2 (significant penalty)
     /// - Quality 2 (hard):   multiplier = 0.7
     /// - Quality 3 (good):   multiplier = 1.0 (standard FSRS)
     /// - Quality 4 (easy):   multiplier = 1.3
+    ///
+    /// For quality 1 (forgot), the FSRS v4.5 post-lapse formula is used:
+    /// ```text
+    /// S'_f = w11 * D^(-w12) * ((S + 1)^w13 - 1) * e^(w14 * (1 - R))
+    /// ```
+    /// This produces an absolute stability value (typically much lower
+    /// than the old stability), modeling the memory reset after a lapse.
     ///
     /// # Arguments
     ///
@@ -628,12 +641,27 @@ impl<'a> FsrsEngine<'a> {
         // Compute current retrievability at the moment of review.
         let current_r = self.retrievability(elapsed_days, stability, decay_rate_multiplier);
 
-        // Compute the base SInc using the standard FSRS formula.
+        if quality == 1 {
+            // Quality 1 (forgot): use the FSRS v4.5 post-lapse formula.
+            //
+            // S'_f = w11 * D^(-w12) * ((S + 1)^w13 - 1) * e^(w14 * (1 - R))
+            //
+            // This produces a new absolute stability value (not a multiplier),
+            // typically much lower than the old stability. For example, with
+            // S = 3.7145, the formula yields S'_f ~ 0.76.
+            let d = self.config.difficulty;
+            let new_stability = W11
+                * d.powf(-W12)
+                * ((stability + 1.0).powf(W13) - 1.0)
+                * (W14 * (1.0 - current_r)).exp();
+
+            return new_stability.clamp(STABILITY_FLOOR, STABILITY_CEILING);
+        }
+
+        // Quality 2-4: use the multiplicative SInc approach.
         let base_sinc = self.stability_increase(stability, current_r, self.config.difficulty);
 
-        // Apply a grade-dependent multiplier to the growth portion (SInc - 1).
         let grade_multiplier = match quality {
-            1 => 0.2, // forgot — substantial penalty
             2 => 0.7, // hard — reduced growth
             3 => 1.0, // good — standard FSRS
             _ => 1.3, // easy (4+) — boosted growth
