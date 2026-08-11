@@ -1552,6 +1552,21 @@ mod tests {
     }
 
     /// The directory shape the boot sweep recognizes, planted by hand.
+    /// True when `root` lives on a case-insensitive filesystem, as APFS on
+    /// macOS is by default.
+    ///
+    /// Tests that plant a case variant of a live namespace's directory have
+    /// to know this: on such a filesystem the variant is not a second
+    /// directory, it is the same one, so planting into it overwrites the
+    /// live namespace's real `vectors.dat`.
+    fn filesystem_is_case_insensitive(root: &Path) -> bool {
+        let probe = root.join("CaseProbe");
+        std::fs::create_dir_all(&probe).expect("create case probe");
+        let insensitive = root.join("caseprobe").exists();
+        std::fs::remove_dir_all(&probe).expect("remove case probe");
+        insensitive
+    }
+
     fn plant_orphan_dir(root: &Path, name: &str) -> PathBuf {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).expect("create orphan dir");
@@ -2090,13 +2105,26 @@ mod tests {
     fn w51_the_boot_sweep_does_not_delete_a_case_variant_live_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
 
+        // Probe before the engine exists, so the throwaway directory cannot
+        // be seen by the boot sweep.
+        let case_insensitive = filesystem_is_case_insensitive(dir.path());
+
         {
             let mut engine = open_engine(dir.path());
             make_namespace(&mut engine, "Notes");
-            // The directory as a case-insensitive filesystem would have
-            // recorded it, planted explicitly so the test proves the
-            // same thing on a case-sensitive one.
-            plant_orphan_dir(dir.path(), "notes");
+            // On a case-sensitive filesystem the lowercase variant has to be
+            // planted, so that the sweep is made to choose between deleting
+            // it and recognising it as the live namespace's directory.
+            //
+            // On a case-insensitive one there is nothing to plant: creating
+            // `Notes` already produced the directory `notes` resolves to.
+            // Planting would write a stub over the live namespace's real
+            // vectors.dat and the reopen below would fail to parse it --
+            // which is exactly how this test used to fail on macOS while
+            // passing on Linux.
+            if !case_insensitive {
+                plant_orphan_dir(dir.path(), "notes");
+            }
         }
 
         let _engine = open_engine(dir.path());
