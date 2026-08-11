@@ -1000,36 +1000,18 @@ impl MetadataStore {
         Ok(all.into_iter().find(|c| c.name.eq_ignore_ascii_case(name)))
     }
 
-    /// Update a namespace's mutable fields (name, thresholds, etc.).
-    /// Immutable fields (id, embedding_dim, created_at) are preserved.
-    pub fn update_namespace(
-        &self,
-        id: NamespaceId,
-        updated: &NamespaceConfig,
-    ) -> Result<(), StorageError> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(NAMESPACE_TABLE)?;
-            let existing: NamespaceConfig = {
-                let existing_bytes = table
-                    .get(id.get())?
-                    .ok_or(StorageError::NamespaceNotFound(id.get()))?;
-                serde_json::from_slice(existing_bytes.value())
-                    .map_err(|e| StorageError::Deserialize(e.to_string()))?
-            };
-
-            let mut to_store = updated.clone();
-            to_store.id = existing.id;
-            to_store.embedding_dim = existing.embedding_dim;
-            to_store.created_at = existing.created_at;
-
-            let bytes = serde_json::to_vec(&to_store)
-                .map_err(|e| StorageError::Serialize(e.to_string()))?;
-            table.insert(id.get(), bytes.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
+    // `update_namespace` used to live here: a read-modify-write of the
+    // NAMESPACE_TABLE row that preserved id, embedding_dim and
+    // created_at and let everything else through — including `name`.
+    // It had zero callers, and a rename is not a metadata edit. The name
+    // IS the directory: renaming the row leaves the memories reading
+    // `<old>/vectors.dat` until the next boot, where step 6 creates a
+    // fresh empty `<new>/` and
+    // `RedbStorageEngine::sweep_orphan_namespace_dirs` finds `<old>/`
+    // matching no live name and removes it. A namespace rename would
+    // have been a delayed, unattended shredder for every embedding in
+    // it. Deleted rather than documented; if a rename is ever wanted it
+    // has to move the directory in the same operation.
 
     /// Delete a namespace record from NAMESPACE_TABLE.
     ///
