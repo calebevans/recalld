@@ -1361,10 +1361,16 @@ fn namespace_stats_def() -> ToolInfo {
     ToolInfo {
         name: "namespace_stats".to_string(),
         title: Some("Namespace Stats".to_string()),
-        description: "Get statistics for a memory namespace including total memory count, \
+        description: "Get statistics for a memory namespace: live memory count, \
             phase breakdown (full/summary/ghost), permastore count, average strength, \
             edge count, and vector storage size. Use this to check how many memories \
-            exist or monitor namespace health."
+            exist or monitor namespace health. \
+            `memoryCount` and every figure derived from it EXCLUDE deleted \
+            (tombstoned) memories, and always equal full + summary + ghost, so it \
+            agrees with list_memories and list_namespaces. Tombstoned records are \
+            reported separately as `tombstoneCount`: they hold no content, but nothing \
+            except delete_namespace ever reclaims them, so a namespace showing one \
+            memory where eleven were stored has ten of them."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -1920,6 +1926,29 @@ mod tests {
         assert!(
             description.contains("never reclaimed"),
             "forget_memory does not say tombstones are never reclaimed: {description}"
+        );
+    }
+
+    /// `list_namespaces` and `list_tags` both got an "excludes deleted"
+    /// sentence when the counts changed; `namespace_stats` shipped the
+    /// same semantic change and kept saying "total memory count". The
+    /// tool description is what the agent actually reads — the docs are
+    /// not in its context — so a stale one is the version that governs.
+    #[test]
+    fn w69_namespace_stats_description_states_what_its_counts_exclude() {
+        let description = namespace_stats_def().description;
+        assert!(
+            !description.contains("total memory count"),
+            "namespace_stats still calls its count a total: {description}"
+        );
+        assert!(
+            description.contains("tombstoneCount"),
+            "namespace_stats does not name the field it added: {description}"
+        );
+        assert!(
+            description.to_lowercase().contains("exclude"),
+            "namespace_stats does not say its counts exclude deleted memories: \
+             {description}"
         );
     }
 

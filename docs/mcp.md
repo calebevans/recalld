@@ -1047,7 +1047,7 @@ Response:
   "memoriesCounted": 128,
   "tags": {
     "total": 41,
-    "truncated": false,
+    "truncated": true,
     "items": [
       { "name": "type/decision", "count": 12 },
       { "name": "project/recalld", "count": 9 }
