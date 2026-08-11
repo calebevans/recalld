@@ -880,11 +880,11 @@ Strengthen a memory so it decays more slowly.
 
 ### `forget_memory`
 
-Permanently delete a memory.
+Delete a memory's content. The memory moves to the Tombstone phase: its summary, full text and tags are erased and it stops appearing in recall, but its record and its graph edges are kept so relationship chains stay intact, and its UUID is never reused. Tombstoned memories are never reclaimed by the decay sweep, so they persist for the life of the database.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `id` | string | Yes | Memory UUID to delete. |
+| `id` | string | Yes | Memory UUID to forget. The memory moves to the Tombstone phase; its graph edges are kept and its UUID is never reused. |
 
 ### `find_similar_memories`
 

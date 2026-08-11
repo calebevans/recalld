@@ -814,16 +814,27 @@ fn forget_memory_def() -> ToolInfo {
     ToolInfo {
         name: "forget_memory".to_string(),
         title: Some("Forget Memory".to_string()),
-        description: "Permanently delete a memory. Use for incorrect, outdated, \
-            or harmful information that should be immediately removed rather \
-            than allowed to decay naturally."
+        // "Permanently delete" was wrong in both directions: the record
+        // survives (only its content is erased), and the tombstone it
+        // leaves behind is never reclaimed. An agent told "permanent"
+        // reasonably assumes the row is gone and the space is back.
+        description: "Delete a memory's content. The memory moves to the Tombstone \
+            phase: its summary, full text and tags are erased and it stops appearing \
+            in recall, but its record and its graph edges are kept so relationship \
+            chains stay intact, and its UUID is never reused. Tombstoned memories are \
+            never reclaimed by the decay sweep, so they persist for the life of the \
+            database. Use for incorrect, outdated or harmful information that must \
+            stop being recalled immediately. To correct a memory, prefer storing the \
+            correction with `supersedes`."
             .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "id": {
                     "type": "string",
-                    "description": "Memory UUID to delete"
+                    "description": "Memory UUID to forget. The memory moves to the \
+                        Tombstone phase; its graph edges are kept and its UUID is \
+                        never reused."
                 }
             },
             "required": ["id"]
@@ -1652,6 +1663,31 @@ mod tests {
 
         assert!(!obj.contains_key("supersedes"), "{batch}");
         assert!(!obj.contains_key("nearDuplicates"), "{batch}");
+    }
+
+    // ── Destructive-tool descriptions ────────────────────────────────
+
+    /// `forget_memory` used to promise a permanent delete. It does not
+    /// perform one: the record stays in meta.db, only its content is
+    /// stripped, and no code path ever hard-deletes a tombstone. An agent
+    /// reading "permanently delete" will believe the row and its disk
+    /// space are gone, and will not reach for the tool that actually
+    /// reclaims them.
+    #[test]
+    fn w39_forget_memory_description_does_not_promise_a_permanent_delete() {
+        let description = forget_memory_def().description;
+        assert!(
+            !description.to_lowercase().contains("permanent"),
+            "forget_memory still claims a permanent delete: {description}"
+        );
+        assert!(
+            description.contains("Tombstone"),
+            "forget_memory does not name the phase the memory moves to: {description}"
+        );
+        assert!(
+            description.contains("never reclaimed"),
+            "forget_memory does not say tombstones are never reclaimed: {description}"
+        );
     }
 
     // ── Registry shape ───────────────────────────────────────────────

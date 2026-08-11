@@ -605,13 +605,17 @@ Response:
 
 ### forget_memory
 
-Permanently delete a memory. Use for incorrect or outdated information that should be removed immediately rather than allowed to decay. The memory transitions to Tombstone phase (graph edges are preserved).
+Delete a memory's content. The memory moves to the Tombstone phase: its summary, full text and tags are erased and it stops appearing in recall, but its record and its graph edges are kept so relationship chains stay intact, and its UUID is never reused.
+
+Tombstoned memories are never reclaimed by the decay sweep, so they persist for the life of the database.
+
+Use for incorrect, outdated or harmful information that must stop being recalled immediately. To correct a memory, prefer storing the correction with `supersedes`.
 
 #### Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `id` | string | yes | -- | Memory UUID to delete |
+| `id` | string | yes | -- | Memory UUID to forget. The memory moves to the Tombstone phase; its graph edges are kept and its UUID is never reused. |
 
 #### Example
 
