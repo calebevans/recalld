@@ -635,6 +635,13 @@ impl RelationshipGraph {
             };
         };
         let Some(node) = self.nodes.get(node_key) else {
+            // Same stale-index case as `remove_memory`: the entry has to
+            // go, or `contains` keeps claiming the memory is here.
+            tracing::warn!(
+                memory_id = %memory_id,
+                "Graph id_index named a node that does not exist; dropping the stale entry"
+            );
+            self.id_index.remove(&memory_id);
             return RemovalResult {
                 removed_edges: Vec::new(),
                 bridge_created: None,
@@ -725,6 +732,16 @@ impl RelationshipGraph {
             return Vec::new();
         };
         let Some(node) = self.nodes.get(node_key) else {
+            // An id_index key whose node is gone. Bailing out left the
+            // stale entry in place forever, so `contains` went on saying
+            // the memory was in the graph and every later removal took
+            // this same branch and did nothing. Removing it is the whole
+            // job that is left to do.
+            tracing::warn!(
+                memory_id = %memory_id,
+                "Graph id_index named a node that does not exist; dropping the stale entry"
+            );
+            self.id_index.remove(&memory_id);
             return Vec::new();
         };
 
@@ -859,6 +876,38 @@ mod tests {
                 .expect("fresh id");
         }
         (graph, ids)
+    }
+
+    /// A stale `id_index` entry — a key whose `nodes` slot is gone —
+    /// used to make both removal paths bail out WITHOUT dropping it. So
+    /// `contains` went on reporting the memory as present, every later
+    /// removal took the same branch and did nothing, and the entry
+    /// outlived the process.
+    #[test]
+    fn w72_removal_drops_an_id_index_entry_whose_node_is_gone() {
+        for with_bridging in [false, true] {
+            let (mut graph, ids) = graph_with_nodes(1);
+            let id = ids[0];
+
+            // Remove the node behind the index's back.
+            let key = *graph.id_index.get(&id).expect("indexed");
+            graph.nodes.remove(key);
+            assert!(
+                graph.contains(&id),
+                "the setup did not create a stale entry"
+            );
+
+            if with_bridging {
+                graph.remove_memory_with_bridging(id);
+            } else {
+                graph.remove_memory(id);
+            }
+
+            assert!(
+                !graph.contains(&id),
+                "with_bridging={with_bridging}: the stale id_index entry survived"
+            );
+        }
     }
 
     /// Add a Supersedes edge meaning "`new` replaces `old`".
