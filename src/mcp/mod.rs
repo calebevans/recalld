@@ -9,6 +9,7 @@ pub mod protocol;
 pub mod server;
 pub mod transport;
 
+pub mod args;
 pub mod bridge;
 pub mod bridge_adapters;
 pub mod resources;

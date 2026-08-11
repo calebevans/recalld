@@ -101,6 +101,44 @@ Array limits (`tags`, `entities`, `topics`, `emotions`) are plain item counts.
 
 > **Known limitation:** `entities`, `topics`, and `emotions` are converted into `entity/…`, `topic/…`, and `emotion/…` tags *after* validation runs, and the `tags` limit of 64 is checked against the tags you supplied. A memory that supplies 64 tags plus 32 entities, 32 topics, and 32 emotions can therefore end up with up to 160 tags stored. This is accepted today and is not treated as an error.
 
+### Argument validation
+
+`store_memory` and `store_memories` validate their arguments strictly. A wrong-typed or unparseable argument is an error naming the field; it is never coerced, defaulted, or dropped. Earlier versions guessed silently — a `tags` array sent as a comma-joined string stored zero tags, a wrong-typed `namespace` fell back to the default partition, and an unparseable `supersedes` stored the memory with no link — so a client with a broken serializer could write a long run of quietly wrong memories without a single error reaching the agent.
+
+**Explicit `null` still means "absent."** `{"fullText": null}` is treated exactly like omitting `fullText`, for every optional field. SDKs that serialize optional fields as `null` need no changes.
+
+Example messages:
+
+| Situation | Error |
+|---|---|
+| `"summary"` missing or `null` | `Missing required parameter: summary` |
+| `"fullText": ["a"]` | `Parameter 'fullText' must be a string (got array)` |
+| `"tags": "a,b"` | `Parameter 'tags' must be an array of strings (got string)` |
+| `"tags": ["a", 3]` | `Parameter 'tags' must be an array of strings (element at index 2 is a number)` |
+| `"supersedes": 123` | `Parameter 'supersedes' must be a string containing a UUID (got number)` |
+| `"supersedes": "mem-1234"` | `Invalid UUID in parameter 'supersedes': "mem-1234"` |
+| a `memories` entry that is not an object | `Item at index 3 must be an object (got string)` |
+
+`parentId` and `supersedes` accept any spelling `Uuid::parse_str` accepts: canonical, hyphenless, braced, and `urn:uuid:` forms.
+
+In `store_memories`, a rejected item does not abort the batch: its entry in `results` carries `error` plus a `field` naming the offending parameter (`""` when the item as a whole is at fault), and the remaining items are still stored. The `field` member is additive; the rest of the response shape is unchanged.
+
+#### Tool-call markup in text fields
+
+`summary` and `fullText` are additionally scanned for literal tool-call markup — the XML-ish tags a client emits when serializing a tool call, spliced into the argument text instead of being parsed. This happens when the client's serializer breaks; the symptom is a memory whose `fullText` ends in parameter closing tags and whose `tags`, `entities`, and `namespace` are silently wrong. Such a call is rejected outright rather than cleaned up, because stripping the tags cannot recover the fields that never arrived, and a sanitized write becomes a permanent record whose embedding, full-text index, and graph edges were all computed from corrupt text.
+
+The rejection names the matched token and its byte offset, and states plainly that nothing was stored:
+
+```
+Parameter 'fullText' contains literal tool-call markup ("</fullText>" at byte offset 2731).
+Arguments appear to have been serialized incorrectly; nothing was stored. Re-send with
+structured JSON arguments and no XML tool-call tags in text fields.
+```
+
+The detector is deliberately narrow, because a memory store is used to record notes *about* markup. It anchors on the client's reserved vendor-namespace tag prefix, on invoke/function-call literals and the attribute-first `<invoke name=` / `<parameter name=` forms, on the exact camelCase parameter tags `<fullText>` and `<parentId>`, on a parameter closing tag followed across whitespace only by another parameter tag or a call terminator, and on text that ends with a call terminator. Ordinary technical prose is unaffected: C# `/// <summary>` doc comments, HTML `<details><summary>`, Atom entries, DocBook `<parameter>`, WS-BPEL `<invoke partnerLink=…>`, JSX, Maven POM fragments, Rust generics such as `Vec<String>`, shell redirection, and prose quoting recalld's own parameter names in JSON all store normally.
+
+The one known false positive is a note whose **last line** is a bare `</invoke>` quoted from a BPEL snippet. That rule exists to catch truncated corruption where the parameter closing tag was consumed but the terminator survived; if it ever bites you in practice, end the note with a sentence after the quoted snippet (trailing whitespace alone is ignored) and report it.
+
 ### store_memory
 
 Store a new observation, fact, or piece of context. The system automatically generates an embedding for semantic search. Memories decay over time unless reinforced.

@@ -6,13 +6,14 @@
 
 use serde_json::json;
 
+use crate::mcp::args;
 use crate::mcp::bridge::McpBridge;
 use crate::mcp::protocol::{ToolAnnotations, ToolCallResult, ToolInfo};
 use crate::model::constants::{
     FULL_TEXT_MAX_BYTES, MAX_BATCH_MEMORIES, MAX_EMOTIONS, MAX_ENTITIES, MAX_TAGS, MAX_TOPICS,
     SUMMARY_MAX_BYTES,
 };
-use crate::model::validation::{MemoryInputRef, validate_memory_input, validate_namespace_name};
+use crate::model::validation::validate_namespace_name;
 
 /// Schema description for the `summary` field.
 ///
@@ -148,74 +149,24 @@ fn store_memory_def() -> ToolInfo {
 }
 
 async fn handle_store_memory(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
-    let summary = match arguments.get("summary").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => return ToolCallResult::error("Missing required parameter: summary"),
-    };
-
-    let full_text = arguments
-        .get("fullText")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let tags: Vec<String> = arguments
-        .get("tags")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let entities: Vec<String> = arguments
-        .get("entities")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let topics: Vec<String> = arguments
-        .get("topics")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let emotions: Vec<String> = arguments
-        .get("emotions")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    // Content limits — shared with the HTTP API so the two paths cannot
-    // disagree about what fits.
-    if let Err(e) = validate_memory_input(MemoryInputRef {
-        summary: &summary,
-        full_text: full_text.as_deref(),
-        tags: &tags,
-        entities: &entities,
-        topics: &topics,
-        emotions: &emotions,
-    }) {
-        return ToolCallResult::error(e.to_string());
-    }
-
-    let namespace = arguments
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| bridge.default_namespace().to_string());
-    let parent_id = arguments
-        .get("parentId")
-        .and_then(|v| v.as_str())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        .map(crate::model::MemoryId::from_uuid);
-    let supersedes = arguments
-        .get("supersedes")
-        .and_then(|v| v.as_str())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        .map(crate::model::MemoryId::from_uuid);
-
-    let input = crate::mcp::bridge::StoreInput {
-        summary,
-        full_text,
-        tags,
-        entities,
-        topics,
-        emotions,
-        namespace,
-        embedding: None,
-        initial_stability: None,
-        parent_id,
-        supersedes,
+    // Extraction, type strictness, markup detection, and the shared
+    // content limits all live in `args`, so this handler and the batch
+    // one below cannot drift apart.
+    let input = match args::parse_store_input(&arguments, bridge.default_namespace()) {
+        Ok(input) => input,
+        Err(e) => {
+            // Logged, never silently defaulted: a client whose
+            // serializer mangles arguments shows up in the operator's
+            // logs on the first call, not after ten bad writes. The
+            // offending text body is deliberately not logged.
+            tracing::warn!(
+                tool = "store_memory",
+                field = %e.field,
+                error = %e.message,
+                "Rejected malformed MCP tool arguments"
+            );
+            return ToolCallResult::error(e.to_string());
+        }
     };
 
     match bridge.storage.store_memory(input).await {
@@ -336,82 +287,25 @@ async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value)
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(memories_arr.len());
 
     for (index, item) in memories_arr.iter().enumerate() {
-        let summary = match item.get("summary").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => {
+        let input = match args::parse_store_item(item, index, bridge.default_namespace()) {
+            Ok(input) => input,
+            Err(e) => {
+                tracing::warn!(
+                    tool = "store_memories",
+                    index,
+                    field = %e.field,
+                    error = %e.message,
+                    "Rejected malformed MCP tool arguments"
+                );
+                // `field` is additive; existing consumers already
+                // handle a per-item `error`.
                 results.push(json!({
                     "index": index,
-                    "error": "Missing required parameter: summary"
+                    "error": e.to_string(),
+                    "field": e.field,
                 }));
                 continue;
             }
-        };
-
-        let full_text = item
-            .get("fullText")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        let tags: Vec<String> = item
-            .get("tags")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let entities: Vec<String> = item
-            .get("entities")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let topics: Vec<String> = item
-            .get("topics")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let emotions: Vec<String> = item
-            .get("emotions")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        if let Err(e) = validate_memory_input(MemoryInputRef {
-            summary: &summary,
-            full_text: full_text.as_deref(),
-            tags: &tags,
-            entities: &entities,
-            topics: &topics,
-            emotions: &emotions,
-        }) {
-            results.push(json!({
-                "index": index,
-                "error": e.to_string()
-            }));
-            continue;
-        }
-
-        let namespace = item
-            .get("namespace")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| bridge.default_namespace().to_string());
-        let parent_id = item
-            .get("parentId")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .map(crate::model::MemoryId::from_uuid);
-        let supersedes = item
-            .get("supersedes")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .map(crate::model::MemoryId::from_uuid);
-
-        let input = crate::mcp::bridge::StoreInput {
-            summary,
-            full_text,
-            tags,
-            entities,
-            topics,
-            emotions,
-            namespace,
-            embedding: None,
-            initial_stability: None,
-            parent_id,
-            supersedes,
         };
 
         match bridge.storage.store_memory(input).await {
