@@ -435,6 +435,10 @@ async fn run_serve(
         let storage: Arc<dyn recalld::api::StorageEngine> = Arc::new(StorageEngineAdapter::new(
             system.storage().clone(),
             system.cache().clone(),
+            system.vector_index().clone(),
+            system.fts_index().clone(),
+            system.entity_index().clone(),
+            system.graph().clone(),
         ));
         let cache: Arc<dyn recalld::api::RecordCache> =
             Arc::new(RecordCacheAdapter::new(system.cache().clone()));
