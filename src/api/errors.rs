@@ -223,6 +223,12 @@ impl From<SearchError> for AppError {
                 id: format!("{id}"),
             },
             SearchError::StageTimeout { .. } => AppError::Timeout,
+            // The caller's filter, not our fault: 400, and the message
+            // already names the field and the offending label.
+            SearchError::InvalidFilter(message) => AppError::BadRequest {
+                message: message.clone(),
+                field: None,
+            },
             _ => AppError::Internal {
                 source: Box::new(err),
             },

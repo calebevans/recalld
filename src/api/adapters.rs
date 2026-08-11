@@ -104,15 +104,25 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             state::QueryInput::Vector(_) => None,
         };
 
-        // Build proper filter from query tags/entities (Issue 2)
+        // A label that cannot become a tag is an error, not a dropped
+        // filter: dropping one from `includeTags` or `entities` WIDENS
+        // the query, and a caller cannot tell "every memory in the
+        // namespace" from a genuine match.
         let mut require_tags: Vec<Tag> =
-            crate::model::parse_tags_lossy("search.includeTags", &query.include_tags);
-        // Convert entities to entity/ tags (Issue 4)
-        for e in &query.entities {
-            if let Ok(tag) = Tag::new(&format!("entity/{}", e.to_lowercase())) {
-                require_tags.push(tag);
-            }
-        }
+            crate::model::parse_filter_tags("includeTags", "", &query.include_tags)
+                .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?;
+        require_tags.extend(
+            crate::model::parse_filter_tags(
+                "entities",
+                crate::model::constants::ENTITY_TAG_PREFIX,
+                &query.entities,
+            )
+            .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?,
+        );
+        // `excludeTags` is the safe direction — dropping one can only
+        // ever return MORE than asked for in the same sense a missing
+        // exclusion does, and it never masquerades as a match — so it
+        // keeps the lossy parse.
         let exclude_tags: Vec<Tag> =
             crate::model::parse_tags_lossy("search.excludeTags", &query.exclude_tags);
         let phases: Vec<DecayPhase> = query

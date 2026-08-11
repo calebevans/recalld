@@ -125,6 +125,53 @@ pub fn parse_tags_lossy(context: &str, raw: &[String]) -> Vec<Tag> {
         .collect()
 }
 
+/// A query filter that names a label no tag can carry.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Filter '{field}' cannot be applied: {value:?} is not a valid tag ({source}). \
+     Tags allow only a-z, 0-9 and - _ / . : — entity, topic and emotion filters are \
+     matched as `entity/<name>`, `topic/<name>` and `emotion/<name>` tags, so no \
+     memory can carry this label."
+)]
+pub struct TagFilterError {
+    /// Which request field the bad label came from.
+    pub field: String,
+    /// The label, as sent.
+    pub value: String,
+    /// Why it is not a tag.
+    pub source: TagError,
+}
+
+/// Parse `raw` into [`Tag`]s for a query FILTER, failing on the first
+/// element that will not validate. `prefix` is prepended to each element
+/// (`"entity/"`, `"topic/"`, `"emotion/"`, or `""` for plain tags).
+///
+/// The mirror image of [`parse_tags_lossy`], and deliberately the
+/// opposite trade-off. Dropping a tag from a store keeps the memory and
+/// loses one label. Dropping a tag from a filter **widens the query**:
+/// `list_memories {"entities": ["José"]}` derived `entity/josé`, failed
+/// the alphabet, swallowed the error and returned EVERY memory in the
+/// namespace as though it had matched a filter. A caller cannot tell a
+/// widened answer from a genuine one, and an agent acting on "these are
+/// the memories about José" gets the whole namespace instead.
+///
+/// An error is recoverable. A wrong answer that looks right is not.
+pub fn parse_filter_tags(
+    field: &str,
+    prefix: &str,
+    raw: &[String],
+) -> Result<Vec<Tag>, TagFilterError> {
+    raw.iter()
+        .map(|label| {
+            Tag::new(format!("{prefix}{}", label.to_lowercase())).map_err(|source| TagFilterError {
+                field: field.to_string(),
+                value: label.clone(),
+                source,
+            })
+        })
+        .collect()
+}
+
 /// Structured metadata extracted from hierarchical tags.
 #[derive(Debug, Clone, Default)]
 pub struct StructuredMetadata {

@@ -99,23 +99,33 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             })??;
         };
 
-        let mut require_tags: Vec<crate::model::Tag> =
-            crate::model::parse_tags_lossy("recall_memories.tags", &query.tags);
-        for e in &query.entities {
-            if let Ok(tag) = crate::model::Tag::new(&format!("entity/{}", e.to_lowercase())) {
-                require_tags.push(tag);
-            }
-        }
-        for t in &query.topics {
-            if let Ok(tag) = crate::model::Tag::new(&format!("topic/{}", t.to_lowercase())) {
-                require_tags.push(tag);
-            }
-        }
-        for em in &query.emotions {
-            if let Ok(tag) = crate::model::Tag::new(&format!("emotion/{}", em.to_lowercase())) {
-                require_tags.push(tag);
-            }
-        }
+        // A label that cannot become a tag is an ERROR, not a dropped
+        // filter: dropping one widens the query, and "every memory in
+        // the namespace" is indistinguishable from a real result set.
+        let require_tags = match filter_tags(
+            &[
+                ("tags", "", &query.tags),
+                (
+                    "entities",
+                    crate::model::constants::ENTITY_TAG_PREFIX,
+                    &query.entities,
+                ),
+                (
+                    "topics",
+                    crate::model::constants::TOPIC_TAG_PREFIX,
+                    &query.topics,
+                ),
+                (
+                    "emotions",
+                    crate::model::constants::EMOTION_TAG_PREFIX,
+                    &query.emotions,
+                ),
+            ],
+            "recall_memories",
+        ) {
+            Ok(tags) => tags,
+            Err(e) => return Err(bridge::BridgeError::InvalidInput(e)),
+        };
 
         let pipeline_query = crate::search::SearchQuery {
             text: Some(query.query),
@@ -1426,14 +1436,23 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         input: bridge::ListMemoriesInput,
     ) -> Result<bridge::ListMemoriesResponse, bridge::BridgeError> {
-        // Build tag filters: merge explicit tags + entity/topic tags for AND semantics.
-        let mut require_tags: Vec<crate::model::Tag> =
-            crate::model::parse_tags_lossy("list_memories.tags", &input.tags);
-        for entity in &input.entities {
-            if let Ok(tag) = crate::model::Tag::new(&format!("entity/{}", entity.to_lowercase())) {
-                require_tags.push(tag);
-            }
-        }
+        // Build tag filters: merge explicit tags + entity tags for AND
+        // semantics. An unfilterable label is an error — see
+        // `filter_tags`.
+        let require_tags = match filter_tags(
+            &[
+                ("tags", "", &input.tags),
+                (
+                    "entities",
+                    crate::model::constants::ENTITY_TAG_PREFIX,
+                    &input.entities,
+                ),
+            ],
+            "list_memories",
+        ) {
+            Ok(tags) => tags,
+            Err(e) => return Err(bridge::BridgeError::InvalidInput(e)),
+        };
 
         // Resolve namespace and query in a single blocking task.
         let storage = self.storage.clone();
@@ -1667,6 +1686,40 @@ impl McpNamespaceAdapter {
             graph: &self.graph,
         }
     }
+}
+
+/// Build a query's `require_tags` from several labelled groups, failing
+/// with a caller-facing message on the first label that is not a tag.
+///
+/// `groups` is `(request field, tag prefix, labels)`. Order is fixed so
+/// a request broken in several ways always reports the same failure.
+///
+/// Deliberately NOT `parse_tags_lossy`: that drops what it cannot parse,
+/// which is the right trade-off for a store (keep the memory, lose a
+/// label) and exactly the wrong one for a filter. A dropped filter
+/// WIDENS the query — `list_memories {"entities": ["José"]}` returned
+/// every memory in the namespace — and the caller has no way to tell.
+fn filter_tags(
+    groups: &[(&str, &str, &Vec<String>)],
+    tool: &str,
+) -> Result<Vec<crate::model::Tag>, String> {
+    let mut out = Vec::new();
+    for (field, prefix, labels) in groups {
+        match crate::model::parse_filter_tags(field, prefix, labels) {
+            Ok(tags) => out.extend(tags),
+            Err(e) => {
+                tracing::warn!(
+                    tool = %tool,
+                    field = %e.field,
+                    value = %e.value,
+                    error = %e.source,
+                    "Rejected an unfilterable label rather than widening the query"
+                );
+                return Err(e.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A namespace deletion that failed, and what it had already destroyed.
@@ -3189,6 +3242,89 @@ mod tests {
             "the recreated namespace inherited the deleted one's vector file"
         );
         assert!(fx.record(old_id).is_none());
+    }
+
+    // ── unfilterable labels ──────────────────────────────────────────
+
+    /// `entity/josé` fails `Tag`'s alphabet. The `if let Ok` around it
+    /// swallowed that, the filter was dropped, and `list_memories`
+    /// returned EVERY memory in the namespace — presented as the result
+    /// of filtering by entity. An agent acting on "these are the
+    /// memories about José" got the whole namespace.
+    #[tokio::test]
+    async fn w66_an_unfilterable_entity_is_an_error_not_a_wider_query() {
+        let fx = Fixture::new();
+        let visible = fx.insert_memory().await;
+
+        let err = fx
+            .storage_adapter()
+            .list_memories(bridge::ListMemoriesInput {
+                namespace: "default".into(),
+                limit: 10,
+                offset: 0,
+                tags: Vec::new(),
+                entities: vec!["José".to_string()],
+                time_range_start: None,
+                time_range_end: None,
+            })
+            .await
+            .expect_err("an unfilterable entity must not widen the query");
+
+        assert!(
+            matches!(err, bridge::BridgeError::InvalidInput(ref m) if m.contains("José")),
+            "the error must name the label: {err:?}"
+        );
+        assert!(
+            fx.record(visible).is_some(),
+            "the fixture memory should still exist"
+        );
+    }
+
+    /// The recall path builds the same filter from four groups; any of
+    /// them can carry the bad label, and each must name ITS field so the
+    /// caller knows which argument to fix.
+    #[test]
+    fn w67_filter_tags_names_the_group_that_carried_the_bad_label() {
+        let ok = vec!["fine".to_string()];
+        let bad = vec!["José".to_string()];
+
+        for field in ["tags", "entities", "topics", "emotions"] {
+            let groups: Vec<(&str, &str, &Vec<String>)> =
+                ["tags", "entities", "topics", "emotions"]
+                    .iter()
+                    .map(|g| {
+                        let prefix = match *g {
+                            "entities" => crate::model::constants::ENTITY_TAG_PREFIX,
+                            "topics" => crate::model::constants::TOPIC_TAG_PREFIX,
+                            "emotions" => crate::model::constants::EMOTION_TAG_PREFIX,
+                            _ => "",
+                        };
+                        (*g, prefix, if *g == field { &bad } else { &ok })
+                    })
+                    .collect();
+
+            let err = filter_tags(&groups, "recall_memories")
+                .expect_err("an unfilterable label must not be dropped");
+            assert!(err.contains(field), "{field}: {err}");
+            assert!(err.contains("José"), "{field}: {err}");
+        }
+
+        // All four groups valid: every label becomes a prefixed tag.
+        let groups: Vec<(&str, &str, &Vec<String>)> = vec![
+            ("tags", "", &ok),
+            ("entities", crate::model::constants::ENTITY_TAG_PREFIX, &ok),
+            ("topics", crate::model::constants::TOPIC_TAG_PREFIX, &ok),
+            ("emotions", crate::model::constants::EMOTION_TAG_PREFIX, &ok),
+        ];
+        let tags: Vec<String> = filter_tags(&groups, "recall_memories")
+            .expect("all four groups are valid")
+            .iter()
+            .map(|t| t.as_str().to_string())
+            .collect();
+        assert_eq!(
+            tags,
+            vec!["fine", "entity/fine", "topic/fine", "emotion/fine"]
+        );
     }
 
     // ── namespace-name validation on the socket's own entry point ────
