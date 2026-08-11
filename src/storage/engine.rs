@@ -345,7 +345,7 @@ impl RedbStorageEngine {
     /// 2. Validate fulltext.dat header.
     /// 3. Clean up orphaned edges.
     /// 4. Sweep namespace directories left behind by an interrupted
-    ///    namespace deletion.
+    ///    namespace deletion into quarantine.
     fn startup_validation(&mut self) -> Result<(), StorageError> {
         tracing::info!("Running storage startup validation...");
 
@@ -374,9 +374,11 @@ impl RedbStorageEngine {
         match self.sweep_orphan_namespace_dirs() {
             Ok(removed) if removed > 0 => {
                 tracing::warn!(
-                    removed,
-                    "Removed orphaned namespace directories left by an interrupted \
-                     namespace deletion"
+                    quarantined = removed,
+                    path = %self.db_path.join(QUARANTINE_DIR_NAME).display(),
+                    "Moved orphaned namespace directories left by an interrupted \
+                     namespace deletion into quarantine. Nothing was deleted; remove \
+                     the quarantine directory by hand once you are satisfied."
                 );
             }
             Ok(_) => {}
@@ -392,11 +394,16 @@ impl RedbStorageEngine {
         Ok(())
     }
 
-    /// Remove namespace directories that belong to no live namespace.
+    /// Quarantine namespace directories that belong to no live
+    /// namespace.
     ///
     /// Cleans up after a `purge_namespace` that was interrupted between
     /// deleting the `NAMESPACE_TABLE` row and removing the directory.
-    /// Returns the number of directories removed.
+    /// Returns the number of directories moved.
+    ///
+    /// Directories are MOVED to `<db_path>/.orphaned/`, not deleted —
+    /// see [`quarantine_orphan_dir`](Self::quarantine_orphan_dir) for
+    /// why the delete had no lower bound.
     ///
     /// # Why this cannot delete a live namespace
     ///
@@ -496,12 +503,13 @@ impl RedbStorageEngine {
                 continue;
             }
 
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {
+            match self.quarantine_orphan_dir(name, &dir) {
+                Ok(moved_to) => {
                     tracing::info!(
                         namespace = name,
-                        path = %dir.display(),
-                        "Removed orphaned namespace directory"
+                        from = %dir.display(),
+                        to = %moved_to.display(),
+                        "Quarantined orphaned namespace directory"
                     );
                     removed += 1;
                 }
@@ -509,13 +517,58 @@ impl RedbStorageEngine {
                     tracing::warn!(
                         path = %dir.display(),
                         error = %e,
-                        "Failed to remove orphaned namespace directory"
+                        "Failed to quarantine orphaned namespace directory"
                     );
                 }
             }
         }
 
         Ok(removed)
+    }
+
+    /// Move an orphaned namespace directory into
+    /// `<db_path>/.orphaned/<name>-<timestamp>/` instead of deleting it.
+    /// Returns where it went.
+    ///
+    /// # Why a rename and not `remove_dir_all`
+    ///
+    /// The sweep's whole argument for being safe is "every live
+    /// namespace has a row in `NAMESPACE_TABLE`, so a directory with no
+    /// row is dead". That argument has no lower bound: if `meta.db` is
+    /// absent or restored from an older backup, `live` is EMPTY and
+    /// every namespace directory in the data directory is a candidate.
+    /// The guards all pass — they are real namespace directories — and
+    /// a recursive delete of all of them is unrecoverable.
+    ///
+    /// A rename keeps the entire hygiene benefit (the directories stop
+    /// occupying the data directory and stop being reopened) with none
+    /// of the blast radius: whatever the sweep got wrong is still on
+    /// disk, named, timestamped, and can be moved back.
+    ///
+    /// Refusing to sweep when `live` is empty was the alternative. It is
+    /// strictly weaker — it does nothing for the case where `live` is
+    /// merely STALE rather than empty, which is the same restored-backup
+    /// scenario one namespace later — and it would break the legitimate
+    /// case of a fresh database with a leftover directory.
+    fn quarantine_orphan_dir(&self, name: &str, dir: &Path) -> Result<PathBuf, std::io::Error> {
+        let quarantine = self.db_path.join(QUARANTINE_DIR_NAME);
+        std::fs::create_dir_all(&quarantine)?;
+
+        // Same filesystem by construction — both are under db_path — so
+        // this is a rename, not a copy.
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let mut dest = quarantine.join(format!("{name}-{stamp}"));
+        // Two sweeps in the same second must not merge into one
+        // directory, and `rename` onto an existing directory is not an
+        // error on every platform.
+        let mut attempt = 1u32;
+        while dest.exists() {
+            dest = quarantine.join(format!("{name}-{stamp}-{attempt}"));
+            attempt += 1;
+        }
+
+        std::fs::rename(dir, &dest)?;
+        Ok(dest)
     }
 
     /// Whether `dir` has exactly the shape this code creates for a
@@ -1009,6 +1062,12 @@ impl RedbStorageEngine {
         }
     }
 }
+
+/// Where the boot sweep moves orphaned namespace directories.
+///
+/// Leading dot on purpose: the sweep skips dotfile directories, so its
+/// own quarantine can never become a candidate for the next sweep.
+const QUARANTINE_DIR_NAME: &str = ".orphaned";
 
 /// How many records one `purge_namespace_records` transaction commits.
 ///
@@ -1586,7 +1645,95 @@ mod tests {
         let orphan = plant_orphan_dir(dir.path(), "ghost-namespace");
 
         let _engine = open_engine(dir.path());
-        assert!(!orphan.exists(), "orphan directory survived the boot sweep");
+        assert!(
+            !orphan.exists(),
+            "orphan directory was left in the data directory"
+        );
+        assert_eq!(
+            quarantined(dir.path()).len(),
+            1,
+            "the orphan was destroyed rather than quarantined"
+        );
+    }
+
+    /// The sweep's safety argument — "no NAMESPACE_TABLE row means dead"
+    /// — has no lower bound: an absent or restored-from-backup meta.db
+    /// makes `live` empty and EVERY namespace directory a candidate.
+    /// Every guard passes, because they really are namespace
+    /// directories. Quarantine is what makes that survivable.
+    #[test]
+    fn w59_a_swept_directory_is_moved_not_destroyed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let mut engine = open_engine(dir.path());
+            make_namespace(&mut engine, "irreplaceable");
+            std::fs::write(
+                dir.path().join("irreplaceable").join("vectors.dat"),
+                b"the only copy",
+            )
+            .expect("write vectors.dat");
+        }
+
+        // The restored-backup shape: the namespace rows are gone, the
+        // directories are not.
+        std::fs::remove_file(dir.path().join("meta.db")).expect("remove meta.db");
+
+        {
+            let _engine = open_engine(dir.path());
+        }
+
+        let survivors = quarantined(dir.path());
+        assert_eq!(survivors.len(), 1, "{survivors:?}");
+        assert!(
+            survivors[0]
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("irreplaceable-")),
+            "the quarantined directory must be named after the namespace: {survivors:?}"
+        );
+        assert_eq!(
+            std::fs::read(survivors[0].join("vectors.dat")).expect("read"),
+            b"the only copy",
+            "the quarantined directory does not hold the original contents"
+        );
+    }
+
+    /// The quarantine directory must never become the next sweep's
+    /// candidate, or the recovery copy is swept into a copy of itself
+    /// every boot.
+    #[test]
+    fn w60_the_quarantine_directory_is_not_itself_swept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let _engine = open_engine(dir.path());
+        }
+        plant_orphan_dir(dir.path(), "ghost");
+
+        {
+            let _engine = open_engine(dir.path());
+        }
+        let after_first = quarantined(dir.path());
+        assert_eq!(after_first.len(), 1);
+
+        {
+            let _engine = open_engine(dir.path());
+        }
+        assert_eq!(
+            quarantined(dir.path()),
+            after_first,
+            "the second boot moved the quarantine"
+        );
+    }
+
+    /// Everything currently in `<db_path>/.orphaned/`, sorted.
+    fn quarantined(db_path: &Path) -> Vec<PathBuf> {
+        let quarantine = db_path.join(QUARANTINE_DIR_NAME);
+        let Ok(entries) = std::fs::read_dir(&quarantine) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        out.sort();
+        out
     }
 
     /// `db_path` is user-configurable and may hold directories that are
