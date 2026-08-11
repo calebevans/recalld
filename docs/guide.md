@@ -747,7 +747,7 @@ Shows decay forecast, at-risk memories, and storage breakdown.
 
 ## 6. MCP Tools Reference
 
-recalld exposes 10 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
+recalld exposes 12 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
 
 ### `store_memory`
 
@@ -875,7 +875,9 @@ Create a new memory namespace.
 
 ### `namespace_stats`
 
-Get statistics for a memory namespace including total memory count, phase breakdown (full/summary/ghost), permastore count, average strength, edge count, and vector storage size.
+Get statistics for a memory namespace including the live memory count, tombstone count, phase breakdown (full/summary/ghost), permastore count, average strength, edge count, and vector storage size.
+
+`memoryCount` counts live memories only and always equals `full + summary + ghost`. Deleted memories appear separately as `tombstoneCount`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -894,6 +896,24 @@ List memories in a namespace with pagination and optional filters. Unlike `recal
 | `entities` | string[] | No | Only return memories mentioning ALL of these entities. |
 | `timeRangeStart` | integer or string | No | Lower bound: epoch ms (integer) or ISO 8601 string. Only memories created at or after this time are returned. |
 | `timeRangeEnd` | integer or string | No | Upper bound: epoch ms (integer) or ISO 8601 string. Only memories created at or before this time are returned. |
+
+A `limit` above the maximum is rejected, not clamped: silently returning 200 rows to a caller who asked for 1000 makes a paginating agent believe it has seen the whole namespace.
+
+### `list_namespaces`
+
+List every namespace with its ID, embedding dimensions, live memory count, and creation date. Call this first when you do not know which namespaces exist. Counts exclude deleted memories.
+
+Takes no parameters.
+
+### `list_tags`
+
+List the tag vocabulary with per-label memory counts, most common first. Use it to reuse an existing tag instead of inventing a near-duplicate. Results come in four buckets — plain `tags`, plus `entities`, `topics`, and `emotions` — with the derived buckets' prefixes stripped so their names can be passed straight back to `store_memory` or `list_memories`. Counts cover live memories only.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `namespace` | string | No | Namespace to count within (default: `"default"`). |
+| `allNamespaces` | boolean | No | Count across every namespace (default: `false`). Cannot be combined with an explicit `namespace`. |
+| `limit` | integer | No | Maximum labels per bucket (default: 50, max: 500). Each bucket also reports its untruncated total. |
 
 ---
 

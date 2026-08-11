@@ -81,7 +81,9 @@ Then allow the MCP tools so Claude can use them without prompting each time. Add
       "mcp__recalld__find_similar_memories",
       "mcp__recalld__create_namespace",
       "mcp__recalld__namespace_stats",
-      "mcp__recalld__list_memories"
+      "mcp__recalld__list_memories",
+      "mcp__recalld__list_namespaces",
+      "mcp__recalld__list_tags"
     ]
   }
 }
@@ -173,7 +175,7 @@ See [docs/benchmark.md](docs/benchmark.md) for full methodology, per-category br
 
 ## Usage modes
 
-**MCP server (stdio)** -- Runs as a Model Context Protocol server for AI tools like Claude Code. Exposes 10 tools: `store_memory`, `store_memories`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `namespace_stats`, `list_memories`.
+**MCP server (stdio)** -- Runs as a Model Context Protocol server for AI tools like Claude Code. Exposes 12 tools: `store_memory`, `store_memories`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `namespace_stats`, `list_memories`, `list_namespaces`, `list_tags`.
 
 ```sh
 recalld mcp
