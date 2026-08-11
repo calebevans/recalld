@@ -764,6 +764,7 @@ Store a new memory.
 | `namespace` | string | No | Target namespace (default: `"default"`). |
 | `parentId` | string | No | UUID of an existing memory in the same namespace, linked as this memory's parent. The store fails if the target does not exist or is in a different namespace. |
 | `supersedes` | string | No | UUID of an existing memory in the same namespace that this one replaces. Recall REMOVES the old memory from results and returns this one in its place. The store fails if the target does not exist or is in a different namespace. |
+| `checkDuplicates` | boolean | No | Report existing memories that closely resemble this one (default: `true`). Never blocks the store; it only adds a `nearDuplicates` object to the result. |
 
 #### supersedes semantics
 
@@ -795,13 +796,51 @@ always says what actually happened to the link.
 - **Counted.** The new memory's `edgeCount` includes the supersedes edge.
   Memories stored before this behaviour existed are not backfilled.
 
+#### Near-duplicate warnings
+
+Every store compares the new memory against what is already there. When
+something is at least 0.85 cosine similar, the result carries a
+`nearDuplicates` object naming up to three existing memories, closest first,
+each with its id, score, and summary (truncated to 240 bytes).
+
+- **Advisory, never a block.** The memory is stored either way. The field is
+  absent — not `null` — when nothing crossed the threshold, when
+  `checkDuplicates: false` was passed, or when the namespace's vectors are
+  not L2-normalized.
+- **0.85 is the same number `find_similar_memories` scan mode uses**, so the
+  two surfaces cannot disagree about whether a pair of memories is a
+  duplicate. It is not configurable: the right value is a property of the
+  embedding model, not of the deployment.
+- **Scope.** Full- and summary-phase memories in the same namespace only —
+  the same set auto-linking considers.
+- **The recovery.** The warning arrives after the write, so acting on it
+  means undoing: `forget_memory` on the id you just created, then either
+  `reinforce_memory` on the existing memory (nothing new to say) or
+  `store_memory` again with `supersedes` set to the existing id (the fact
+  changed). Leave both only when they are genuinely distinct facts that
+  happen to read alike.
+- **Cost.** The scan is a linear pass over every vector in the index — all
+  namespaces, since the index is one flat array with a per-entry namespace
+  filter — so it scales with the total number of memories, not with the size
+  of the namespace being written to. Pass `checkDuplicates: false` during
+  bulk ingestion.
+- **Batches catch themselves.** `store_memories` indexes each item before
+  checking the next, so a batch containing the same fact twice reports the
+  second against the first.
+- **Normalization caveat.** Scores are dot products, which are cosine
+  similarities only for L2-normalized vectors. In a `passthrough` namespace
+  the caller supplies the vectors and nothing validates them, so the check
+  verifies the query vector first and skips rather than reporting a number
+  that is not a similarity. The skip is logged at `debug` every time and at
+  `warn` once per process.
+
 ### `store_memories`
 
 Store multiple memories in a single call. Each item has the same schema as `store_memory`. Returns an array of results, one per input memory.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `memories` | array | Yes | Array of memory objects (max 100 per call). Each object has the same fields as `store_memory`, including `supersedes` and its preconditions. |
+| `memories` | array | Yes | Array of memory objects (max 100 per call). Each object has the same fields as `store_memory`, including `supersedes` and its preconditions, and `checkDuplicates` — both are set per item, and `nearDuplicates` is reported per result entry. |
 
 ### `recall_memories`
 
