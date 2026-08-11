@@ -234,7 +234,15 @@ impl Fixture {
 
     /// The MCP namespace adapter over this fixture's storage.
     pub(crate) fn namespace_adapter(&self) -> crate::mcp::bridge_adapters::McpNamespaceAdapter {
-        crate::mcp::bridge_adapters::McpNamespaceAdapter::new(self.storage.clone(), chrono_tz::UTC)
+        crate::mcp::bridge_adapters::McpNamespaceAdapter::new(
+            self.storage.clone(),
+            self.cache.clone(),
+            self.vector_index.clone(),
+            self.fts_index.clone(),
+            self.entity_index.clone(),
+            self.graph.clone(),
+            chrono_tz::UTC,
+        )
     }
 
     /// The MCP storage adapter over this fixture's storage.

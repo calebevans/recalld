@@ -567,7 +567,15 @@ fn create_direct_mcp_bridge(
         tz,
     ));
     let namespaces: Arc<dyn recalld::mcp::bridge::NamespaceRegistry> =
-        Arc::new(McpNamespaceAdapter::new(system.storage().clone(), tz));
+        Arc::new(McpNamespaceAdapter::new(
+            system.storage().clone(),
+            system.cache().clone(),
+            system.vector_index().clone(),
+            system.fts_index().clone(),
+            system.entity_index().clone(),
+            system.graph().clone(),
+            tz,
+        ));
     let health: Arc<dyn recalld::mcp::bridge::HealthChecker> =
         Arc::new(McpHealthAdapter::new(system.storage().clone()));
 

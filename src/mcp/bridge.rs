@@ -105,6 +105,17 @@ pub trait NamespaceRegistry: Send + Sync {
 
     /// Get detailed statistics for a namespace by name.
     async fn namespace_stats(&self, name: &str) -> Result<NamespaceStats, BridgeError>;
+
+    /// Destroy a namespace and every memory in it.
+    ///
+    /// **Destructive and irreversible.** There is no undo and no backup.
+    /// Implementations must refuse the default namespace outright and
+    /// must refuse a namespace still holding live memories unless
+    /// `force` is set.
+    async fn delete_namespace(
+        &self,
+        input: DeleteNamespaceInput,
+    ) -> Result<DeleteNamespaceResult, BridgeError>;
 }
 
 /// Health check interface.
@@ -511,6 +522,52 @@ pub struct CreateNamespaceInput {
     pub decay_rate_multiplier: Option<f32>,
 }
 
+/// Input for destroying a namespace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteNamespaceInput {
+    /// Name of the namespace to destroy.
+    pub name: String,
+    /// Destroy the namespace even if it still holds live memories.
+    ///
+    /// `#[serde(default)]` for the same wire-compatibility reason as
+    /// [`StoreInput::check_duplicates`]: this struct is deserialized
+    /// straight off the daemon socket, and an older client sends a
+    /// payload with no `force` key. Without the attribute, such a call
+    /// would be a hard parse failure. Defaulting to `false` is also the
+    /// safe direction — a missing key can only ever make the operation
+    /// more cautious.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// What a namespace deletion destroyed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteNamespaceResult {
+    /// Name of the namespace that was destroyed.
+    pub name: String,
+    /// Its numeric id. Never reused.
+    pub id: u32,
+    /// Always true on success; present so the response shape matches
+    /// `forget_memory`.
+    pub deleted: bool,
+    /// Live memories destroyed.
+    pub memories_deleted: u64,
+    /// Tombstoned records reclaimed. These held no content — they had
+    /// already been forgotten — but nothing else in the system ever
+    /// removes them, so they are reported separately rather than folded
+    /// into `memoriesDeleted`.
+    pub tombstones_purged: u64,
+    /// Graph edges removed, including edges that pointed into the
+    /// namespace from outside it.
+    pub edges_removed: u64,
+    /// Full-text search rows removed.
+    pub fts_rows_removed: u64,
+    /// Whether the namespace's vector file was removed from disk.
+    pub vector_file_removed: bool,
+}
+
 /// Namespace information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -908,6 +965,28 @@ mod tests {
 
         assert!(decoded.check_duplicates.is_none());
         assert_eq!(decoded.summary, "a fact");
+    }
+
+    /// Same wire-compatibility rule as `checkDuplicates`, and the safe
+    /// direction on top: `DeleteNamespaceInput` is deserialized straight
+    /// off the daemon socket, so an older client sends no `force` key.
+    /// Without `#[serde(default)]` that is a hard parse failure; with
+    /// it, the missing key can only ever make the operation more
+    /// cautious.
+    #[test]
+    fn w44_delete_namespace_input_decodes_a_payload_without_force() {
+        let decoded: DeleteNamespaceInput = serde_json::from_value(json!({ "name": "scratch" }))
+            .expect("old client payload decodes");
+
+        assert_eq!(decoded.name, "scratch");
+        assert!(
+            !decoded.force,
+            "a missing force key must mean the safe path"
+        );
+
+        let decoded: DeleteNamespaceInput =
+            serde_json::from_value(json!({ "name": "scratch", "force": true })).expect("decodes");
+        assert!(decoded.force);
     }
 
     #[test]

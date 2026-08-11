@@ -462,7 +462,7 @@ impl Recalld {
                 source: None,
             })?;
             let has_default = storage_r
-                .get_namespace_by_name("default")
+                .get_namespace_by_name(crate::model::constants::DEFAULT_NAMESPACE_NAME)
                 .map_err(|e| RecalldError::Init {
                     step: "check_default_namespace",
                     message: format!("failed to check default namespace: {}", e),
@@ -474,7 +474,7 @@ impl Recalld {
             if !has_default {
                 let ns_config = crate::model::NamespaceConfig {
                     id: crate::model::NamespaceId::UNSET,
-                    name: "default".to_string(),
+                    name: crate::model::constants::DEFAULT_NAMESPACE_NAME.to_string(),
                     embedding_dim: config.embedding.dimensions as u32,
                     initial_stability: 3.7145,
                     default_difficulty: 5.0,

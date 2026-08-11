@@ -199,6 +199,17 @@ impl bridge::NamespaceRegistry for RemoteNamespaceAdapter {
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
 
+    async fn delete_namespace(
+        &self,
+        input: bridge::DeleteNamespaceInput,
+    ) -> Result<bridge::DeleteNamespaceResult, BridgeError> {
+        let params =
+            serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let result = self.client.call("delete_namespace", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
+    }
+
     async fn namespace_stats(&self, name: &str) -> Result<NamespaceStats, BridgeError> {
         let params = serde_json::to_value(protocol::NamespaceStatsParams {
             name: name.to_string(),

@@ -12,9 +12,9 @@ use super::lifecycle;
 use super::protocol::*;
 use crate::Recalld;
 use crate::mcp::bridge::{
-    BridgeError, CreateNamespaceInput, HealthChecker, ListMemoriesInput, ListTagsInput,
-    NamespaceRegistry, SearchInput, SearchPipeline, StorageEngine as BridgeStorageEngine,
-    StoreInput,
+    BridgeError, CreateNamespaceInput, DeleteNamespaceInput, HealthChecker, ListMemoriesInput,
+    ListTagsInput, NamespaceRegistry, SearchInput, SearchPipeline,
+    StorageEngine as BridgeStorageEngine, StoreInput,
 };
 use crate::mcp::bridge_adapters::*;
 use crate::model::MemoryId;
@@ -54,8 +54,15 @@ impl DaemonServer {
             std::sync::Arc::new(system.config().clone()),
             tz,
         ));
-        let namespaces: Arc<dyn NamespaceRegistry> =
-            Arc::new(McpNamespaceAdapter::new(system.storage().clone(), tz));
+        let namespaces: Arc<dyn NamespaceRegistry> = Arc::new(McpNamespaceAdapter::new(
+            system.storage().clone(),
+            system.cache().clone(),
+            system.vector_index().clone(),
+            system.fts_index().clone(),
+            system.entity_index().clone(),
+            system.graph().clone(),
+            tz,
+        ));
         let health: Arc<dyn HealthChecker> =
             Arc::new(McpHealthAdapter::new(system.storage().clone()));
 
@@ -493,6 +500,13 @@ async fn dispatch(
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
+        "delete_namespace" => {
+            let input: DeleteNamespaceInput = serde_json::from_value(params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            let result = namespaces.delete_namespace(input).await?;
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
+        }
+
         "namespace_stats" => {
             let p: NamespaceStatsParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
@@ -515,8 +529,9 @@ async fn dispatch(
 mod tests {
     use super::*;
     use crate::mcp::bridge::{
-        DuplicateCluster, HealthStatus, ListMemoriesResponse, ListTagsResponse, MemoryRecord,
-        NamespaceInfo, NamespaceStats, ReinforceResult, SearchHit, SearchResponse, StoredMemory,
+        DeleteNamespaceResult, DuplicateCluster, HealthStatus, ListMemoriesResponse,
+        ListTagsResponse, MemoryRecord, NamespaceInfo, NamespaceStats, ReinforceResult, SearchHit,
+        SearchResponse, StoredMemory,
     };
 
     /// Stub subsystems for the dispatch tests. Only the unknown-method path
@@ -591,6 +606,12 @@ mod tests {
             unreachable!()
         }
         async fn namespace_stats(&self, _: &str) -> Result<NamespaceStats, BridgeError> {
+            unreachable!()
+        }
+        async fn delete_namespace(
+            &self,
+            _: DeleteNamespaceInput,
+        ) -> Result<DeleteNamespaceResult, BridgeError> {
             unreachable!()
         }
     }

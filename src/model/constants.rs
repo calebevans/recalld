@@ -132,6 +132,15 @@ pub const MAX_EMOTIONS: usize = 32;
 /// Maximum number of memories accepted in a single batch store call.
 pub const MAX_BATCH_MEMORIES: usize = 100;
 
+// ── Namespaces ───────────────────────────────────────────────────────
+/// Name of the namespace every store and recall falls back to.
+///
+/// Startup recreates it whenever it is missing, and it is recreated
+/// under the *same directory name* with a *new* namespace id — which is
+/// why `delete_namespace` refuses it outright. One constant so the
+/// coupling between the refusal and the recreation is a single grep.
+pub const DEFAULT_NAMESPACE_NAME: &str = "default";
+
 // ── Near-Duplicate Detection ─────────────────────────────────────────
 /// Cosine similarity at or above which two memories count as
 /// near-duplicates of each other.

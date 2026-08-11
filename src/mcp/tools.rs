@@ -1,8 +1,9 @@
 //! MCP tool definitions and handlers for Recalld memory operations.
 //!
-//! Defines 13 tools: store_memory, store_memories, recall_memories, get_memory,
+//! Defines 14 tools: store_memory, store_memories, recall_memories, get_memory,
 //! reinforce_memory, forget_memory, forget_memories, find_similar_memories,
-//! create_namespace, namespace_stats, list_memories, list_namespaces, list_tags.
+//! create_namespace, delete_namespace, namespace_stats, list_memories,
+//! list_namespaces, list_tags.
 
 use serde_json::json;
 
@@ -46,6 +47,7 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
         forget_memories_def(),
         find_similar_memories_def(),
         create_namespace_def(),
+        delete_namespace_def(),
         namespace_stats_def(),
         list_memories_def(),
         list_namespaces_def(),
@@ -59,7 +61,7 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
 /// which advertises a tool that then answers "Unknown tool" — fails a
 /// test rather than a caller.
 #[cfg(test)]
-const DISPATCHED: [&str; 13] = [
+const DISPATCHED: [&str; 14] = [
     "store_memory",
     "store_memories",
     "recall_memories",
@@ -69,6 +71,7 @@ const DISPATCHED: [&str; 13] = [
     "forget_memories",
     "find_similar_memories",
     "create_namespace",
+    "delete_namespace",
     "namespace_stats",
     "list_memories",
     "list_namespaces",
@@ -91,6 +94,7 @@ pub async fn dispatch_tool(
         "forget_memories" => handle_forget_memories(bridge, arguments).await,
         "find_similar_memories" => handle_find_similar_memories(bridge, arguments).await,
         "create_namespace" => handle_create_namespace(bridge, arguments).await,
+        "delete_namespace" => handle_delete_namespace(bridge, arguments).await,
         "namespace_stats" => handle_namespace_stats(bridge, arguments).await,
         "list_memories" => handle_list_memories(bridge, arguments).await,
         "list_namespaces" => handle_list_namespaces(bridge, arguments).await,
@@ -1304,6 +1308,98 @@ async fn handle_create_namespace(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Tool 8b: delete_namespace
+// ═══════════════════════════════════════════════════════════════════════
+
+fn delete_namespace_def() -> ToolInfo {
+    ToolInfo {
+        name: "delete_namespace".to_string(),
+        title: Some("Delete Namespace".to_string()),
+        description: "Destroy a namespace and everything in it: every memory, every \
+            graph edge touching one, its search index entries, and its vector file on \
+            disk. There is no undo and no backup. A namespace that still holds \
+            memories is refused unless you pass force: true. \
+            This is also the only operation that reclaims tombstones — memories \
+            deleted with forget_memory keep a record for the life of the database, and \
+            nothing else ever removes it. \
+            The 'default' namespace cannot be deleted."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "Namespace to delete. The 'default' namespace cannot be deleted."
+                },
+                "force": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Delete the namespace even if it still holds memories. \
+                        Without this, a non-empty namespace is refused. Forced deletion \
+                        permanently destroys every memory in the namespace and removes \
+                        its vector file from disk. There is no undo and no backup."
+                }
+            },
+            "required": ["name"]
+        }),
+        annotations: Some(ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            // Deliberately NOT idempotent, unlike forget_memory. This
+            // removes a directory from disk and the namespace id is
+            // never reused, so a blind retry after an unknown outcome
+            // could destroy a same-named namespace the user recreated in
+            // between.
+            idempotent_hint: Some(false),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+async fn handle_delete_namespace(
+    bridge: &McpBridge,
+    arguments: serde_json::Value,
+) -> ToolCallResult {
+    use crate::model::constants::DEFAULT_NAMESPACE_NAME;
+
+    let name = match arguments.get("name").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return ToolCallResult::error("Missing required parameter: name"),
+    };
+
+    // Refused here as well as in the adapter. This copy saves a daemon
+    // round trip; the adapter's copy is the load-bearing one, because
+    // the socket is its own entry point.
+    if name == DEFAULT_NAMESPACE_NAME {
+        return ToolCallResult::error(format!(
+            "The '{DEFAULT_NAMESPACE_NAME}' namespace cannot be deleted. It is recreated \
+             on every startup under the same directory name, so deleting it would leave \
+             a stale vectors.dat that a new namespace could silently reuse."
+        ));
+    }
+
+    // A wrong-typed `force` is an error naming the field, never a silent
+    // false: quietly downgrading to the safe path would make a caller
+    // with a broken serializer see a refusal they cannot explain.
+    let force = match args::opt_bool(&arguments, "force") {
+        Ok(v) => v.unwrap_or(false),
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+
+    let input = crate::mcp::bridge::DeleteNamespaceInput { name, force };
+
+    match bridge.namespaces.delete_namespace(input).await {
+        Ok(result) => match ToolCallResult::json(&result) {
+            Ok(r) => r,
+            Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+        },
+        Err(e) => ToolCallResult::error(format!("Failed to delete namespace: {e}")),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Tool 9: namespace_stats
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1821,6 +1917,33 @@ mod tests {
         );
     }
 
+    // ── delete_namespace ─────────────────────────────────────────────
+
+    /// `force` has to advertise its default. A caller that reads the
+    /// schema and omits the key must be able to predict which way the
+    /// call goes, because the two answers are "refused" and "everything
+    /// is destroyed".
+    #[test]
+    fn w38_delete_namespace_declares_a_required_name_and_force_defaulting_to_false() {
+        let schema = delete_namespace_def().input_schema;
+        assert_eq!(schema["required"], json!(["name"]));
+
+        let force = &schema["properties"]["force"];
+        assert_eq!(force["type"], json!("boolean"));
+        assert_eq!(force["default"], json!(false));
+        assert!(
+            force["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("no undo")),
+            "force must say there is no undo: {force}"
+        );
+
+        let name = &schema["properties"]["name"];
+        assert_eq!(name["type"], json!("string"));
+        assert_eq!(name["minLength"].as_u64(), Some(1));
+        assert_eq!(name["maxLength"].as_u64(), Some(64));
+    }
+
     // ── Destructive-tool descriptions ────────────────────────────────
 
     /// `forget_memory` used to promise a permanent delete. It does not
@@ -1846,6 +1969,42 @@ mod tests {
         );
     }
 
+    /// The annotation an MCP client uses to decide whether to prompt.
+    /// Getting it wrong on these three means a destructive call goes
+    /// through unconfirmed.
+    #[test]
+    fn w41_every_destructive_tool_declares_the_destructive_hint() {
+        for def in [
+            forget_memory_def(),
+            forget_memories_def(),
+            delete_namespace_def(),
+        ] {
+            let annotations = def
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no annotations", def.name));
+            assert_eq!(
+                annotations.destructive_hint,
+                Some(true),
+                "{} does not declare itself destructive",
+                def.name
+            );
+            assert_eq!(annotations.read_only_hint, Some(false), "{}", def.name);
+        }
+
+        // Deliberately not idempotent, unlike the two forget tools: this
+        // removes a directory from disk and the namespace id is never
+        // reused, so a blind retry could destroy a same-named namespace
+        // recreated in between.
+        assert_eq!(
+            delete_namespace_def()
+                .annotations
+                .expect("annotations")
+                .idempotent_hint,
+            Some(false)
+        );
+    }
+
     // ── Registry shape ───────────────────────────────────────────────
 
     #[test]
@@ -1864,8 +2023,8 @@ mod tests {
     /// The count the module doc, the README and the guide all repeat. If
     /// it moves, they have to move with it.
     #[test]
-    fn t35_declares_thirteen_tools() {
-        assert_eq!(tool_definitions().len(), 13);
+    fn t35_declares_fourteen_tools() {
+        assert_eq!(tool_definitions().len(), 14);
     }
 
     /// A definition without a dispatch arm advertises a tool that answers

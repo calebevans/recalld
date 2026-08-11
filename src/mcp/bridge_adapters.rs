@@ -1599,18 +1599,58 @@ fn build_list_tags_response(
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Adapts `RedbStorageEngine` to the MCP `NamespaceRegistry` trait.
+///
+/// Holds the four out-of-storage indexes as well as storage, because
+/// namespace deletion has to clean them: storage can destroy the
+/// records, but a namespace whose FTS rows and vector-index entries
+/// survive is a namespace that goes on burning top-k slots in every
+/// search. Namespace lifecycle already lives on this trait —
+/// create, list and stats are all here — so widening it is preferable
+/// to splitting deletion onto `StorageEngine` because that is where the
+/// handles happen to be.
 pub struct McpNamespaceAdapter {
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: Arc<CacheManager>,
+    vector_index: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
+    fts_index: Arc<tokio::sync::Mutex<FtsIndex>>,
+    entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
+    graph: SharedGraph,
     timezone: chrono_tz::Tz,
 }
 
 impl McpNamespaceAdapter {
-    /// Create a new namespace adapter wrapping the storage engine.
+    /// Create a new namespace adapter wrapping the storage engine and
+    /// the indexes a namespace deletion has to clean.
     pub fn new(
         storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+        cache: Arc<CacheManager>,
+        vector_index: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
+        fts_index: Arc<tokio::sync::Mutex<FtsIndex>>,
+        entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
+        graph: SharedGraph,
         timezone: chrono_tz::Tz,
     ) -> Self {
-        Self { storage, timezone }
+        Self {
+            storage,
+            cache,
+            vector_index,
+            fts_index,
+            entity_index,
+            graph,
+            timezone,
+        }
+    }
+
+    /// Borrow this adapter's out-of-storage indexes for
+    /// [`crate::index_cleanup::purge_from_indexes`].
+    fn index_handles(&self) -> crate::index_cleanup::IndexHandles<'_> {
+        crate::index_cleanup::IndexHandles {
+            cache: &self.cache,
+            vector_index: &self.vector_index,
+            fts_index: &self.fts_index,
+            entity_index: &self.entity_index,
+            graph: &self.graph,
+        }
     }
 }
 
@@ -1671,7 +1711,11 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                 storage
                     .read()
                     .ok()
-                    .and_then(|s| s.get_namespace_by_name("default").ok().flatten())
+                    .and_then(|s| {
+                        s.get_namespace_by_name(crate::model::constants::DEFAULT_NAMESPACE_NAME)
+                            .ok()
+                            .flatten()
+                    })
                     .map(|ns| ns.embedding_dim)
                     .unwrap_or(1536)
             });
@@ -1802,6 +1846,110 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         })
         .await
         .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
+    }
+
+    async fn delete_namespace(
+        &self,
+        input: bridge::DeleteNamespaceInput,
+    ) -> Result<bridge::DeleteNamespaceResult, bridge::BridgeError> {
+        use crate::model::constants::DEFAULT_NAMESPACE_NAME;
+
+        // The default namespace is refused here as well as at the tool
+        // layer, and this is the load-bearing copy: the daemon socket is
+        // its own entry point and never runs the tool handler.
+        //
+        // Refused even with `force: true`, and even when empty. Startup
+        // recreates a missing default under the SAME directory name with
+        // a NEW namespace id, so a deleted default leaves a stale
+        // vectors.dat that the recreated namespace opens and reuses —
+        // handing unrelated memories somebody else's embeddings. The
+        // boot sweep would remove that directory first, which makes the
+        // failure unlikely rather than impossible, and "unlikely" is not
+        // the right guarantee for silently wrong vectors.
+        if input.name == DEFAULT_NAMESPACE_NAME {
+            return Err(bridge::BridgeError::InvalidInput(format!(
+                "The '{DEFAULT_NAMESPACE_NAME}' namespace cannot be deleted. It is \
+                 recreated on every startup under the same directory name, so deleting \
+                 it would leave a stale vectors.dat that a new namespace could silently \
+                 reuse."
+            )));
+        }
+
+        // Lookup, refuse-check and purge all happen inside ONE
+        // storage.write() in ONE blocking closure. Splitting them across
+        // two blocking hops would open a window in which a memory stored
+        // between the check and the purge is destroyed by a check that
+        // said "empty".
+        let purged = {
+            let storage = self.storage.clone();
+            let name = input.name.clone();
+            let force = input.force;
+            tokio::task::spawn_blocking(move || {
+                let mut storage_w = storage.write().map_err(|e| {
+                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                })?;
+
+                let config = storage_w
+                    .get_namespace_by_name(&name)
+                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+                    .ok_or_else(|| {
+                        bridge::BridgeError::NotFound(format!("namespace '{name}' not found"))
+                    })?;
+
+                if !force {
+                    // Live memories only. A namespace holding nothing
+                    // but tombstones reports memoryCount 0 everywhere
+                    // else, so refusing it here would be unexplainable —
+                    // and those tombstones hold no content the user has
+                    // not already asked to forget. The purge still reaps
+                    // them, and the result reports how many.
+                    let live = storage_w
+                        .meta_store()
+                        .count_memories_in_namespace(config.id)
+                        .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+                    if live > 0 {
+                        // Nothing has been touched at this point.
+                        return Err(bridge::BridgeError::InvalidInput(format!(
+                            "Namespace '{name}' still holds {live} memories. Deleting it \
+                             permanently destroys them and removes its vector file from \
+                             disk; there is no undo and no backup. Re-run with \
+                             force: true to proceed."
+                        )));
+                    }
+                }
+
+                storage_w
+                    .purge_namespace(config.id)
+                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))
+            })
+            .await
+            .map_err(|e| {
+                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
+            })??
+        };
+
+        // Whole-namespace FTS removal, not per record: it also reaches
+        // rows whose meta.db record was already gone. RemoveNode, not
+        // MarkTombstoned: the records are destroyed, so a surviving node
+        // would dangle.
+        let index_counts = crate::index_cleanup::purge_from_indexes(
+            &self.index_handles(),
+            &purged.records,
+            crate::index_cleanup::FtsAction::WholeNamespace(purged.config.id),
+            crate::index_cleanup::GraphAction::RemoveNode,
+        )
+        .await;
+
+        Ok(bridge::DeleteNamespaceResult {
+            name: purged.config.name.clone(),
+            id: purged.config.id.get(),
+            deleted: true,
+            memories_deleted: purged.live_removed as u64,
+            tombstones_purged: purged.tombstones_removed as u64,
+            edges_removed: purged.edges_removed as u64,
+            fts_rows_removed: index_counts.fts_removed as u64,
+            vector_file_removed: purged.directory_removed,
+        })
     }
 }
 
@@ -2596,5 +2744,253 @@ mod tests {
             slot_of(&second),
             "two memories were handed the same vector slot: the free list is a cycle"
         );
+    }
+
+    // ── delete_namespace ─────────────────────────────────────────────
+
+    /// Set up a namespace holding one fully indexed memory.
+    async fn indexed_namespace(fx: &Fixture, name: &str) -> (NamespaceId, MemoryId) {
+        let ns = fx.create_namespace(name);
+        let mut input = store_input("a fact worth keeping", name, unit_x());
+        input.entities = vec!["Sarah".to_string()];
+        let stored = fx
+            .storage_adapter()
+            .store_memory(input)
+            .await
+            .expect("store");
+        let id = MemoryId::from_uuid(uuid::Uuid::parse_str(&stored.id).expect("uuid"));
+        (ns, id)
+    }
+
+    /// THE most important test in this wave. A refusal that has already
+    /// destroyed something is worse than no refusal at all: the caller
+    /// reads an error, believes nothing happened, and the memories are
+    /// gone. The check runs before `purge_namespace` inside the same
+    /// write lock, and this asserts the whole state is untouched — not
+    /// just that an error came back.
+    #[tokio::test]
+    async fn w29_a_refused_non_force_delete_destroys_nothing() {
+        let fx = Fixture::new();
+        let (_ns, id) = indexed_namespace(&fx, "scratch").await;
+
+        let err = fx
+            .namespace_adapter()
+            .delete_namespace(bridge::DeleteNamespaceInput {
+                name: "scratch".into(),
+                force: false,
+            })
+            .await
+            .expect_err("a non-empty namespace must be refused");
+
+        assert!(
+            matches!(err, bridge::BridgeError::InvalidInput(ref m) if m.contains("still holds 1")),
+            "the refusal must name the count: {err}"
+        );
+
+        assert!(fx.record(id).is_some(), "the record was destroyed");
+        assert!(
+            fx.namespace_dir("scratch").join("vectors.dat").exists(),
+            "the vector file was destroyed"
+        );
+        assert!(
+            !fx.fts_index.lock().await.is_empty().expect("fts"),
+            "the FTS rows were destroyed"
+        );
+        assert!(
+            fx.storage
+                .read()
+                .expect("storage lock")
+                .get_namespace_by_name("scratch")
+                .expect("lookup")
+                .is_some(),
+            "the namespace config row was destroyed"
+        );
+    }
+
+    /// A namespace holding only tombstones reports memoryCount 0 in
+    /// `list_namespaces` and `namespace_stats`, so refusing it without
+    /// force would be a refusal the caller cannot explain. The purge
+    /// still reaps the rows — which is the whole point, since nothing
+    /// else in the system ever does — and the result says how many.
+    #[tokio::test]
+    async fn w30_a_tombstone_only_namespace_deletes_without_force() {
+        let fx = Fixture::new();
+        let ns = fx.create_namespace("scratch");
+        let a = fx.insert_memory_in(ns, &[]).await;
+        let b = fx.insert_memory_in(ns, &[]).await;
+        fx.tombstone(a);
+        fx.tombstone(b);
+
+        let result = fx
+            .namespace_adapter()
+            .delete_namespace(bridge::DeleteNamespaceInput {
+                name: "scratch".into(),
+                force: false,
+            })
+            .await
+            .expect("a namespace holding only tombstones is empty");
+
+        assert!(result.deleted);
+        assert_eq!(result.memories_deleted, 0);
+        assert_eq!(
+            result.tombstones_purged, 2,
+            "the tombstones were not reaped"
+        );
+        assert!(fx.record(a).is_none());
+        assert!(fx.record(b).is_none());
+    }
+
+    #[tokio::test]
+    async fn w31_a_forced_delete_removes_the_records_indexes_and_directory() {
+        let fx = Fixture::new();
+        let (_ns, id) = indexed_namespace(&fx, "scratch").await;
+        let other = fx.insert_memory_in(NamespaceId::new(1), &[]).await;
+
+        let result = fx
+            .namespace_adapter()
+            .delete_namespace(bridge::DeleteNamespaceInput {
+                name: "scratch".into(),
+                force: true,
+            })
+            .await
+            .expect("forced delete");
+
+        assert!(result.deleted);
+        assert_eq!(result.memories_deleted, 1);
+        assert_eq!(result.fts_rows_removed, 1);
+        assert!(result.vector_file_removed);
+
+        assert!(fx.record(id).is_none(), "the record survived");
+        assert!(
+            !fx.namespace_dir("scratch").exists(),
+            "the directory survived"
+        );
+        assert!(fx.fts_index.lock().await.is_empty().expect("fts"));
+        assert_eq!(
+            {
+                use crate::search::VectorIndex;
+                fx.vector_index.read().await.len()
+            },
+            0
+        );
+        assert_eq!(fx.entity_index.read().await.len(), 0);
+        assert!(
+            !fx.graph.read().await.contains(&id),
+            "the graph node survived"
+        );
+        assert!(
+            fx.storage
+                .read()
+                .expect("storage lock")
+                .get_namespace_by_name("scratch")
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(
+            fx.record(other).is_some(),
+            "a memory in another namespace was destroyed"
+        );
+    }
+
+    /// Startup recreates a missing default under the SAME directory name
+    /// with a NEW namespace id, so a deleted default leaves a stale
+    /// vectors.dat that the recreated namespace would open and reuse —
+    /// handing unrelated memories somebody else's embeddings. Refused
+    /// even with force, and even when the namespace is empty, because
+    /// neither of those makes the recreation any less automatic.
+    #[tokio::test]
+    async fn w32_the_default_namespace_is_refused_even_forced_and_even_empty() {
+        let fx = Fixture::new();
+        let adapter = fx.namespace_adapter();
+
+        for force in [false, true] {
+            let err = adapter
+                .delete_namespace(bridge::DeleteNamespaceInput {
+                    name: "default".into(),
+                    force,
+                })
+                .await
+                .expect_err("the default namespace must never be deletable");
+            assert!(
+                matches!(err, bridge::BridgeError::InvalidInput(_)),
+                "force={force}: {err}"
+            );
+        }
+
+        assert!(
+            fx.namespace_dir("default").join("vectors.dat").exists(),
+            "the default namespace's vector file was removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn w33_an_unknown_namespace_is_not_found_and_touches_nothing() {
+        let fx = Fixture::new();
+        let id = fx.insert_memory().await;
+
+        let err = fx
+            .namespace_adapter()
+            .delete_namespace(bridge::DeleteNamespaceInput {
+                name: "no-such-namespace".into(),
+                force: true,
+            })
+            .await
+            .expect_err("an unknown namespace is not found");
+
+        assert!(matches!(err, bridge::BridgeError::NotFound(_)), "{err}");
+        assert!(fx.record(id).is_some());
+        assert!(fx.namespace_dir("default").exists());
+    }
+
+    /// The stale-vectors.dat regression, from the other direction: a
+    /// namespace recreated under a name that was just deleted must get a
+    /// fresh, empty vector file. If the directory survived the delete,
+    /// the new namespace would open the old file and hand its slots out
+    /// again.
+    #[tokio::test]
+    async fn w34_recreating_a_deleted_namespace_gets_a_fresh_vector_file() {
+        let fx = Fixture::new();
+        let (old_ns, old_id) = indexed_namespace(&fx, "scratch").await;
+        let namespace_adapter = fx.namespace_adapter();
+
+        namespace_adapter
+            .delete_namespace(bridge::DeleteNamespaceInput {
+                name: "scratch".into(),
+                force: true,
+            })
+            .await
+            .expect("forced delete");
+
+        let recreated = namespace_adapter
+            .create_namespace(bridge::CreateNamespaceInput {
+                name: "scratch".into(),
+                embedding_dim: Some(crate::test_support::DIM as u16),
+                initial_stability: None,
+                desired_retention: None,
+                decay_rate_multiplier: None,
+            })
+            .await
+            .expect("recreate");
+
+        assert_ne!(
+            recreated.id,
+            old_ns.get(),
+            "namespace ids must never be recycled"
+        );
+        assert_eq!(recreated.memory_count, 0);
+
+        let stored = fx
+            .storage_adapter()
+            .store_memory(store_input("a brand new fact", "scratch", unit_x()))
+            .await
+            .expect("store into the recreated namespace");
+        let new_id = MemoryId::from_uuid(uuid::Uuid::parse_str(&stored.id).expect("uuid"));
+
+        assert_eq!(
+            fx.record(new_id).expect("record").vector_slot,
+            0,
+            "the recreated namespace inherited the deleted one's vector file"
+        );
+        assert!(fx.record(old_id).is_none());
     }
 }
