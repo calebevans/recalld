@@ -693,6 +693,54 @@ Two transports expose the same 9 MCP tools (`store_memory`, `store_memories`, `r
 - Stale socket cleanup on startup (checks if PID is alive).
 - MCP clients connect to the daemon via JSON-RPC 2.0.
 
+#### Framing
+
+Messages are length-prefixed JSON: a 4-byte big-endian byte count followed by
+the JSON payload.
+
+| Limit | Value | Meaning |
+|---|---|---|
+| `MAX_MESSAGE_SIZE` | 8 MiB | Largest frame this build will send or accept. |
+| `LEGACY_MAX_MESSAGE_SIZE` | 1 MiB | What a protocol v1 peer (recalld <= 0.1.10) enforces. |
+| `MAX_DRAIN_SIZE` | 64 MiB | Largest declared length still worth skipping past. |
+| `DRAIN_TIMEOUT` | 30 s | How long a peer may take to deliver a frame being skipped. |
+
+The frame limit is deliberately much larger than the 1 MiB `fullText` content
+limit. The content limit measures raw UTF-8 bytes; the frame carries those
+bytes *after* JSON escaping, which expands `\n` 2x and control bytes up to 6x.
+A worst-case `store_memory` request with a maximum `fullText` serializes to
+roughly 6.1 MiB, so the headroom belongs in the transport rather than in the
+content limit.
+
+**Drain and resync.** Once the length prefix is read, the frame boundary is
+known. An oversized but believable frame (over the peer limit, under
+`MAX_DRAIN_SIZE`) is skipped exactly — copied to a sink, so no allocation —
+which leaves the stream sitting on the next frame boundary. Both sides then
+report the error and keep the connection. Only three conditions close a
+connection: a clean EOF, a declared length beyond `MAX_DRAIN_SIZE` (the
+boundary is fiction), and a drain that times out.
+
+Oversized messages are rejected at serialization time, **before** any byte
+reaches the socket, so an outsized request cannot desynchronize a connection
+for the calls that follow it.
+
+**Protocol negotiation.** `ping` doubles as a handshake: the client sends
+`{"protocolVersion": 2, "maxMessageSize": 8388608}` and the daemon answers in
+kind. Each side writes frames sized for what the other announced, defaulting
+to 1 MiB for a peer that announces nothing. This matters because a protocol v1
+peer rejects an oversized length prefix *without* draining the payload, which
+corrupts its stream permanently — so a v2 peer never sends one an oversized
+frame. Negotiation is repeated on every reconnect.
+
+**Client recovery.** A transport failure poisons the client connection; the
+next call re-establishes it (3 attempts, 50/200/500 ms backoff). Read-only
+methods are replayed transparently on the fresh connection. Mutating methods
+are never replayed — `store_memory` mints a server-side id, `reinforce_memory`
+advances the FSRS schedule — and instead return an error stating that the
+operation may or may not have been applied. Request ids are monotonic across
+reconnects, so a response left over from an abandoned call can be recognized
+and discarded rather than mistaken for the current one.
+
 ### CLI client (recalld-cli)
 
 - Separate binary that communicates with the HTTP API server (default `http://localhost:7680`).

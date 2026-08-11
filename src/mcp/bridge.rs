@@ -495,6 +495,24 @@ pub enum BridgeError {
     /// An unexpected internal error occurred.
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// The request or response exceeded the daemon's frame size limit.
+    #[error("Too large: {0}")]
+    TooLarge(String),
+}
+
+impl BridgeError {
+    /// Builds a [`BridgeError::TooLarge`] describing an oversized message.
+    ///
+    /// The payload is a plain string rather than structured fields so the
+    /// message survives the `DaemonRpcError` wire round trip intact.
+    pub fn too_large(size: usize, limit: usize) -> Self {
+        Self::TooLarge(format!(
+            "request is {size} bytes, which exceeds the {limit} byte daemon message limit. \
+             Reduce fullText (max 1 MiB), shorten tags/entities/topics/emotions, \
+             or split this into multiple memories."
+        ))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

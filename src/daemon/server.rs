@@ -12,8 +12,8 @@ use super::lifecycle;
 use super::protocol::*;
 use crate::Recalld;
 use crate::mcp::bridge::{
-    BridgeError, CreateNamespaceInput, HealthChecker, NamespaceRegistry, SearchInput,
-    SearchPipeline, StorageEngine as BridgeStorageEngine, StoreInput,
+    BridgeError, CreateNamespaceInput, HealthChecker, ListMemoriesInput, NamespaceRegistry,
+    SearchInput, SearchPipeline, StorageEngine as BridgeStorageEngine, StoreInput,
 };
 use crate::mcp::bridge_adapters::*;
 use crate::model::MemoryId;
@@ -174,13 +174,21 @@ async fn handle_connection(
     let mut reader = BufReader::new(reader);
     let mut writer = writer;
 
+    // Largest frame this peer is known to accept. Stays at the protocol v1
+    // limit until the client announces v2 in its `ping`, so an old client
+    // never receives a frame it would reject without draining.
+    let mut peer_limit = LEGACY_MAX_MESSAGE_SIZE;
+
     loop {
         tokio::select! {
-            msg = read_framed_message(&mut reader) => {
+            msg = read_framed_message(&mut reader, MAX_MESSAGE_SIZE) => {
                 match msg {
-                    Ok(None) => break,
-                    Ok(Some(request)) => {
+                    Ok(request) => {
                         let method = request.method.clone();
+
+                        if method == "ping" {
+                            peer_limit = peer_frame_limit(&request.params);
+                        }
 
                         let response = dispatch(
                             &*search, &*storage, &*namespaces, &*health,
@@ -192,8 +200,38 @@ async fn handle_connection(
                             Err(e) => DaemonResponse::error(request.id, DaemonRpcError::from(&e)),
                         };
 
-                        if write_framed_message(&mut writer, &resp).await.is_err() {
-                            break;
+                        match write_framed_message(&mut writer, &resp, peer_limit).await {
+                            Ok(()) => {}
+                            // The result does not fit in a frame. Sending it anyway
+                            // would desynchronize the client's stream, so send an
+                            // error that does fit instead.
+                            Err(FrameError::TooLarge { size, limit }) => {
+                                tracing::warn!(
+                                    method = %method, size, limit,
+                                    "response exceeds the peer frame limit, replying with an error"
+                                );
+                                let fallback = DaemonResponse::error(
+                                    request.id,
+                                    DaemonRpcError {
+                                        code: ERR_TOO_LARGE,
+                                        message: format!(
+                                            "response is {size} bytes, exceeding the {limit} byte \
+                                             message limit. Reduce `limit`, or fetch large memories \
+                                             individually with get_memory."
+                                        ),
+                                    },
+                                );
+                                if write_framed_message(&mut writer, &fallback, peer_limit)
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "client write error, closing connection");
+                                break;
+                            }
                         }
 
                         if !matches!(method.as_str(), "ping" | "check_health" | "shutdown") {
@@ -205,10 +243,21 @@ async fn handle_connection(
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(%e, "client read error");
-                        break;
-                    }
+                    Err(e) => match action_for_frame_error(&e) {
+                        // The stream is provably still on a frame boundary, so
+                        // the connection survives; only this request is lost.
+                        ConnectionAction::Reply(err) => {
+                            tracing::warn!(%e, "recoverable client frame error, replying and continuing");
+                            let resp = DaemonResponse::error(UNATTRIBUTED_ID, err);
+                            if write_framed_message(&mut writer, &resp, peer_limit).await.is_err() {
+                                break;
+                            }
+                        }
+                        ConnectionAction::Close => {
+                            tracing::warn!(%e, "client read error, closing connection");
+                            break;
+                        }
+                    },
                 }
             }
             _ = shutdown_rx.changed() => break,
@@ -216,6 +265,67 @@ async fn handle_connection(
     }
 
     connection_count.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Response id used when a framing error leaves the request id unknown.
+/// Client request ids start at 1, so 0 can never collide with a live call.
+const UNATTRIBUTED_ID: u64 = 0;
+
+/// What a connection should do after a [`FrameError`].
+#[derive(Debug)]
+enum ConnectionAction {
+    /// Report the error to the client and keep serving.
+    Reply(DaemonRpcError),
+    /// Close the connection; the stream cannot be trusted.
+    Close,
+}
+
+/// Classifies a framing error into a connection-level action.
+///
+/// Extracted as a free function so the policy is unit-testable without a
+/// live `Recalld` instance.
+fn action_for_frame_error(e: &FrameError) -> ConnectionAction {
+    match e {
+        FrameError::OversizedDiscarded { size, limit } => ConnectionAction::Reply(DaemonRpcError {
+            code: ERR_TOO_LARGE,
+            message: format!(
+                "request is {size} bytes, exceeding the {limit} byte daemon message limit; \
+                 the frame was discarded. Reduce fullText (max 1 MiB), shorten \
+                 tags/entities/topics/emotions, or split this into multiple memories."
+            ),
+        }),
+        FrameError::Malformed(detail) => ConnectionAction::Reply(DaemonRpcError {
+            code: ERR_INVALID_INPUT,
+            message: format!("malformed request frame: {detail}"),
+        }),
+        // `TooLarge` is a write-side error and never reaches this path, but
+        // closing is the safe default if it ever does.
+        FrameError::Closed
+        | FrameError::Desync { .. }
+        | FrameError::DrainTimeout { .. }
+        | FrameError::Io(_)
+        | FrameError::TooLarge { .. } => ConnectionAction::Close,
+    }
+}
+
+/// Frame limit to use when writing to the peer that sent these `ping` params.
+///
+/// A protocol v1 client sends no version field; it is held at the legacy
+/// 1 MiB limit because it rejects an oversized length prefix without
+/// draining the payload, which would corrupt its stream permanently.
+fn peer_frame_limit(params: &serde_json::Value) -> usize {
+    let version = params
+        .get("protocolVersion")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    if version < PROTOCOL_VERSION as u64 {
+        return LEGACY_MAX_MESSAGE_SIZE;
+    }
+    let announced = params
+        .get("maxMessageSize")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(LEGACY_MAX_MESSAGE_SIZE as u64);
+    (announced as usize).clamp(LEGACY_MAX_MESSAGE_SIZE, MAX_MESSAGE_SIZE)
 }
 
 fn parse_memory_id(s: &str) -> Result<MemoryId, BridgeError> {
@@ -233,7 +343,12 @@ async fn dispatch(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, BridgeError> {
     match method {
-        "ping" => Ok(serde_json::json!({})),
+        // Doubles as the protocol handshake. A v1 client ignores the extra
+        // fields; a v2 client uses them to size its outgoing frames.
+        "ping" => Ok(serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "maxMessageSize": MAX_MESSAGE_SIZE,
+        })),
 
         "shutdown" => Ok(serde_json::json!({})),
 
@@ -294,6 +409,13 @@ async fn dispatch(
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
+        "list_memories" => {
+            let input: ListMemoriesInput = serde_json::from_value(params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            let result = storage.list_memories(input).await?;
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
+        }
+
         "list_namespaces" => {
             let result = namespaces.list_namespaces().await?;
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
@@ -321,5 +443,208 @@ async fn dispatch(
         other => Err(BridgeError::InvalidInput(format!(
             "unknown method: {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::bridge::{
+        DuplicateCluster, HealthStatus, ListMemoriesResponse, MemoryRecord, NamespaceInfo,
+        NamespaceStats, ReinforceResult, SearchHit, SearchResponse, StoredMemory,
+    };
+
+    /// Stub subsystems for the dispatch tests. Only the unknown-method path
+    /// is exercised, which never reaches any of these.
+    struct Unused;
+
+    #[async_trait::async_trait]
+    impl SearchPipeline for Unused {
+        async fn search(&self, _: SearchInput) -> Result<SearchResponse, BridgeError> {
+            unreachable!()
+        }
+        async fn find_similar(
+            &self,
+            _: MemoryId,
+            _: usize,
+            _: Option<f32>,
+            _: bool,
+        ) -> Result<Vec<SearchHit>, BridgeError> {
+            unreachable!()
+        }
+        async fn scan_duplicates(
+            &self,
+            _: &str,
+            _: f32,
+            _: usize,
+        ) -> Result<Vec<DuplicateCluster>, BridgeError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeStorageEngine for Unused {
+        async fn store_memory(&self, _: StoreInput) -> Result<StoredMemory, BridgeError> {
+            unreachable!()
+        }
+        async fn get_memory(&self, _: MemoryId) -> Result<Option<MemoryRecord>, BridgeError> {
+            unreachable!()
+        }
+        async fn delete_memory(&self, _: MemoryId) -> Result<bool, BridgeError> {
+            unreachable!()
+        }
+        async fn reinforce_memory(
+            &self,
+            _: MemoryId,
+            _: u8,
+        ) -> Result<ReinforceResult, BridgeError> {
+            unreachable!()
+        }
+        async fn list_memories(
+            &self,
+            _: ListMemoriesInput,
+        ) -> Result<ListMemoriesResponse, BridgeError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NamespaceRegistry for Unused {
+        async fn list_namespaces(&self) -> Result<Vec<NamespaceInfo>, BridgeError> {
+            unreachable!()
+        }
+        async fn create_namespace(
+            &self,
+            _: CreateNamespaceInput,
+        ) -> Result<NamespaceInfo, BridgeError> {
+            unreachable!()
+        }
+        async fn namespace_stats(&self, _: &str) -> Result<NamespaceStats, BridgeError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HealthChecker for Unused {
+        async fn check_health(&self) -> HealthStatus {
+            unreachable!()
+        }
+    }
+
+    async fn dispatch_stub(
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, BridgeError> {
+        dispatch(&Unused, &Unused, &Unused, &Unused, method, params).await
+    }
+
+    // 23
+    #[test]
+    fn action_for_frame_error_classification() {
+        let recoverable = [
+            (
+                FrameError::OversizedDiscarded {
+                    size: 9_000_000,
+                    limit: 1_048_576,
+                },
+                ERR_TOO_LARGE,
+            ),
+            (
+                FrameError::Malformed("expected value".into()),
+                ERR_INVALID_INPUT,
+            ),
+        ];
+        for (error, code) in recoverable {
+            match action_for_frame_error(&error) {
+                ConnectionAction::Reply(rpc) => {
+                    assert_eq!(rpc.code, code, "for {error}");
+                    assert!(!rpc.message.is_empty());
+                }
+                ConnectionAction::Close => panic!("{error} must not close the connection"),
+            }
+            assert!(error.is_recoverable(), "{error}");
+        }
+
+        let fatal = [
+            FrameError::Closed,
+            FrameError::Desync {
+                size: u32::MAX as usize,
+                limit: MAX_DRAIN_SIZE,
+            },
+            FrameError::DrainTimeout { size: 9_000_000 },
+            FrameError::Io(std::io::Error::other("boom")),
+            FrameError::TooLarge {
+                size: 9_000_000,
+                limit: 1_048_576,
+            },
+        ];
+        for error in fatal {
+            assert!(
+                matches!(action_for_frame_error(&error), ConnectionAction::Close),
+                "{error} must close the connection"
+            );
+            assert!(!error.is_recoverable(), "{error}");
+        }
+    }
+
+    // 23b — the oversized-request reply must name the limit so the caller can act.
+    #[test]
+    fn oversized_request_reply_explains_the_limit() {
+        let action = action_for_frame_error(&FrameError::OversizedDiscarded {
+            size: 9_000_000,
+            limit: 8_388_608,
+        });
+        let ConnectionAction::Reply(rpc) = action else {
+            panic!("expected a reply");
+        };
+        assert!(rpc.message.contains("9000000"), "{}", rpc.message);
+        assert!(rpc.message.contains("8388608"), "{}", rpc.message);
+    }
+
+    // 24
+    #[tokio::test]
+    async fn dispatch_unknown_method_returns_invalid_input() {
+        let err = dispatch_stub("no_such_method", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidInput(_)), "{err}");
+        assert!(err.to_string().contains("no_such_method"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_ping_announces_the_protocol_version() {
+        let result = dispatch_stub("ping", serde_json::json!({})).await.unwrap();
+        assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(result["maxMessageSize"], MAX_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn peer_frame_limit_holds_unannounced_peers_at_the_legacy_limit() {
+        // A protocol v1 client sends no version field.
+        assert_eq!(
+            peer_frame_limit(&serde_json::json!({})),
+            LEGACY_MAX_MESSAGE_SIZE
+        );
+        assert_eq!(
+            peer_frame_limit(&serde_json::Value::Null),
+            LEGACY_MAX_MESSAGE_SIZE
+        );
+        assert_eq!(
+            peer_frame_limit(&serde_json::json!({ "protocolVersion": 2 })),
+            LEGACY_MAX_MESSAGE_SIZE
+        );
+        assert_eq!(
+            peer_frame_limit(
+                &serde_json::json!({ "protocolVersion": 2, "maxMessageSize": MAX_MESSAGE_SIZE })
+            ),
+            MAX_MESSAGE_SIZE
+        );
+        // An absurd announcement is clamped rather than trusted.
+        assert_eq!(
+            peer_frame_limit(
+                &serde_json::json!({ "protocolVersion": 2, "maxMessageSize": 1_u64 << 40 })
+            ),
+            MAX_MESSAGE_SIZE
+        );
     }
 }

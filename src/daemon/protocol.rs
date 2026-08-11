@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::mcp::bridge::BridgeError;
 
@@ -112,6 +114,8 @@ pub const ERR_STORAGE: i32 = -32003;
 pub const ERR_SEARCH: i32 = -32004;
 /// RPC error code: internal server error.
 pub const ERR_INTERNAL: i32 = -32603;
+/// RPC error code: the request or response did not fit in a protocol frame.
+pub const ERR_TOO_LARGE: i32 = -32005;
 
 // ── BridgeError conversion ───────────────────────────────────────────
 
@@ -138,6 +142,10 @@ impl From<&BridgeError> for DaemonRpcError {
                 code: ERR_INTERNAL,
                 message: msg.clone(),
             },
+            BridgeError::TooLarge(msg) => DaemonRpcError {
+                code: ERR_TOO_LARGE,
+                message: msg.clone(),
+            },
         }
     }
 }
@@ -150,6 +158,7 @@ impl DaemonRpcError {
             ERR_INVALID_INPUT => BridgeError::InvalidInput(self.message),
             ERR_STORAGE => BridgeError::Storage(self.message),
             ERR_SEARCH => BridgeError::Search(self.message),
+            ERR_TOO_LARGE => BridgeError::TooLarge(self.message),
             _ => BridgeError::Internal(self.message),
         }
     }
@@ -183,76 +192,517 @@ impl DaemonResponse {
 //
 // Length-prefixed JSON: [4-byte big-endian length][JSON payload].
 
-const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1 MB
+/// Version of the daemon framing protocol implemented by this build.
+///
+/// Version 1 (recalld <= 0.1.10) had no negotiation and a hard 1 MiB frame
+/// limit on both sides. Version 2 raises the limit and adds recovery from
+/// oversized frames. A v2 peer announces itself in the `ping` request /
+/// response; a peer that says nothing is assumed to be v1 and is only ever
+/// sent frames within [`LEGACY_MAX_MESSAGE_SIZE`].
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Maximum size in bytes of a single protocol frame.
+///
+/// This bounds the *serialized* JSON envelope, not the content limits the
+/// MCP layer enforces. The gap between the two is JSON escaping, which is
+/// a pure transport artifact, so the headroom belongs here rather than in
+/// [`crate::model::constants::FULL_TEXT_MAX_BYTES`].
+///
+/// `serde_json` expands a byte by at most 6x (a control byte becomes
+/// `\u00XX`), which puts the worst-case `store_memory` request at:
+///
+/// ```text
+/// fullText     1,048,576 x 6           = 6,291,456
+/// summary          2,000 x 6           =    12,000
+/// tags          64 x (128 x 6 + 3)     =    49,344
+/// ent+top+emo   96 x (128 x 6 + 3)     =    74,016
+/// namespace           64 x 6           =       384
+/// scaffold                             <     1,024
+///                               total  ~ 6,428,224  (6.13 MiB)
+/// ```
+///
+/// 8 MiB is the smallest power of two that clears that with headroom: 2 MiB
+/// is not enough for a newline-heavy 1 MiB `fullText` (`\n` alone doubles),
+/// and 4 MiB sits under the worst case.
+pub const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
+/// The frame limit a protocol v1 peer (recalld <= 0.1.10) enforces.
+///
+/// Used as the assumed limit for a peer that has not announced itself, so
+/// we never hand an old peer a frame it will reject — an old peer rejects
+/// the length prefix *without* draining the payload, which corrupts its
+/// stream permanently.
+pub const LEGACY_MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+
+/// Largest declared frame length that is still worth draining.
+///
+/// Draining is allocation-free (it copies into [`tokio::io::sink`]), so this
+/// bounds only how much garbage we are willing to *skip*, not how much we
+/// allocate — hence it is much larger than [`MAX_MESSAGE_SIZE`]. Beyond it,
+/// the declared length is more likely fiction than truth and the frame
+/// boundary cannot be trusted, so the connection is closed instead.
+pub const MAX_DRAIN_SIZE: usize = 64 * 1024 * 1024;
+
+/// How long a peer may take to deliver an oversized frame we are draining.
+///
+/// Without this, a peer could declare [`MAX_DRAIN_SIZE`] and then dribble
+/// bytes forever, pinning one of [`MAX_CONNECTIONS`] connection tasks.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of concurrent client connections the daemon will accept.
 /// Additional connections are dropped immediately until an existing one closes.
 pub const MAX_CONNECTIONS: u32 = 32;
 
-/// Reads a length-prefixed JSON-RPC request from the stream.
-pub async fn read_framed_message<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<Option<DaemonRequest>> {
-    let len = match reader.read_u32().await {
-        Ok(n) => n as usize,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if len > MAX_MESSAGE_SIZE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("message too large: {len} bytes (max {MAX_MESSAGE_SIZE})"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
-    let request = serde_json::from_slice(&buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(Some(request))
+/// An error encountered while reading or writing a protocol frame.
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    /// The peer closed the connection cleanly between frames.
+    #[error("connection closed by peer")]
+    Closed,
+
+    /// The outgoing message does not fit in a frame. Nothing was written.
+    #[error("frame too large: {size} bytes exceeds the {limit} byte protocol limit")]
+    TooLarge {
+        /// Serialized size of the message.
+        size: usize,
+        /// Frame limit in force for this peer.
+        limit: usize,
+    },
+
+    /// An oversized incoming frame was skipped. The stream is resynchronized.
+    #[error(
+        "discarded oversized incoming frame of {size} bytes (limit {limit}); stream resynchronized"
+    )]
+    OversizedDiscarded {
+        /// Declared length of the discarded frame.
+        size: usize,
+        /// Frame limit in force for this peer.
+        limit: usize,
+    },
+
+    /// A frame was read whole but its payload is not a valid message.
+    /// The stream is resynchronized.
+    #[error("malformed frame payload: {0}")]
+    Malformed(String),
+
+    /// The declared frame length is too large to be believed. The frame
+    /// boundary is unknown, so the stream cannot be resynchronized.
+    #[error("unrecoverable framing desync: declared length {size} exceeds drain limit {limit}")]
+    Desync {
+        /// Declared length of the frame.
+        size: usize,
+        /// [`MAX_DRAIN_SIZE`].
+        limit: usize,
+    },
+
+    /// The peer stopped sending mid-drain. The frame boundary was never
+    /// reached, so the stream cannot be resynchronized.
+    #[error(
+        "timed out draining an oversized frame of {size} bytes; stream cannot be resynchronized"
+    )]
+    DrainTimeout {
+        /// Declared length of the frame being drained.
+        size: usize,
+    },
+
+    /// Transport failure.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
-/// Writes a length-prefixed JSON-RPC response to the stream.
-pub async fn write_framed_message<W: AsyncWriteExt + Unpin>(
+impl FrameError {
+    /// True when the stream is known to sit on a frame boundary, so the
+    /// connection can keep serving after this error.
+    pub fn is_recoverable(&self) -> bool {
+        matches!(self, Self::OversizedDiscarded { .. } | Self::Malformed(_))
+    }
+}
+
+/// Serializes `value` and checks it against `limit` **before** any byte
+/// reaches the socket.
+///
+/// This is what keeps an oversized message from poisoning a connection: the
+/// caller gets [`FrameError::TooLarge`] with the stream untouched.
+fn encode_frame<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, FrameError> {
+    let payload = serde_json::to_vec(value).map_err(|e| FrameError::Malformed(e.to_string()))?;
+    if payload.len() > limit {
+        return Err(FrameError::TooLarge {
+            size: payload.len(),
+            limit,
+        });
+    }
+    Ok(payload)
+}
+
+/// Writes an already-encoded payload as a length-prefixed frame.
+async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    response: &DaemonResponse,
-) -> std::io::Result<()> {
-    let payload = serde_json::to_vec(response)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    payload: &[u8],
+) -> Result<(), FrameError> {
     writer.write_u32(payload.len() as u32).await?;
-    writer.write_all(&payload).await?;
-    writer.flush().await
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Reads one length-prefixed frame, recovering where recovery is provable.
+///
+/// Once the length prefix has been read the frame boundary is known, so an
+/// oversized-but-believable frame can be skipped exactly and the stream left
+/// sitting on the next frame. See [`FrameError::is_recoverable`].
+async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Vec<u8>, FrameError> {
+    let len = match reader.read_u32().await {
+        Ok(n) => n as usize,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(FrameError::Closed),
+        Err(e) => return Err(FrameError::Io(e)),
+    };
+
+    if len > MAX_DRAIN_SIZE {
+        return Err(FrameError::Desync {
+            size: len,
+            limit: MAX_DRAIN_SIZE,
+        });
+    }
+
+    if len > limit {
+        let mut limited = (&mut *reader).take(len as u64);
+        let mut sink = tokio::io::sink();
+        let drain = tokio::io::copy(&mut limited, &mut sink);
+        return match tokio::time::timeout(DRAIN_TIMEOUT, drain).await {
+            Ok(Ok(n)) if n == len as u64 => {
+                Err(FrameError::OversizedDiscarded { size: len, limit })
+            }
+            // EOF before the frame boundary: nothing left to resynchronize to.
+            Ok(Ok(_)) => Err(FrameError::Closed),
+            Ok(Err(e)) => Err(FrameError::Io(e)),
+            Err(_) => Err(FrameError::DrainTimeout { size: len }),
+        };
+    }
+
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Reads a length-prefixed JSON-RPC request from the stream.
+pub async fn read_framed_message<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<DaemonRequest, FrameError> {
+    let buf = read_frame(reader, limit).await?;
+    serde_json::from_slice(&buf).map_err(|e| FrameError::Malformed(e.to_string()))
 }
 
 /// Reads a length-prefixed JSON-RPC response from the stream.
-pub async fn read_framed_response<R: AsyncReadExt + Unpin>(
+pub async fn read_framed_response<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> std::io::Result<Option<DaemonResponse>> {
-    let len = match reader.read_u32().await {
-        Ok(n) => n as usize,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if len > MAX_MESSAGE_SIZE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("message too large: {len} bytes (max {MAX_MESSAGE_SIZE})"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
-    let response = serde_json::from_slice(&buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(Some(response))
+    limit: usize,
+) -> Result<DaemonResponse, FrameError> {
+    let buf = read_frame(reader, limit).await?;
+    serde_json::from_slice(&buf).map_err(|e| FrameError::Malformed(e.to_string()))
+}
+
+/// Writes a length-prefixed JSON-RPC response to the stream.
+///
+/// Returns [`FrameError::TooLarge`] without writing anything if the response
+/// exceeds `limit`.
+pub async fn write_framed_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &DaemonResponse,
+    limit: usize,
+) -> Result<(), FrameError> {
+    let payload = encode_frame(response, limit)?;
+    write_frame(writer, &payload).await
 }
 
 /// Writes a length-prefixed JSON-RPC request to the stream.
-pub async fn write_framed_request<W: AsyncWriteExt + Unpin>(
+///
+/// Returns [`FrameError::TooLarge`] without writing anything if the request
+/// exceeds `limit`.
+pub async fn write_framed_request<W: AsyncWrite + Unpin>(
     writer: &mut W,
     request: &DaemonRequest,
-) -> std::io::Result<()> {
-    let payload = serde_json::to_vec(request)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    writer.write_u32(payload.len() as u32).await?;
-    writer.write_all(&payload).await?;
-    writer.flush().await
+    limit: usize,
+) -> Result<(), FrameError> {
+    let payload = encode_frame(request, limit)?;
+    write_frame(writer, &payload).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frames used in these tests are tiny, so a tiny limit keeps every
+    /// assertion sub-millisecond.
+    const TINY: usize = 64;
+    const ROOMY: usize = 64 * 1024;
+
+    fn request(id: u64) -> DaemonRequest {
+        DaemonRequest {
+            jsonrpc: "2.0".into(),
+            id,
+            method: "ping".into(),
+            params: serde_json::json!({}),
+        }
+    }
+
+    /// A request whose serialized form is far larger than [`TINY`].
+    fn fat_request() -> DaemonRequest {
+        DaemonRequest {
+            jsonrpc: "2.0".into(),
+            id: 1,
+            method: "store_memory".into(),
+            params: serde_json::json!({ "fullText": "z".repeat(500) }),
+        }
+    }
+
+    // 1
+    #[tokio::test]
+    async fn round_trip_request() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        let sent = DaemonRequest {
+            jsonrpc: "2.0".into(),
+            id: 7,
+            method: "get_memory".into(),
+            params: serde_json::json!({ "id": "abc" }),
+        };
+
+        write_framed_request(&mut a, &sent, ROOMY).await.unwrap();
+        let got = read_framed_message(&mut b, ROOMY).await.unwrap();
+
+        assert_eq!(got.id, 7);
+        assert_eq!(got.method, "get_memory");
+        assert_eq!(got.params, serde_json::json!({ "id": "abc" }));
+    }
+
+    // 2
+    #[tokio::test]
+    async fn round_trip_response_success() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        let sent = DaemonResponse::success(3, serde_json::json!({ "ok": true }));
+
+        write_framed_message(&mut a, &sent, ROOMY).await.unwrap();
+        let got = read_framed_response(&mut b, ROOMY).await.unwrap();
+
+        assert_eq!(got.id, 3);
+        assert_eq!(got.result, Some(serde_json::json!({ "ok": true })));
+        assert!(got.error.is_none());
+    }
+
+    // 2b
+    #[tokio::test]
+    async fn round_trip_response_error() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        let sent = DaemonResponse::error(
+            9,
+            DaemonRpcError {
+                code: ERR_NOT_FOUND,
+                message: "no such memory".into(),
+            },
+        );
+
+        write_framed_message(&mut a, &sent, ROOMY).await.unwrap();
+        let got = read_framed_response(&mut b, ROOMY).await.unwrap();
+
+        let err = got.error.expect("error payload");
+        assert_eq!(got.id, 9);
+        assert_eq!(err.code, ERR_NOT_FOUND);
+        assert_eq!(err.message, "no such memory");
+        assert!(got.result.is_none());
+    }
+
+    // 3
+    #[tokio::test]
+    async fn three_frames_read_back_in_order() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        for id in 1..=3 {
+            write_framed_request(&mut a, &request(id), ROOMY)
+                .await
+                .unwrap();
+        }
+
+        for id in 1..=3 {
+            assert_eq!(read_framed_message(&mut b, ROOMY).await.unwrap().id, id);
+        }
+    }
+
+    // 4
+    #[tokio::test]
+    async fn read_returns_closed_on_clean_eof() {
+        let (a, mut b) = tokio::io::duplex(ROOMY);
+        drop(a);
+
+        let err = read_framed_message(&mut b, ROOMY).await.unwrap_err();
+        assert!(matches!(err, FrameError::Closed), "got {err}");
+        assert!(!err.is_recoverable());
+    }
+
+    // 5
+    #[tokio::test]
+    async fn write_rejects_oversized_request_without_writing() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+
+        match write_framed_request(&mut a, &fat_request(), TINY)
+            .await
+            .unwrap_err()
+        {
+            FrameError::TooLarge { size, limit } => {
+                assert!(size > TINY);
+                assert_eq!(limit, TINY);
+            }
+            other => panic!("expected TooLarge, got {other}"),
+        }
+
+        // Nothing at all reached the peer.
+        let peeked = tokio::time::timeout(Duration::from_millis(10), b.read_u8()).await;
+        assert!(peeked.is_err(), "the socket must be untouched");
+    }
+
+    // 6
+    #[tokio::test]
+    async fn write_rejects_oversized_response_without_writing() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        let fat = DaemonResponse::success(1, serde_json::json!({ "blob": "z".repeat(500) }));
+
+        let err = write_framed_message(&mut a, &fat, TINY).await.unwrap_err();
+        assert!(
+            matches!(err, FrameError::TooLarge { limit: TINY, .. }),
+            "got {err}"
+        );
+
+        let peeked = tokio::time::timeout(Duration::from_millis(10), b.read_u8()).await;
+        assert!(peeked.is_err(), "the socket must be untouched");
+    }
+
+    // 7 — the flagship: an oversized frame must not cost us the connection.
+    #[tokio::test]
+    async fn oversized_incoming_frame_is_drained_and_stream_resyncs() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+
+        let junk = vec![b'x'; 200];
+        a.write_u32(junk.len() as u32).await.unwrap();
+        a.write_all(&junk).await.unwrap();
+        write_framed_request(&mut a, &request(42), ROOMY)
+            .await
+            .unwrap();
+
+        let err = read_framed_message(&mut b, TINY).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrameError::OversizedDiscarded {
+                    size: 200,
+                    limit: TINY
+                }
+            ),
+            "got {err}"
+        );
+        assert!(err.is_recoverable());
+
+        // The stream landed exactly on the next frame boundary.
+        assert_eq!(read_framed_message(&mut b, ROOMY).await.unwrap().id, 42);
+    }
+
+    // 8
+    #[tokio::test]
+    async fn desync_length_beyond_drain_limit_is_fatal() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        a.write_u32(MAX_DRAIN_SIZE as u32 + 1).await.unwrap();
+
+        let err = read_framed_message(&mut b, TINY).await.unwrap_err();
+        assert!(
+            matches!(err, FrameError::Desync { limit, .. } if limit == MAX_DRAIN_SIZE),
+            "got {err}"
+        );
+        assert!(!err.is_recoverable());
+    }
+
+    // 9
+    #[tokio::test(start_paused = true)]
+    async fn drain_times_out_when_payload_never_arrives() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        a.write_u32(200).await.unwrap();
+        a.write_all(b"only ten b").await.unwrap();
+
+        // `a` stays alive, so the read blocks rather than seeing EOF.
+        let err = read_framed_message(&mut b, TINY).await.unwrap_err();
+        assert!(
+            matches!(err, FrameError::DrainTimeout { size: 200 }),
+            "got {err}"
+        );
+        assert!(!err.is_recoverable());
+        drop(a);
+    }
+
+    // 10
+    #[tokio::test]
+    async fn malformed_json_is_recoverable_and_stream_resyncs() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        let junk = b"not json at all";
+        a.write_u32(junk.len() as u32).await.unwrap();
+        a.write_all(junk).await.unwrap();
+        write_framed_request(&mut a, &request(5), ROOMY)
+            .await
+            .unwrap();
+
+        let err = read_framed_message(&mut b, ROOMY).await.unwrap_err();
+        assert!(matches!(err, FrameError::Malformed(_)), "got {err}");
+        assert!(err.is_recoverable());
+
+        assert_eq!(read_framed_message(&mut b, ROOMY).await.unwrap().id, 5);
+    }
+
+    // 11
+    #[tokio::test]
+    async fn zero_length_frame_is_malformed_not_fatal() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        a.write_u32(0).await.unwrap();
+        write_framed_request(&mut a, &request(6), ROOMY)
+            .await
+            .unwrap();
+
+        let err = read_framed_message(&mut b, ROOMY).await.unwrap_err();
+        assert!(matches!(err, FrameError::Malformed(_)), "got {err}");
+        assert!(err.is_recoverable());
+
+        assert_eq!(read_framed_message(&mut b, ROOMY).await.unwrap().id, 6);
+    }
+
+    // 12
+    #[test]
+    fn too_large_error_message_names_size_and_limit() {
+        let err = FrameError::TooLarge {
+            size: 2_000_000,
+            limit: 1_048_576,
+        };
+        let text = err.to_string();
+        assert!(text.contains("2000000"), "{text}");
+        assert!(text.contains("1048576"), "{text}");
+    }
+
+    // 13
+    #[test]
+    fn err_too_large_round_trips_through_daemon_rpc_error() {
+        let original = BridgeError::too_large(9_000_000, MAX_MESSAGE_SIZE);
+        let wire = DaemonRpcError::from(&original);
+        assert_eq!(wire.code, ERR_TOO_LARGE);
+
+        let back = wire.into_bridge_error();
+        assert!(matches!(back, BridgeError::TooLarge(_)), "got {back}");
+        assert_eq!(back.to_string(), original.to_string());
+        assert!(back.to_string().contains("9000000"));
+    }
+
+    #[test]
+    fn frame_limits_leave_headroom_over_the_content_limit() {
+        // The transport must be able to carry a maximum-size `fullText`
+        // after worst-case JSON escaping (one byte -> `\u00XX`).
+        const _: () = assert!(MAX_MESSAGE_SIZE >= crate::model::constants::FULL_TEXT_MAX_BYTES * 6);
+        // Skipping garbage costs no memory, so the drain bound is looser.
+        const _: () = assert!(MAX_DRAIN_SIZE > MAX_MESSAGE_SIZE);
+        const _: () = assert!(LEGACY_MAX_MESSAGE_SIZE < MAX_MESSAGE_SIZE);
+    }
 }
