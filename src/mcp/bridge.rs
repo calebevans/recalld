@@ -295,17 +295,21 @@ pub struct StoreInput {
     /// Whether to check the new memory against existing ones and report
     /// near-duplicates. Absent means enabled.
     ///
-    /// `#[serde(default)]` is load-bearing, and in the *opposite*
-    /// direction from the one on [`StoredMemory::supersedes`]: this struct
-    /// is deserialized straight off the daemon socket, so an older client
-    /// sends a payload without this key. Without the attribute, every
-    /// store from such a client becomes a hard parse failure rather than a
-    /// store with the default behaviour.
+    /// `Option<bool>` rather than `bool` with a `default_true` function
+    /// is the load-bearing choice. This struct is deserialized straight
+    /// off the daemon socket, so an older client sends a payload with no
+    /// `checkDuplicates` key; serde already decodes a missing
+    /// `Option<T>` as `None` — as the un-attributed `embedding` and
+    /// `initial_stability` beside it demonstrate — so "unset" arrives
+    /// intact and means "on". A `bool` would need
+    /// `#[serde(default = "…")]` and a bare `#[serde(default)]` on one
+    /// would yield `false`, silently disabling the feature for every
+    /// pre-existing client.
     ///
-    /// `Option<bool>` rather than `bool` with a `default_true` function:
-    /// a bare `#[serde(default)]` on a `bool` yields `false`, which would
-    /// silently disable the feature for every pre-existing client. The
-    /// `Option` makes "unset" explicit, matching `initial_stability`.
+    /// The `#[serde(default)]` below is therefore redundant, and kept
+    /// only so the attribute set matches [`DeleteNamespaceInput::force`],
+    /// where it IS required. Do not read it as evidence that a
+    /// non-`Option` field is safe without one.
     #[serde(default)]
     pub check_duplicates: Option<bool>,
 }
@@ -329,10 +333,12 @@ pub struct StoredMemory {
     /// What became of the requested `supersedes` link, when one was asked
     /// for. Absent when the store named no target.
     ///
-    /// `#[serde(default)]` is load-bearing, not decoration: this struct
-    /// round-trips through the daemon protocol, so a new client talking to
-    /// an older daemon receives a payload without this key and must still
-    /// decode it.
+    /// `skip_serializing_if` is the load-bearing half: it keeps the key
+    /// OUT of the response when there is nothing to report, so existing
+    /// clients see the shape they saw before this field existed. The
+    /// `default` is redundant — serde decodes a missing `Option<T>` as
+    /// `None` on its own — and is kept only for symmetry with the pair
+    /// below it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<crate::model::SupersedesOutcome>,
     /// Existing memories that closely resemble this one.
@@ -530,13 +536,14 @@ pub struct DeleteNamespaceInput {
     pub name: String,
     /// Destroy the namespace even if it still holds live memories.
     ///
-    /// `#[serde(default)]` for the same wire-compatibility reason as
-    /// [`StoreInput::check_duplicates`]: this struct is deserialized
-    /// straight off the daemon socket, and an older client sends a
-    /// payload with no `force` key. Without the attribute, such a call
-    /// would be a hard parse failure. Defaulting to `false` is also the
-    /// safe direction — a missing key can only ever make the operation
-    /// more cautious.
+    /// `#[serde(default)]` is required: this struct is deserialized
+    /// straight off the daemon socket, an older client sends a payload
+    /// with no `force` key, and `bool` has no "missing" representation —
+    /// so without the attribute such a call is a hard parse failure.
+    /// (`Option` fields elsewhere in this module get that for free from
+    /// serde and carry the attribute only for symmetry; this one does
+    /// not.) Defaulting to `false` is also the safe direction — a
+    /// missing key can only ever make the operation more cautious.
     #[serde(default)]
     pub force: bool,
 }
@@ -600,10 +607,11 @@ pub struct NamespaceStats {
     /// agent auditing it needs to see that rather than guess whether
     /// something was lost to a bug.
     ///
-    /// `#[serde(default)]` because this type round-trips the daemon
-    /// socket in both directions — without it a new client decoding an
-    /// old daemon's response would fail outright, which is strictly worse
-    /// than the wrong number it replaces.
+    /// `#[serde(default)]` is required here, unlike the `Option` fields
+    /// elsewhere in this module: `u64` has no "missing" representation,
+    /// so without the attribute a new client decoding an old daemon's
+    /// response — which has no `tombstoneCount` — fails outright, which
+    /// is strictly worse than the zero it reports instead.
     #[serde(default)]
     pub tombstone_count: u64,
     /// Memory counts broken down by decay phase.
@@ -827,8 +835,10 @@ mod tests {
 
     /// Back-compat guard for the daemon protocol. `StoredMemory` is
     /// round-tripped through serde between client and daemon, so a new
-    /// client must still decode a response from a daemon that predates the
-    /// `supersedes` field. This is what `#[serde(default)]` buys.
+    /// client must still decode a response from a daemon that predates
+    /// the `supersedes` field. (Serde gives an `Option` field that for
+    /// free; the test is here because the guarantee matters, not because
+    /// an attribute is doing the work.)
     #[test]
     fn stored_memory_decodes_a_payload_without_the_supersedes_field() {
         let decoded: StoredMemory =
@@ -965,11 +975,12 @@ mod tests {
         assert_eq!(report.matches[0].id, target);
     }
 
-    /// The REQUEST-side guard, and the direction the `supersedes` recipe
-    /// does not cover. `StoreInput` is deserialized straight off the daemon
-    /// socket, so an older client sends a payload without `checkDuplicates`.
-    /// Without `#[serde(default)]` every one of its stores becomes a hard
-    /// parse failure — a break, not a graceful degradation.
+    /// The REQUEST-side guard. `StoreInput` is deserialized straight off
+    /// the daemon socket, so an older client sends a payload without
+    /// `checkDuplicates`, and it must decode as "unset" — which means
+    /// enabled. The `Option` is what carries that: a `bool` with a bare
+    /// `#[serde(default)]` would decode as `false` and silently disable
+    /// the feature for every pre-existing client.
     #[test]
     fn b14_store_input_decodes_a_payload_without_check_duplicates() {
         let decoded: StoreInput =
@@ -979,12 +990,39 @@ mod tests {
         assert_eq!(decoded.summary, "a fact");
     }
 
-    /// Same wire-compatibility rule as `checkDuplicates`, and the safe
-    /// direction on top: `DeleteNamespaceInput` is deserialized straight
-    /// off the daemon socket, so an older client sends no `force` key.
-    /// Without `#[serde(default)]` that is a hard parse failure; with
-    /// it, the missing key can only ever make the operation more
-    /// cautious.
+    /// The executable form of the note on `check_duplicates`: serde
+    /// decodes a MISSING `Option<T>` as `None` with no attribute at all.
+    /// `embedding`, `initialStability`, `parentId` and `supersedes` carry
+    /// no `#[serde(default)]` and are absent here.
+    ///
+    /// Written down because the comments used to claim the attribute was
+    /// what made these decode, which would tell the next author that a
+    /// non-`Option` field is equally safe without one. It is not — see
+    /// `DeleteNamespaceInput::force` and `NamespaceStats::tombstone_count`,
+    /// where the attribute is the only thing standing between an old
+    /// payload and a hard parse failure.
+    #[test]
+    fn w68_a_missing_option_field_needs_no_serde_default() {
+        let decoded: StoreInput = serde_json::from_value(json!({
+            "summary": "a fact",
+            "tags": [],
+            "namespace": "default",
+        }))
+        .expect("a payload with every optional key absent decodes");
+
+        assert!(decoded.embedding.is_none());
+        assert!(decoded.initial_stability.is_none());
+        assert!(decoded.parent_id.is_none());
+        assert!(decoded.supersedes.is_none());
+        assert!(decoded.full_text.is_none());
+        assert!(decoded.check_duplicates.is_none());
+    }
+
+    /// The case where `#[serde(default)]` is genuinely load-bearing:
+    /// `force` is a `bool`, not an `Option<bool>`, so a missing key has
+    /// no representation and the decode fails outright without it. An
+    /// older client sends no `force` key, and with the attribute that
+    /// missing key can only ever make the operation more cautious.
     #[test]
     fn w44_delete_namespace_input_decodes_a_payload_without_force() {
         let decoded: DeleteNamespaceInput = serde_json::from_value(json!({ "name": "scratch" }))
@@ -1018,8 +1056,9 @@ mod tests {
     /// Back-compat guard for the daemon protocol. `NamespaceStats` is
     /// round-tripped through serde in BOTH directions, so a new client
     /// must still decode a response from a daemon that predates
-    /// `tombstoneCount`. Without `#[serde(default)]` the call would fail
-    /// outright -- strictly worse than the wrong number it replaces.
+    /// `tombstoneCount`. `#[serde(default)]` really is doing the work
+    /// here — `tombstone_count` is a `u64`, which has no "missing"
+    /// representation — so without it the call fails outright.
     #[test]
     fn namespace_stats_decodes_a_payload_without_the_tombstone_count() {
         let decoded: NamespaceStats = serde_json::from_value(json!({
