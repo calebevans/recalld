@@ -594,6 +594,68 @@ pub struct PurgedNamespace {
     pub directory_removed: bool,
 }
 
+/// A [`RedbStorageEngine::purge_namespace`] that failed.
+///
+/// A purge is chunked and multi-step, so "it failed" says nothing about
+/// how much survived. `destroyed` is the answer, and it is not
+/// diagnostic decoration: those records are permanently gone from
+/// `META_TABLE` and still occupy the FTS, vector, entity and graph
+/// indexes, which only the caller can reach. Dropping the list strands
+/// them there forever — a retry cannot find them, because it looks in
+/// `META_TABLE`.
+#[derive(Debug)]
+pub struct NamespacePurgeError {
+    /// Records this purge destroyed before it stopped. Empty when it
+    /// failed before touching anything.
+    pub destroyed: Vec<(MemoryId, DiskRecord)>,
+    /// What stopped it.
+    pub source: StorageError,
+}
+
+impl NamespacePurgeError {
+    /// A failure that happened before any record was committed.
+    fn nothing_destroyed(source: StorageError) -> Self {
+        Self {
+            destroyed: Vec::new(),
+            source,
+        }
+    }
+
+    /// A failure that happened after `destroyed` was already gone.
+    fn partial(destroyed: Vec<(MemoryId, DiskRecord)>, source: StorageError) -> Self {
+        Self { destroyed, source }
+    }
+
+    /// Whether anything was destroyed before the failure. A caller that
+    /// reports a bare failure for this case is lying to its user.
+    pub fn is_partial(&self) -> bool {
+        !self.destroyed.is_empty()
+    }
+}
+
+impl std::fmt::Display for NamespacePurgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_partial() {
+            write!(
+                f,
+                "the namespace was PARTIALLY destroyed: {} memories are permanently \
+                 gone and the namespace still exists. Re-run the deletion to finish \
+                 it. Cause: {}",
+                self.destroyed.len(),
+                self.source
+            )
+        } else {
+            write!(f, "{}", self.source)
+        }
+    }
+}
+
+impl std::error::Error for NamespacePurgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl RedbStorageEngine {
     /// Destroy a namespace: its records, its edges, its configuration
     /// row and its vector file.
@@ -629,14 +691,28 @@ impl RedbStorageEngine {
     /// No crash marker is needed. Namespace ids are never recycled and
     /// `NAMESPACE_TABLE` is authoritative, so "the row is gone" is
     /// itself the durable record that the namespace is dead.
+    ///
+    /// # A failure is not the same as "nothing happened"
+    ///
+    /// Step 1 commits in chunks, so an ERROR — not merely a crash — part
+    /// of the way through has already destroyed everything up to that
+    /// point. The error type carries those records for exactly the
+    /// reason the success type does: without them the caller cannot
+    /// clean the indexes, and nothing ever can, because a retry finds
+    /// their `META_TABLE` rows already gone and reports an empty purge.
     pub fn purge_namespace(
         &mut self,
         namespace_id: NamespaceId,
-    ) -> Result<PurgedNamespace, StorageError> {
-        let config = self
-            .meta_store
-            .get_namespace(namespace_id)?
-            .ok_or(StorageError::NamespaceNotFound(namespace_id.get()))?;
+    ) -> Result<PurgedNamespace, NamespacePurgeError> {
+        let config = match self.meta_store.get_namespace(namespace_id) {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                return Err(NamespacePurgeError::nothing_destroyed(
+                    StorageError::NamespaceNotFound(namespace_id.get()),
+                ));
+            }
+            Err(e) => return Err(NamespacePurgeError::nothing_destroyed(e)),
+        };
 
         tracing::info!(
             namespace = %config.name,
@@ -645,9 +721,25 @@ impl RedbStorageEngine {
         );
 
         // 1. Records. This is the pass that reaches tombstones.
-        let records = self
+        let records = match self
             .meta_store
-            .purge_namespace_records(namespace_id, PURGE_CHUNK_SIZE)?;
+            .purge_namespace_records(namespace_id, PURGE_CHUNK_SIZE)
+        {
+            Ok(records) => records,
+            Err(partial) => {
+                tracing::error!(
+                    namespace = %config.name,
+                    destroyed = partial.destroyed.len(),
+                    error = %partial.source,
+                    "Namespace purge failed part-way; the records it had already \
+                     committed are permanently gone"
+                );
+                return Err(NamespacePurgeError {
+                    destroyed: partial.destroyed,
+                    source: partial.source,
+                });
+            }
+        };
 
         let live_removed = records
             .iter()
@@ -655,15 +747,22 @@ impl RedbStorageEngine {
             .count();
         let tombstones_removed = records.len() - live_removed;
 
+        // From here on every record in `records` is already destroyed,
+        // so any failure hands them back rather than dropping them.
         // 2. Edges. `remove_all_edges` covers both directions, so an
         //    edge from a surviving memory into a purged one goes too.
         let mut edges_removed = 0usize;
         for (id, _) in &records {
-            edges_removed += self.edge_store.remove_all_edges(*id)?;
+            match self.edge_store.remove_all_edges(*id) {
+                Ok(n) => edges_removed += n,
+                Err(e) => return Err(NamespacePurgeError::partial(records, e)),
+            }
         }
 
         // 3. Configuration row. Point of no return.
-        self.meta_store.delete_namespace(namespace_id)?;
+        if let Err(e) = self.meta_store.delete_namespace(namespace_id) {
+            return Err(NamespacePurgeError::partial(records, e));
+        }
 
         // 4. Vector file. The store must be dropped before the unlink:
         //    it holds an fs2 exclusive lock and a live mmap.
@@ -1707,6 +1806,58 @@ mod tests {
             dir.path().join("notes").join("vectors.dat").exists(),
             "the boot sweep destroyed a live namespace's vectors"
         );
+    }
+
+    // ── partial purge ────────────────────────────────────────────────
+
+    /// A failure before anything was committed must say so, or the
+    /// caller cleans indexes for records that still exist.
+    #[test]
+    fn w52_a_purge_that_destroyed_nothing_reports_nothing_destroyed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let err = engine
+            .purge_namespace(NamespaceId::new(999))
+            .expect_err("an unknown namespace cannot be purged");
+
+        assert!(!err.is_partial(), "{err}");
+        assert!(err.destroyed.is_empty());
+        assert!(
+            !err.to_string().contains("PARTIALLY"),
+            "a failure that destroyed nothing must not claim otherwise: {err}"
+        );
+    }
+
+    /// The other half of the contract, and the one that matters: an
+    /// error that arrives after chunks have committed carries them, and
+    /// says what the caller has to do about it. Without this the records
+    /// are gone from meta.db, still in every index, and unreachable by a
+    /// retry — which looks in meta.db and finds nothing.
+    #[test]
+    fn w53_a_partial_purge_carries_its_destroyed_records_and_asks_for_a_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "scratch");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+
+        let destroyed: Vec<(MemoryId, DiskRecord)> = [a, b]
+            .into_iter()
+            .map(|id| (id, engine.get_record(id).expect("get").expect("record")))
+            .collect();
+
+        let err = NamespacePurgeError::partial(
+            destroyed,
+            StorageError::CorruptIndex("simulated mid-purge fault".into()),
+        );
+
+        assert!(err.is_partial());
+        assert_eq!(err.destroyed.len(), 2);
+        let message = err.to_string();
+        assert!(message.contains("PARTIALLY destroyed"), "{message}");
+        assert!(message.contains('2'), "the count must be in it: {message}");
+        assert!(message.contains("Re-run"), "{message}");
     }
 
     /// Whether the database files a purge must never touch are all still

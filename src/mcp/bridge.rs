@@ -682,6 +682,18 @@ pub enum BridgeError {
     /// The request or response exceeded the daemon's frame size limit.
     #[error("Too large: {0}")]
     TooLarge(String),
+
+    /// The operation failed after it had already changed something, and
+    /// the change is not undoable.
+    ///
+    /// Distinct from [`Storage`](Self::Storage) because the two demand
+    /// opposite reactions from the agent reading the message: a storage
+    /// failure means "nothing happened, try again or give up", and this
+    /// means "something was destroyed, re-run to finish the job". A
+    /// caller that renders both as a bare failure tells its user the
+    /// destroyed records are still there.
+    #[error("Partially applied: {0}")]
+    PartiallyApplied(String),
 }
 
 impl BridgeError {

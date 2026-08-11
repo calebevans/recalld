@@ -1066,54 +1066,46 @@ impl MetadataStore {
         &self,
         namespace_id: NamespaceId,
         batch_size: usize,
-    ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+    ) -> Result<Vec<(MemoryId, DiskRecord)>, PartialPurge> {
         // chunks(0) panics, and a zero batch would never terminate
         // anyway.
         let batch_size = batch_size.max(1);
         let ns = namespace_id.get();
 
         // Pass 1: read scan. Collects tombstones as well as live rows.
-        let victims: Vec<(MemoryId, DiskRecord)> = {
-            let read_txn = self.db.begin_read()?;
-            let table = read_txn.open_table(META_TABLE)?;
-            let mut found = Vec::new();
-            for result in table.iter()? {
-                let (key_bytes, value) = result?;
-                let record = DiskRecord::from_bytes(value.value())?;
-                if record.namespace_id != ns {
-                    continue;
-                }
-                let uuid = uuid::Uuid::from_slice(key_bytes.value())
-                    .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
-                found.push((MemoryId::from_uuid(uuid), record));
+        // Nothing is committed yet, so a failure here destroyed nothing.
+        let victims = match self.scan_namespace_records(ns) {
+            Ok(v) => v,
+            Err(source) => {
+                return Err(PartialPurge {
+                    destroyed: Vec::new(),
+                    source,
+                });
             }
-            found
         };
 
         if victims.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Pass 2: chunked removal.
+        // Pass 2: chunked removal. Each chunk that commits is gone
+        // forever, so the count of committed chunks travels with the
+        // error rather than being thrown away with it.
+        let mut destroyed: Vec<(MemoryId, DiskRecord)> = Vec::with_capacity(victims.len());
         for chunk in victims.chunks(batch_size) {
-            let write_txn = self.db.begin_write()?;
-            {
-                let mut meta = write_txn.open_table(META_TABLE)?;
-                let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
-                let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
-
-                for (id, record) in chunk {
-                    let key = id.as_bytes().as_slice();
-                    meta.remove(key)?;
-                    for tag in &record.tags {
-                        tags.remove(tag.as_str(), key)?;
+            if let Err(source) = self.purge_one_chunk(ns, chunk) {
+                // The bitmaps for what DID go are dropped slot by slot:
+                // `remove_namespace` would drop the survivors' entries
+                // too, and the survivors are still live records.
+                {
+                    let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+                    for (_, record) in &destroyed {
+                        pi.remove(ns, record.vector_slot, record.phase);
                     }
-                    // A tombstoned record was already unlinked from
-                    // NAMESPACE_INDEX; removing again is a no-op.
-                    ns_idx.remove(ns, key)?;
                 }
+                return Err(PartialPurge { destroyed, source });
             }
-            write_txn.commit()?;
+            destroyed.extend_from_slice(chunk);
         }
 
         // The whole namespace is gone, so drop its bitmaps wholesale
@@ -1123,7 +1115,88 @@ impl MetadataStore {
             pi.remove_namespace(ns);
         }
 
-        Ok(victims)
+        Ok(destroyed)
+    }
+
+    /// Every `META_TABLE` row belonging to `ns`, tombstones included.
+    fn scan_namespace_records(&self, ns: u32) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(META_TABLE)?;
+        let mut found = Vec::new();
+        for result in table.iter()? {
+            let (key_bytes, value) = result?;
+            let record = DiskRecord::from_bytes(value.value())?;
+            if record.namespace_id != ns {
+                continue;
+            }
+            let uuid = uuid::Uuid::from_slice(key_bytes.value())
+                .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
+            found.push((MemoryId::from_uuid(uuid), record));
+        }
+        Ok(found)
+    }
+
+    /// Remove one chunk of records, with their tag and namespace index
+    /// entries, in a single transaction.
+    fn purge_one_chunk(
+        &self,
+        ns: u32,
+        chunk: &[(MemoryId, DiskRecord)],
+    ) -> Result<(), StorageError> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut meta = write_txn.open_table(META_TABLE)?;
+            let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
+            let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+
+            for (id, record) in chunk {
+                let key = id.as_bytes().as_slice();
+                meta.remove(key)?;
+                for tag in &record.tags {
+                    tags.remove(tag.as_str(), key)?;
+                }
+                // A tombstoned record was already unlinked from
+                // NAMESPACE_INDEX; removing again is a no-op.
+                ns_idx.remove(ns, key)?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+}
+
+/// A [`MetadataStore::purge_namespace_records`] that stopped part-way.
+///
+/// Removal is chunked, so a failure in chunk N leaves chunks `0..N`
+/// committed and permanently gone. Carrying that list out with the error
+/// is the difference between a caller that can finish the job — free the
+/// vector slots and clean the FTS, vector, entity and graph entries those
+/// records still occupy — and one that reports a bare failure and strands
+/// them in every index for the life of the database, where a retry cannot
+/// find them because their `META_TABLE` rows are already gone.
+#[derive(Debug)]
+pub struct PartialPurge {
+    /// Records already removed. Permanently destroyed; the caller still
+    /// owes them index cleanup.
+    pub destroyed: Vec<(MemoryId, DiskRecord)>,
+    /// What stopped the purge.
+    pub source: StorageError,
+}
+
+impl std::fmt::Display for PartialPurge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} records were destroyed before the purge failed: {}",
+            self.destroyed.len(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for PartialPurge {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 

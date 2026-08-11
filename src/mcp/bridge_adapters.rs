@@ -1654,6 +1654,28 @@ impl McpNamespaceAdapter {
     }
 }
 
+/// A namespace deletion that failed, and what it had already destroyed.
+///
+/// Exists because `spawn_blocking` can only hand back one value: the
+/// error the caller sees and the records the caller still owes index
+/// cleanup for have to travel together, or the second is lost.
+struct DeleteFailure {
+    /// Records destroyed before the failure. Empty when nothing was.
+    destroyed: Vec<(MemoryId, crate::model::DiskRecord)>,
+    /// What the caller is told.
+    error: bridge::BridgeError,
+}
+
+impl DeleteFailure {
+    /// A failure that destroyed nothing.
+    fn nothing_destroyed(error: bridge::BridgeError) -> Self {
+        Self {
+            destroyed: Vec::new(),
+            error,
+        }
+    }
+}
+
 #[async_trait]
 impl bridge::NamespaceRegistry for McpNamespaceAdapter {
     async fn list_namespaces(&self) -> Result<Vec<bridge::NamespaceInfo>, bridge::BridgeError> {
@@ -1903,20 +1925,28 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         // two blocking hops would open a window in which a memory stored
         // between the check and the purge is destroyed by a check that
         // said "empty".
-        let purged = {
+        let outcome = {
             let storage = self.storage.clone();
             let name = input.name.clone();
             let force = input.force;
             tokio::task::spawn_blocking(move || {
                 let mut storage_w = storage.write().map_err(|e| {
-                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                    DeleteFailure::nothing_destroyed(bridge::BridgeError::Internal(format!(
+                        "storage lock poisoned: {e}"
+                    )))
                 })?;
 
                 let config = storage_w
                     .get_namespace_by_name(&name)
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+                    .map_err(|e| {
+                        DeleteFailure::nothing_destroyed(bridge::BridgeError::Storage(
+                            e.to_string(),
+                        ))
+                    })?
                     .ok_or_else(|| {
-                        bridge::BridgeError::NotFound(format!("namespace '{name}' not found"))
+                        DeleteFailure::nothing_destroyed(bridge::BridgeError::NotFound(format!(
+                            "namespace '{name}' not found"
+                        )))
                     })?;
 
                 if !force {
@@ -1929,26 +1959,67 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                     let live = storage_w
                         .meta_store()
                         .count_memories_in_namespace(config.id)
-                        .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+                        .map_err(|e| {
+                            DeleteFailure::nothing_destroyed(bridge::BridgeError::Storage(
+                                e.to_string(),
+                            ))
+                        })?;
                     if live > 0 {
                         // Nothing has been touched at this point.
-                        return Err(bridge::BridgeError::InvalidInput(format!(
-                            "Namespace '{name}' still holds {live} memories. Deleting it \
-                             permanently destroys them and removes its vector file from \
-                             disk; there is no undo and no backup. Re-run with \
-                             force: true to proceed."
-                        )));
+                        return Err(DeleteFailure::nothing_destroyed(
+                            bridge::BridgeError::InvalidInput(format!(
+                                "Namespace '{name}' still holds {live} memories. Deleting it \
+                                 permanently destroys them and removes its vector file from \
+                                 disk; there is no undo and no backup. Re-run with \
+                                 force: true to proceed."
+                            )),
+                        ));
                     }
                 }
 
-                storage_w
-                    .purge_namespace(config.id)
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))
+                storage_w.purge_namespace(config.id).map_err(|e| {
+                    let error = if e.is_partial() {
+                        bridge::BridgeError::PartiallyApplied(format!(
+                            "Namespace '{name}' was PARTIALLY destroyed: {} memories are \
+                             permanently gone, and the namespace still exists holding the \
+                             rest. Re-run delete_namespace to finish it. Cause: {}",
+                            e.destroyed.len(),
+                            e.source
+                        ))
+                    } else {
+                        bridge::BridgeError::Storage(e.source.to_string())
+                    };
+                    DeleteFailure {
+                        destroyed: e.destroyed,
+                        error,
+                    }
+                })
             })
             .await
-            .map_err(|e| {
-                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
-            })??
+            .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
+        };
+
+        let purged = match outcome {
+            Ok(purged) => purged,
+            Err(failure) => {
+                // The records in `failure.destroyed` are already gone
+                // from meta.db and nothing else will ever reach their
+                // index entries: a retry looks in META_TABLE and finds
+                // them missing. Per-record FTS removal, not
+                // whole-namespace — the namespace still holds the
+                // records the purge did not get to, and their rows must
+                // stay.
+                if !failure.destroyed.is_empty() {
+                    crate::index_cleanup::purge_from_indexes(
+                        &self.index_handles(),
+                        &failure.destroyed,
+                        crate::index_cleanup::FtsAction::PerRecord,
+                        crate::index_cleanup::GraphAction::RemoveNode,
+                    )
+                    .await;
+                }
+                return Err(failure.error);
+            }
         };
 
         // Whole-namespace FTS removal, not per record: it also reaches

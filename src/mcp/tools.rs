@@ -1405,6 +1405,11 @@ async fn handle_delete_namespace(
             Ok(r) => r,
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
         },
+        // A partial purge is not a failed delete. Prefixing it with
+        // "Failed to delete namespace" would tell the agent nothing
+        // happened, when in fact memories were destroyed and the job
+        // needs finishing — so the message passes through unwrapped.
+        Err(crate::mcp::bridge::BridgeError::PartiallyApplied(msg)) => ToolCallResult::error(msg),
         Err(e) => ToolCallResult::error(format!("Failed to delete namespace: {e}")),
     }
 }
@@ -2298,5 +2303,72 @@ mod tests {
                 .contains("Cannot be combined"),
             "the mutual exclusion has to be in the schema, not just the error"
         );
+    }
+
+    // ── partial namespace purge ──────────────────────────────────────
+
+    /// A purge that destroyed 2,000 memories and then failed is not a
+    /// delete that failed. Rendering it as "Failed to delete namespace"
+    /// tells the agent nothing happened, so it moves on and the
+    /// half-purged namespace is never finished — and the memories are
+    /// gone either way.
+    #[tokio::test]
+    async fn w52_a_partial_purge_says_partially_destroyed_not_failed() {
+        let bridge = crate::test_support::StubBridge {
+            delete_namespace_error: Some(crate::mcp::bridge::BridgeError::PartiallyApplied(
+                "Namespace 'scratch' was PARTIALLY destroyed: 2000 memories are \
+                 permanently gone. Re-run delete_namespace to finish it."
+                    .to_string(),
+            )),
+        }
+        .into_bridge();
+
+        let result =
+            handle_delete_namespace(&bridge, json!({ "name": "scratch", "force": true })).await;
+
+        assert_eq!(result.is_error, Some(true));
+        let text = tool_text(&result);
+        assert!(
+            text.contains("PARTIALLY destroyed") && text.contains("Re-run"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Failed to delete namespace"),
+            "a partial purge must not be reported as a plain failure: {text}"
+        );
+    }
+
+    /// The other direction: an ordinary failure keeps the prefix that
+    /// says nothing was destroyed.
+    #[tokio::test]
+    async fn w53_an_ordinary_delete_failure_keeps_the_failed_prefix() {
+        let bridge = crate::test_support::StubBridge {
+            delete_namespace_error: Some(crate::mcp::bridge::BridgeError::Storage(
+                "disk on fire".to_string(),
+            )),
+        }
+        .into_bridge();
+
+        let result =
+            handle_delete_namespace(&bridge, json!({ "name": "scratch", "force": true })).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            tool_text(&result).contains("Failed to delete namespace"),
+            "{:?}",
+            tool_text(&result)
+        );
+    }
+
+    /// The text of a tool result, joined across content blocks.
+    fn tool_text(result: &ToolCallResult) -> String {
+        result
+            .content
+            .iter()
+            .map(|c| match c {
+                crate::mcp::protocol::ContentBlock::Text { text } => text.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

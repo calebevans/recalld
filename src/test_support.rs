@@ -283,3 +283,162 @@ impl Fixture {
             .expect("load edges")
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Stub MCP bridge
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A bridge whose every operation panics, except the ones a test asks
+/// for.
+///
+/// The subject is the tool handler's own behaviour — the argument
+/// checking and the error rendering it does BEFORE and AFTER the bridge
+/// call. `unreachable!()` on everything else is the assertion: a handler
+/// that was supposed to reject its arguments and instead ran the query
+/// fails loudly rather than silently returning an empty result that
+/// looks like a pass.
+#[derive(Default)]
+pub(crate) struct StubBridge {
+    /// What `delete_namespace` returns instead of doing anything.
+    pub(crate) delete_namespace_error: Option<crate::mcp::bridge::BridgeError>,
+}
+
+impl StubBridge {
+    /// Wrap this stub in an [`McpBridge`](crate::mcp::bridge::McpBridge)
+    /// with `default` as the session namespace.
+    pub(crate) fn into_bridge(self) -> crate::mcp::bridge::McpBridge {
+        let shared = Arc::new(self);
+        crate::mcp::bridge::McpBridge {
+            search: shared.clone(),
+            storage: shared.clone(),
+            namespaces: shared.clone(),
+            health: shared,
+            default_namespace: crate::model::constants::DEFAULT_NAMESPACE_NAME.to_string(),
+            timezone: chrono_tz::UTC,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mcp::bridge::SearchPipeline for StubBridge {
+    async fn search(
+        &self,
+        _: crate::mcp::bridge::SearchInput,
+    ) -> Result<crate::mcp::bridge::SearchResponse, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before searching")
+    }
+    async fn find_similar(
+        &self,
+        _: MemoryId,
+        _: usize,
+        _: Option<f32>,
+        _: bool,
+    ) -> Result<Vec<crate::mcp::bridge::SearchHit>, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before searching")
+    }
+    async fn scan_duplicates(
+        &self,
+        _: &str,
+        _: f32,
+        _: usize,
+    ) -> Result<Vec<crate::mcp::bridge::DuplicateCluster>, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before scanning")
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mcp::bridge::StorageEngine for StubBridge {
+    async fn store_memory(
+        &self,
+        _: crate::mcp::bridge::StoreInput,
+    ) -> Result<crate::mcp::bridge::StoredMemory, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before storing")
+    }
+    async fn get_memory(
+        &self,
+        _: MemoryId,
+    ) -> Result<Option<crate::mcp::bridge::MemoryRecord>, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before reading")
+    }
+    async fn delete_memory(&self, _: MemoryId) -> Result<bool, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before deleting")
+    }
+    async fn delete_memories(
+        &self,
+        _: &[MemoryId],
+    ) -> Result<Vec<bool>, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before deleting")
+    }
+    async fn reinforce_memory(
+        &self,
+        _: MemoryId,
+        _: u8,
+    ) -> Result<crate::mcp::bridge::ReinforceResult, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before reinforcing")
+    }
+    async fn list_memories(
+        &self,
+        _: crate::mcp::bridge::ListMemoriesInput,
+    ) -> Result<crate::mcp::bridge::ListMemoriesResponse, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before listing")
+    }
+    async fn list_tags(
+        &self,
+        _: crate::mcp::bridge::ListTagsInput,
+    ) -> Result<crate::mcp::bridge::ListTagsResponse, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before listing")
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mcp::bridge::NamespaceRegistry for StubBridge {
+    async fn list_namespaces(
+        &self,
+    ) -> Result<Vec<crate::mcp::bridge::NamespaceInfo>, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before listing")
+    }
+    async fn create_namespace(
+        &self,
+        _: crate::mcp::bridge::CreateNamespaceInput,
+    ) -> Result<crate::mcp::bridge::NamespaceInfo, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before creating")
+    }
+    async fn namespace_stats(
+        &self,
+        _: &str,
+    ) -> Result<crate::mcp::bridge::NamespaceStats, crate::mcp::bridge::BridgeError> {
+        unreachable!("the handler was expected to reject its arguments before reading stats")
+    }
+    async fn delete_namespace(
+        &self,
+        _: crate::mcp::bridge::DeleteNamespaceInput,
+    ) -> Result<crate::mcp::bridge::DeleteNamespaceResult, crate::mcp::bridge::BridgeError> {
+        match &self.delete_namespace_error {
+            Some(e) => Err(clone_bridge_error(e)),
+            None => {
+                unreachable!("the handler was expected to reject its arguments before deleting")
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mcp::bridge::HealthChecker for StubBridge {
+    async fn check_health(&self) -> crate::mcp::bridge::HealthStatus {
+        unreachable!("no test in this module checks health")
+    }
+}
+
+/// `BridgeError` is not `Clone`; this is enough of one for a stub.
+fn clone_bridge_error(e: &crate::mcp::bridge::BridgeError) -> crate::mcp::bridge::BridgeError {
+    use crate::mcp::bridge::BridgeError as E;
+    match e {
+        E::NotFound(m) => E::NotFound(m.clone()),
+        E::InvalidInput(m) => E::InvalidInput(m.clone()),
+        E::Storage(m) => E::Storage(m.clone()),
+        E::Search(m) => E::Search(m.clone()),
+        E::Internal(m) => E::Internal(m.clone()),
+        E::TooLarge(m) => E::TooLarge(m.clone()),
+        E::PartiallyApplied(m) => E::PartiallyApplied(m.clone()),
+    }
+}
