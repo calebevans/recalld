@@ -894,12 +894,31 @@ impl MetadataStore {
         let new_id;
         {
             // Check name uniqueness by scanning existing namespaces.
+            //
+            // Case-INSENSITIVELY, because the name becomes a directory
+            // name and macOS APFS, Windows NTFS and a case-insensitive
+            // ext4 volume all give "notes" and "Notes" the SAME
+            // directory. Two rows sharing one directory is not a
+            // cosmetic collision:
+            //
+            // - delete "notes" (row gone, remove_dir_all fails, warn
+            //   only), create "Notes", and the new namespace adopts the
+            //   old one's `vectors.dat` — somebody else's embeddings.
+            // - `create_namespace("Default")` used to pass the
+            //   uniqueness check, commit its row, no-op `create_dir_all`
+            //   onto `default/` and only then fail on the exclusive
+            //   flock. The row survived, and `delete_namespace("Default")`
+            //   walked past the `!= "default"` guard and unlinked the
+            //   real default's vectors.
+            //
+            // `validate_namespace_name` restricts names to ASCII, so
+            // ASCII case folding is total here.
             let ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
             for result in ns_table.iter()? {
                 let (_, value) = result?;
                 let existing: NamespaceConfig = serde_json::from_slice(value.value())
                     .map_err(|e| StorageError::Deserialize(e.to_string()))?;
-                if existing.name == config.name {
+                if existing.name.eq_ignore_ascii_case(&config.name) {
                     return Err(StorageError::DuplicateName(config.name.clone()));
                 }
             }
@@ -958,12 +977,27 @@ impl MetadataStore {
 
     /// Get a namespace by name (linear scan -- acceptable for <100
     /// namespaces).
+    ///
+    /// Matching is case-insensitive, to agree with the uniqueness rule
+    /// in [`create_namespace`](Self::create_namespace) — a name that
+    /// cannot be created because it collides case-insensitively must
+    /// also resolve case-insensitively, or `create` says "duplicate"
+    /// while `stats` says "not found" for the same string.
+    ///
+    /// An exact match wins over a case-folded one. That only matters for
+    /// a database written before the uniqueness rule folded case, which
+    /// can already hold both `notes` and `Notes`; preferring the exact
+    /// match keeps each of those rows individually addressable rather
+    /// than resolving both to whichever the scan reaches first.
     pub fn get_namespace_by_name(
         &self,
         name: &str,
     ) -> Result<Option<NamespaceConfig>, StorageError> {
         let all = self.list_namespaces()?;
-        Ok(all.into_iter().find(|c| c.name == name))
+        if let Some(exact) = all.iter().find(|c| c.name == name) {
+            return Ok(Some(exact.clone()));
+        }
+        Ok(all.into_iter().find(|c| c.name.eq_ignore_ascii_case(name)))
     }
 
     /// Update a namespace's mutable fields (name, thresholds, etc.).

@@ -1882,7 +1882,14 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         // boot sweep would remove that directory first, which makes the
         // failure unlikely rather than impossible, and "unlikely" is not
         // the right guarantee for silently wrong vectors.
-        if input.name == DEFAULT_NAMESPACE_NAME {
+        //
+        // Compared case-insensitively, because the guard protects a
+        // DIRECTORY and macOS APFS resolves `Default/` to `default/`.
+        // With an exact compare, `create_namespace("Default")` +
+        // `delete_namespace("Default", force: true)` walked straight
+        // past this and unlinked the real default's vectors.dat; on the
+        // next boot every record's vector_slot pointed past EOF.
+        if input.name.eq_ignore_ascii_case(DEFAULT_NAMESPACE_NAME) {
             return Err(bridge::BridgeError::InvalidInput(format!(
                 "The '{DEFAULT_NAMESPACE_NAME}' namespace cannot be deleted. It is \
                  recreated on every startup under the same directory name, so deleting \
@@ -3116,6 +3123,64 @@ mod tests {
         assert!(
             fx.namespace_dir("default").join("vectors.dat").exists(),
             "the default namespace's vectors were destroyed"
+        );
+    }
+
+    // ── case-insensitive namespace identity ──────────────────────────
+
+    /// Chain B. `create_namespace("Default")` passed the exact-match
+    /// uniqueness check, committed its row, and only then failed on the
+    /// default namespace's exclusive flock — so the caller saw an error
+    /// and the row survived. `delete_namespace("Default", force: true)`
+    /// then walked past `"Default" != "default"` and pointed
+    /// `remove_dir_all` at the real `default/`, taking its vectors.dat
+    /// with it. On the next boot every record's vector_slot is past EOF.
+    #[tokio::test]
+    async fn w48_the_default_namespace_is_refused_under_any_casing() {
+        let fx = Fixture::new();
+        let adapter = fx.namespace_adapter();
+
+        for spelling in ["Default", "DEFAULT", "dEfAuLt"] {
+            let create = adapter
+                .create_namespace(bridge::CreateNamespaceInput {
+                    name: spelling.to_string(),
+                    embedding_dim: Some(crate::test_support::DIM as u16),
+                    initial_stability: None,
+                    desired_retention: None,
+                    decay_rate_multiplier: None,
+                })
+                .await;
+            assert!(
+                create.is_err(),
+                "{spelling} was created alongside the default namespace"
+            );
+
+            let err = adapter
+                .delete_namespace(bridge::DeleteNamespaceInput {
+                    name: spelling.to_string(),
+                    force: true,
+                })
+                .await
+                .expect_err("the default namespace must never be deletable");
+            assert!(
+                matches!(err, bridge::BridgeError::InvalidInput(_)),
+                "{spelling}: {err:?}"
+            );
+        }
+
+        assert!(
+            fx.namespace_dir("default").join("vectors.dat").exists(),
+            "the default namespace's vector file was destroyed"
+        );
+        assert_eq!(
+            fx.storage
+                .read()
+                .expect("storage lock")
+                .list_namespaces()
+                .expect("list")
+                .len(),
+            1,
+            "a case-variant of 'default' left a namespace row behind"
         );
     }
 }

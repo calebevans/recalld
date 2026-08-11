@@ -1380,7 +1380,9 @@ async fn handle_delete_namespace(
     // Refused here as well as in the adapter. This copy saves a daemon
     // round trip; the adapter's copy is the load-bearing one, because
     // the socket is its own entry point.
-    if name == DEFAULT_NAMESPACE_NAME {
+    // Case-insensitive: the guard protects a directory, and a
+    // case-insensitive filesystem resolves `Default/` to `default/`.
+    if name.eq_ignore_ascii_case(DEFAULT_NAMESPACE_NAME) {
         return ToolCallResult::error(format!(
             "The '{DEFAULT_NAMESPACE_NAME}' namespace cannot be deleted. It is recreated \
              on every startup under the same directory name, so deleting it would leave \

@@ -419,7 +419,10 @@ impl RedbStorageEngine {
     ///   `db_path` is reported as a symlink and skipped rather than
     ///   followed into someone else's tree.
     /// - have a UTF-8 name (a name we cannot compare against `live` is
-    ///   a name we cannot prove is dead).
+    ///   a name we cannot prove is dead). The comparison itself is ASCII
+    ///   case-folded: on a case-insensitive filesystem the live
+    ///   namespace `Notes` and the directory `notes/` are the same
+    ///   directory, and an exact-string compare would call it dead.
     /// - not start with `.` — dotfile directories are conventionally
     ///   somebody else's state.
     /// - **contain `vectors.dat` and nothing else.** This is the load-
@@ -428,11 +431,21 @@ impl RedbStorageEngine {
     ///
     /// Anything that fails a guard is logged and left strictly alone.
     fn sweep_orphan_namespace_dirs(&self) -> Result<usize, StorageError> {
+        // Case-folded, because the identity that matters here is the
+        // one the FILESYSTEM uses and macOS APFS is case-insensitive by
+        // default. An exact-string compare let a live namespace named
+        // `Notes` fail to claim the directory `notes/` that it is
+        // actually reading and writing — and the shape guard passes,
+        // because it is genuinely a namespace directory. The sweep then
+        // deleted a live namespace's vectors, unattended, at boot.
+        //
+        // Folding is the conservative direction: it can only ever make
+        // this refuse to delete something, never delete more.
         let live: HashSet<String> = self
             .meta_store
             .list_namespaces()?
             .into_iter()
-            .map(|ns| ns.name)
+            .map(|ns| ns.name.to_ascii_lowercase())
             .collect();
 
         let mut removed = 0usize;
@@ -469,7 +482,7 @@ impl RedbStorageEngine {
                 continue;
             };
 
-            if name.starts_with('.') || live.contains(name) {
+            if name.starts_with('.') || live.contains(&name.to_ascii_lowercase()) {
                 continue;
             }
 
@@ -1618,6 +1631,82 @@ mod tests {
 
         RedbStorageEngine::open(dir.path())
             .expect("a rejected create_namespace must not wedge the next startup");
+    }
+
+    // ── case-insensitive namespace identity ──────────────────────────
+
+    /// Chain A. On a case-insensitive filesystem `notes/` and `Notes/`
+    /// are one directory, so two rows pointing at it is two namespaces
+    /// sharing one `vectors.dat`. The uniqueness check compared names
+    /// exactly and let the second row in.
+    #[test]
+    fn w49_a_namespace_name_differing_only_in_case_is_a_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        make_namespace(&mut engine, "notes");
+
+        for collision in ["Notes", "NOTES", "nOtEs"] {
+            let mut config = NamespaceConfig::default_namespace(0);
+            config.name = collision.to_string();
+            config.embedding_dim = DIM as u32;
+            let err = engine
+                .create_namespace(&config)
+                .expect_err("a case-variant name must collide");
+            assert!(
+                matches!(err, StorageError::DuplicateName(_)),
+                "{collision}: {err}"
+            );
+        }
+
+        assert_eq!(engine.list_namespaces().expect("list").len(), 1);
+    }
+
+    /// The lookup has to agree with the uniqueness rule, or
+    /// `create_namespace` reports "duplicate" and `namespace_stats`
+    /// reports "not found" for the same string.
+    #[test]
+    fn w50_a_namespace_resolves_by_name_regardless_of_case() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "notes");
+
+        for spelling in ["notes", "Notes", "NOTES"] {
+            assert_eq!(
+                engine
+                    .get_namespace_by_name(spelling)
+                    .expect("lookup")
+                    .map(|c| c.id),
+                Some(ns),
+                "{spelling} did not resolve"
+            );
+        }
+    }
+
+    /// The unattended half of chain A. A live namespace whose directory
+    /// differs from its row only in case used to be invisible to the
+    /// sweep's exact-string compare, and the shape guard cannot save it
+    /// — it really is a namespace directory. Boot then deleted a live
+    /// namespace's vectors.
+    #[test]
+    fn w51_the_boot_sweep_does_not_delete_a_case_variant_live_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        {
+            let mut engine = open_engine(dir.path());
+            make_namespace(&mut engine, "Notes");
+            // The directory as a case-insensitive filesystem would have
+            // recorded it, planted explicitly so the test proves the
+            // same thing on a case-sensitive one.
+            plant_orphan_dir(dir.path(), "notes");
+        }
+
+        let _engine = open_engine(dir.path());
+
+        assert!(
+            dir.path().join("notes").join("vectors.dat").exists(),
+            "the boot sweep destroyed a live namespace's vectors"
+        );
     }
 
     /// Whether the database files a purge must never touch are all still
