@@ -41,6 +41,8 @@ pub mod search;
 pub mod serialization;
 pub mod storage;
 pub mod system;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod time;
 
 // ── Top-level re-exports ─────────────────────────────────────────────
