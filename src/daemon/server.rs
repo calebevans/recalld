@@ -458,6 +458,16 @@ async fn dispatch(
         "delete_memories" => {
             let p: DeleteMemoriesParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            // The socket is its own entry point: the tool layer's cap is
+            // not on this path, and an uncapped batch is one write
+            // transaction over an unbounded id list.
+            if p.ids.len() > crate::model::constants::MAX_BATCH_MEMORIES {
+                return Err(BridgeError::InvalidInput(format!(
+                    "Too many ids ({}); the maximum is {} per call",
+                    p.ids.len(),
+                    crate::model::constants::MAX_BATCH_MEMORIES
+                )));
+            }
             let mut ids = Vec::with_capacity(p.ids.len());
             for id in &p.ids {
                 ids.push(parse_memory_id(id)?);
@@ -812,6 +822,28 @@ mod tests {
     }
 
     // 24
+    /// The tool layer caps a `forget_memories` batch at
+    /// `MAX_BATCH_MEMORIES`, but the socket is its own entry point and
+    /// never runs the tool handler. Without this the frame goes straight
+    /// to one write transaction over an unbounded id list — and the stub
+    /// `delete_memories` is `unreachable!()`, so reaching it fails the
+    /// test rather than passing it quietly.
+    #[tokio::test]
+    async fn w70_delete_memories_caps_the_batch_at_the_shared_constant() {
+        let over_cap: Vec<String> = (0..crate::model::constants::MAX_BATCH_MEMORIES + 1)
+            .map(|_| crate::model::MemoryId::new().to_string())
+            .collect();
+
+        let err = dispatch_stub("delete_memories", serde_json::json!({ "ids": over_cap }))
+            .await
+            .expect_err("an over-cap batch must be refused");
+
+        assert!(
+            matches!(err, BridgeError::InvalidInput(ref m) if m.contains("Too many ids")),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_unknown_method_returns_invalid_input() {
         let err = dispatch_stub("no_such_method", serde_json::json!({}))

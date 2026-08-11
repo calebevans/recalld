@@ -916,6 +916,33 @@ async fn handle_forget_memories(
     if !parsed.is_empty() {
         let ids: Vec<crate::model::MemoryId> = parsed.iter().map(|(_, id)| *id).collect();
         match bridge.storage.delete_memories(&ids).await {
+            // One flag per id, in input order, is the contract. The
+            // in-process adapter keeps it by construction, but this also
+            // decodes a `Vec<bool>` off the daemon socket — and `zip`
+            // stops at the shorter side, so a short response would leave
+            // `Value::Null` entries in `results`, under-count `deleted`,
+            // and report all of it as a success.
+            Ok(flags) if flags.len() != parsed.len() => {
+                let detail = format!(
+                    "delete_memories returned {} results for {} ids; no per-id outcome \
+                     can be reported. Re-read the ids to find out which were deleted.",
+                    flags.len(),
+                    parsed.len()
+                );
+                tracing::error!(
+                    tool = "forget_memories",
+                    returned = flags.len(),
+                    requested = parsed.len(),
+                    "delete_memories broke its one-flag-per-id contract"
+                );
+                for (index, id) in &parsed {
+                    results[*index] = json!({
+                        "index": index,
+                        "id": id.to_string(),
+                        "error": detail,
+                    });
+                }
+            }
             Ok(flags) => {
                 for ((index, id), deleted) in parsed.iter().zip(flags) {
                     results[*index] = json!({
@@ -2288,6 +2315,7 @@ mod tests {
                  permanently gone. Re-run delete_namespace to finish it."
                     .to_string(),
             )),
+            ..Default::default()
         }
         .into_bridge();
 
@@ -2314,6 +2342,7 @@ mod tests {
             delete_namespace_error: Some(crate::mcp::bridge::BridgeError::Storage(
                 "disk on fire".to_string(),
             )),
+            ..Default::default()
         }
         .into_bridge();
 
@@ -2326,6 +2355,46 @@ mod tests {
             "{:?}",
             tool_text(&result)
         );
+    }
+
+    // ── batch result assembly ────────────────────────────────────────
+
+    /// `zip` stops at the shorter side. A `delete_memories` that came
+    /// back one flag short — this decodes a bare `Vec<bool>` off the
+    /// daemon socket, so nothing structural prevents it — left a
+    /// `Value::Null` in `results`, under-counted `deleted`, and reported
+    /// the whole thing as a success.
+    #[tokio::test]
+    async fn w71_a_short_delete_memories_response_is_an_error_per_id() {
+        let ids: Vec<String> = (0..3)
+            .map(|_| crate::model::MemoryId::new().to_string())
+            .collect();
+
+        let bridge = crate::test_support::StubBridge {
+            // Two flags for three ids.
+            delete_memories_result: Some(vec![true, true]),
+            ..Default::default()
+        }
+        .into_bridge();
+
+        let result = handle_forget_memories(&bridge, json!({ "ids": ids })).await;
+        let payload: serde_json::Value =
+            serde_json::from_str(&tool_text(&result)).expect("the result is JSON");
+
+        assert_eq!(payload["total"], json!(3));
+        assert_eq!(
+            payload["deleted"],
+            json!(0),
+            "a broken contract must not be reported as a partial success: {payload}"
+        );
+        assert_eq!(payload["errors"], json!(3));
+        for entry in payload["results"].as_array().expect("results is an array") {
+            assert!(
+                !entry.is_null(),
+                "a null entry survived into the response: {payload}"
+            );
+            assert!(entry["error"].is_string(), "{entry}");
+        }
     }
 
     // ── strict argument checking on the search tools ─────────────────

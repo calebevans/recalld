@@ -301,6 +301,10 @@ impl Fixture {
 pub(crate) struct StubBridge {
     /// What `delete_namespace` returns instead of doing anything.
     pub(crate) delete_namespace_error: Option<crate::mcp::bridge::BridgeError>,
+    /// What `delete_memories` returns instead of doing anything.
+    /// Deliberately settable to a WRONG length, which is the contract
+    /// violation the handler has to notice.
+    pub(crate) delete_memories_result: Option<Vec<bool>>,
 }
 
 impl StubBridge {
@@ -367,7 +371,12 @@ impl crate::mcp::bridge::StorageEngine for StubBridge {
         &self,
         _: &[MemoryId],
     ) -> Result<Vec<bool>, crate::mcp::bridge::BridgeError> {
-        unreachable!("the handler was expected to reject its arguments before deleting")
+        match &self.delete_memories_result {
+            Some(flags) => Ok(flags.clone()),
+            None => {
+                unreachable!("the handler was expected to reject its arguments before deleting")
+            }
+        }
     }
     async fn reinforce_memory(
         &self,
