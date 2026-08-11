@@ -15,9 +15,9 @@ pub mod bridge_adapters;
 pub mod resources;
 pub mod tools;
 
-pub use http_transport::mcp_router;
+pub use http_transport::{McpHttpConfig, mcp_router};
 pub use protocol::*;
-pub use server::{McpHandler, McpServer};
+pub use server::{McpDispatcher, McpHandler, McpServer, RequestContext};
 pub use transport::run_stdio;
 
 use thiserror::Error;
@@ -32,10 +32,6 @@ pub enum McpError {
     /// A JSON serialization or deserialization error occurred.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-
-    /// The server has not been initialized yet.
-    #[error("Server not initialized")]
-    NotInitialized,
 
     /// The requested tool was not found.
     #[error("Tool not found: {0}")]

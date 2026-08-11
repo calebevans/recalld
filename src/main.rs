@@ -406,6 +406,14 @@ async fn run_serve(
         ..recalld::api::ApiConfig::from_server_config(&config.server)
     };
 
+    // `/mcp` is merged in outside the REST tower stack, so it carries its
+    // own body limit and Origin policy rather than inheriting them.
+    let mcp_http_config = recalld::mcp::McpHttpConfig {
+        max_body_bytes: config.server.max_body_bytes,
+        allowed_origins: config.server.mcp_allowed_origins.clone(),
+        ..Default::default()
+    };
+
     let system = match Recalld::new(config).await {
         Ok(s) => s,
         Err(e) => {
@@ -456,7 +464,7 @@ async fn run_serve(
     // Build MCP bridge and router for the /mcp endpoint.
     let mcp_bridge = create_direct_mcp_bridge(&system, default_namespace);
     let mcp_handler: Arc<dyn recalld::mcp::McpHandler> = Arc::new(mcp_bridge);
-    let mcp_router = recalld::mcp::mcp_router(mcp_handler);
+    let mcp_router = recalld::mcp::mcp_router(mcp_handler, mcp_http_config);
 
     // Start the API server (blocks until shutdown signal).
     match recalld::api::serve(app_state, api_config, Some(mcp_router)).await {

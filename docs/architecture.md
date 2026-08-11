@@ -674,16 +674,78 @@ recalld exposes the same core functionality through three transport layers:
 
 Two transports expose the same 9 MCP tools (`store_memory`, `store_memories`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `list_memories`) and memory resources:
 
+Both transports are **dual-era**: MCP 2026-07-28 (stateless) and 2025-06-18
+(legacy `initialize` handshake) are served on the same endpoint and process.
+The era is decided **per message**, not per connection:
+
+- A message whose `params._meta` carries
+  `io.modelcontextprotocol/protocolVersion` is served on the stateless modern
+  path. The key wins over the method name, so an `initialize` carrying modern
+  `_meta` gets `-32601` — that revision removed `initialize`.
+- An `initialize` or `notifications/initialized` message takes the legacy path.
+- `server/discover` and `ping` are answered on either path, without `_meta`, so
+  a modern client's era probe (`server/discover` first) works before it knows
+  which era the server speaks.
+- Anything else with neither marker is a legacy message: over HTTP it needs an
+  `Mcp-Session-Id`, over stdio it needs a prior `initialize`. Without either it
+  is rejected with `-32602` naming both remedies.
+
+Ten methods are dispatched: `server/discover`, `initialize` (legacy only),
+`ping` (legacy only), `tools/list`, `tools/call`, `resources/list`,
+`resources/templates/list`, `resources/read`, plus the
+`notifications/initialized` and `notifications/cancelled` notifications.
+
+Every result carries `resultType: "complete"` and
+`_meta["io.modelcontextprotocol/serverInfo"]`. The three catalogs and
+`server/discover` also carry SEP-2549 caching hints (`ttlMs` 3600000,
+`cacheScope: "public"` — recalld's catalogs are compile-time constants);
+`resources/read` carries `ttlMs: 0`, `cacheScope: "private"` because its
+contents are live instance state. These are top-level fields, siblings of
+`tools`/`resources`/`contents`, never nested in `_meta`. They are emitted on
+both eras: the 2025-06-18 `Result` type is an open index signature, so the
+extra keys are schema-legal there, not merely tolerated.
+
+`initialize` never echoes `2026-07-28`. It echoes the version the client
+asked for when we recognise it (`2025-06-18`, `2025-03-26`, `2024-11-05`),
+otherwise `2025-06-18`. Claiming the modern version in an `initialize`
+response would advertise a revision in which `initialize` does not exist.
+
 **Stdio** (`recalld mcp`):
 - Runs as a subprocess of an AI agent (Claude Code, Cursor, etc.).
 - Communicates via stdin/stdout using newline-delimited JSON-RPC 2.0.
+- A process is **not** a session for a modern client: the single `McpServer`
+  held for the process lifetime carries legacy lifecycle state only, and
+  modern requests never consult it.
 
 **HTTP** (`recalld serve`, endpoint `/mcp`):
 - Runs alongside the REST API on the same port.
-- Implements the MCP streamable HTTP transport (spec 2025-03-26).
-- Session management via `Mcp-Session-Id` header.
 - Responds with `application/json` for requests, `202 Accepted` for notifications.
 - Recommended transport for Docker containers and remote servers.
+- **Modern requests are stateless**: no session is minted, any inbound
+  `Mcp-Session-Id` is ignored, and dispatch takes no lock — concurrent clients
+  do not serialize behind one mutex. Clients must send the SEP-2243 headers
+  `Mcp-Method`, `MCP-Protocol-Version` and (on `tools/call`, `prompts/get`,
+  `resources/read`) `Mcp-Name`; each is validated against the body and a
+  mismatch is `400` + `-32020`. Values may use the `=?base64?…?=` sentinel.
+  Header validation is skipped on notification POSTs, which the revision
+  leaves undefined.
+- **`Mcp-Session-Id` is legacy-only.** A session is created only by a
+  *successful* `initialize`; a repeat `initialize` bearing a live session id
+  reuses it rather than orphaning it. Sessions expire after 30 minutes idle
+  (swept lazily, at most once a minute) and are capped at 1024 (`503` +
+  `-32603` beyond that). An unknown or expired session gets a `404` with a
+  JSON-RPC body telling the client to `initialize` again.
+- **`Origin` is validated** on every request (a spec MUST, and a real DNS
+  rebinding exposure for a loopback-bound server): absent → allowed
+  (non-browser client); `null` → `403`; any loopback host on any scheme or
+  port → allowed; otherwise it must match `server.mcp_allowed_origins`.
+- **10 MiB body limit** applied on the MCP router itself. `/mcp` is merged in
+  outside the REST tower stack, so it inherits neither that stack's body limit
+  (previously unlimited here) nor its 30s timeout — the timeout is omitted
+  deliberately, since tool calls may run long.
+- `GET /mcp`, and `DELETE` without a session id, return `405` with
+  `Allow: POST, DELETE`. The 2026-07-28 transport removed the GET stream
+  endpoint; recalld never had one.
 
 ### Daemon (Unix socket)
 

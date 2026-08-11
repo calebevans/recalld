@@ -179,7 +179,7 @@ See [docs/benchmark.md](docs/benchmark.md) for full methodology, per-category br
 recalld mcp
 ```
 
-**HTTP API** -- Runs a standalone HTTP server (default `127.0.0.1:7680`). Also exposes an MCP endpoint at `/mcp` using the streamable HTTP transport, so MCP clients can connect via URL.
+**HTTP API** -- Runs a standalone HTTP server (default `127.0.0.1:7680`). Also exposes an MCP endpoint at `/mcp`, so MCP clients can connect via URL. Both MCP transports are dual-era: stateless MCP 2026-07-28 and the legacy `initialize`/`Mcp-Session-Id` handshake (2025-06-18 and earlier) are served on the same endpoint, chosen per message.
 
 ```sh
 recalld serve

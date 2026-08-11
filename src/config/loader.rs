@@ -315,6 +315,20 @@ fn apply_env_overrides(config: &mut RecalldConfig) -> std::result::Result<(), Ve
         };
     }
 
+    // Helper for Vec<String> fields (comma-separated; empty clears).
+    macro_rules! env_override_string_list {
+        ($var:expr, $field:expr) => {
+            if let Ok(val) = std::env::var($var) {
+                $field = val
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+        };
+    }
+
     // Helper for Option<String> fields.
     macro_rules! env_override_opt_string {
         ($var:expr, $field:expr) => {
@@ -336,6 +350,10 @@ fn apply_env_overrides(config: &mut RecalldConfig) -> std::result::Result<(), Ve
         "RECALLD_SERVER_MAX_BODY_BYTES",
         config.server.max_body_bytes,
         usize
+    );
+    env_override_string_list!(
+        "RECALLD_SERVER_MCP_ALLOWED_ORIGINS",
+        config.server.mcp_allowed_origins
     );
 
     // --- Storage ---

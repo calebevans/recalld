@@ -188,9 +188,10 @@ HTTP API server settings.
 | `bind_address` | string | `"127.0.0.1"` | IP address to bind to. |
 | `port` | u16 | `7680` | TCP port to listen on. |
 | `request_timeout_ms` | u64 | `30000` | Maximum request time in milliseconds before abort. |
-| `max_body_bytes` | usize | `10485760` | Maximum request body size in bytes (10 MB). |
+| `max_body_bytes` | usize | `10485760` | Maximum request body size in bytes (10 MB). Also applied to `/mcp`. |
+| `mcp_allowed_origins` | array of string | `[]` | Extra browser origins allowed to call `/mcp`, beyond loopback. Matched case-insensitively and exactly, e.g. `["https://app.example.com"]`. Requests with no `Origin` header are always allowed; any loopback origin is allowed on any scheme or port; `Origin: null` is always rejected. |
 
-Env vars: `RECALLD_SERVER_BIND_ADDRESS`, `RECALLD_SERVER_PORT`, `RECALLD_SERVER_REQUEST_TIMEOUT_MS`, `RECALLD_SERVER_MAX_BODY_BYTES`
+Env vars: `RECALLD_SERVER_BIND_ADDRESS`, `RECALLD_SERVER_PORT`, `RECALLD_SERVER_REQUEST_TIMEOUT_MS`, `RECALLD_SERVER_MAX_BODY_BYTES`, `RECALLD_SERVER_MCP_ALLOWED_ORIGINS` (comma-separated)
 
 ### `[storage]`
 

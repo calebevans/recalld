@@ -87,7 +87,37 @@ Optional: add `--log-level <level>` to `args` for debug logging (logs go to stde
 }
 ```
 
-The HTTP endpoint is available whenever `recalld serve` is running. It implements the MCP streamable HTTP transport with session management via the `Mcp-Session-Id` header.
+The HTTP endpoint is available whenever `recalld serve` is running. It is a **dual-era** MCP endpoint: MCP 2026-07-28 (stateless) and MCP 2025-06-18 and earlier (the `initialize` handshake) are served on the same URL, and the era is chosen per message.
+
+**Modern clients (MCP 2026-07-28)** send no `initialize` and get no session. Every request carries its own identity in `params._meta`:
+
+```json
+"_meta": {
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientInfo": { "name": "ExampleClient", "version": "1.0.0" },
+  "io.modelcontextprotocol/clientCapabilities": {}
+}
+```
+
+`protocolVersion` and `clientCapabilities` are required (`-32602` naming the missing key if absent; `-32022` with `data.supported` if the version is one we do not serve). Every request must also mirror three SEP-2243 headers, which are validated against the body — a mismatch is HTTP 400 with JSON-RPC `-32020`:
+
+| Header | Value | Required for |
+|---|---|---|
+| `Mcp-Method` | the `method` field | every request |
+| `MCP-Protocol-Version` | `_meta`'s protocol version | every request |
+| `Mcp-Name` | `params.name`, or `params.uri` for `resources/read` | `tools/call`, `prompts/get`, `resources/read` |
+
+Values that are not safe plain ASCII may use the `=?base64?{value}?=` sentinel, which is decoded before comparison. Notification POSTs skip header validation — the revision leaves that case undefined.
+
+Modern responses never carry `Mcp-Session-Id`, and any session id sent on a modern request is ignored. Every result carries `resultType: "complete"` and `_meta["io.modelcontextprotocol/serverInfo"]`; `server/discover`, `tools/list`, `resources/list` and `resources/templates/list` also carry `ttlMs: 3600000` / `cacheScope: "public"`, and `resources/read` carries `ttlMs: 0` / `cacheScope: "private"`.
+
+Start with `server/discover`, which is answered on either era and needs no `_meta`. It returns `supportedVersions`, `capabilities` and `instructions`.
+
+**Legacy clients** work exactly as before: send `initialize`, get an `Mcp-Session-Id`, send it on every subsequent request. `initialize` echoes the version you asked for (`2025-06-18`, `2025-03-26` or `2024-11-05`; anything else falls back to `2025-06-18`) and never `2026-07-28`, since that revision has no `initialize`. Three behaviours are new: sessions expire after 30 minutes idle (the resulting 404 tells you to `initialize` again), at most 1024 may be live at once, and a *failed* `initialize` no longer leaves an unusable session behind.
+
+**Origin validation.** `/mcp` rejects browser requests from unexpected origins with HTTP 403 (DNS-rebinding protection for a loopback-bound server). Requests with no `Origin` header — curl, SDKs, anything non-browser — are always allowed, as is any loopback origin on any scheme or port. `Origin: null` (a `file://` page or sandboxed iframe) is rejected. To allow a real browser origin, list it in `server.mcp_allowed_origins` (or `RECALLD_SERVER_MCP_ALLOWED_ORIGINS`, comma-separated).
+
+Request bodies over `server.max_body_bytes` (10 MB by default) are rejected with HTTP 413; `/mcp` previously had no body limit at all. `GET /mcp`, and `DELETE` without a session id, return 405.
 
 Configure per-project namespace defaults in a `.recalld.toml` file (see above), not CLI flags.
 

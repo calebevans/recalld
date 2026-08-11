@@ -21,6 +21,14 @@ pub struct ServerConfig {
 
     /// Maximum request body size in bytes (prevents OOM from large payloads).
     pub max_body_bytes: usize,
+
+    /// Extra `Origin` values allowed to call `/mcp`, beyond loopback.
+    ///
+    /// Matched case-insensitively and exactly (scheme, host and port all
+    /// significant), e.g. `"https://app.example.com"`. Requests with no
+    /// `Origin` header are always allowed; loopback origins are always
+    /// allowed on any scheme or port.
+    pub mcp_allowed_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -30,6 +38,7 @@ impl Default for ServerConfig {
             port: 7680,
             request_timeout_ms: 30_000,
             max_body_bytes: 10 * 1024 * 1024, // 10 MB
+            mcp_allowed_origins: Vec::new(),
         }
     }
 }
