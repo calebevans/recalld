@@ -46,7 +46,7 @@
 
 use serde_json::Value;
 
-use crate::mcp::bridge::{ListMemoriesInput, ListTagsInput, StoreInput};
+use crate::mcp::bridge::{ListMemoriesInput, ListTagsInput, SearchInput, StoreInput};
 use crate::model::MemoryId;
 use crate::model::constants::{
     DEFAULT_LIST_LIMIT, DEFAULT_TAG_LIMIT, MAX_LIST_LIMIT, MAX_TAG_LIMIT,
@@ -718,6 +718,180 @@ pub fn parse_store_item(
         ));
     }
     parse_store_input(item, default_namespace)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Search-tool parsers
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The maximum `limit` a search tool will accept, matching the schema.
+const MAX_SEARCH_LIMIT: usize = 100;
+/// The `limit` a search uses when the caller names none.
+const DEFAULT_SEARCH_LIMIT: usize = 10;
+/// The maximum graph `depth` a recall will traverse, matching the schema.
+const MAX_RECALL_DEPTH: u64 = 3;
+
+/// Extract an optional floating-point parameter and check an inclusive
+/// range.
+///
+/// A JSON integer is a legitimate float (`1` is `1.0`); a numeric
+/// *string* is not, for the same reason [`opt_u64_in_range`] refuses
+/// one. Out of range is an error, not a clamp: `minScore: 5` asks for
+/// something the caller will not get, and silently answering a different
+/// question is what this module exists to stop.
+pub fn opt_f32_in_range(
+    obj: &Value,
+    key: &str,
+    min: f64,
+    max: f64,
+) -> Result<Option<f32>, ArgError> {
+    let Some(v) = field_opt(obj, key) else {
+        return Ok(None);
+    };
+    let Some(n) = v.as_f64() else {
+        return Err(ArgError::new(
+            key,
+            format!(
+                "Parameter '{key}' must be a number (got {})",
+                json_type_name(v)
+            ),
+        ));
+    };
+    if n.is_nan() || n < min || n > max {
+        return Err(ArgError::new(
+            key,
+            format!("Parameter '{key}' must be between {min} and {max} (got {n})"),
+        ));
+    }
+    Ok(Some(n as f32))
+}
+
+/// Extract an optional string parameter constrained to a fixed set.
+///
+/// A wrong-typed or unknown value is an error naming the alternatives.
+/// `mode` used to be read with `.and_then(|v| v.as_str())`, so
+/// `{"mode": 2}` silently ran "single" — a different operation from the
+/// one asked for.
+pub fn opt_enum(obj: &Value, key: &str, allowed: &[&str]) -> Result<Option<String>, ArgError> {
+    let Some(value) = opt_str(obj, key)? else {
+        return Ok(None);
+    };
+    if !allowed.contains(&value.as_str()) {
+        return Err(ArgError::new(
+            key,
+            format!(
+                "Parameter '{key}' must be one of {} (got {:?})",
+                allowed
+                    .iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                elide(&value, ECHO_MAX_BYTES)
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// A parsed `recall_memories` call.
+pub struct RecallArgs {
+    /// What the search pipeline is given.
+    pub input: SearchInput,
+    /// Whether to render the token-efficient response shape.
+    pub compact: bool,
+}
+
+/// Parse the arguments of a `recall_memories` call.
+///
+/// Only `namespace` was ever checked here. Everything else went through
+/// the `.get(k).and_then(..)` chain this module exists to replace, so
+/// `{"tags": "topic/rust"}` became `[]` and ran UNFILTERED over the
+/// whole namespace, `limit: 1000` was clamped to 100 (telling a
+/// paginating caller it had seen everything), `compact: "false"` became
+/// `true`, and `depth: 5` sailed past a schema that says 3.
+pub fn parse_recall_input(obj: &Value, default_namespace: &str) -> Result<RecallArgs, ArgError> {
+    let query = require_str(obj, "query")?;
+    let namespace = namespace_or(obj, default_namespace)?;
+    let limit =
+        opt_usize_in_range(obj, "limit", 1, MAX_SEARCH_LIMIT)?.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let tags = opt_string_array(obj, "tags")?;
+    let entities = opt_string_array(obj, "entities")?;
+    let topics = opt_string_array(obj, "topics")?;
+    let emotions = opt_string_array(obj, "emotions")?;
+    let min_strength = opt_f32_in_range(obj, "minStrength", 0.0, 1.0)?;
+    let depth = opt_u64_in_range(obj, "depth", 0, MAX_RECALL_DEPTH)?.unwrap_or(0) as u32;
+    let time_range_start = opt_time_bound(obj, "timeRangeStart")?;
+    let time_range_end = opt_time_bound(obj, "timeRangeEnd")?;
+    let compact = opt_bool(obj, "compact")?.unwrap_or(true);
+
+    Ok(RecallArgs {
+        input: SearchInput {
+            query,
+            namespace,
+            limit,
+            tags,
+            entities,
+            topics,
+            emotions,
+            min_strength,
+            depth,
+            time_range_start,
+            time_range_end,
+        },
+        compact,
+    })
+}
+
+/// A parsed `find_similar_memories` call in `single` mode.
+pub struct FindSimilarArgs {
+    /// The memory to find neighbours of.
+    pub id: MemoryId,
+    /// Maximum neighbours to return.
+    pub limit: usize,
+    /// Minimum similarity, when the caller set one.
+    pub min_score: Option<f32>,
+    /// Whether to stay inside the source memory's namespace.
+    pub same_namespace: bool,
+}
+
+/// Parse the `single`-mode arguments of a `find_similar_memories` call.
+pub fn parse_find_similar_args(obj: &Value) -> Result<FindSimilarArgs, ArgError> {
+    let id = require_uuid(obj, "id")?;
+    let limit =
+        opt_usize_in_range(obj, "limit", 1, MAX_SEARCH_LIMIT)?.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let min_score = opt_f32_in_range(obj, "minScore", 0.0, 1.0)?;
+    let same_namespace = opt_bool(obj, "sameNamespace")?.unwrap_or(true);
+
+    Ok(FindSimilarArgs {
+        id,
+        limit,
+        min_score,
+        same_namespace,
+    })
+}
+
+/// A parsed `find_similar_memories` call in `scan` mode.
+pub struct DuplicateScanArgs {
+    /// The namespace to scan.
+    pub namespace: String,
+    /// Similarity at or above which two memories are a duplicate.
+    pub threshold: f32,
+}
+
+/// Parse the `scan`-mode arguments of a `find_similar_memories` call.
+pub fn parse_duplicate_scan_args(
+    obj: &Value,
+    default_namespace: &str,
+    default_threshold: f64,
+) -> Result<DuplicateScanArgs, ArgError> {
+    let namespace = namespace_or(obj, default_namespace)?;
+    let threshold =
+        opt_f32_in_range(obj, "threshold", 0.0, 1.0)?.unwrap_or(default_threshold as f32);
+
+    Ok(DuplicateScanArgs {
+        namespace,
+        threshold,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════

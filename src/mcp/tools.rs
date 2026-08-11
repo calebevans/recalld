@@ -554,84 +554,23 @@ async fn handle_recall_memories(
     bridge: &McpBridge,
     arguments: serde_json::Value,
 ) -> ToolCallResult {
-    let query = match arguments.get("query").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => return ToolCallResult::error("Missing required parameter: query"),
-    };
-
-    let limit = arguments
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10) as usize;
-    let namespace = match args::namespace_or(&arguments, bridge.default_namespace()) {
-        Ok(ns) => ns,
-        Err(e) => {
-            tracing::warn!(
-                tool = "recall_memories",
-                field = %e.field,
-                error = %e.message,
-                "Rejected malformed MCP tool arguments"
-            );
-            return ToolCallResult::error(e.to_string());
-        }
-    };
-    let tags: Vec<String> = arguments
-        .get("tags")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let entities: Vec<String> = arguments
-        .get("entities")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let topics: Vec<String> = arguments
-        .get("topics")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let emotions: Vec<String> = arguments
-        .get("emotions")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let min_strength = arguments
-        .get("minStrength")
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32);
-    let depth = arguments.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let compact = arguments
-        .get("compact")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-
-    // Parse time range values: accept either integer (millis) or ISO 8601 string.
-    let time_range_start = match arguments.get("timeRangeStart") {
-        Some(v) => match crate::time::parse_time_value(v) {
-            Some(Ok(ms)) => Some(ms),
-            Some(Err(e)) => return ToolCallResult::error(format!("Invalid timeRangeStart: {e}")),
-            None => None,
-        },
-        None => None,
-    };
-    let time_range_end = match arguments.get("timeRangeEnd") {
-        Some(v) => match crate::time::parse_time_value(v) {
-            Some(Ok(ms)) => Some(ms),
-            Some(Err(e)) => return ToolCallResult::error(format!("Invalid timeRangeEnd: {e}")),
-            None => None,
-        },
-        None => None,
-    };
-
-    let input = crate::mcp::bridge::SearchInput {
-        query,
-        namespace,
-        limit: limit.min(100),
-        tags,
-        entities,
-        topics,
-        emotions,
-        min_strength,
-        depth,
-        time_range_start,
-        time_range_end,
-    };
+    // Every wrong-typed or out-of-range argument is rejected in `args`.
+    // Only `namespace` used to be: `{"tags": "topic/rust"}` became `[]`
+    // and ran UNFILTERED over the whole namespace, `limit: 1000` was
+    // clamped to 100, and `compact: "false"` became `true`.
+    let args::RecallArgs { input, compact } =
+        match args::parse_recall_input(&arguments, bridge.default_namespace()) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(
+                    tool = "recall_memories",
+                    field = %e.field,
+                    error = %e.message,
+                    "Rejected malformed MCP tool arguments"
+                );
+                return ToolCallResult::error(e.to_string());
+            }
+        };
 
     match bridge.search.search(input).await {
         Ok(search_response) => {
@@ -1086,14 +1025,26 @@ async fn handle_find_similar_memories(
     bridge: &McpBridge,
     arguments: serde_json::Value,
 ) -> ToolCallResult {
-    let mode = arguments
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("single");
+    // A wrong-typed `mode` is an error, never a silent "single": those
+    // are two different operations, and running the wrong one is not a
+    // degradation the caller can detect.
+    let mode = match args::opt_enum(&arguments, "mode", &["single", "scan"]) {
+        Ok(m) => m.unwrap_or_else(|| "single".to_string()),
+        Err(e) => {
+            tracing::warn!(
+                tool = "find_similar_memories",
+                field = %e.field,
+                error = %e.message,
+                "Rejected malformed MCP tool arguments"
+            );
+            return ToolCallResult::error(e.to_string());
+        }
+    };
 
-    match mode {
+    match mode.as_str() {
         "single" => handle_find_similar_single(bridge, &arguments).await,
         "scan" => handle_find_similar_scan(bridge, &arguments).await,
+        // Unreachable: `opt_enum` already rejected anything else.
         other => ToolCallResult::error(format!(
             "Invalid mode: \"{other}\". Must be \"single\" or \"scan\"."
         )),
@@ -1105,42 +1056,32 @@ async fn handle_find_similar_single(
     bridge: &McpBridge,
     arguments: &serde_json::Value,
 ) -> ToolCallResult {
-    let id_str = match arguments.get("id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            return ToolCallResult::error(
-                "Missing required parameter: id (required for \"single\" mode)",
+    let args::FindSimilarArgs {
+        id,
+        limit,
+        min_score,
+        same_namespace,
+    } = match args::parse_find_similar_args(arguments) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            tracing::warn!(
+                tool = "find_similar_memories",
+                field = %e.field,
+                error = %e.message,
+                "Rejected malformed MCP tool arguments"
             );
+            return ToolCallResult::error(e.to_string());
         }
     };
 
-    let uuid = match uuid::Uuid::parse_str(id_str) {
-        Ok(u) => u,
-        Err(_) => return ToolCallResult::error(format!("Invalid UUID: {id_str}")),
-    };
-    let id = crate::model::MemoryId::from_uuid(uuid);
-
-    let limit = arguments
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10) as usize;
-    let min_score = arguments
-        .get("minScore")
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32);
-    let same_namespace = arguments
-        .get("sameNamespace")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-
     match bridge
         .search
-        .find_similar(id, limit.min(100), min_score, same_namespace)
+        .find_similar(id, limit, min_score, same_namespace)
         .await
     {
         Ok(hits) => {
             let response = json!({
-                "sourceId": id_str,
+                "sourceId": id.to_string(),
                 "memories": hits,
                 "count": hits.len(),
             });
@@ -1158,8 +1099,15 @@ async fn handle_find_similar_scan(
     bridge: &McpBridge,
     arguments: &serde_json::Value,
 ) -> ToolCallResult {
-    let namespace = match args::namespace_or(arguments, bridge.default_namespace()) {
-        Ok(ns) => ns,
+    let args::DuplicateScanArgs {
+        namespace,
+        threshold,
+    } = match args::parse_duplicate_scan_args(
+        arguments,
+        bridge.default_namespace(),
+        DUPLICATE_SIMILARITY_THRESHOLD,
+    ) {
+        Ok(parsed) => parsed,
         Err(e) => {
             tracing::warn!(
                 tool = "find_similar_memories",
@@ -1170,15 +1118,6 @@ async fn handle_find_similar_scan(
             return ToolCallResult::error(e.to_string());
         }
     };
-
-    let threshold = arguments
-        .get("threshold")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(DUPLICATE_SIMILARITY_THRESHOLD) as f32;
-
-    if !(0.0..=1.0).contains(&threshold) {
-        return ToolCallResult::error("threshold must be between 0.0 and 1.0");
-    }
 
     // Max memories to sample from the namespace (bounded to 200).
     const MAX_SCAN_MEMORIES: usize = 200;
@@ -2358,6 +2297,94 @@ mod tests {
             "{:?}",
             tool_text(&result)
         );
+    }
+
+    // ── strict argument checking on the search tools ─────────────────
+
+    /// `docs/mcp.md` claims `recall_memories` validates strictly; only
+    /// its `namespace` was retrofitted. Everything here used to be a
+    /// silent default, and the flagship case is the first one: a
+    /// comma-joined `tags` string became `[]` and the recall ran
+    /// UNFILTERED over the whole namespace, which is a *wider* answer
+    /// than was asked for, returned as a success.
+    #[tokio::test]
+    async fn w64_recall_memories_rejects_every_malformed_argument() {
+        let bridge = crate::test_support::StubBridge::default().into_bridge();
+
+        let cases = [
+            ("tags", json!({ "query": "q", "tags": "topic/rust" })),
+            ("entities", json!({ "query": "q", "entities": "Sarah" })),
+            ("topics", json!({ "query": "q", "topics": "rust" })),
+            ("emotions", json!({ "query": "q", "emotions": "happy" })),
+            ("limit", json!({ "query": "q", "limit": 1000 })),
+            ("limit", json!({ "query": "q", "limit": "10" })),
+            ("depth", json!({ "query": "q", "depth": 5 })),
+            ("compact", json!({ "query": "q", "compact": "false" })),
+            ("minStrength", json!({ "query": "q", "minStrength": 5 })),
+            (
+                "timeRangeStart",
+                json!({ "query": "q", "timeRangeStart": ["x"] }),
+            ),
+            ("query", json!({})),
+        ];
+
+        for (field, arguments) in cases {
+            // The stub's `search` is `unreachable!()`, so reaching the
+            // bridge at all is the failure: it means the handler ran the
+            // query instead of rejecting the arguments.
+            let result = handle_recall_memories(&bridge, arguments.clone()).await;
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{field} was accepted: {arguments}"
+            );
+            assert!(
+                tool_text(&result).contains(field),
+                "the error must name the field: {}",
+                tool_text(&result)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn w65_find_similar_memories_rejects_every_malformed_argument() {
+        let bridge = crate::test_support::StubBridge::default().into_bridge();
+        let id = crate::model::MemoryId::new().to_string();
+
+        let cases = [
+            ("mode", json!({ "mode": 2, "id": id })),
+            ("mode", json!({ "mode": "sngle", "id": id })),
+            ("id", json!({ "mode": "single" })),
+            ("id", json!({ "mode": "single", "id": "not-a-uuid" })),
+            (
+                "limit",
+                json!({ "mode": "single", "id": id, "limit": 1000 }),
+            ),
+            (
+                "minScore",
+                json!({ "mode": "single", "id": id, "minScore": 5 }),
+            ),
+            (
+                "sameNamespace",
+                json!({ "mode": "single", "id": id, "sameNamespace": "true" }),
+            ),
+            ("threshold", json!({ "mode": "scan", "threshold": 5 })),
+            ("namespace", json!({ "mode": "scan", "namespace": ["a"] })),
+        ];
+
+        for (field, arguments) in cases {
+            let result = handle_find_similar_memories(&bridge, arguments.clone()).await;
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{field} was accepted: {arguments}"
+            );
+            assert!(
+                tool_text(&result).contains(field),
+                "the error must name the field: {}",
+                tool_text(&result)
+            );
+        }
     }
 
     /// The text of a tool result, joined across content blocks.
