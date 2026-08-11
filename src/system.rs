@@ -4,6 +4,7 @@
 //! subsystem. Constructed by [`Recalld::new()`], which executes
 //! the ordered startup sequence. Torn down by [`Recalld::shutdown()`].
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -20,11 +21,160 @@ use crate::embedding::{self, EmbeddingProvider};
 use crate::error::{RecalldError, Result};
 use crate::graph::activation::ActivationConfig;
 use crate::graph::{self, RelationshipGraph, SharedGraph};
+use crate::model::{DecayPhase, DiskRecord, MemoryId, NamespaceId};
 use crate::rif::{RifConfig, RifEngine};
-use crate::search::{EntityIndex, FlatVectorIndex, FtsIndex, QueryEngine};
+use crate::search::{
+    EntityIndex, FlatVectorIndex, FtsIndex, QueryEngine, VectorError, VectorIndex as _,
+    VectorMetadata,
+};
 use crate::storage::engine::RedbStorageEngine;
 // Import the StorageEngine trait so its methods are in scope.
 use crate::storage::StorageEngine as _;
+
+// ═══════════════════════════════════════════════════════════════════════
+// Startup vector-index load
+// ═══════════════════════════════════════════════════════════════════════
+
+/// What the startup vector load did.
+///
+/// Counts rather than per-record logging: a store with a changed
+/// embedding width would otherwise emit one warning per memory, and the
+/// one number an operator needs — how many — would be the one thing not
+/// on the line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VectorLoadStats {
+    /// Vectors added to the index.
+    loaded: usize,
+    /// Records skipped for being tombstones. Tombstones have had their
+    /// content stripped and are deliberately absent from every search
+    /// index; loading one would resurrect it as a vector hit.
+    tombstoned: usize,
+    /// Records whose `vector_slot` points past the end of their
+    /// namespace's `vectors.dat`.
+    missing: usize,
+    /// Records whose namespace's vector file could not be read at all —
+    /// in practice, a namespace directory that is gone or was never
+    /// opened.
+    unreadable: usize,
+    /// Records whose stored vector is a different width than the index.
+    dim_mismatch: usize,
+    /// Namespaces that produced at least one [`dim_mismatch`], sorted so
+    /// the log line is stable across boots.
+    ///
+    /// [`dim_mismatch`]: VectorLoadStats::dim_mismatch
+    mismatched_namespaces: BTreeSet<u32>,
+    /// Namespaces that produced at least one [`unreadable`] record.
+    ///
+    /// [`unreadable`]: VectorLoadStats::unreadable
+    unreadable_namespaces: BTreeSet<u32>,
+}
+
+impl VectorLoadStats {
+    /// Every record that did not make it into the index, for the
+    /// one-line summary.
+    fn skipped(&self) -> usize {
+        self.tombstoned + self.missing + self.unreadable + self.dim_mismatch
+    }
+}
+
+/// Fill `index` from the vectors already on disk.
+///
+/// [`FlatVectorIndex`] is pure RAM. It is created empty, and until this
+/// existed nothing but the store path ever put anything in it — so every
+/// restart began with an empty index and stayed empty until the process
+/// stored its first memory. `find_similar_memories` failed outright
+/// ("no embedding found for memory <id>"), and `recall_memories`
+/// silently degraded to FTS, entity and graph matching, which returns
+/// accurate-looking results that ignore semantic similarity entirely.
+/// This load is what makes a restart invisible.
+///
+/// # Nothing here is fatal
+///
+/// A missing vector, an unreadable namespace, a width that does not
+/// match: all are counted and skipped. The consequence of skipping is
+/// that one memory is not reachable by vector search — which is
+/// precisely the state it was in before this function existed, so
+/// failing startup over it would trade a degraded system for no system.
+///
+/// `records` is the caller's existing `scan_all()`. This function does
+/// not scan; it reads one vector per live record.
+fn load_vector_index(
+    storage: &RedbStorageEngine,
+    records: &[(MemoryId, DiskRecord)],
+    index: &mut FlatVectorIndex,
+) -> VectorLoadStats {
+    let mut stats = VectorLoadStats::default();
+
+    // Size the buffer from the live records, not all of them. A store
+    // that is mostly tombstones would otherwise reserve — and actually
+    // allocate — several hundred MB it never uses.
+    let live = records
+        .iter()
+        .filter(|(_, r)| r.phase != DecayPhase::Tombstone)
+        .count();
+    index.reserve(live);
+
+    for (memory_id, record) in records {
+        if record.phase == DecayPhase::Tombstone {
+            stats.tombstoned += 1;
+            continue;
+        }
+
+        let namespace_id = NamespaceId::new(record.namespace_id);
+        let vector = match storage.get_vector(namespace_id, record.vector_slot) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                stats.missing += 1;
+                continue;
+            }
+            Err(_) => {
+                stats.unreadable += 1;
+                stats.unreadable_namespaces.insert(record.namespace_id);
+                continue;
+            }
+        };
+
+        let metadata = VectorMetadata {
+            namespace_id,
+            // The phase the record ACTUALLY has. The store path writes a
+            // hardcoded `Full` and `VectorIndex::update_metadata` has no
+            // callers, so before this every index-level phase filter
+            // matched everything and was in effect inert.
+            //
+            // KNOWN GAP, stated plainly: this makes the filter correct
+            // only as of the last restart. A memory that transitions
+            // Full -> Summary -> Ghost while the process is running
+            // still carries its boot-time phase in the index, because
+            // the decay sweep holds no handle on the vector index.
+            // Giving it one is a separate change; do not paper over it
+            // here.
+            decay_phase: record.phase.as_u8(),
+            // From the record, not from the store request. `DiskRecord`
+            // tags are already normalized `Tag`s, which is the same form
+            // the query side derives its filter tags in — so a tag
+            // filter behaves the same before and after a restart.
+            tags: record.tags.iter().map(|t| t.to_string()).collect(),
+        };
+
+        match index.add(*memory_id, &vector, metadata) {
+            Ok(()) => stats.loaded += 1,
+            Err(VectorError::DimensionMismatch { .. }) => {
+                stats.dim_mismatch += 1;
+                stats.mismatched_namespaces.insert(record.namespace_id);
+            }
+            Err(e) => {
+                // `add` has no other failure mode today. If it grows
+                // one, count it where an operator will see it rather
+                // than dropping the record silently.
+                stats.unreadable += 1;
+                stats.unreadable_namespaces.insert(record.namespace_id);
+                tracing::warn!(memory_id = %memory_id, %e, "vector rejected by the index");
+            }
+        }
+    }
+
+    stats
+}
 
 /// System readiness state. Checked by the health endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,12 +415,64 @@ impl Recalld {
             Arc::new(engine)
         };
 
-        // -- Step 6: Create FlatVectorIndex ---------------------------
+        // -- Step 6: Create FlatVectorIndex and load persisted vectors -
         let vector_index = {
-            let index = FlatVectorIndex::new(config.embedding.dimensions);
+            let mut index = FlatVectorIndex::new(config.embedding.dimensions);
+
+            // The index lives in RAM only; without this the process
+            // starts semantically blind and stays that way until it
+            // stores something. See `load_vector_index`.
+            let started = std::time::Instant::now();
+            let stats = match storage.read() {
+                Ok(storage_r) => load_vector_index(&storage_r, &all_records, &mut index),
+                Err(e) => {
+                    // Unreachable — step 2 already took this lock and
+                    // would have failed first. Degrade rather than
+                    // refuse to boot, on principle: an empty vector
+                    // index is the old behaviour, not a new outage.
+                    tracing::warn!(%e, "storage lock poisoned; vector index left empty");
+                    VectorLoadStats::default()
+                }
+            };
+            let elapsed = started.elapsed();
+
+            if stats.dim_mismatch > 0 {
+                tracing::warn!(
+                    skipped = stats.dim_mismatch,
+                    index_dimensions = config.embedding.dimensions,
+                    namespaces = ?stats.mismatched_namespaces,
+                    "stored vectors are a different width than the vector index and were \
+                     skipped; those memories are unreachable by vector search. Either \
+                     embedding.dimensions changed since they were written, or the namespace \
+                     was created with its own embeddingDim"
+                );
+            }
+            if stats.unreadable > 0 {
+                tracing::warn!(
+                    skipped = stats.unreadable,
+                    namespaces = ?stats.unreadable_namespaces,
+                    "vectors could not be read and were skipped; those memories are \
+                     unreachable by vector search"
+                );
+            }
+            if stats.missing > 0 {
+                tracing::warn!(
+                    skipped = stats.missing,
+                    "records point at vector slots that do not exist and were skipped; \
+                     those memories are unreachable by vector search"
+                );
+            }
+
             tracing::info!(
                 dimensions = config.embedding.dimensions,
-                "flat vector index created"
+                loaded = stats.loaded,
+                skipped = stats.skipped(),
+                skipped_tombstoned = stats.tombstoned,
+                skipped_missing_slot = stats.missing,
+                skipped_unreadable = stats.unreadable,
+                skipped_dimension_mismatch = stats.dim_mismatch,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "flat vector index created and loaded from storage"
             );
             Arc::new(RwLock::new(index))
         };
@@ -738,5 +940,290 @@ impl Recalld {
         tracing::info!(elapsed_ms = elapsed.as_millis(), "shutdown complete");
 
         Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::SearchFilter;
+    use crate::test_support::{DIM, Fixture, MemorySpec};
+
+    fn ns() -> NamespaceId {
+        NamespaceId::new(1)
+    }
+
+    /// Run the startup load against a fixture's storage, into a fresh
+    /// index of `dim` — which is what step 6 does, minus the logging.
+    fn load(fx: &Fixture, dim: usize) -> (FlatVectorIndex, VectorLoadStats) {
+        let storage_r = fx.storage.read().expect("storage lock");
+        let records = storage_r.scan_all().expect("scan_all");
+        let mut index = FlatVectorIndex::new(dim);
+        let stats = load_vector_index(&storage_r, &records, &mut index);
+        (index, stats)
+    }
+
+    /// A config pointed at `dir` that will not talk to the network or
+    /// start a sweep.
+    fn offline_config(dir: &std::path::Path) -> RecalldConfig {
+        let mut config = RecalldConfig::default();
+        config.storage.data_dir = dir.to_str().expect("utf-8 temp dir").to_string();
+        config.embedding.provider = crate::config::EmbeddingProvider::Passthrough;
+        config.embedding.dimensions = DIM;
+        config.decay.disable_sweep = true;
+        config
+    }
+
+    // ── the regression ───────────────────────────────────────────────
+
+    /// THE bug. `FlatVectorIndex` is RAM-only and was only ever filled
+    /// by the store path, so every restart came up with an empty index:
+    /// `find_similar_memories` failed with "no embedding found for
+    /// memory <id>" and `recall_memories` quietly fell back to FTS and
+    /// graph matching until something was stored in that process.
+    ///
+    /// This drives the real `Recalld::new`, not the helper, because the
+    /// helper is not what was broken — the wiring was. Delete the load
+    /// from step 6 and this fails with `0 == 3`.
+    #[tokio::test]
+    async fn a_restart_reloads_the_vector_index_from_disk() {
+        let dir = {
+            let fx = Fixture::new();
+            for _ in 0..3 {
+                fx.insert_memory().await;
+            }
+            fx.close()
+        };
+
+        let system = Recalld::new(offline_config(dir.path()))
+            .await
+            .expect("system starts over the existing store");
+
+        assert_eq!(
+            system.vector_index().read().await.len(),
+            3,
+            "the three memories on disk should be searchable by vector \
+             immediately, before this process stores anything"
+        );
+    }
+
+    /// The same property one layer down, where the counts are visible.
+    #[tokio::test]
+    async fn the_load_reads_vectors_that_outlived_the_engine_that_wrote_them() {
+        let dir = {
+            let fx = Fixture::new();
+            fx.insert_memory().await;
+            fx.insert_memory().await;
+            fx.close()
+        };
+
+        let engine = RedbStorageEngine::open(dir.path()).expect("reopen engine");
+        let records = engine.scan_all().expect("scan_all");
+        let mut index = FlatVectorIndex::new(DIM);
+        let stats = load_vector_index(&engine, &records, &mut index);
+
+        assert_eq!(stats.loaded, 2);
+        assert_eq!(stats.skipped(), 0);
+        assert_eq!(index.len(), 2);
+    }
+
+    // ── what gets skipped ────────────────────────────────────────────
+
+    /// A tombstone has had its content stripped and is deliberately
+    /// absent from every search index. Loading its vector would
+    /// resurrect it as a similarity hit.
+    #[tokio::test]
+    async fn a_tombstoned_memory_is_not_loaded() {
+        let fx = Fixture::new();
+        let live = fx.insert_memory().await;
+        let dead = fx.insert_memory().await;
+        fx.tombstone(dead);
+
+        let (index, stats) = load(&fx, DIM);
+
+        assert_eq!(stats.loaded, 1);
+        assert_eq!(stats.tombstoned, 1);
+        assert!(index.get_vector(live).is_some());
+        assert!(
+            index.get_vector(dead).is_none(),
+            "a tombstone must not come back as a vector hit"
+        );
+    }
+
+    /// A record pointing past the end of its namespace's `vectors.dat` —
+    /// what a truncated or replaced vector file leaves behind. The
+    /// memory is simply not vector-searchable, which is what it was
+    /// before this load existed; startup carries on.
+    #[tokio::test]
+    async fn a_record_whose_vector_is_gone_is_skipped_and_startup_continues() {
+        let fx = Fixture::new();
+        let good = fx.insert_memory().await;
+        fx.insert_memory().await;
+
+        let storage_r = fx.storage.read().expect("storage lock");
+        let mut records = storage_r.scan_all().expect("scan_all");
+        // Point one record at a slot that was never allocated.
+        let orphan = records
+            .iter_mut()
+            .find(|(id, _)| *id != good)
+            .expect("two records");
+        orphan.1.vector_slot = 9_999;
+
+        let mut index = FlatVectorIndex::new(DIM);
+        let stats = load_vector_index(&storage_r, &records, &mut index);
+
+        assert_eq!(stats.missing, 1);
+        assert_eq!(stats.loaded, 1);
+        assert!(
+            index.get_vector(good).is_some(),
+            "one bad record must not cost the others their vectors"
+        );
+    }
+
+    /// A record in a namespace that no longer has a vector store at all.
+    #[tokio::test]
+    async fn a_record_in_an_unreadable_namespace_is_skipped() {
+        let fx = Fixture::new();
+        fx.insert_memory().await;
+
+        let storage_r = fx.storage.read().expect("storage lock");
+        let mut records = storage_r.scan_all().expect("scan_all");
+        records[0].1.namespace_id = 4_242;
+
+        let mut index = FlatVectorIndex::new(DIM);
+        let stats = load_vector_index(&storage_r, &records, &mut index);
+
+        assert_eq!(stats.unreadable, 1);
+        assert_eq!(stats.loaded, 0);
+        assert!(stats.unreadable_namespaces.contains(&4_242));
+        assert_eq!(index.len(), 0);
+    }
+
+    // ── the real decay phase ─────────────────────────────────────────
+
+    /// The store path hardcodes `Full`, so every index-level phase
+    /// filter was inert. Loading the record's true phase is what makes
+    /// the filter mean something.
+    #[tokio::test]
+    async fn the_loaded_entry_carries_the_records_real_phase() {
+        let fx = Fixture::new();
+        let ghost = fx
+            .insert_memory_with(MemorySpec {
+                phase: DecayPhase::Ghost,
+                ..MemorySpec::new(ns())
+            })
+            .await;
+        let summary = fx
+            .insert_memory_with(MemorySpec {
+                phase: DecayPhase::Summary,
+                ..MemorySpec::new(ns())
+            })
+            .await;
+        let full = fx.insert_memory().await;
+
+        let (index, stats) = load(&fx, DIM);
+        assert_eq!(stats.loaded, 3);
+
+        // Asserted through the filter, because the filter is the point.
+        let only = |phase: DecayPhase| {
+            let filter = SearchFilter {
+                decay_phases: Some(vec![phase.as_u8()]),
+                ..SearchFilter::default()
+            };
+            let hits = index
+                .search(&[1.0, 0.0, 0.0, 0.0], 10, &filter)
+                .expect("search");
+            hits.into_iter().map(|h| h.id).collect::<Vec<_>>()
+        };
+
+        assert_eq!(only(DecayPhase::Ghost), vec![ghost]);
+        assert_eq!(only(DecayPhase::Summary), vec![summary]);
+        assert_eq!(only(DecayPhase::Full), vec![full]);
+    }
+
+    // ── per-namespace widths ─────────────────────────────────────────
+
+    /// The index has one width; namespaces each have their own. A stored
+    /// vector of a different width cannot go in, and that is a warning,
+    /// not a failed boot.
+    #[tokio::test]
+    async fn vectors_of_the_wrong_width_are_counted_not_fatal() {
+        let fx = Fixture::new();
+        let narrow = fx.insert_memory().await;
+
+        let wide_ns = fx.with_namespace("wide", 8);
+        fx.insert_memory_with(MemorySpec {
+            embedding: Some(&[0.0; 8]),
+            ..MemorySpec::new(wide_ns)
+        })
+        .await;
+
+        let (index, stats) = load(&fx, DIM);
+
+        assert_eq!(stats.loaded, 1, "the matching-width memory still loads");
+        assert_eq!(stats.dim_mismatch, 1);
+        assert_eq!(
+            stats.mismatched_namespaces,
+            [wide_ns.get()].into_iter().collect(),
+            "the warning names the namespace an operator has to go look at"
+        );
+        assert!(index.get_vector(narrow).is_some());
+    }
+
+    /// The other route to the same state, and the likelier one: the
+    /// operator changed `embedding.dimensions` between runs. Every
+    /// stored vector is now the wrong width.
+    #[tokio::test]
+    async fn a_changed_embedding_width_skips_everything_without_failing() {
+        let fx = Fixture::new();
+        fx.insert_memory().await;
+        fx.insert_memory().await;
+
+        let (index, stats) = load(&fx, DIM * 2);
+
+        assert_eq!(stats.loaded, 0);
+        assert_eq!(stats.dim_mismatch, 2);
+        assert_eq!(index.len(), 0);
+    }
+
+    // ── end to end ───────────────────────────────────────────────────
+
+    /// The property the bug report was actually about: after a restart,
+    /// asking for a memory's neighbours works. `find_similar` fails at
+    /// `vector_indexes.get_vector(id)` — the same lookup this asserts —
+    /// so an index that has the vector is the whole of the fix.
+    #[tokio::test]
+    async fn a_stored_memory_still_has_its_embedding_after_a_restart() {
+        let (dir, id) = {
+            let fx = Fixture::new();
+            let id = fx
+                .insert_memory_with(MemorySpec {
+                    embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+                    ..MemorySpec::new(ns())
+                })
+                .await;
+            (fx.close(), id)
+        };
+
+        let system = Recalld::new(offline_config(dir.path()))
+            .await
+            .expect("system starts over the existing store");
+
+        let index = system.vector_index().read().await;
+        assert_eq!(
+            index.get_vector(id),
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+            "find_similar_memories resolves the source embedding through \
+             exactly this lookup; None is the 'no embedding found for \
+             memory <id>' error the user saw"
+        );
+        let hits = index
+            .search(&[1.0, 0.0, 0.0, 0.0], 5, &SearchFilter::default())
+            .expect("search");
+        assert_eq!(hits.first().map(|h| h.id), Some(id));
     }
 }

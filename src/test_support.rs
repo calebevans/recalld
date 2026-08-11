@@ -50,6 +50,11 @@ pub(crate) struct MemorySpec<'a> {
     pub(crate) decay_strength: f32,
     pub(crate) is_permastore: bool,
     pub(crate) edge_count: u16,
+    /// The embedding to write. `None` means [`DIM`] zeros, which is what
+    /// a test that is not about vectors wants. Set it when the namespace
+    /// has a width of its own — `insert_vector` rejects anything that is
+    /// not exactly the namespace's width.
+    pub(crate) embedding: Option<&'a [f32]>,
 }
 
 impl MemorySpec<'_> {
@@ -63,6 +68,7 @@ impl MemorySpec<'_> {
             decay_strength: 1.0,
             is_permastore: false,
             edge_count: 0,
+            embedding: None,
         }
     }
 }
@@ -128,6 +134,42 @@ impl Fixture {
     /// Where a namespace's `vectors.dat` directory lives.
     pub(crate) fn namespace_dir(&self, name: &str) -> std::path::PathBuf {
         self.path().join(name)
+    }
+
+    /// Shut this fixture's storage down and hand back the directory,
+    /// still alive, for someone else to open.
+    ///
+    /// This is how a test spells "restart". A [`RedbStorageEngine`]
+    /// holds an exclusive `recalld.lock` and a live mmap per namespace
+    /// for its entire lifetime, so nothing — not a second engine, not a
+    /// whole `Recalld` — can open the same directory until this one is
+    /// dropped. Consuming the fixture is what guarantees the drop
+    /// happens, and returning the [`tempfile::TempDir`] is what keeps
+    /// the files from going with it.
+    pub(crate) fn close(self) -> tempfile::TempDir {
+        let Self {
+            graph,
+            storage,
+            cache,
+            vector_index,
+            fts_index,
+            entity_index,
+            _dir,
+        } = self;
+        drop((graph, cache, vector_index, fts_index, entity_index));
+
+        // Not a formality: if a test built an adapter and kept it, the
+        // engine would outlive this call and the next open would fail
+        // with `DatabaseLocked` somewhere far from the cause.
+        let engine = Arc::try_unwrap(storage).unwrap_or_else(|_| {
+            panic!(
+                "close(): something still holds the storage Arc, so the engine's file \
+                 locks would outlive this call and the next open would fail"
+            )
+        });
+        drop(engine);
+
+        _dir
     }
 
     /// Create an extra namespace, so a test can prove a per-namespace
@@ -203,9 +245,11 @@ impl Fixture {
         };
 
         {
+            let zeros = [0.0; DIM];
+            let embedding = spec.embedding.unwrap_or(&zeros);
             let mut storage_w = self.storage.write().expect("storage lock");
             storage_w
-                .insert_memory(id, spec.namespace, &mut record, &[0.0; DIM], None)
+                .insert_memory(id, spec.namespace, &mut record, embedding, None)
                 .expect("insert memory");
         }
 
