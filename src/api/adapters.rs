@@ -837,72 +837,6 @@ impl RelationshipGraphAdapter {
 
 #[async_trait]
 impl state::RelationshipGraph for RelationshipGraphAdapter {
-    async fn add_edge(
-        &self,
-        from: MemoryId,
-        to: MemoryId,
-        edge_type: &str,
-    ) -> Result<(), crate::graph::GraphError> {
-        use crate::model::EdgeType;
-        let etype = match edge_type {
-            "parent" | "parent_child" | "ParentChild" => EdgeType::ParentChild,
-            "supersedes" | "Supersedes" => EdgeType::Supersedes,
-            "associative" | "Associative" => EdgeType::Associative,
-            "causal" | "Causal" => EdgeType::Causal,
-            "contradicts" | "Contradicts" => EdgeType::Contradicts,
-            _ => EdgeType::Associative,
-        };
-        let mut graph = self.graph.write().await;
-        graph.add_edge(from, to, etype, 1.0, false)?;
-
-        // Persist edge to storage.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let persisted = crate::storage::PersistedEdge {
-            source: from,
-            target: to,
-            edge_type: etype,
-            weight: 1.0,
-            auto_created: false,
-            created_at: now_ms,
-        };
-        drop(graph); // Release graph lock before storage
-
-        let storage = self.storage.clone();
-        let persist = tokio::task::spawn_blocking(move || {
-            let storage_r = storage
-                .read()
-                .map_err(|e| format!("storage lock poisoned: {e}"))?;
-            storage_r
-                .batch_add_edges(&[persisted])
-                .map_err(|e| e.to_string())
-        })
-        .await;
-
-        // The edge is already live in the graph, so a persistence failure
-        // is not worth failing the caller over — but it does mean the edge
-        // disappears on restart, which is worth saying out loud.
-        let persist_error = match persist {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e),
-            Err(e) => Some(format!("blocking task join error: {e}")),
-        };
-        if let Some(error) = persist_error {
-            tracing::warn!(
-                source_id = %from,
-                target_id = %to,
-                edge_type,
-                %error,
-                "edge is live in the graph but could not be persisted to edges.db; \
-                 it will be lost on restart"
-            );
-        }
-
-        Ok(())
-    }
-
     async fn check_link_target(
         &self,
         field: &'static str,
@@ -929,6 +863,11 @@ impl state::RelationshipGraph for RelationshipGraphAdapter {
     ) -> crate::model::SupersedesOutcome {
         crate::graph::apply_supersedes_edge(new_id, target, &self.graph, &self.storage, &self.cache)
             .await
+    }
+
+    async fn apply_parent_edge(&self, parent: MemoryId, child: MemoryId) {
+        crate::graph::apply_parent_edge(parent, child, &self.graph, &self.storage, &self.cache)
+            .await;
     }
 
     async fn tombstone_node(&self, id: MemoryId) -> Result<(), crate::graph::GraphError> {

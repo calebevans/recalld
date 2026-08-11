@@ -210,7 +210,7 @@ impl McpDispatcher {
     /// `server/discover` -- the 2026-07-28 replacement for `initialize`.
     ///
     /// Answered on both eras and, deliberately, without requiring `_meta`;
-    /// see [`is_era_neutral_method`] for the reasoning.
+    /// see [`is_handshake_exempt_method`] for the reasoning.
     fn handle_discover(&self) -> Result<Outcome, DispatchError> {
         let result = DiscoverResult {
             supported_versions: SUPPORTED_MODERN_VERSIONS
@@ -443,7 +443,7 @@ impl McpServer {
                 // Era-neutral methods are answered without any handshake,
                 // and an already-initialized legacy connection keeps
                 // working exactly as before.
-                if is_era_neutral_method(&msg.method) || self.initialized {
+                if is_handshake_exempt_method(&msg.method) || self.initialized {
                     Ok(RequestContext::legacy())
                 } else {
                     // Replaces the old -32600 "Server not initialized"

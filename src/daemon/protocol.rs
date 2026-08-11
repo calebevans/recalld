@@ -256,6 +256,28 @@ pub const MAX_DRAIN_SIZE: usize = 64 * 1024 * 1024;
 /// bytes forever, pinning one of [`MAX_CONNECTIONS`] connection tasks.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a peer may take to deliver a frame payload it has already
+/// declared with a length prefix.
+///
+/// The same argument as [`DRAIN_TIMEOUT`], for the frames we actually keep:
+/// without it a peer could declare a full [`MAX_MESSAGE_SIZE`] frame and
+/// then send nothing, pinning a connection task forever.
+///
+/// This bounds only the *body* of a frame whose length prefix has already
+/// arrived. The wait for the next length prefix stays unbounded on purpose:
+/// that is the client waiting for the daemon to finish work, and the idle
+/// monitor is what reclaims genuinely idle connections.
+pub const PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How much of a declared payload is allocated at a time.
+///
+/// A frame's length prefix is a claim, not evidence. Allocating the whole
+/// declared length before a single body byte arrives would let 32 peers
+/// (see [`MAX_CONNECTIONS`]) reserve 32 x [`MAX_MESSAGE_SIZE`] for free, so
+/// the buffer grows in steps as bytes actually arrive. A peer that declares
+/// a frame and sends nothing therefore costs one step, not one frame.
+const PAYLOAD_CHUNK: usize = 64 * 1024;
+
 /// Maximum number of concurrent client connections the daemon will accept.
 /// Additional connections are dropped immediately until an existing one closes.
 pub const MAX_CONNECTIONS: u32 = 32;
@@ -312,6 +334,15 @@ pub enum FrameError {
         size: usize,
     },
 
+    /// The peer declared a frame and then failed to deliver its payload
+    /// within [`PAYLOAD_TIMEOUT`]. The frame boundary was never reached, so
+    /// the stream cannot be resynchronized.
+    #[error("timed out reading a declared {size} byte frame; stream cannot be resynchronized")]
+    PayloadTimeout {
+        /// Declared length of the frame that never arrived.
+        size: usize,
+    },
+
     /// Transport failure.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -352,11 +383,44 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Reads exactly `len` bytes, growing `buf` in [`PAYLOAD_CHUNK`] steps.
+///
+/// Split out from [`read_frame`] so the whole body read can be wrapped in
+/// one [`PAYLOAD_TIMEOUT`] without the borrow of `buf` outliving it.
+async fn read_payload<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    len: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), FrameError> {
+    while buf.len() < len {
+        let want = (len - buf.len()).min(PAYLOAD_CHUNK);
+        let filled = buf.len();
+        // `resize` grows the allocation amortized, so a genuine 8 MiB frame
+        // still costs a handful of reallocations rather than one per chunk.
+        buf.resize(filled + want, 0);
+        match reader.read_exact(&mut buf[filled..]).await {
+            Ok(_) => {}
+            // EOF mid-frame: the boundary was never reached.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(FrameError::Closed);
+            }
+            Err(e) => return Err(FrameError::Io(e)),
+        }
+    }
+    Ok(())
+}
+
 /// Reads one length-prefixed frame, recovering where recovery is provable.
 ///
 /// Once the length prefix has been read the frame boundary is known, so an
 /// oversized-but-believable frame can be skipped exactly and the stream left
 /// sitting on the next frame. See [`FrameError::is_recoverable`].
+///
+/// Both the drained and the kept path are bounded in time, and neither
+/// allocates on the strength of the declared length alone: a peer that
+/// declares a frame and then goes quiet costs one [`PAYLOAD_CHUNK`] and at
+/// most one timeout, not a pinned connection task holding
+/// [`MAX_MESSAGE_SIZE`].
 async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     limit: usize,
@@ -389,9 +453,12 @@ async fn read_frame<R: AsyncRead + Unpin>(
         };
     }
 
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
-    Ok(buf)
+    let mut buf: Vec<u8> = Vec::new();
+    match tokio::time::timeout(PAYLOAD_TIMEOUT, read_payload(reader, len, &mut buf)).await {
+        Ok(Ok(())) => Ok(buf),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(FrameError::PayloadTimeout { size: len }),
+    }
 }
 
 /// Reads a length-prefixed JSON-RPC request from the stream.
@@ -642,6 +709,103 @@ mod tests {
         );
         assert!(!err.is_recoverable());
         drop(a);
+    }
+
+    // 9b — regression: the in-limit path must be bounded in time too.
+    //
+    // Before the fix this path did `vec![0u8; len]` and a bare `read_exact`,
+    // so a peer that declared a frame and then went quiet held a connection
+    // task (and its buffer) forever.
+    #[tokio::test(start_paused = true)]
+    async fn declared_payload_that_never_arrives_times_out() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        a.write_u32(200).await.unwrap();
+        a.write_all(b"only ten b").await.unwrap();
+
+        // 200 is inside `ROOMY`, so this takes the kept path, not the drain.
+        // The outer guard is twice `PAYLOAD_TIMEOUT`, so a regression that
+        // drops the bound fails here instead of hanging the suite.
+        let err = tokio::time::timeout(PAYLOAD_TIMEOUT * 2, read_framed_message(&mut b, ROOMY))
+            .await
+            .expect("the payload read must be bounded")
+            .unwrap_err();
+        assert!(
+            matches!(err, FrameError::PayloadTimeout { size: 200 }),
+            "got {err}"
+        );
+        // The boundary was never reached, so the stream cannot resynchronize.
+        assert!(!err.is_recoverable());
+        drop(a);
+    }
+
+    // 9c — a huge *declared* length must not be allocated up front.
+    //
+    // The peer never sends a byte, so the read must give up on the timeout
+    // rather than reserving `MAX_MESSAGE_SIZE`. Thirty-two of these (the
+    // connection cap) used to be 256 MiB of buffers held by nothing.
+    #[tokio::test(start_paused = true)]
+    async fn maximum_declared_length_with_no_body_times_out_without_hoarding() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        a.write_u32(MAX_MESSAGE_SIZE as u32).await.unwrap();
+
+        let err = tokio::time::timeout(
+            PAYLOAD_TIMEOUT * 2,
+            read_framed_message(&mut b, MAX_MESSAGE_SIZE),
+        )
+        .await
+        .expect("the payload read must be bounded")
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrameError::PayloadTimeout {
+                    size: MAX_MESSAGE_SIZE
+                }
+            ),
+            "got {err}"
+        );
+        drop(a);
+    }
+
+    // 9d — a payload cut short by a hangup is a closed connection, not a
+    // timeout: there is nothing left to wait for.
+    #[tokio::test]
+    async fn payload_truncated_by_hangup_reports_closed() {
+        let (mut a, mut b) = tokio::io::duplex(ROOMY);
+        a.write_u32(200).await.unwrap();
+        a.write_all(b"partial").await.unwrap();
+        drop(a);
+
+        let err = read_framed_message(&mut b, ROOMY).await.unwrap_err();
+        assert!(matches!(err, FrameError::Closed), "got {err}");
+        assert!(!err.is_recoverable());
+    }
+
+    // 9e — a payload larger than one `PAYLOAD_CHUNK` still round-trips, so
+    // the chunked read is not silently truncating anything.
+    #[tokio::test]
+    async fn multi_chunk_payload_round_trips_intact() {
+        let (mut a, mut b) = tokio::io::duplex(4 * PAYLOAD_CHUNK);
+        let big = DaemonRequest {
+            jsonrpc: "2.0".into(),
+            id: 1,
+            method: "store_memory".into(),
+            params: serde_json::json!({ "fullText": "q".repeat(3 * PAYLOAD_CHUNK) }),
+        };
+
+        let writer = tokio::spawn(async move {
+            write_framed_request(&mut a, &big, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap();
+            a
+        });
+
+        let got = read_framed_message(&mut b, MAX_MESSAGE_SIZE).await.unwrap();
+        let _a = writer.await.unwrap();
+        assert_eq!(
+            got.params["fullText"].as_str().unwrap().len(),
+            3 * PAYLOAD_CHUNK
+        );
     }
 
     // 10

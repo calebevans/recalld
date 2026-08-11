@@ -25,25 +25,49 @@ const MAX_STALE_SKIPS: usize = 8;
 /// Whether a method may be replayed on a fresh connection after the original
 /// attempt failed with an unknown outcome.
 ///
-/// Only read-only methods qualify. Every mutating method here either mints
-/// new server-side state (`store_memory` allocates a fresh id, so a replay
-/// silently creates a duplicate the caller can never reconcile), advances
-/// state on each call (`reinforce_memory` moves the FSRS schedule), or has a
-/// return value that is not idempotent even where the effect is
+/// The bar is **no observable state change of any kind**, not "not a write".
+/// Access and decay bookkeeping counts: recording an access advances
+/// `last_accessed_at` and appends an `AccessEvent` that feeds the FSRS
+/// schedule, so a transparent replay would silently age a memory twice off
+/// one caller request. That is what keeps `search` and `find_similar` off
+/// this list even though neither creates or edits a memory — both record
+/// accesses for every result they return (`SearchPipeline::search`,
+/// `SearchPipeline::similar`).
+///
+/// The methods that remain are pure reads of storage, the namespace table,
+/// or process health. `get_memory` qualifies because the *daemon* path
+/// (`McpStorageAdapter::get_memory`) reads the record straight out of
+/// storage and records nothing; the access-recording `get_memory` lives on
+/// the in-process query engine, which the socket never reaches. Should the
+/// adapter ever start recording accesses, it has to come off this list.
+///
+/// Mutating methods are excluded for the usual reasons: they mint new
+/// server-side state (`store_memory` allocates a fresh id, so a replay
+/// silently creates a duplicate the caller can never reconcile), advance
+/// state on each call (`reinforce_memory` moves the FSRS schedule), or have
+/// a return value that is not idempotent even where the effect is
 /// (`delete_memory` returns whether the memory existed).
 fn is_retry_safe(method: &str) -> bool {
     matches!(
         method,
         "ping"
             | "check_health"
-            | "search"
-            | "find_similar"
             | "scan_duplicates"
             | "get_memory"
             | "list_namespaces"
             | "namespace_stats"
             | "list_memories"
     )
+}
+
+/// Whether a method is barred from the automatic replay *only* because it
+/// records accesses.
+///
+/// These write no memory content, so the honest report to the caller is
+/// "ask again", not the "may or may not have been applied" warning that a
+/// half-applied mutation deserves.
+fn records_accesses_only(method: &str) -> bool {
+    matches!(method, "search" | "find_similar")
 }
 
 /// An established socket connection to the daemon.
@@ -188,20 +212,34 @@ impl DaemonClient {
 
         if !is_retry_safe(method) {
             let mut message = format!(
-                "daemon connection lost while awaiting the response to `{method}` \
-                 ({}); the operation may or may not have been applied.",
+                "daemon connection lost while awaiting the response to `{method}` ({}); ",
                 failure.error
             );
-            if reconnected.is_ok() {
+            // A read that is withheld from the automatic replay only because
+            // it records accesses must not be described as a write that may
+            // have half-happened: the caller can simply ask again.
+            if records_accesses_only(method) {
                 message.push_str(
-                    " The connection has been re-established - verify with recall_memories \
-                     before retrying.",
+                    "no memory was created, changed, or deleted, and reissuing the call is safe.",
                 );
+                if reconnected.is_ok() {
+                    message.push_str(" The connection has been re-established.");
+                } else {
+                    message.push_str(" The daemon is currently unreachable.");
+                }
             } else {
-                message.push_str(
-                    " The daemon is currently unreachable - verify with recall_memories \
-                     once it is back before retrying.",
-                );
+                message.push_str("the operation may or may not have been applied.");
+                if reconnected.is_ok() {
+                    message.push_str(
+                        " The connection has been re-established - verify with recall_memories \
+                         before retrying.",
+                    );
+                } else {
+                    message.push_str(
+                        " The daemon is currently unreachable - verify with recall_memories \
+                         once it is back before retrying.",
+                    );
+                }
             }
             return Err(BridgeError::Internal(message));
         }
@@ -212,10 +250,24 @@ impl DaemonClient {
 
     /// Sends a ping to verify the daemon is responsive and negotiate the
     /// frame limit for this connection.
+    ///
+    /// The mutex is held across the whole exchange *and* the write that
+    /// records the answer. Releasing it in between would make this a
+    /// read-modify-write on shared state: a reconnect landing in the gap
+    /// negotiates its own (possibly legacy 1 MiB) limit, and this method
+    /// would then stamp a stale 8 MiB over it. The client would go on to
+    /// send frames a v1 daemon rejects *without draining*, permanently
+    /// desynchronizing the stream — the precise failure the negotiation
+    /// exists to prevent.
     pub async fn ping(&self) -> Result<(), BridgeError> {
-        let result = self.call("ping", handshake_params()).await?;
-        let limit = negotiated_limit(&result);
-        self.state.lock().await.frame_limit = limit;
+        let mut state = self.state.lock().await;
+        let outcome = self
+            .call_locked(&mut state, "ping", handshake_params())
+            .await;
+        self.connected
+            .store(state.conn.is_some(), AtomicOrdering::Relaxed);
+        // The answer describes the connection the lock is still protecting.
+        state.frame_limit = negotiated_limit(&outcome?);
         Ok(())
     }
 
@@ -336,11 +388,21 @@ impl ClientState {
 
             let response = match read {
                 Ok(response) => response,
-                // The frame was skipped or unparseable but the stream is back
-                // on a boundary: only this call is lost.
-                Err(e) if e.is_recoverable() => {
+                // Both arms below leave the stream on a frame boundary, so
+                // only this call is lost - but they are different failures
+                // and must not be reported as the same one. `TooLarge` sends
+                // the caller off to shrink their input, which is exactly the
+                // wrong move when the daemon simply emitted a frame we could
+                // not parse.
+                Err(e @ FrameError::OversizedDiscarded { .. }) => {
                     return Err(ExchangeError::settled(BridgeError::TooLarge(format!(
                         "the daemon's response to `{method}` could not be delivered: {e}"
+                    ))));
+                }
+                Err(FrameError::Malformed(detail)) => {
+                    return Err(ExchangeError::settled(BridgeError::Internal(format!(
+                        "the daemon's response to `{method}` could not be parsed: {detail}; \
+                         the connection is still usable and the call can be retried"
                     ))));
                 }
                 Err(e) => {
@@ -461,6 +523,12 @@ mod tests {
         StaleThenCorrect,
         /// Answer the first call with an id from the future.
         FutureId,
+        /// Answer the first call with a well-framed but unparseable payload.
+        MalformedResponse,
+        /// Answer the first connection's `ping` slowly and hang up on its
+        /// first real call; negotiate as a v1 daemon on every connection
+        /// after that. Drives the ping/reconnect interleaving.
+        SlowPingThenLegacyReconnect,
     }
 
     struct Stub {
@@ -512,11 +580,15 @@ mod tests {
         behavior: Behavior,
         received: Arc<StdMutex<Vec<DaemonRequest>>>,
     ) {
+        use tokio::io::AsyncWriteExt;
+
         let mut calls = 0usize;
+        let mut connections = 0usize;
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            connections += 1;
             let (reader, writer) = stream.into_split();
             let mut reader = BufReader::new(reader);
             let mut writer = writer;
@@ -528,7 +600,9 @@ mod tests {
                 received.lock().unwrap().push(request.clone());
 
                 if request.method == "ping" {
-                    let result = if behavior == Behavior::LegacyPing {
+                    let legacy = behavior == Behavior::LegacyPing
+                        || (behavior == Behavior::SlowPingThenLegacyReconnect && connections > 1);
+                    let result = if legacy {
                         json!({})
                     } else {
                         json!({
@@ -536,6 +610,11 @@ mod tests {
                             "maxMessageSize": MAX_MESSAGE_SIZE,
                         })
                     };
+                    // A slow answer keeps the client's mutex held long enough
+                    // for a second caller to queue behind it.
+                    if behavior == Behavior::SlowPingThenLegacyReconnect && connections == 1 {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
                     let response = DaemonResponse::success(request.id, result);
                     if write_framed_message(&mut writer, &response, MAX_MESSAGE_SIZE)
                         .await
@@ -547,7 +626,20 @@ mod tests {
                 }
 
                 calls += 1;
+
+                // A well-framed reply the client cannot parse. Written raw,
+                // because the framing helpers only emit valid messages.
+                if behavior == Behavior::MalformedResponse && calls == 1 {
+                    if writer.write_u32(4).await.is_err()
+                        || writer.write_all(b"junk").await.is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
                 let replies: Vec<DaemonResponse> = match behavior {
+                    Behavior::SlowPingThenLegacyReconnect if connections == 1 => break,
                     Behavior::CloseAfterFirstCall if calls == 1 => break,
                     Behavior::HugeResponse if calls == 1 => vec![DaemonResponse::success(
                         request.id,
@@ -647,9 +739,39 @@ mod tests {
         let stub = Stub::start(Behavior::CloseAfterFirstCall);
         let client = DaemonClient::connect(&stub.path).await.unwrap();
 
-        let result = client.call("search", json!({})).await.unwrap();
+        let result = client.call("list_memories", json!({})).await.unwrap();
         assert_eq!(result, json!({ "ok": true }));
-        assert_eq!(stub.count("search"), 2, "the read-only call was replayed");
+        assert_eq!(
+            stub.count("list_memories"),
+            2,
+            "the side-effect-free call was replayed"
+        );
+    }
+
+    // 16b — regression: `search` and `find_similar` look read-only but
+    // record an access for every result, which advances `last_accessed_at`
+    // and the FSRS schedule. A transparent replay would age those memories
+    // twice off one caller request, so the call is reported instead.
+    #[tokio::test]
+    async fn access_recording_reads_are_not_replayed() {
+        for method in ["search", "find_similar"] {
+            let stub = Stub::start(Behavior::CloseAfterFirstCall);
+            let client = DaemonClient::connect(&stub.path).await.unwrap();
+
+            let err = client.call(method, json!({})).await.unwrap_err();
+            assert_eq!(
+                stub.count(method),
+                1,
+                "{method} must reach the daemon exactly once"
+            );
+
+            // ...and the report must not describe a read as a half-applied
+            // write, which is the other way to get this wrong.
+            let text = err.to_string();
+            assert!(text.contains("safe"), "{text}");
+            assert!(!text.contains("may or may not have been applied"), "{text}");
+            assert!(client.is_connected());
+        }
     }
 
     // 17
@@ -768,6 +890,38 @@ mod tests {
         assert_eq!(stub.count("ping"), 0, "no reconnect was needed");
     }
 
+    // 21b — regression: a response we cannot parse is not a size problem.
+    //
+    // Both failures leave the stream on a frame boundary, and the client
+    // used to collapse them into `TooLarge`, telling the caller to shrink
+    // an input that was never the problem.
+    #[tokio::test]
+    async fn malformed_response_is_reported_as_a_protocol_error_not_a_size_error() {
+        let stub = Stub::start(Behavior::MalformedResponse);
+        let client = DaemonClient::connect(&stub.path).await.unwrap();
+
+        let err = client
+            .call("get_memory", json!({ "id": "a" }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BridgeError::Internal(_)),
+            "a malformed response is a protocol failure, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("could not be parsed"), "{text}");
+        assert!(!text.contains("Too large"), "{text}");
+
+        // The stream is still aligned, so the next call goes through.
+        assert!(client.is_connected());
+        let result = client
+            .call("get_memory", json!({ "id": "b" }))
+            .await
+            .unwrap();
+        assert_eq!(result, json!({ "ok": true }));
+        assert_eq!(stub.count("ping"), 0, "no reconnect was needed");
+    }
+
     // 22
     #[tokio::test]
     async fn ping_negotiates_frame_limit() {
@@ -777,6 +931,43 @@ mod tests {
 
         client.ping().await.unwrap();
         assert_eq!(client.frame_limit().await, MAX_MESSAGE_SIZE);
+    }
+
+    // 22c — regression: `ping` must not be a read-modify-write.
+    //
+    // The pinger holds the client mutex while the (slow) first connection
+    // answers, so the concurrent `get_memory` queues behind it. When that
+    // call finds the connection dead it reconnects to what is now a v1
+    // daemon and correctly clamps the limit to 1 MiB. If `ping` released the
+    // lock between its exchange and its write, tokio's FIFO mutex hands the
+    // waiter in first and the stale 8 MiB lands on top of that clamp -
+    // after which the client sends frames a v1 daemon rejects *without*
+    // draining, desynchronizing the stream for good.
+    #[tokio::test]
+    async fn concurrent_reconnect_cannot_have_its_clamp_overwritten_by_ping() {
+        let stub = Stub::start(Behavior::SlowPingThenLegacyReconnect);
+        let client = Arc::new(DaemonClient::connect(&stub.path).await.unwrap());
+
+        let pinger = {
+            let client = client.clone();
+            tokio::spawn(async move { client.ping().await })
+        };
+
+        // Long enough for the ping to own the lock and block on the answer.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let reader = {
+            let client = client.clone();
+            tokio::spawn(async move { client.call("get_memory", json!({ "id": "a" })).await })
+        };
+
+        pinger.await.unwrap().unwrap();
+        reader.await.unwrap().unwrap();
+
+        assert_eq!(
+            client.frame_limit().await,
+            LEGACY_MAX_MESSAGE_SIZE,
+            "the live connection is a v1 daemon; its clamp must be the one in force"
+        );
     }
 
     // 22b
@@ -790,17 +981,29 @@ mod tests {
     }
 
     #[test]
-    fn mutating_methods_are_never_retry_safe() {
+    fn only_methods_without_observable_effects_are_retry_safe() {
         for method in [
             "store_memory",
             "create_namespace",
             "reinforce_memory",
             "delete_memory",
             "shutdown",
+            // Not mutations, but not effect-free either: both record an
+            // access per result, which moves the decay schedule.
+            "search",
+            "find_similar",
         ] {
             assert!(!is_retry_safe(method), "{method} must not be replayed");
         }
-        for method in ["ping", "search", "get_memory", "list_memories"] {
+        for method in [
+            "ping",
+            "check_health",
+            "scan_duplicates",
+            "get_memory",
+            "list_namespaces",
+            "namespace_stats",
+            "list_memories",
+        ] {
             assert!(is_retry_safe(method), "{method} should be replayable");
         }
     }

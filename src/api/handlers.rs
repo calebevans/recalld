@@ -218,16 +218,11 @@ pub async fn create_memory(
     // --- Parent edge ---
     // Both explicit edges were validated before the record was written, so
     // neither can fail the request from here — which is the point. A `?` at
-    // this line would return a 4xx with the memory already created.
+    // this line would return a 4xx with the memory already created. Both go
+    // through the shared `explicit_links` helpers, so an HTTP-created parent
+    // edge counts toward `edge_count` exactly as an MCP-created one does.
     if let Some(parent_id) = req.parent_id {
-        if let Err(e) = state.graph.add_edge(parent_id, memory.id, "parent").await {
-            tracing::error!(
-                memory_id = %memory.id,
-                parent = %parent_id,
-                %e,
-                "parent edge could not be created after pre-validation passed"
-            );
-        }
+        state.graph.apply_parent_edge(parent_id, memory.id).await;
     }
 
     // --- Supersedes edge (Issue 8) ---
@@ -1441,15 +1436,10 @@ pub async fn batch_store(
 
         // Explicit links. Both targets were validated before this item was
         // created, so failures here are durability details, not rejections.
+        // Both use the shared `explicit_links` helpers, so `edge_count` moves
+        // the same way it does on the single-store and MCP paths.
         if let Some(parent_id) = mem_req.parent_id {
-            if let Err(e) = state.graph.add_edge(parent_id, memory.id, "parent").await {
-                tracing::error!(
-                    memory_id = %memory.id,
-                    parent = %parent_id,
-                    %e,
-                    "parent edge could not be created after pre-validation passed"
-                );
-            }
+            state.graph.apply_parent_edge(parent_id, memory.id).await;
         }
 
         let supersedes_outcome = match mem_req.supersedes {

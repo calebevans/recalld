@@ -189,14 +189,6 @@ pub trait RecordCache: Send + Sync {
 /// Relationship graph for edge traversal.
 #[async_trait::async_trait]
 pub trait RelationshipGraph: Send + Sync {
-    /// Add a directed edge between two memories.
-    async fn add_edge(
-        &self,
-        from: MemoryId,
-        to: MemoryId,
-        edge_type: &str,
-    ) -> Result<(), GraphError>;
-
     /// Validate a caller-specified link target (`supersedes`, `parentId`)
     /// before the new memory is written.
     ///
@@ -223,6 +215,17 @@ pub trait RelationshipGraph: Send + Sync {
         new_id: MemoryId,
         target: MemoryId,
     ) -> crate::model::SupersedesOutcome;
+
+    /// Create and persist the `ParentChild` edge from `parent` to `child`
+    /// for a memory that has already been written.
+    ///
+    /// The counterpart of [`RelationshipGraph::apply_supersedes_edge`], and
+    /// for the same reason: both explicit link fields must go through the
+    /// one helper in [`crate::graph::explicit_links`] so they cannot drift
+    /// apart in durability, lock order, or `edge_count` upkeep. `edge_count`
+    /// feeds ranking, so a parent edge that skips it makes a memory rank
+    /// differently depending on which door created it.
+    async fn apply_parent_edge(&self, parent: MemoryId, child: MemoryId);
 
     /// Tombstone a memory's graph node (set phase to Tombstone, strength to 0).
     /// Unlike full removal, this preserves the node and edges for graph traversal.

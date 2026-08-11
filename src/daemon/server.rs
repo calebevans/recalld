@@ -179,11 +179,15 @@ async fn handle_connection(
     // never receives a frame it would reject without draining.
     let mut peer_limit = LEGACY_MAX_MESSAGE_SIZE;
 
+    // Consecutive recoverable frame errors, reset by every frame that parses.
+    let mut frame_error_strikes: u32 = 0;
+
     loop {
         tokio::select! {
             msg = read_framed_message(&mut reader, MAX_MESSAGE_SIZE) => {
                 match msg {
                     Ok(request) => {
+                        frame_error_strikes = 0;
                         let method = request.method.clone();
 
                         if method == "ping" {
@@ -247,9 +251,25 @@ async fn handle_connection(
                         // The stream is provably still on a frame boundary, so
                         // the connection survives; only this request is lost.
                         ConnectionAction::Reply(err) => {
-                            tracing::warn!(%e, "recoverable client frame error, replying and continuing");
+                            frame_error_strikes += 1;
+                            tracing::warn!(
+                                %e,
+                                strikes = frame_error_strikes,
+                                max = MAX_CONSECUTIVE_FRAME_ERRORS,
+                                "recoverable client frame error, replying and continuing"
+                            );
                             let resp = DaemonResponse::error(UNATTRIBUTED_ID, err);
                             if write_framed_message(&mut writer, &resp, peer_limit).await.is_err() {
+                                break;
+                            }
+                            // Answered, then hung up: a peer that only ever
+                            // sends garbage is not worth a connection slot.
+                            if frame_error_strikes >= MAX_CONSECUTIVE_FRAME_ERRORS {
+                                tracing::warn!(
+                                    strikes = frame_error_strikes,
+                                    "client sent {MAX_CONSECUTIVE_FRAME_ERRORS} consecutive \
+                                     unusable frames, closing connection"
+                                );
                                 break;
                             }
                         }
@@ -270,6 +290,18 @@ async fn handle_connection(
 /// Response id used when a framing error leaves the request id unknown.
 /// Client request ids start at 1, so 0 can never collide with a live call.
 const UNATTRIBUTED_ID: u64 = 0;
+
+/// Recoverable frame errors a connection may hit in a row before it is
+/// closed.
+///
+/// Each recoverable error is answered and the connection kept, which is what
+/// makes one oversized or malformed request survivable. Unbounded, that same
+/// tolerance is a free denial of service: an oversized frame costs up to
+/// [`DRAIN_TIMEOUT`] of a connection slot, and there are only
+/// [`MAX_CONNECTIONS`] of them. A well-behaved client never trips this — it
+/// takes a *run* of bad frames with no good frame in between, and any good
+/// frame resets the count.
+const MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 
 /// What a connection should do after a [`FrameError`].
 #[derive(Debug)]
@@ -303,6 +335,7 @@ fn action_for_frame_error(e: &FrameError) -> ConnectionAction {
         FrameError::Closed
         | FrameError::Desync { .. }
         | FrameError::DrainTimeout { .. }
+        | FrameError::PayloadTimeout { .. }
         | FrameError::Io(_)
         | FrameError::TooLarge { .. } => ConnectionAction::Close,
     }
@@ -551,6 +584,123 @@ mod tests {
         dispatch(&Unused, &Unused, &Unused, &Unused, method, params).await
     }
 
+    /// Drives a real [`handle_connection`] over a socket pair, so the
+    /// connection-level policies (strikes, replies, hangup) are exercised
+    /// end to end rather than asserted in prose.
+    fn spawn_connection() -> (tokio::net::UnixStream, Arc<AtomicU32>) {
+        let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+        let count = Arc::new(AtomicU32::new(1));
+        let (tx, rx) = watch::channel(false);
+        tokio::spawn(handle_connection(
+            Arc::new(Unused),
+            Arc::new(Unused),
+            Arc::new(Unused),
+            Arc::new(Unused),
+            server,
+            count.clone(),
+            Arc::new(AtomicI64::new(lifecycle::now_millis())),
+            rx,
+            tx,
+        ));
+        (client, count)
+    }
+
+    fn ping_request(id: u64) -> DaemonRequest {
+        DaemonRequest {
+            jsonrpc: "2.0".into(),
+            id,
+            method: "ping".into(),
+            params: serde_json::json!({}),
+        }
+    }
+
+    /// Sends one unparseable frame and returns the daemon's reply.
+    async fn send_junk_frame<W, R>(writer: &mut W, reader: &mut R) -> DaemonResponse
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+        writer.write_u32(4).await.expect("write length");
+        writer.write_all(b"junk").await.expect("write payload");
+        read_framed_response(reader, MAX_MESSAGE_SIZE)
+            .await
+            .expect("the daemon answers a recoverable frame error")
+    }
+
+    // 25 — regression: an endless stream of unusable frames must not hold a
+    // connection slot forever.
+    #[tokio::test]
+    async fn a_run_of_unusable_frames_closes_the_connection() {
+        let (client, count) = spawn_connection();
+        let (reader, mut writer) = client.into_split();
+        let mut reader = BufReader::new(reader);
+
+        for strike in 1..=MAX_CONSECUTIVE_FRAME_ERRORS {
+            let resp = send_junk_frame(&mut writer, &mut reader).await;
+            assert_eq!(resp.id, UNATTRIBUTED_ID, "strike {strike}");
+            assert_eq!(
+                resp.error.expect("error payload").code,
+                ERR_INVALID_INPUT,
+                "strike {strike}"
+            );
+        }
+
+        // The last strike was still answered, and then the daemon hung up.
+        // Bounded so an unbounded-tolerance regression fails instead of
+        // hanging the suite.
+        let after = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_framed_response(&mut reader, MAX_MESSAGE_SIZE),
+        )
+        .await
+        .expect("the daemon must close the connection, not wait for more garbage");
+        assert!(
+            matches!(after, Err(FrameError::Closed)),
+            "expected the connection to be closed, got {after:?}"
+        );
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "the connection slot must be released"
+        );
+    }
+
+    // 25b — the limit counts *consecutive* errors: any frame that parses
+    // clears the record, so a long-lived client that occasionally overruns
+    // the frame limit is never penalized for it.
+    #[tokio::test]
+    async fn a_good_frame_resets_the_strike_count() {
+        let (client, _count) = spawn_connection();
+        let (reader, mut writer) = client.into_split();
+        let mut reader = BufReader::new(reader);
+
+        for _ in 0..MAX_CONSECUTIVE_FRAME_ERRORS - 1 {
+            send_junk_frame(&mut writer, &mut reader).await;
+        }
+
+        write_framed_request(&mut writer, &ping_request(1), MAX_MESSAGE_SIZE)
+            .await
+            .expect("write ping");
+        let ok = read_framed_response(&mut reader, MAX_MESSAGE_SIZE)
+            .await
+            .expect("ping is answered");
+        assert_eq!(ok.id, 1);
+
+        // A second run of the same length is tolerated, which it would not
+        // be if the counter were cumulative.
+        for _ in 0..MAX_CONSECUTIVE_FRAME_ERRORS - 1 {
+            send_junk_frame(&mut writer, &mut reader).await;
+        }
+        write_framed_request(&mut writer, &ping_request(2), MAX_MESSAGE_SIZE)
+            .await
+            .expect("write second ping");
+        let ok = read_framed_response(&mut reader, MAX_MESSAGE_SIZE)
+            .await
+            .expect("the connection is still alive");
+        assert_eq!(ok.id, 2);
+    }
+
     // 23
     #[test]
     fn action_for_frame_error_classification() {
@@ -585,6 +735,7 @@ mod tests {
                 limit: MAX_DRAIN_SIZE,
             },
             FrameError::DrainTimeout { size: 9_000_000 },
+            FrameError::PayloadTimeout { size: 9_000_000 },
             FrameError::Io(std::io::Error::other("boom")),
             FrameError::TooLarge {
                 size: 9_000_000,

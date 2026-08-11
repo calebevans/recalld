@@ -856,18 +856,30 @@ pub fn era_hint(msg: &JsonRpcMessage) -> EraHint {
     EraHint::Ambiguous
 }
 
-/// Whether a method is answered identically in both eras, without
-/// requiring `_meta`.
+/// Whether a method may be dispatched without first establishing an era —
+/// that is, with neither modern `_meta` nor a completed legacy
+/// `initialize`.
 ///
-/// FLAGGED DEVIATION from "every request MUST carry `_meta`": the stdio era
-/// probe sends `server/discover` FIRST, so demanding a protocol version in
-/// order to discover which versions are supported is circular -- and any
-/// error at all (the spec forbids keying the fallback to one code) would
-/// push a genuinely modern client into the legacy fallback. `ping` is
-/// included because it is tolerated pre-`initialize` today and clients
-/// health-check with it. If `_meta` IS supplied on these methods it is
-/// still version-validated. The strict alternative is a two-line change.
-pub fn is_era_neutral_method(method: &str) -> bool {
+/// This is a *handshake* exemption, not a promise about the answer. The two
+/// members earn it for different reasons and are answered differently:
+///
+/// * `server/discover` is genuinely era-neutral: both eras answer it, and
+///   identically. FLAGGED DEVIATION from "every request MUST carry
+///   `_meta`": the stdio era probe sends `server/discover` FIRST, so
+///   demanding a protocol version in order to discover which versions are
+///   supported is circular -- and any error at all (the spec forbids keying
+///   the fallback to one code) would push a genuinely modern client into
+///   the legacy fallback.
+/// * `ping` is legacy-only, and merely *tolerated* without `_meta`. It was
+///   removed in 2026-07-28 (SEP-2575), so a request that does carry modern
+///   `_meta` is answered `-32601` by the dispatcher; being listed here only
+///   means an un-annotated `ping` is served on the legacy path (`{}`)
+///   instead of being refused for a missing handshake, which is what
+///   existing health-checking clients expect.
+///
+/// If `_meta` IS supplied on either method it is still version-validated,
+/// which is exactly how a modern `ping` reaches its `-32601`.
+pub fn is_handshake_exempt_method(method: &str) -> bool {
     matches!(method, "server/discover" | "ping")
 }
 
@@ -1120,10 +1132,10 @@ mod tests {
     }
 
     #[test]
-    fn era_neutral_methods_are_discover_and_ping() {
-        assert!(is_era_neutral_method("server/discover"));
-        assert!(is_era_neutral_method("ping"));
-        assert!(!is_era_neutral_method("tools/list"));
-        assert!(!is_era_neutral_method("initialize"));
+    fn handshake_exempt_methods_are_discover_and_ping() {
+        assert!(is_handshake_exempt_method("server/discover"));
+        assert!(is_handshake_exempt_method("ping"));
+        assert!(!is_handshake_exempt_method("tools/list"));
+        assert!(!is_handshake_exempt_method("initialize"));
     }
 }

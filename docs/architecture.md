@@ -686,9 +686,13 @@ The era is decided **per message**, not per connection:
   path. The key wins over the method name, so an `initialize` carrying modern
   `_meta` gets `-32601` — that revision removed `initialize`.
 - An `initialize` or `notifications/initialized` message takes the legacy path.
-- `server/discover` and `ping` are answered on either path, without `_meta`, so
-  a modern client's era probe (`server/discover` first) works before it knows
-  which era the server speaks.
+- `server/discover` and `ping` are dispatched without `_meta` and without a
+  handshake, so a modern client's era probe (`server/discover` first) works
+  before it knows which era the server speaks. Only `server/discover` is
+  genuinely era-neutral — both eras answer it identically. `ping` was removed
+  in 2026-07-28 (SEP-2575): an un-annotated `ping` is *tolerated* and answered
+  `{}` on the legacy path for existing health-checkers, but a `ping` carrying
+  modern `_meta` gets `-32601` like any other removed method.
 - Anything else with neither marker is a legacy message: over HTTP it needs an
   `Mcp-Session-Id`, over stdio it needs a prior `initialize`. Without either it
   is rejected with `-32602` naming both remedies.
@@ -769,6 +773,8 @@ the JSON payload.
 | `LEGACY_MAX_MESSAGE_SIZE` | 1 MiB | What a protocol v1 peer (recalld <= 0.1.10) enforces. |
 | `MAX_DRAIN_SIZE` | 64 MiB | Largest declared length still worth skipping past. |
 | `DRAIN_TIMEOUT` | 30 s | How long a peer may take to deliver a frame being skipped. |
+| `PAYLOAD_TIMEOUT` | 30 s | How long a peer may take to deliver a frame being kept. |
+| `MAX_CONSECUTIVE_FRAME_ERRORS` | 8 | Recoverable frame errors in a row before the daemon hangs up. |
 
 The frame limit is deliberately much larger than the 1 MiB `fullText` content
 limit. The content limit measures raw UTF-8 bytes; the frame carries those
@@ -781,9 +787,18 @@ content limit.
 known. An oversized but believable frame (over the peer limit, under
 `MAX_DRAIN_SIZE`) is skipped exactly — copied to a sink, so no allocation —
 which leaves the stream sitting on the next frame boundary. Both sides then
-report the error and keep the connection. Only three conditions close a
-connection: a clean EOF, a declared length beyond `MAX_DRAIN_SIZE` (the
-boundary is fiction), and a drain that times out.
+report the error and keep the connection. A connection is closed on: a clean
+EOF, a declared length beyond `MAX_DRAIN_SIZE` (the boundary is fiction), a
+drain that times out, and a declared payload that never arrives within
+`PAYLOAD_TIMEOUT`. A kept frame is also never allocated on the strength of its
+declared length alone — the buffer grows in 64 KiB steps as bytes actually
+arrive — so a peer that declares 8 MiB and sends nothing costs one chunk and
+one timeout rather than a pinned connection task holding 8 MiB.
+
+Recovery is tolerant but not unlimited: `MAX_CONSECUTIVE_FRAME_ERRORS`
+recoverable errors in a row (with no good frame in between) close the
+connection, since each one can cost up to `DRAIN_TIMEOUT` of one of the 32
+connection slots. Any frame that parses resets the count.
 
 Oversized messages are rejected at serialization time, **before** any byte
 reaches the socket, so an outsized request cannot desynchronize a connection
@@ -798,12 +813,18 @@ corrupts its stream permanently — so a v2 peer never sends one an oversized
 frame. Negotiation is repeated on every reconnect.
 
 **Client recovery.** A transport failure poisons the client connection; the
-next call re-establishes it (3 attempts, 50/200/500 ms backoff). Read-only
-methods are replayed transparently on the fresh connection. Mutating methods
+next call re-establishes it (3 attempts, 50/200/500 ms backoff). Only methods
+with **no observable effect at all** are replayed transparently on the fresh
+connection: `get_memory`, `list_memories`, `list_namespaces`,
+`namespace_stats`, `scan_duplicates`, `check_health`, `ping`. Mutating methods
 are never replayed — `store_memory` mints a server-side id, `reinforce_memory`
 advances the FSRS schedule — and instead return an error stating that the
-operation may or may not have been applied. Request ids are monotonic across
-reconnects, so a response left over from an abandoned call can be recognized
+operation may or may not have been applied. `search` and `find_similar` are
+excluded too, despite writing no memory content: both record an access per
+result, which advances `last_accessed_at` and the FSRS schedule, so a silent
+replay would age those memories twice off one request. They report that
+nothing was written and that reissuing the call is safe. Request ids are
+monotonic across reconnects, so a response left over from an abandoned call can be recognized
 and discarded rather than mistaken for the current one.
 
 ### CLI client (recalld-cli)

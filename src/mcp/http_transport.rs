@@ -281,7 +281,7 @@ async fn handle_post(
         EraHint::Ambiguous => {
             if header_str(&headers, HDR_SESSION_ID).is_some() {
                 handle_legacy_session(state, headers, message).await
-            } else if is_era_neutral_method(&message.method) {
+            } else if is_handshake_exempt_method(&message.method) {
                 // `server/discover` and `ping` are answered without a
                 // handshake and without a session -- the stdio-style era
                 // probe works over HTTP too.
@@ -561,13 +561,23 @@ fn unknown_session(message: &JsonRpcMessage) -> Response {
 /// removed.
 ///
 /// Pure in `now_ms` so it is unit-testable without a clock abstraction.
+///
+/// Evictions are counted *inside* `retain` rather than derived from the
+/// map's length before and after. The map is shared: a concurrent
+/// `initialize` can insert a session mid-sweep, and a `len()` difference
+/// would then be wrong in both directions — under-reporting at best, and
+/// underflowing (a debug panic, or ~1.8e19 in release) when the map ends up
+/// larger than it started. The counter here is exact by construction.
 fn sweep_sessions(sessions: &DashMap<String, SessionEntry>, now_ms: u64, idle_ms: u64) -> usize {
-    let before = sessions.len();
+    let mut removed = 0usize;
     sessions.retain(|_, entry| {
         let last = entry.last_seen.load(Ordering::Relaxed);
-        now_ms.saturating_sub(last) < idle_ms
+        let live = now_ms.saturating_sub(last) < idle_ms;
+        if !live {
+            removed += 1;
+        }
+        live
     });
-    let removed = before - sessions.len();
     if removed > 0 {
         tracing::info!(removed, "swept idle MCP HTTP sessions");
     }
@@ -938,7 +948,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_message_without_session_header_echoes_the_real_id() {
         let r = router();
-        // `ping` is era-neutral, so use a method that requires a session.
+        // `ping` is exempt from the handshake, so use a method that is not.
         let msg = plain_request(4242, "tools/call", Some(serde_json::json!({ "name": "x" })));
         let (status, _, body) = send(&r, Req::post(&msg)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1054,6 +1064,49 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(sessions.contains_key("fresh"));
         assert!(!sessions.contains_key("stale"));
+    }
+
+    // Regression: the eviction count used to be `len_before - len_after`,
+    // which is not a property of this sweep at all — the map is shared, and
+    // an `initialize` landing mid-sweep makes the difference meaningless.
+    // When the map grows past its starting size the subtraction underflows:
+    // a panic in debug, ~1.8e19 in release.
+    // Real threads, not cooperative yields: the failure needs an insert to
+    // land *inside* the sweep, which a single-threaded runtime can never
+    // produce.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sweep_count_is_exact_while_sessions_are_being_created() {
+        let sessions: Arc<DashMap<String, SessionEntry>> = Arc::new(DashMap::new());
+        let entry = |last: u64| SessionEntry {
+            server: Arc::new(Mutex::new(McpServer::new(stub_handler()))),
+            last_seen: Arc::new(AtomicU64::new(last)),
+        };
+
+        const IDLE: usize = 64;
+        for i in 0..IDLE {
+            sessions.insert(format!("idle-{i}"), entry(0));
+        }
+
+        // A writer racing the sweep, exactly as `handle_legacy_initialize`
+        // does. Every session it adds is fresh, so none of them is eligible.
+        let writer = {
+            let sessions = sessions.clone();
+            tokio::spawn(async move {
+                for i in 0..512 {
+                    sessions.insert(format!("new-{i}"), entry(10_000));
+                }
+            })
+        };
+
+        let mut total = 0usize;
+        for _ in 0..512 {
+            total += sweep_sessions(&sessions, 10_000, 5_000);
+        }
+        writer.await.unwrap();
+        total += sweep_sessions(&sessions, 10_000, 5_000);
+
+        assert_eq!(total, IDLE, "each idle session is counted exactly once");
+        assert_eq!(sessions.len(), 512, "the fresh sessions all survived");
     }
 
     #[tokio::test]

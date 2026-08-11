@@ -476,6 +476,171 @@ mod tests {
         NamespaceId::new(1)
     }
 
+    // ── Live-storage fixtures ────────────────────────────────────────
+
+    /// Embedding width used by the fixture namespace. Small on purpose:
+    /// these tests are about edge bookkeeping, not vectors.
+    const DIM: usize = 4;
+
+    struct Fixture {
+        graph: SharedGraph,
+        storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+        cache: Arc<CacheManager>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut engine = RedbStorageEngine::open(dir.path()).expect("open storage");
+            let mut config = crate::model::NamespaceConfig::default_namespace(0);
+            config.embedding_dim = DIM as u32;
+            if engine
+                .get_namespace_by_name(&config.name)
+                .expect("namespace lookup")
+                .is_none()
+            {
+                engine.create_namespace(&config).expect("create namespace");
+            }
+
+            Self {
+                graph: Arc::new(tokio::sync::RwLock::new(
+                    crate::graph::RelationshipGraph::new(),
+                )),
+                storage: Arc::new(std::sync::RwLock::new(engine)),
+                cache: Arc::new(crate::cache::CacheManager::new(
+                    crate::cache::CacheConfig {
+                        embedding_dim: DIM,
+                        ..Default::default()
+                    },
+                    None,
+                )),
+                _dir: dir,
+            }
+        }
+
+        /// Writes a memory to storage and gives it a graph node, which is
+        /// the state an explicit edge is applied against.
+        async fn insert_memory(&self) -> MemoryId {
+            let id = MemoryId::new();
+            let mut record = crate::model::DiskRecord {
+                version: crate::model::DiskRecord::CURRENT_VERSION,
+                id: *id.as_bytes(),
+                namespace_id: ns().get(),
+                created_at: 0,
+                last_accessed_at: 0,
+                phase: crate::model::DecayPhase::Full,
+                strength: 1.0,
+                decay_strength: 1.0,
+                stability: 1.0,
+                difficulty: 5.0,
+                is_permastore: 0,
+                vector_slot: 0,
+                edge_count: 0,
+                summary: "fixture".into(),
+                tags: Vec::new(),
+                access_history: Vec::new(),
+                text_offset: 0,
+                text_length: 0,
+            };
+
+            {
+                let mut storage_w = self.storage.write().expect("storage lock");
+                storage_w
+                    .insert_memory(id, ns(), &mut record, &[0.0; DIM], None)
+                    .expect("insert memory");
+            }
+
+            let slot = record.vector_slot;
+            self.graph
+                .write()
+                .await
+                .add_node(id, ns(), crate::model::DecayPhase::Full, 1.0, slot)
+                .expect("add node");
+            id
+        }
+
+        fn edge_count(&self, id: MemoryId) -> u16 {
+            self.storage
+                .read()
+                .expect("storage lock")
+                .get_record(id)
+                .expect("get record")
+                .expect("record exists")
+                .edge_count
+        }
+
+        fn persisted_edges(&self) -> Vec<PersistedEdge> {
+            self.storage
+                .read()
+                .expect("storage lock")
+                .load_all_edges()
+                .expect("load edges")
+        }
+    }
+
+    /// Regression: a `parentId` edge must move `edge_count`, whichever door
+    /// created it.
+    ///
+    /// The HTTP handlers used to insert this edge themselves and skip the
+    /// counter, so the same memory ranked differently depending on whether
+    /// it arrived over HTTP or MCP. Both doors now call this helper, and
+    /// there is no longer a raw edge-insertion method on the HTTP graph
+    /// trait to drift back to.
+    #[tokio::test]
+    async fn parent_edge_is_persisted_and_counted_on_the_parent() {
+        let fx = Fixture::new();
+        let parent = fx.insert_memory().await;
+        let child = fx.insert_memory().await;
+
+        apply_parent_edge(parent, child, &fx.graph, &fx.storage, &fx.cache).await;
+
+        // `edge_count` counts OUTGOING edges, so only the parent's moves.
+        assert_eq!(fx.edge_count(parent), 1, "parent edge must be counted");
+        assert_eq!(fx.edge_count(child), 0, "the child owns no outgoing edge");
+
+        let edges = fx.persisted_edges();
+        assert_eq!(edges.len(), 1, "the edge must survive a restart");
+        assert_eq!(edges[0].source, parent);
+        assert_eq!(edges[0].target, child);
+        assert_eq!(edges[0].edge_type, EdgeType::ParentChild);
+        assert!(!edges[0].auto_created);
+    }
+
+    /// The two explicit link fields must behave identically, which is the
+    /// reason they share [`apply_explicit_edge`] at all.
+    #[tokio::test]
+    async fn supersedes_and_parent_edges_count_the_same_way() {
+        let fx = Fixture::new();
+        let parent = fx.insert_memory().await;
+        let child = fx.insert_memory().await;
+        let superseded = fx.insert_memory().await;
+
+        apply_parent_edge(parent, child, &fx.graph, &fx.storage, &fx.cache).await;
+        let outcome =
+            apply_supersedes_edge(child, superseded, &fx.graph, &fx.storage, &fx.cache).await;
+
+        assert_eq!(outcome.status, SupersedesStatus::Applied);
+        assert_eq!(fx.edge_count(parent), 1);
+        assert_eq!(fx.edge_count(child), 1, "the supersedes source is counted");
+        assert_eq!(fx.edge_count(superseded), 0);
+    }
+
+    /// Re-applying the same parent edge must not inflate the count: the
+    /// requested end state was already in place.
+    #[tokio::test]
+    async fn repeated_parent_edge_does_not_double_count() {
+        let fx = Fixture::new();
+        let parent = fx.insert_memory().await;
+        let child = fx.insert_memory().await;
+
+        apply_parent_edge(parent, child, &fx.graph, &fx.storage, &fx.cache).await;
+        apply_parent_edge(parent, child, &fx.graph, &fx.storage, &fx.cache).await;
+
+        assert_eq!(fx.edge_count(parent), 1);
+        assert_eq!(fx.persisted_edges().len(), 1);
+    }
+
     /// Any other namespace.
     fn other_ns() -> NamespaceId {
         NamespaceId::new(2)

@@ -260,18 +260,22 @@ const VENDOR_CLOSE: &str = concat!("</", "ant", "ml", ":");
 /// appears in no legitimate corpus, so one occurrence is decisive.
 const VENDOR_LITERALS: [&str; 2] = [VENDOR_OPEN, VENDOR_CLOSE];
 
-/// R2 anchors, in both the bare and vendor-prefixed spellings.
+/// R2 anchors.
 ///
 /// `function_calls` is underscore-joined and plural — not an element in
-/// any real schema. `<invoke name=` and `<parameter name=` are the
-/// exact attribute-first forms the client emits: WS-BPEL's real
-/// `<invoke>` leads with `partnerLink=`/`operation=`, and DocBook's
-/// `<parameter>` takes no attributes at all.
-const INVOKE_LITERALS: [&str; 8] = [
+/// any real schema — so both spellings of it are anchored. `invoke` and
+/// `parameter` are anchored **only** in the vendor-prefixed form.
+///
+/// The bare `<invoke name=` / `<parameter name=` spellings used to be
+/// here too and were a false-positive machine: TestNG suite XML is built
+/// out of `<parameter name="browser" value="chrome"/>`, which is
+/// commonplace in Java repositories and was rejected outright. They
+/// bought nothing, either — the corruption this detector exists to catch
+/// always carries the reserved vendor prefix, which R1 ([`VENDOR_LITERALS`])
+/// already treats as decisive on its own.
+const INVOKE_LITERALS: [&str; 6] = [
     "<function_calls>",
     "</function_calls>",
-    "<invoke name=",
-    "<parameter name=",
     concat!("<", "ant", "ml", ":", "function_calls>"),
     concat!("</", "ant", "ml", ":", "function_calls>"),
     concat!("<", "ant", "ml", ":", "invoke name="),
@@ -336,8 +340,8 @@ const TAG_NAME_SCAN_LIMIT: usize = 32;
 pub enum MarkupRule {
     /// R1 — the reserved client vendor-namespace prefix in tag position.
     VendorNamespace,
-    /// R2 — an invoke/function-call literal, or an attribute-first
-    /// `<invoke name=` / `<parameter name=`.
+    /// R2 — a `function_calls` literal, or a vendor-prefixed
+    /// attribute-first `<invoke name=` / `<parameter name=`.
     InvokeAttribute,
     /// R3 — an exact open/close tag of a camelCase parameter name.
     DistinctiveParamTag,
@@ -706,18 +710,17 @@ mod tests {
     }
 
     #[test]
-    fn a6c_bare_attribute_first_invoke_and_parameter_are_rejected() {
+    fn a6c_bare_attribute_first_invoke_still_falls_to_another_rule_when_corrupt() {
+        // The bare spellings are no longer anchors of their own (see
+        // `b17`/`b18`). Real corruption still trips a rule, because the
+        // parameter tags it splices in are what the later rules are for.
+        let text =
+            "<invoke name=\"store_memory\">\n<parameter name=\"summary\">x</summary>\n</invoke>";
         assert_rejected(
-            "<invoke name=\"store_memory\">",
-            MarkupRule::InvokeAttribute,
-            "<invoke name=",
-            0,
-        );
-        assert_rejected(
-            "<parameter name=\"summary\">",
-            MarkupRule::InvokeAttribute,
-            "<parameter name=",
-            0,
+            text,
+            MarkupRule::TagAdjacency,
+            "</summary>",
+            text.find("</summary>").unwrap(),
         );
     }
 
@@ -916,6 +919,44 @@ mod tests {
         assert!(big.len() >= 1_048_576);
         // Not `assert_accepted`: a failure there would dump a megabyte.
         assert!(scan_client_markup(&big).is_none());
+    }
+
+    #[test]
+    fn b17_testng_suite_xml_is_accepted() {
+        // The reported false positive. `<parameter name=... value=.../>` is
+        // how every TestNG suite passes data to a test, so a bare
+        // `<parameter name=` anchor rejects a whole class of legitimate
+        // Java notes.
+        assert_accepted(
+            "<!DOCTYPE suite SYSTEM \"https://testng.org/testng-1.0.dtd\">\n\
+             <suite name=\"Regression\" parallel=\"tests\">\n\
+             \x20 <parameter name=\"browser\" value=\"chrome\"/>\n\
+             \x20 <test name=\"smoke\">\n\
+             \x20   <parameter name=\"baseUrl\" value=\"https://staging.example.com\"/>\n\
+             \x20   <classes><class name=\"com.example.SmokeTest\"/></classes>\n\
+             \x20 </test>\n\
+             </suite>",
+        );
+    }
+
+    #[test]
+    fn b18_maven_and_spring_parameter_elements_are_accepted() {
+        // Attribute-first `<parameter name=` with a text body, as Maven
+        // plugin docs and Spring XML both spell it.
+        assert_accepted(
+            "The failsafe config sets <parameter name=\"timeout\">30</parameter> and Spring's \
+             <bean class=\"Job\"><parameter name=\"retries\">3</parameter></bean> mirrors it.",
+        );
+    }
+
+    #[test]
+    fn b19_bare_invoke_with_a_name_attribute_is_accepted() {
+        // A `<invoke name=...>` in prose is now judged on its context like
+        // any other tag: nothing else here looks like a tool call.
+        assert_accepted(
+            "The old workflow engine used <invoke name=\"chargeCard\" retries=\"2\"/> for \
+             every step, which we replaced with an idempotency key.",
+        );
     }
 
     #[test]

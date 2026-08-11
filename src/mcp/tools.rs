@@ -313,7 +313,7 @@ async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value)
 
         match bridge.storage.store_memory(input).await {
             Ok(stored) => {
-                results.push(json!({
+                let mut entry = json!({
                     "index": index,
                     "id": stored.id,
                     "namespace": stored.namespace,
@@ -321,8 +321,19 @@ async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value)
                     "strength": stored.strength,
                     "stability": stored.stability,
                     "createdAt": stored.created_at,
-                    "supersedes": stored.supersedes,
-                }));
+                });
+                // `json!` ignores `skip_serializing_if`, so insert the outcome
+                // only when there is one. Otherwise every batch item would
+                // carry a `"supersedes": null` that the single-memory tool,
+                // which serializes `StoredMemory` directly, does not emit.
+                if let Some(outcome) = &stored.supersedes {
+                    if let (Some(obj), Ok(value)) =
+                        (entry.as_object_mut(), serde_json::to_value(outcome))
+                    {
+                        obj.insert("supersedes".to_string(), value);
+                    }
+                }
+                results.push(entry);
             }
             Err(e) => {
                 results.push(json!({
