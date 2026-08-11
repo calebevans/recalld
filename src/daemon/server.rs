@@ -12,8 +12,9 @@ use super::lifecycle;
 use super::protocol::*;
 use crate::Recalld;
 use crate::mcp::bridge::{
-    BridgeError, CreateNamespaceInput, HealthChecker, ListMemoriesInput, NamespaceRegistry,
-    SearchInput, SearchPipeline, StorageEngine as BridgeStorageEngine, StoreInput,
+    BridgeError, CreateNamespaceInput, HealthChecker, ListMemoriesInput, ListTagsInput,
+    NamespaceRegistry, SearchInput, SearchPipeline, StorageEngine as BridgeStorageEngine,
+    StoreInput,
 };
 use crate::mcp::bridge_adapters::*;
 use crate::model::MemoryId;
@@ -462,6 +463,13 @@ async fn dispatch(
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
+        "list_tags" => {
+            let input: ListTagsInput = serde_json::from_value(params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            let result = storage.list_tags(input).await?;
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
+        }
+
         "list_namespaces" => {
             let result = namespaces.list_namespaces().await?;
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
@@ -496,8 +504,8 @@ async fn dispatch(
 mod tests {
     use super::*;
     use crate::mcp::bridge::{
-        DuplicateCluster, HealthStatus, ListMemoriesResponse, MemoryRecord, NamespaceInfo,
-        NamespaceStats, ReinforceResult, SearchHit, SearchResponse, StoredMemory,
+        DuplicateCluster, HealthStatus, ListMemoriesResponse, ListTagsResponse, MemoryRecord,
+        NamespaceInfo, NamespaceStats, ReinforceResult, SearchHit, SearchResponse, StoredMemory,
     };
 
     /// Stub subsystems for the dispatch tests. Only the unknown-method path
@@ -550,6 +558,9 @@ mod tests {
             &self,
             _: ListMemoriesInput,
         ) -> Result<ListMemoriesResponse, BridgeError> {
+            unreachable!()
+        }
+        async fn list_tags(&self, _: ListTagsInput) -> Result<ListTagsResponse, BridgeError> {
             unreachable!()
         }
     }
@@ -773,6 +784,17 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, BridgeError::InvalidInput(_)), "{err}");
         assert!(err.to_string().contains("no_such_method"), "{err}");
+    }
+
+    /// `list_tags` params have no serde default for `limit`, so an empty
+    /// object is rejected at decode time -- which is also why the `Unused`
+    /// stub's `list_tags` is never reached.
+    #[tokio::test]
+    async fn dispatch_list_tags_rejects_params_it_cannot_decode() {
+        let err = dispatch_stub("list_tags", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidInput(_)), "{err}");
     }
 
     #[tokio::test]

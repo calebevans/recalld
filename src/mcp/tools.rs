@@ -1,8 +1,8 @@
 //! MCP tool definitions and handlers for Recalld memory operations.
 //!
-//! Defines 11 tools: store_memory, store_memories, recall_memories, get_memory,
+//! Defines 12 tools: store_memory, store_memories, recall_memories, get_memory,
 //! reinforce_memory, forget_memory, find_similar_memories, create_namespace,
-//! namespace_stats, list_memories, list_namespaces.
+//! namespace_stats, list_memories, list_namespaces, list_tags.
 
 use serde_json::json;
 
@@ -10,9 +10,9 @@ use crate::mcp::args;
 use crate::mcp::bridge::McpBridge;
 use crate::mcp::protocol::{ToolAnnotations, ToolCallResult, ToolInfo};
 use crate::model::constants::{
-    DEFAULT_LIST_LIMIT, EMOTION_MAX_BYTES, ENTITY_MAX_BYTES, FULL_TEXT_MAX_BYTES,
-    MAX_BATCH_MEMORIES, MAX_EMOTIONS, MAX_ENTITIES, MAX_LIST_LIMIT, MAX_TAGS, MAX_TOPICS,
-    SUMMARY_MAX_BYTES, TAG_MAX_BYTES, TOPIC_MAX_BYTES,
+    DEFAULT_LIST_LIMIT, DEFAULT_TAG_LIMIT, EMOTION_MAX_BYTES, ENTITY_MAX_BYTES,
+    FULL_TEXT_MAX_BYTES, MAX_BATCH_MEMORIES, MAX_EMOTIONS, MAX_ENTITIES, MAX_LIST_LIMIT,
+    MAX_TAG_LIMIT, MAX_TAGS, MAX_TOPICS, SUMMARY_MAX_BYTES, TAG_MAX_BYTES, TOPIC_MAX_BYTES,
 };
 use crate::model::validation::validate_namespace_name;
 
@@ -47,6 +47,7 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
         namespace_stats_def(),
         list_memories_def(),
         list_namespaces_def(),
+        list_tags_def(),
     ]
 }
 
@@ -56,7 +57,7 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
 /// which advertises a tool that then answers "Unknown tool" — fails a
 /// test rather than a caller.
 #[cfg(test)]
-const DISPATCHED: [&str; 11] = [
+const DISPATCHED: [&str; 12] = [
     "store_memory",
     "store_memories",
     "recall_memories",
@@ -68,6 +69,7 @@ const DISPATCHED: [&str; 11] = [
     "namespace_stats",
     "list_memories",
     "list_namespaces",
+    "list_tags",
 ];
 
 /// Dispatch a tool call by name to the appropriate handler.
@@ -88,6 +90,7 @@ pub async fn dispatch_tool(
         "namespace_stats" => handle_namespace_stats(bridge, arguments).await,
         "list_memories" => handle_list_memories(bridge, arguments).await,
         "list_namespaces" => handle_list_namespaces(bridge, arguments).await,
+        "list_tags" => handle_list_tags(bridge, arguments).await,
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -1292,6 +1295,84 @@ async fn handle_list_namespaces(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Tool 12: list_tags
+// ═══════════════════════════════════════════════════════════════════════
+
+fn list_tags_def() -> ToolInfo {
+    ToolInfo {
+        name: "list_tags".to_string(),
+        title: Some("List Tags".to_string()),
+        description: "List the tag vocabulary with per-label memory counts, most common \
+            first. Use this to discover what labels already exist before filtering \
+            list_memories or recall_memories, and before storing — so you reuse an existing \
+            tag instead of inventing a near-duplicate. Results come in four buckets: plain \
+            tags, plus the entity, topic, and emotion labels derived from those fields, \
+            returned without their prefixes so they can be passed straight back to \
+            store_memory or list_memories. Counts cover live memories only; deleted \
+            memories are excluded."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "Which namespace to count within (default: \"default\"). \
+                        Reads that namespace's memory records, costing about one \
+                        list_memories call.",
+                    "default": "default"
+                },
+                "allNamespaces": {
+                    "type": "boolean",
+                    "description": "Count across every namespace instead of one. \
+                        Cannot be combined with an explicit namespace.",
+                    "default": false
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": format!(
+                        "Maximum labels returned per bucket (default: {DEFAULT_TAG_LIMIT}, \
+                         max: {MAX_TAG_LIMIT}). Each bucket also reports its untruncated \
+                         total."
+                    ),
+                    "default": DEFAULT_TAG_LIMIT,
+                    "minimum": 1,
+                    "maximum": MAX_TAG_LIMIT
+                }
+            }
+        }),
+        annotations: Some(ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+async fn handle_list_tags(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
+    let input = match args::parse_list_tags_input(&arguments, bridge.default_namespace()) {
+        Ok(input) => input,
+        Err(e) => {
+            tracing::warn!(
+                tool = "list_tags",
+                field = %e.field,
+                error = %e.message,
+                "Rejected malformed MCP tool arguments"
+            );
+            return ToolCallResult::error(e.to_string());
+        }
+    };
+
+    match bridge.storage.list_tags(input).await {
+        Ok(response) => match ToolCallResult::json(&response) {
+            Ok(r) => r,
+            Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+        },
+        Err(e) => ToolCallResult::error(format!("List tags failed: {e}")),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1391,8 +1472,8 @@ mod tests {
     /// The count the module doc, the README and the guide all repeat. If
     /// it moves, they have to move with it.
     #[test]
-    fn t35_declares_eleven_tools() {
-        assert_eq!(tool_definitions().len(), 11);
+    fn t35_declares_twelve_tools() {
+        assert_eq!(tool_definitions().len(), 12);
     }
 
     /// A definition without a dispatch arm advertises a tool that answers
@@ -1425,17 +1506,29 @@ mod tests {
             Some(DEFAULT_LIST_LIMIT as u64)
         );
         assert_eq!(list["properties"]["limit"]["minimum"].as_u64(), Some(1));
+
+        let tags = list_tags_def().input_schema;
+        assert_eq!(
+            tags["properties"]["limit"]["maximum"].as_u64(),
+            Some(MAX_TAG_LIMIT as u64)
+        );
+        assert_eq!(
+            tags["properties"]["limit"]["default"].as_u64(),
+            Some(DEFAULT_TAG_LIMIT as u64)
+        );
+        assert_eq!(tags["properties"]["limit"]["minimum"].as_u64(), Some(1));
     }
 
     #[test]
     fn t38_read_only_tools_declare_the_read_only_hint() {
-        const READ_ONLY: [&str; 6] = [
+        const READ_ONLY: [&str; 7] = [
             "recall_memories",
             "get_memory",
             "find_similar_memories",
             "namespace_stats",
             "list_memories",
             "list_namespaces",
+            "list_tags",
         ];
         for tool in tool_definitions() {
             let Some(annotations) = tool.annotations else {
@@ -1459,6 +1552,24 @@ mod tests {
             schema["properties"].as_object().map(|o| o.len()),
             Some(0),
             "list_namespaces must not require the caller to know anything first"
+        );
+    }
+
+    /// Both scope switches must be discoverable from the schema, or a
+    /// caller cannot know that global scope exists -- nor that the two
+    /// cannot be combined.
+    #[test]
+    fn t40_list_tags_declares_both_scope_switches() {
+        let props = list_tags_def().input_schema["properties"].clone();
+        assert_eq!(props["namespace"]["type"].as_str(), Some("string"));
+        assert_eq!(props["allNamespaces"]["type"].as_str(), Some("boolean"));
+        assert_eq!(props["allNamespaces"]["default"].as_bool(), Some(false));
+        assert!(
+            props["allNamespaces"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Cannot be combined"),
+            "the mutual exclusion has to be in the schema, not just the error"
         );
     }
 }

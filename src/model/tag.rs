@@ -171,6 +171,17 @@ pub fn parse_structured_tags(tags: &[Tag]) -> StructuredMetadata {
     result
 }
 
+/// Order a tag histogram most-common-first, breaking ties on the tag
+/// name so a report is stable between runs.
+///
+/// `MetadataStore::list_tags` reads a redb B-tree keyed by tag, so it
+/// returns **lexicographic** order. Every caller that wants "top tags"
+/// has to apply this: `health::report` did not, and published the first
+/// ten tags alphabetically under the heading "top tags".
+pub fn sort_tag_counts(counts: &mut [(String, u64)]) {
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
 /// Compute the Jaccard similarity between two sets of entities.
 /// Returns 0.0 if either set is empty. Comparison is case-insensitive.
 pub fn entity_overlap(query_entities: &[String], memory_entities: &[String]) -> f32 {
@@ -195,4 +206,41 @@ pub fn entity_overlap(query_entities: &[String], memory_entities: &[String]) -> 
     }
 
     intersection_count as f32 / union_size as f32
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counts(pairs: &[(&str, u64)]) -> Vec<(String, u64)> {
+        pairs.iter().map(|(n, c)| ((*n).to_string(), *c)).collect()
+    }
+
+    /// The health-report bug in miniature: `list_tags` arrives in
+    /// lexicographic order, so without this the "top tags" heading names
+    /// the alphabetically first tags instead of the most common ones.
+    #[test]
+    fn t27_sort_orders_most_common_first() {
+        let mut c = counts(&[("aardvark", 1), ("zebra", 99), ("moose", 50)]);
+        sort_tag_counts(&mut c);
+        assert_eq!(
+            c.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["zebra", "moose", "aardvark"]
+        );
+    }
+
+    #[test]
+    fn t28_ties_break_on_name_ascending() {
+        let mut c = counts(&[("zebra", 7), ("aardvark", 7), ("moose", 7)]);
+        sort_tag_counts(&mut c);
+        assert_eq!(
+            c.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["aardvark", "moose", "zebra"],
+            "a stable order is what makes two runs of the same report comparable"
+        );
+    }
 }

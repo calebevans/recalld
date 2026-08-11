@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use super::client::DaemonClient;
 use super::protocol;
 use crate::mcp::bridge::{
-    self, BridgeError, CreateNamespaceInput, DuplicateCluster, HealthStatus, MemoryRecord,
-    NamespaceInfo, NamespaceStats, ReinforceResult, SearchHit, SearchInput, SearchPipeline,
-    SearchResponse, StoreInput, StoredMemory, SubsystemHealth,
+    self, BridgeError, CreateNamespaceInput, DuplicateCluster, HealthStatus, ListTagsInput,
+    ListTagsResponse, MemoryRecord, NamespaceInfo, NamespaceStats, ReinforceResult, SearchHit,
+    SearchInput, SearchPipeline, SearchResponse, StoreInput, StoredMemory, SubsystemHealth,
 };
 use crate::model::MemoryId;
 
@@ -138,6 +138,14 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
         let params =
             serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("list_memories", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
+    }
+
+    async fn list_tags(&self, input: ListTagsInput) -> Result<ListTagsResponse, BridgeError> {
+        let params =
+            serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let result = self.client.call("list_tags", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }

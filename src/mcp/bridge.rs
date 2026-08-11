@@ -73,6 +73,13 @@ pub trait StorageEngine: Send + Sync {
         &self,
         input: ListMemoriesInput,
     ) -> Result<ListMemoriesResponse, BridgeError>;
+
+    /// Tag vocabulary with per-label memory counts.
+    ///
+    /// On `StorageEngine` rather than `NamespaceRegistry` because
+    /// `list_tags` already lives on the storage traits and the tag index
+    /// is storage.
+    async fn list_tags(&self, input: ListTagsInput) -> Result<ListTagsResponse, BridgeError>;
 }
 
 /// Namespace registry interface.
@@ -369,6 +376,57 @@ pub struct ListTagsInput {
     /// Maximum labels returned *per bucket*. Each bucket also reports the
     /// untruncated total, so a truncated answer still states its own size.
     pub limit: usize,
+}
+
+/// One label and the number of live memories carrying it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagCount {
+    /// The label. In the `entities`, `topics` and `emotions` buckets the
+    /// derived prefix is **stripped**, so the value can be passed
+    /// straight back to `store_memory` or `list_memories` — which is not
+    /// true of the prefixed form, since those tools add the prefix
+    /// themselves.
+    pub name: String,
+    /// Live memories carrying this label.
+    pub count: u64,
+}
+
+/// One bucket of a tag listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagBucket {
+    /// Distinct labels in this bucket *before* truncation, so a truncated
+    /// answer still states its own size.
+    pub total: u64,
+    /// Whether `items` is shorter than `total`.
+    pub truncated: bool,
+    /// Count descending, ties broken on name ascending.
+    pub items: Vec<TagCount>,
+}
+
+/// Tag vocabulary split into plain and derived buckets.
+///
+/// Split rather than flat because in a real corpus every memory carries
+/// several `entity/` tags, so a single top-50 list is nearly all entities
+/// and useless for discovering the plain tags a caller would filter on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTagsResponse {
+    /// The namespace counted, or `null` when every namespace was counted.
+    pub namespace: Option<String>,
+    /// Live memories inspected. `null` in global scope, where the tag
+    /// index is read directly and no memory records are touched.
+    pub memories_counted: Option<u64>,
+    /// Labels that are not derived from `entities`, `topics` or
+    /// `emotions`.
+    pub tags: TagBucket,
+    /// Labels derived from `entities`, prefix stripped.
+    pub entities: TagBucket,
+    /// Labels derived from `topics`, prefix stripped.
+    pub topics: TagBucket,
+    /// Labels derived from `emotions`, prefix stripped.
+    pub emotions: TagBucket,
 }
 
 /// A single memory entry in a list response (lightweight, no full_text).
@@ -713,5 +771,85 @@ mod tests {
         assert_eq!(outcome.target, target);
         assert_eq!(outcome.status, SupersedesStatus::AppliedNotDurable);
         assert_eq!(outcome.detail.as_deref(), Some("disk write failed"));
+    }
+
+    // ── list_tags wire format ────────────────────────────────────────
+
+    fn bucket(items: &[(&str, u64)], total: u64, truncated: bool) -> TagBucket {
+        TagBucket {
+            total,
+            truncated,
+            items: items
+                .iter()
+                .map(|(n, c)| TagCount {
+                    name: (*n).to_string(),
+                    count: *c,
+                })
+                .collect(),
+        }
+    }
+
+    fn empty_bucket() -> TagBucket {
+        bucket(&[], 0, false)
+    }
+
+    #[test]
+    fn list_tags_response_round_trips_in_camel_case() {
+        let response = ListTagsResponse {
+            namespace: Some("work".into()),
+            memories_counted: Some(128),
+            tags: bucket(&[("type/decision", 12)], 41, false),
+            entities: bucket(&[("recalld", 30)], 120, true),
+            topics: empty_bucket(),
+            emotions: empty_bucket(),
+        };
+
+        let encoded = serde_json::to_value(&response).expect("encodes");
+        assert_eq!(encoded["namespace"], json!("work"));
+        assert_eq!(encoded["memoriesCounted"], json!(128));
+        assert_eq!(encoded["entities"]["truncated"], json!(true));
+        assert_eq!(encoded["entities"]["total"], json!(120));
+        assert_eq!(encoded["entities"]["items"][0]["name"], json!("recalld"));
+        assert_eq!(encoded["entities"]["items"][0]["count"], json!(30));
+
+        let decoded: ListTagsResponse = serde_json::from_value(encoded).expect("decodes");
+        assert_eq!(decoded.tags.items[0].name, "type/decision");
+        assert_eq!(decoded.memories_counted, Some(128));
+    }
+
+    /// Global scope emits EXPLICIT nulls rather than omitting the keys,
+    /// so the response always states its own scope instead of leaving the
+    /// caller to infer it from an absence.
+    #[test]
+    fn list_tags_response_states_global_scope_with_explicit_nulls() {
+        let response = ListTagsResponse {
+            namespace: None,
+            memories_counted: None,
+            tags: empty_bucket(),
+            entities: empty_bucket(),
+            topics: empty_bucket(),
+            emotions: empty_bucket(),
+        };
+
+        let encoded = serde_json::to_value(&response).expect("encodes");
+        assert_eq!(encoded["namespace"], json!(null));
+        assert_eq!(encoded["memoriesCounted"], json!(null));
+        let obj = encoded.as_object().expect("object");
+        assert!(obj.contains_key("namespace"));
+        assert!(obj.contains_key("memoriesCounted"));
+    }
+
+    #[test]
+    fn list_tags_input_round_trips_a_global_scope() {
+        let input = ListTagsInput {
+            namespace: None,
+            limit: 50,
+        };
+        let encoded = serde_json::to_value(&input).expect("encodes");
+        assert_eq!(encoded["namespace"], json!(null));
+
+        let decoded: ListTagsInput = serde_json::from_value(encoded).expect("decodes");
+        assert_eq!(decoded.namespace, None);
+        assert_eq!(decoded.limit, 50);
     }
 }

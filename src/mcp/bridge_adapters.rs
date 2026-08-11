@@ -1310,6 +1310,122 @@ impl bridge::StorageEngine for McpStorageAdapter {
             limit: input.limit,
         })
     }
+
+    async fn list_tags(
+        &self,
+        input: bridge::ListTagsInput,
+    ) -> Result<bridge::ListTagsResponse, bridge::BridgeError> {
+        let storage = self.storage.clone();
+        let namespace = input.namespace.clone();
+        let limit = input.limit;
+
+        tokio::task::spawn_blocking(move || {
+            let storage_r = storage.read().map_err(|e| {
+                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+            })?;
+
+            let (counts, memories_counted) = match namespace.as_deref() {
+                Some(name) => {
+                    let ns = storage_r
+                        .get_namespace_by_name(name)
+                        .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+                        .ok_or_else(|| {
+                            bridge::BridgeError::NotFound(format!("namespace '{name}' not found"))
+                        })?;
+                    let (counts, memories) = storage_r
+                        .meta_store()
+                        .tag_counts_in_namespace(ns.id)
+                        .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+                    (counts.into_iter().collect::<Vec<_>>(), Some(memories))
+                }
+                // Global scope reads TAG_INDEX directly, which is keyed by
+                // tag alone: no memory records are touched, so there is no
+                // honest number to report for `memoriesCounted`.
+                None => (
+                    storage_r
+                        .list_tags()
+                        .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?,
+                    None,
+                ),
+            };
+
+            Ok(build_list_tags_response(
+                namespace,
+                memories_counted,
+                counts,
+                limit,
+            ))
+        })
+        .await
+        .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
+    }
+}
+
+/// Split a flat histogram into plain/entity/topic/emotion buckets, order
+/// each most-common-first, and truncate to `limit`.
+///
+/// A label whose prefix is one of the derived ones moves to that bucket
+/// with the prefix stripped; everything else — including a tag that
+/// merely *contains* a slash, such as `project/recalld` — stays in
+/// `tags`. A bare prefix with an empty label also stays in `tags`, rather
+/// than becoming an entity with no name.
+///
+/// Pure, so the bucketing rules are testable without storage.
+fn build_list_tags_response(
+    namespace: Option<String>,
+    memories_counted: Option<u64>,
+    counts: Vec<(String, u64)>,
+    limit: usize,
+) -> bridge::ListTagsResponse {
+    use crate::model::constants::{EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, TOPIC_TAG_PREFIX};
+
+    let mut plain = Vec::new();
+    let mut entities = Vec::new();
+    let mut topics = Vec::new();
+    let mut emotions = Vec::new();
+
+    for (name, count) in counts {
+        let bucketed = [
+            (ENTITY_TAG_PREFIX, &mut entities),
+            (TOPIC_TAG_PREFIX, &mut topics),
+            (EMOTION_TAG_PREFIX, &mut emotions),
+        ]
+        .into_iter()
+        .find_map(|(prefix, bucket)| {
+            let label = name.strip_prefix(prefix)?;
+            // A bare `entity/` names nothing; leave it where it is
+            // rather than inventing an empty-named entity.
+            (!label.is_empty()).then(|| bucket.push((label.to_string(), count)))
+        });
+
+        if bucketed.is_none() {
+            plain.push((name, count));
+        }
+    }
+
+    let finish = |mut bucket: Vec<(String, u64)>| {
+        crate::model::sort_tag_counts(&mut bucket);
+        let total = bucket.len() as u64;
+        let truncated = bucket.len() > limit;
+        bucket.truncate(limit);
+        bridge::TagBucket {
+            total,
+            truncated,
+            items: bucket
+                .into_iter()
+                .map(|(name, count)| bridge::TagCount { name, count })
+                .collect(),
+        }
+    };
+
+    bridge::ListTagsResponse {
+        namespace,
+        memories_counted,
+        tags: finish(plain),
+        entities: finish(entities),
+        topics: finish(topics),
+        emotions: finish(emotions),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1554,7 +1670,7 @@ impl bridge::HealthChecker for McpHealthAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::bridge::NamespaceRegistry;
+    use crate::mcp::bridge::{NamespaceRegistry, StorageEngine as BridgeStorageEngine};
     use crate::test_support::{Fixture, MemorySpec};
 
     fn default_ns() -> NamespaceId {
@@ -1619,5 +1735,233 @@ mod tests {
         let namespaces = fx.namespace_adapter().list_namespaces().await.unwrap();
         assert_eq!(find(&namespaces, "other").memory_count, 1);
         assert_eq!(find(&namespaces, "default").memory_count, 1);
+    }
+
+    // ── list_tags (live storage) ─────────────────────────────────────
+
+    /// Tags as they appear on disk, prefixes included.
+    fn tagged<'a>(namespace: NamespaceId, tags: &'a [&'a str]) -> MemorySpec<'a> {
+        MemorySpec {
+            tags,
+            ..MemorySpec::new(namespace)
+        }
+    }
+
+    fn names(bucket: &bridge::TagBucket) -> Vec<(&str, u64)> {
+        bucket
+            .items
+            .iter()
+            .map(|t| (t.name.as_str(), t.count))
+            .collect()
+    }
+
+    fn scoped(namespace: &str) -> bridge::ListTagsInput {
+        bridge::ListTagsInput {
+            namespace: Some(namespace.to_string()),
+            limit: 50,
+        }
+    }
+
+    #[tokio::test]
+    async fn a51_list_tags_counts_only_the_requested_namespace() {
+        let fx = Fixture::new();
+        let other = fx.create_namespace("other");
+        fx.insert_memory_with(tagged(default_ns(), &["type/decision"]))
+            .await;
+        fx.insert_memory_with(tagged(default_ns(), &["type/decision"]))
+            .await;
+        fx.insert_memory_with(tagged(other, &["type/decision"]))
+            .await;
+
+        let response = fx
+            .storage_adapter()
+            .list_tags(scoped("default"))
+            .await
+            .unwrap();
+        assert_eq!(response.namespace.as_deref(), Some("default"));
+        assert_eq!(response.memories_counted, Some(2));
+        assert_eq!(names(&response.tags), [("type/decision", 2)]);
+    }
+
+    #[tokio::test]
+    async fn a52_list_tags_excludes_tombstoned_memories() {
+        let fx = Fixture::new();
+        let doomed = fx
+            .insert_memory_with(tagged(default_ns(), &["type/decision"]))
+            .await;
+        fx.insert_memory_with(tagged(default_ns(), &["type/decision"]))
+            .await;
+        fx.tombstone(doomed);
+
+        let response = fx
+            .storage_adapter()
+            .list_tags(scoped("default"))
+            .await
+            .unwrap();
+        assert_eq!(response.memories_counted, Some(1));
+        assert_eq!(names(&response.tags), [("type/decision", 1)]);
+    }
+
+    #[tokio::test]
+    async fn a53_list_tags_aggregates_across_namespaces_in_global_scope() {
+        let fx = Fixture::new();
+        let other = fx.create_namespace("other");
+        fx.insert_memory_with(tagged(default_ns(), &["type/decision"]))
+            .await;
+        fx.insert_memory_with(tagged(other, &["type/decision"]))
+            .await;
+
+        let response = fx
+            .storage_adapter()
+            .list_tags(bridge::ListTagsInput {
+                namespace: None,
+                limit: 50,
+            })
+            .await
+            .unwrap();
+        assert_eq!(names(&response.tags), [("type/decision", 2)]);
+    }
+
+    #[tokio::test]
+    async fn a54_list_tags_rejects_an_unknown_namespace() {
+        let fx = Fixture::new();
+        let err = fx
+            .storage_adapter()
+            .list_tags(scoped("nope"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, bridge::BridgeError::NotFound(_)),
+            "expected NotFound, got {err}"
+        );
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    /// A phase transition strips text, not tags, so a Summary or Ghost
+    /// memory is still part of the namespace's vocabulary.
+    #[tokio::test]
+    async fn a55_list_tags_counts_summary_and_ghost_phases() {
+        let fx = Fixture::new();
+        for phase in [DecayPhase::Full, DecayPhase::Summary, DecayPhase::Ghost] {
+            fx.insert_memory_with(MemorySpec {
+                phase,
+                tags: &["type/decision"],
+                ..MemorySpec::new(default_ns())
+            })
+            .await;
+        }
+
+        let response = fx
+            .storage_adapter()
+            .list_tags(scoped("default"))
+            .await
+            .unwrap();
+        assert_eq!(response.memories_counted, Some(3));
+        assert_eq!(names(&response.tags), [("type/decision", 3)]);
+    }
+
+    /// Global scope reads the tag index directly and touches no memory
+    /// records, so there is no honest number to report.
+    #[tokio::test]
+    async fn a56_list_tags_reports_no_memory_count_in_global_scope() {
+        let fx = Fixture::new();
+        fx.insert_memory_with(tagged(default_ns(), &["type/decision"]))
+            .await;
+
+        let response = fx
+            .storage_adapter()
+            .list_tags(bridge::ListTagsInput {
+                namespace: None,
+                limit: 50,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.namespace, None);
+        assert_eq!(response.memories_counted, None);
+    }
+
+    // ── build_list_tags_response (pure) ──────────────────────────────
+
+    fn histogram(pairs: &[(&str, u64)]) -> Vec<(String, u64)> {
+        pairs.iter().map(|(n, c)| ((*n).to_string(), *c)).collect()
+    }
+
+    #[test]
+    fn a57_build_orders_count_descending_then_name_ascending() {
+        let response = build_list_tags_response(
+            None,
+            None,
+            histogram(&[("zebra", 1), ("aardvark", 9), ("moose", 1)]),
+            50,
+        );
+        assert_eq!(
+            names(&response.tags),
+            [("aardvark", 9), ("moose", 1), ("zebra", 1)]
+        );
+    }
+
+    #[test]
+    fn a58_build_splits_derived_prefixes_and_strips_them() {
+        let response = build_list_tags_response(
+            None,
+            None,
+            histogram(&[
+                ("entity/recalld", 3),
+                ("topic/rust", 2),
+                ("emotion/curious", 1),
+                ("type/decision", 4),
+            ]),
+            50,
+        );
+        assert_eq!(names(&response.entities), [("recalld", 3)]);
+        assert_eq!(names(&response.topics), [("rust", 2)]);
+        assert_eq!(names(&response.emotions), [("curious", 1)]);
+        assert_eq!(names(&response.tags), [("type/decision", 4)]);
+    }
+
+    #[test]
+    fn a59_build_reports_the_untruncated_total_and_flags_truncation() {
+        let response =
+            build_list_tags_response(None, None, histogram(&[("a", 3), ("b", 2), ("c", 1)]), 2);
+        assert_eq!(
+            response.tags.total, 3,
+            "total is the size before truncation"
+        );
+        assert!(response.tags.truncated);
+        assert_eq!(names(&response.tags), [("a", 3), ("b", 2)]);
+
+        let untruncated = build_list_tags_response(None, None, histogram(&[("a", 1)]), 2);
+        assert_eq!(untruncated.tags.total, 1);
+        assert!(!untruncated.tags.truncated);
+    }
+
+    /// Containing a slash does not make a tag derived. `project/recalld`
+    /// is a plain tag a caller filters on, and moving it to `entities`
+    /// would make it unusable there.
+    #[test]
+    fn a60_build_keeps_a_slashed_plain_tag_in_the_tags_bucket() {
+        let response =
+            build_list_tags_response(None, None, histogram(&[("project/recalld", 5)]), 50);
+        assert_eq!(names(&response.tags), [("project/recalld", 5)]);
+        assert!(response.entities.items.is_empty());
+        assert_eq!(response.entities.total, 0);
+    }
+
+    #[test]
+    fn a61_build_treats_a_bare_prefix_as_a_plain_tag() {
+        let response = build_list_tags_response(
+            None,
+            None,
+            histogram(&[("entity/", 2), ("topic/", 1), ("emotion/", 1)]),
+            50,
+        );
+        assert_eq!(
+            names(&response.tags),
+            [("entity/", 2), ("emotion/", 1), ("topic/", 1)],
+            "a bare prefix names nothing; it must never become an empty-named entity"
+        );
+        assert!(response.entities.items.is_empty());
+        assert!(response.topics.items.is_empty());
+        assert!(response.emotions.items.is_empty());
     }
 }

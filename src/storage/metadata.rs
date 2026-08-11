@@ -7,6 +7,7 @@
 //!
 //! See CS-07 for the full specification.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use redb::{
@@ -538,6 +539,49 @@ impl MetadataStore {
         }
 
         Ok(tags)
+    }
+
+    /// Tag histogram over the live memories of one namespace.
+    ///
+    /// `TAG_INDEX` is keyed by tag alone with no namespace dimension, so
+    /// this walks `NAMESPACE_INDEX` and does one `META_TABLE` point
+    /// lookup per member — the same work as one unfiltered
+    /// [`list_memories_filtered`](Self::list_memories_filtered) call, not
+    /// a `scan_all`.
+    ///
+    /// Returns `(tag -> memory count, live memory count)`. Tombstoned
+    /// records are skipped; `Summary` and `Ghost` are included, because a
+    /// phase transition strips text, not tags.
+    pub fn tag_counts_in_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<(HashMap<String, u64>, u64), StorageError> {
+        let read_txn = self.db.begin_read()?;
+        let ns_table = read_txn.open_multimap_table(NAMESPACE_INDEX)?;
+        let meta_table = read_txn.open_table(META_TABLE)?;
+
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        let mut memories = 0u64;
+
+        for result in ns_table.get(namespace_id.get())? {
+            let value = result?;
+            let bytes: [u8; 16] = value.value().try_into().map_err(|_| {
+                StorageError::CorruptIndex("invalid UUID length in namespace index".into())
+            })?;
+            let Some(record_value) = meta_table.get(bytes.as_slice())? else {
+                continue;
+            };
+            let record = DiskRecord::from_bytes(record_value.value())?;
+            if record.phase == DecayPhase::Tombstone {
+                continue;
+            }
+            memories += 1;
+            for tag in &record.tags {
+                *counts.entry(tag.as_str().to_string()).or_insert(0) += 1;
+            }
+        }
+
+        Ok((counts, memories))
     }
 }
 

@@ -57,6 +57,7 @@ fn is_retry_safe(method: &str) -> bool {
             | "list_namespaces"
             | "namespace_stats"
             | "list_memories"
+            | "list_tags"
     )
 }
 
@@ -1003,6 +1004,7 @@ mod tests {
             "list_namespaces",
             "namespace_stats",
             "list_memories",
+            "list_tags",
         ] {
             assert!(is_retry_safe(method), "{method} should be replayable");
         }

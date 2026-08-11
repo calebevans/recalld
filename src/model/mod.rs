@@ -37,5 +37,6 @@ pub use self::namespace::{NamespaceConfig, PhaseThresholds};
 pub use self::record::{CachedRecord, DiskRecord};
 pub use self::tag::{
     StructuredMetadata, Tag, entity_overlap, parse_structured_tags, parse_tags_lossy,
+    sort_tag_counts,
 };
 pub use self::validation::{MemoryInputRef, validate_memory_input};
