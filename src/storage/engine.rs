@@ -7,7 +7,7 @@
 //!
 //! See Spec 04 Section 7 for the design rationale.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -589,6 +589,11 @@ pub struct PurgedNamespace {
     /// Edge rows deleted from edges.db, counting edges in which a
     /// purged memory was the target as well as the source.
     pub edges_removed: usize,
+    /// Surviving memories whose outgoing `edge_count` was corrected
+    /// because an edge of theirs pointed into the purged namespace, with
+    /// their new count. The caller owes these an invalidation: their
+    /// cached record still holds the old number.
+    pub peer_edge_counts: Vec<(MemoryId, u16)>,
     /// Whether the namespace's vector directory was removed. `false`
     /// means it was already gone, or a guard refused to touch it.
     pub directory_removed: bool,
@@ -750,14 +755,13 @@ impl RedbStorageEngine {
         // From here on every record in `records` is already destroyed,
         // so any failure hands them back rather than dropping them.
         // 2. Edges. `remove_all_edges` covers both directions, so an
-        //    edge from a surviving memory into a purged one goes too.
-        let mut edges_removed = 0usize;
-        for (id, _) in &records {
-            match self.edge_store.remove_all_edges(*id) {
-                Ok(n) => edges_removed += n,
-                Err(e) => return Err(NamespacePurgeError::partial(records, e)),
-            }
-        }
+        //    edge from a surviving memory into a purged one goes too —
+        //    and the survivor's cached outgoing count has to follow it.
+        let ids: Vec<MemoryId> = records.iter().map(|(id, _)| *id).collect();
+        let (edges_removed, peer_edge_counts) = match self.remove_edges_and_repair_peers(&ids) {
+            Ok(pair) => pair,
+            Err(e) => return Err(NamespacePurgeError::partial(records, e)),
+        };
 
         // 3. Configuration row. Point of no return.
         if let Err(e) = self.meta_store.delete_namespace(namespace_id) {
@@ -787,8 +791,63 @@ impl RedbStorageEngine {
             live_removed,
             tombstones_removed,
             edges_removed,
+            peer_edge_counts,
             directory_removed,
         })
+    }
+
+    /// Remove every edge touching `ids`, and repair the outgoing
+    /// `edge_count` of every SURVIVING memory that had an edge into one
+    /// of them. Returns the edges removed and the `(peer, new_count)`
+    /// pairs that were rewritten.
+    ///
+    /// # Why anything needs repairing
+    ///
+    /// `DiskRecord.edge_count` counts OUTGOING edges and only the
+    /// source's count ever moves — see
+    /// `explicit_links::bump_edge_count`. Nothing in the system
+    /// decrements it, and until a memory is *destroyed* nothing needs
+    /// to: `tombstone` keeps the record and its edges, so the count
+    /// stays true.
+    ///
+    /// Destroying a memory breaks that. `survivor -> destroyed`
+    /// disappears from edges.db while the survivor's record goes on
+    /// counting it, permanently, and that number feeds degree
+    /// centrality and cache weight. Cross-namespace survivors are the
+    /// visible case — a namespace purge is the one operation that
+    /// removes edges from memories it is not deleting.
+    fn remove_edges_and_repair_peers(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<(usize, Vec<(MemoryId, u16)>), StorageError> {
+        let doomed: HashSet<MemoryId> = ids.iter().copied().collect();
+        let mut lost: HashMap<MemoryId, u16> = HashMap::new();
+        let mut edges_removed = 0usize;
+
+        for id in ids {
+            // Read before removing: these are the memories whose
+            // OUTGOING edge is about to vanish. A source that is itself
+            // doomed needs no repair — its record is going too.
+            for (source, _) in self.edge_store.get_incoming(*id)? {
+                if !doomed.contains(&source) {
+                    let entry = lost.entry(source).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                }
+            }
+            edges_removed += self.edge_store.remove_all_edges(*id)?;
+        }
+
+        let mut repaired = Vec::with_capacity(lost.len());
+        for (peer, n) in lost {
+            let Some(record) = self.meta_store.get(peer)? else {
+                continue;
+            };
+            let new_count = record.edge_count.saturating_sub(n);
+            self.meta_store.update_edge_count(peer, new_count)?;
+            repaired.push((peer, new_count));
+        }
+
+        Ok((edges_removed, repaired))
     }
 
     /// Resolve a namespace name to its directory under `db_path`,
@@ -1074,8 +1133,9 @@ impl StorageEngine for RedbStorageEngine {
             let _ = vector_store.free_slot(record.vector_slot);
         }
 
-        // 3. Remove all edges involving this memory.
-        self.edge_store.remove_all_edges(id)?;
+        // 3. Remove all edges involving this memory, repairing the
+        //    outgoing count of every survivor that pointed at it.
+        self.remove_edges_and_repair_peers(&[id])?;
 
         // 4. Text.log space is reclaimed lazily via compaction.
 
@@ -1620,6 +1680,98 @@ mod tests {
         assert!(!dir.path().join("scratch").exists());
         assert!(engine.load_all_edges().expect("edges").is_empty());
         assert_eq!(engine.count().expect("count"), 0);
+    }
+
+    // ── peer edge counts ─────────────────────────────────────────────
+
+    /// `edge_count` counts OUTGOING edges. A purge removes the edge
+    /// `survivor -> purged` from edges.db but used to leave the
+    /// survivor's record still counting it — permanently, and in a
+    /// number that feeds degree centrality and cache weight. The
+    /// cross-namespace case is the one a user sees: the survivor is not
+    /// in the namespace being deleted and nothing else will ever touch
+    /// its record.
+    #[test]
+    fn w56_a_purge_repairs_the_outgoing_edge_count_of_a_surviving_peer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let keep_ns = make_namespace(&mut engine, "keep");
+        let doomed_ns = make_namespace(&mut engine, "doomed");
+
+        let survivor = add_memory(&mut engine, keep_ns);
+        let other_survivor = add_memory(&mut engine, keep_ns);
+        let doomed_a = add_memory(&mut engine, doomed_ns);
+        let doomed_b = add_memory(&mut engine, doomed_ns);
+
+        // Two edges into the doomed namespace and one that stays.
+        for target in [doomed_a, doomed_b, other_survivor] {
+            engine
+                .add_edge(survivor, target, EdgeType::Associative, 0.5, false, 0)
+                .expect("add edge");
+        }
+        engine.update_edge_count(survivor, 3).expect("seed count");
+
+        let purged = engine.purge_namespace(doomed_ns).expect("purge");
+
+        assert_eq!(
+            engine
+                .get_record(survivor)
+                .expect("get")
+                .expect("record")
+                .edge_count,
+            1,
+            "the survivor still counts edges that no longer exist"
+        );
+        assert_eq!(purged.peer_edge_counts, vec![(survivor, 1)]);
+    }
+
+    /// A peer that is itself being purged needs no repair, and must not
+    /// be reported as one: its record is gone.
+    #[test]
+    fn w57_a_purge_does_not_repair_a_peer_it_is_also_destroying() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let ns = make_namespace(&mut engine, "doomed");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .add_edge(a, b, EdgeType::Associative, 0.5, false, 0)
+            .expect("add edge");
+        engine.update_edge_count(a, 1).expect("seed count");
+
+        let purged = engine.purge_namespace(ns).expect("purge");
+
+        assert!(purged.peer_edge_counts.is_empty(), "{purged:?}");
+    }
+
+    /// The same repair on the single-memory hard delete, which removes
+    /// edges for exactly the same reason and had exactly the same gap.
+    #[test]
+    fn w58_a_hard_delete_repairs_the_outgoing_edge_count_of_a_surviving_peer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let ns = make_namespace(&mut engine, "scratch");
+        let survivor = add_memory(&mut engine, ns);
+        let doomed = add_memory(&mut engine, ns);
+        engine
+            .add_edge(survivor, doomed, EdgeType::Associative, 0.5, false, 0)
+            .expect("add edge");
+        engine.update_edge_count(survivor, 1).expect("seed count");
+
+        engine.delete_memory(doomed).expect("delete");
+
+        assert_eq!(
+            engine
+                .get_record(survivor)
+                .expect("get")
+                .expect("record")
+                .edge_count,
+            0,
+            "the survivor still counts an edge that no longer exists"
+        );
     }
 
     // ── namespace name → directory ───────────────────────────────────

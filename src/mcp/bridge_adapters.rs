@@ -2030,6 +2030,15 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             }
         };
 
+        // Surviving memories whose outgoing edge_count storage just
+        // corrected. Their cached copy still holds the old number, and
+        // nothing else will ever notice: invalidate so the next read
+        // reloads the corrected record.
+        if !purged.peer_edge_counts.is_empty() {
+            let peers: Vec<MemoryId> = purged.peer_edge_counts.iter().map(|(id, _)| *id).collect();
+            self.cache.batch_invalidate(&peers).await;
+        }
+
         // Whole-namespace FTS removal, not per record: it also reaches
         // rows whose meta.db record was already gone. RemoveNode, not
         // MarkTombstoned: the records are destroyed, so a surviving node
