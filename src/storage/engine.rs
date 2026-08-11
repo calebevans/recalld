@@ -8,8 +8,10 @@
 //! See Spec 04 Section 7 for the design rationale.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
 
+use crate::model::validation::validate_namespace_name;
 use crate::model::{
     AccessKind, DecayPhase, DiskRecord, EdgeType, MemoryId, NamespaceConfig, NamespaceId,
 };
@@ -677,21 +679,85 @@ impl RedbStorageEngine {
         })
     }
 
+    /// Resolve a namespace name to its directory under `db_path`,
+    /// refusing anything that is not exactly one ordinary path
+    /// component.
+    ///
+    /// `Path::join` does **not** normalize, so this is the whole
+    /// defence between a namespace name and an arbitrary directory:
+    /// `db_path.join("..")` is the parent of the data directory and
+    /// `db_path.join("")` is the data directory itself. Both are
+    /// `remove_dir_all` targets in [`Self::remove_namespace_dir`].
+    ///
+    /// Modelled on the check
+    /// [`VectorManager::open_or_create`](crate::storage::vectors::VectorManager::open_or_create)
+    /// already performs — the non-destructive path had no business
+    /// being the better-guarded one.
+    fn namespace_dir(&self, name: &str) -> Result<PathBuf, StorageError> {
+        let reject = |reason: &str| {
+            Err(StorageError::InvalidNamespaceName {
+                name: name.to_string(),
+                reason: reason.to_string(),
+            })
+        };
+
+        // Separators are refused explicitly rather than left to
+        // `components`: a backslash is a separator on Windows and an
+        // ordinary character on Unix, and a name that means two
+        // different paths on two platforms is not a name this may act
+        // on.
+        if name.is_empty() {
+            return reject("must not be empty");
+        }
+        if name.contains('/') || name.contains('\\') {
+            return reject("must not contain '/' or '\\'");
+        }
+
+        let mut components = Path::new(name).components();
+        let first_is_the_whole_name =
+            matches!(components.next(), Some(Component::Normal(c)) if c == OsStr::new(name));
+        if !first_is_the_whole_name || components.next().is_some() {
+            return reject(
+                "must be exactly one ordinary path component (not '.', '..', or a path)",
+            );
+        }
+
+        Ok(self.db_path.join(name))
+    }
+
     /// Remove one namespace's vector directory. Returns whether it was
     /// actually removed.
     ///
     /// Unlike the boot sweep this joins a name straight onto `db_path`
-    /// rather than walking `read_dir`, so it does its own symlink check:
-    /// `remove_dir_all` follows a symlinked *root*, and a namespace
-    /// directory replaced by a symlink would hand it an arbitrary tree
-    /// to delete.
+    /// rather than walking `read_dir`, so it does its own guarding:
+    ///
+    /// - [`Self::namespace_dir`] refuses anything that is not one
+    ///   ordinary path component, which is what keeps `..` and `""`
+    ///   away from `remove_dir_all`.
+    /// - a symlink is refused rather than followed: `remove_dir_all`
+    ///   follows a symlinked *root*, and a namespace directory replaced
+    ///   by a symlink would hand it an arbitrary tree to delete.
+    /// - the canonicalized target must be a strict child of the
+    ///   canonicalized `db_path`. The component check already implies
+    ///   this; canonicalizing is what *proves* it, and proof is what a
+    ///   recursive delete is worth.
     ///
     /// Never returns an error. Step 3 of the purge has already
     /// committed by the time this runs, so a failure here is wasted disk
     /// to be logged and swept at next boot, not a reason to report the
     /// deletion as failed.
     fn remove_namespace_dir(&self, name: &str) -> bool {
-        let dir = self.db_path.join(name);
+        let dir = match self.namespace_dir(name) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::error!(
+                    namespace = name,
+                    error = %e,
+                    "Refusing to remove a namespace directory for an unusable name"
+                );
+                return false;
+            }
+        };
 
         let metadata = match std::fs::symlink_metadata(&dir) {
             Ok(m) => m,
@@ -719,6 +785,42 @@ impl RedbStorageEngine {
             tracing::warn!(
                 path = %dir.display(),
                 "Namespace path is not a directory; leaving it alone"
+            );
+            return false;
+        }
+
+        // The last word before the recursive delete: resolve both ends
+        // and require a strict parent/child relationship.
+        let canonical_base = match self.db_path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.db_path.display(),
+                    error = %e,
+                    "Could not canonicalize the data directory; leaving the namespace \
+                     directory on disk"
+                );
+                return false;
+            }
+        };
+        let canonical_dir = match dir.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "Could not canonicalize the namespace directory; leaving it on disk"
+                );
+                return false;
+            }
+        };
+        if canonical_dir.parent() != Some(canonical_base.as_path()) {
+            tracing::error!(
+                namespace = name,
+                path = %canonical_dir.display(),
+                base = %canonical_base.display(),
+                "Namespace directory does not resolve to a direct child of the data \
+                 directory; refusing to remove it"
             );
             return false;
         }
@@ -973,12 +1075,45 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Namespaces ──────────────────────────────────────────────────
 
+    /// # The row must never outlive the directory
+    ///
+    /// This used to commit the `NAMESPACE_TABLE` row and only then ask
+    /// `open_or_create` whether the name could be a directory. A
+    /// rejected name therefore left a committed row for a namespace
+    /// whose directory can never be created — and [`Self::open`] step 6
+    /// calls `open_or_create` for **every** row and `?`-propagates, so
+    /// the next boot failed outright. One rejected `create_namespace`
+    /// call wedged the database.
+    ///
+    /// So: validate first, and roll the row back if the vector store
+    /// still refuses. Validation cannot see a directory already flocked
+    /// by another store or a full disk, and both wedge the boot in
+    /// exactly the same way.
     fn create_namespace(&mut self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
+        validate_namespace_name(&config.name).map_err(|e| StorageError::InvalidNamespaceName {
+            name: config.name.clone(),
+            reason: e.to_string(),
+        })?;
+
         let ns_id = self.meta_store.create_namespace(config)?;
 
         // Open/create the vector file for this namespace.
-        self.vector_manager
-            .open_or_create(ns_id, &config.name, config.embedding_dim as usize)?;
+        if let Err(e) =
+            self.vector_manager
+                .open_or_create(ns_id, &config.name, config.embedding_dim as usize)
+        {
+            if let Err(rollback) = self.meta_store.delete_namespace(ns_id) {
+                tracing::error!(
+                    namespace = %config.name,
+                    namespace_id = ns_id.get(),
+                    error = %rollback,
+                    "Could not roll back the namespace row after its vector store failed \
+                     to open. The next startup will fail to open this namespace; remove \
+                     the row by hand."
+                );
+            }
+            return Err(e.into());
+        }
 
         Ok(ns_id)
     }
@@ -1373,5 +1508,123 @@ mod tests {
         assert!(!dir.path().join("scratch").exists());
         assert!(engine.load_all_edges().expect("edges").is_empty());
         assert_eq!(engine.count().expect("count"), 0);
+    }
+
+    // ── namespace name → directory ───────────────────────────────────
+
+    /// `Path::join` does **not** normalize, so `db_path.join("..")` is
+    /// the parent of the data directory and `remove_dir_all` on it takes
+    /// everything recalld owns — and everything that happens to sit
+    /// beside it. The old guard checked only symlink-and-is-dir, both of
+    /// which `..` passes.
+    #[test]
+    fn w45_a_dot_dot_name_cannot_delete_the_parent_of_the_data_directory() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let db_path = outer.path().join("data");
+        std::fs::create_dir_all(&db_path).expect("create data dir");
+        let bystander = outer.path().join("someone-elses-files");
+        std::fs::create_dir_all(&bystander).expect("create bystander");
+
+        let engine = open_engine(&db_path);
+
+        assert!(
+            !engine.remove_namespace_dir(".."),
+            "'..' was accepted as a namespace directory name"
+        );
+        assert!(
+            bystander.exists(),
+            "the parent of the data directory was destroyed"
+        );
+        assert!(
+            db_path.join("meta.db").exists(),
+            "the database was destroyed"
+        );
+    }
+
+    /// The one that needs no `..` and no daemon frame. `db_path.join("")`
+    /// **is** `db_path`, `VectorManager::open_or_create` accepted `""`,
+    /// so the namespace was live and healthy — and deleting it pointed
+    /// `remove_dir_all` at the whole database.
+    #[test]
+    fn w46_an_empty_name_cannot_delete_the_data_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = open_engine(dir.path());
+
+        assert!(
+            !engine.remove_namespace_dir(""),
+            "'' was accepted as a namespace directory name"
+        );
+        assert!(db_is_intact(dir.path()), "the database was destroyed");
+    }
+
+    #[test]
+    fn w47_only_a_single_ordinary_path_component_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = open_engine(dir.path());
+
+        for bad in [
+            "",
+            ".",
+            "..",
+            "/",
+            "sub/dir",
+            "..\\up",
+            "scratch/",
+            "./scratch",
+        ] {
+            assert!(
+                engine.namespace_dir(bad).is_err(),
+                "{bad:?} was accepted as a namespace directory name"
+            );
+        }
+
+        assert_eq!(
+            engine.namespace_dir("scratch").expect("a plain name"),
+            dir.path().join("scratch")
+        );
+    }
+
+    /// `create_namespace` used to commit the `NAMESPACE_TABLE` row and
+    /// only THEN ask `open_or_create` whether the name could be a
+    /// directory. The caller saw an error and the row survived — and
+    /// [`RedbStorageEngine::open`] step 6 `?`-propagates that same
+    /// rejection for every row, so one bad `create_namespace` call meant
+    /// the database would not start again.
+    #[test]
+    fn w48_a_rejected_name_leaves_no_row_and_the_database_still_opens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        {
+            let mut engine = open_engine(dir.path());
+            for bad in ["", "..", "a/b", "has space", "ünïcode", &"x".repeat(65)] {
+                let mut config = NamespaceConfig::default_namespace(0);
+                config.name = bad.to_string();
+                config.embedding_dim = DIM as u32;
+
+                engine
+                    .create_namespace(&config)
+                    .expect_err(&format!("{bad:?} must be rejected"));
+
+                assert!(
+                    engine
+                        .list_namespaces()
+                        .expect("list")
+                        .iter()
+                        .all(|ns| ns.name != bad),
+                    "{bad:?} left a NAMESPACE_TABLE row behind"
+                );
+            }
+        }
+
+        RedbStorageEngine::open(dir.path())
+            .expect("a rejected create_namespace must not wedge the next startup");
+    }
+
+    /// Whether the database files a purge must never touch are all still
+    /// where they belong.
+    fn db_is_intact(db_path: &Path) -> bool {
+        db_path.join("meta.db").exists()
+            && db_path.join("edges.db").exists()
+            && db_path.join("fulltext.dat").exists()
     }
 }

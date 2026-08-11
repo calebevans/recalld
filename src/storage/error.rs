@@ -46,6 +46,15 @@ pub enum StorageError {
     #[error("duplicate namespace name: {0}")]
     DuplicateName(String),
 
+    /// A namespace name is not usable as an on-disk directory name.
+    #[error("invalid namespace name '{name}': {reason}")]
+    InvalidNamespaceName {
+        /// The rejected name, echoed back for the caller's message.
+        name: String,
+        /// Why it was rejected.
+        reason: String,
+    },
+
     /// No namespace exists for the given ID.
     #[error("namespace not found: {0}")]
     NamespaceNotFound(u32),

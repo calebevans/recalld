@@ -1697,6 +1697,15 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
     ) -> Result<bridge::NamespaceInfo, bridge::BridgeError> {
         use crate::model::NamespaceConfig;
 
+        // Validated here as well as at the tool layer, and this is the
+        // load-bearing copy for the same reason the `default` guard in
+        // `delete_namespace` is: the daemon socket dispatches
+        // `create_namespace` straight into this adapter and never runs
+        // the tool handler. A namespace name becomes a directory name,
+        // so an unvalidated one becomes a path.
+        crate::model::validation::validate_namespace_name(&input.name)
+            .map_err(|e| bridge::BridgeError::InvalidInput(e.to_string()))?;
+
         let now = chrono::Utc::now().timestamp_millis();
         let storage = self.storage.clone();
         let tz = self.timezone;
@@ -1853,6 +1862,13 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         input: bridge::DeleteNamespaceInput,
     ) -> Result<bridge::DeleteNamespaceResult, bridge::BridgeError> {
         use crate::model::constants::DEFAULT_NAMESPACE_NAME;
+
+        // Validated before anything else, and for a blunter reason than
+        // tidiness: the name is joined onto the data directory and
+        // handed to `remove_dir_all`. `""` used to name a live,
+        // healthy namespace whose directory WAS the data directory.
+        crate::model::validation::validate_namespace_name(&input.name)
+            .map_err(|e| bridge::BridgeError::InvalidInput(e.to_string()))?;
 
         // The default namespace is refused here as well as at the tool
         // layer, and this is the load-bearing copy: the daemon socket is
@@ -2992,5 +3008,114 @@ mod tests {
             "the recreated namespace inherited the deleted one's vector file"
         );
         assert!(fx.record(old_id).is_none());
+    }
+
+    // ── namespace-name validation on the socket's own entry point ────
+
+    /// `validate_namespace_name` ran at the tool layer and the HTTP
+    /// layer and nowhere else, but the daemon dispatches
+    /// `create_namespace` straight into this adapter. A namespace name
+    /// becomes a directory name, so an unvalidated one becomes a path.
+    #[tokio::test]
+    async fn w45_create_namespace_validates_the_name_in_the_adapter() {
+        let fx = Fixture::new();
+        let adapter = fx.namespace_adapter();
+
+        for bad in ["", "..", "../evil", "has space", "ünïcode"] {
+            let err = adapter
+                .create_namespace(bridge::CreateNamespaceInput {
+                    name: bad.to_string(),
+                    embedding_dim: Some(crate::test_support::DIM as u16),
+                    initial_stability: None,
+                    desired_retention: None,
+                    decay_rate_multiplier: None,
+                })
+                .await
+                .expect_err("an unusable namespace name must be refused");
+            assert!(
+                matches!(err, bridge::BridgeError::InvalidInput(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+
+        assert_eq!(
+            fx.storage
+                .read()
+                .expect("storage lock")
+                .list_namespaces()
+                .expect("list")
+                .len(),
+            1,
+            "a refused create left a namespace row behind"
+        );
+    }
+
+    /// `delete_namespace` checked `!= "default"` and nothing else. `""`
+    /// passed that check, named a namespace that really was live, and
+    /// resolved to the data directory itself.
+    #[tokio::test]
+    async fn w46_delete_namespace_refuses_an_unusable_name_as_invalid_input() {
+        let fx = Fixture::new();
+        let adapter = fx.namespace_adapter();
+
+        for bad in ["", "..", "../default", "has space"] {
+            let err = adapter
+                .delete_namespace(bridge::DeleteNamespaceInput {
+                    name: bad.to_string(),
+                    force: true,
+                })
+                .await
+                .expect_err("an unusable namespace name must be refused");
+            assert!(
+                matches!(err, bridge::BridgeError::InvalidInput(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+    }
+
+    /// The migration case, and the reason the refusal is by name rather
+    /// than by lookup: a database created before the validator reached
+    /// this layer can already hold a row named `""`, whose directory
+    /// **is** the data directory. Planting the row directly is the only
+    /// way to reach that state now.
+    #[tokio::test]
+    async fn w47_a_legacy_empty_named_namespace_cannot_destroy_the_database() {
+        let fx = Fixture::new();
+
+        {
+            let mut config = crate::model::NamespaceConfig::default_namespace(0);
+            config.name = String::new();
+            config.embedding_dim = crate::test_support::DIM as u32;
+            fx.storage
+                .write()
+                .expect("storage lock")
+                .meta_store()
+                .create_namespace(&config)
+                .expect("plant a legacy row");
+        }
+
+        let err = fx
+            .namespace_adapter()
+            .delete_namespace(bridge::DeleteNamespaceInput {
+                name: String::new(),
+                force: true,
+            })
+            .await
+            .expect_err("an empty namespace name must be refused");
+        assert!(
+            matches!(err, bridge::BridgeError::InvalidInput(_)),
+            "{err:?}"
+        );
+
+        assert!(
+            fx.path().join("meta.db").exists()
+                && fx.path().join("edges.db").exists()
+                && fx.path().join("fulltext.dat").exists(),
+            "the database was destroyed"
+        );
+        assert!(
+            fx.namespace_dir("default").join("vectors.dat").exists(),
+            "the default namespace's vectors were destroyed"
+        );
     }
 }

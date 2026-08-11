@@ -1369,6 +1369,14 @@ async fn handle_delete_namespace(
         None => return ToolCallResult::error("Missing required parameter: name"),
     };
 
+    // The name becomes a directory name that `remove_dir_all` is
+    // pointed at, so it is checked before anything is done with it.
+    // Refused here as well as in the adapter; the adapter's copy is the
+    // load-bearing one, because the socket is its own entry point.
+    if let Err(e) = validate_namespace_name(&name) {
+        return ToolCallResult::error(e.to_string());
+    }
+
     // Refused here as well as in the adapter. This copy saves a daemon
     // round trip; the adapter's copy is the load-bearing one, because
     // the socket is its own entry point.
