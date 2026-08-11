@@ -1118,6 +1118,45 @@ impl MetadataStore {
         Ok(destroyed)
     }
 
+    /// Count the live records a [`purge_namespace_records`] call would
+    /// destroy.
+    ///
+    /// # Why not `count_memories_in_namespace`
+    ///
+    /// That one walks `NAMESPACE_INDEX` and confirms each hit against
+    /// `META_TABLE`; the purge scans `META_TABLE` and filters on
+    /// `record.namespace_id`. They read different sources of truth, so a
+    /// `META_TABLE` row whose index entry is missing is invisible to the
+    /// count and destroyed by the purge — which is precisely the row a
+    /// non-force "is this namespace empty?" guard exists to protect. A
+    /// check and an effect that disagree is not a guard.
+    ///
+    /// Tombstones are excluded, matching the guard's rule that a
+    /// namespace holding only tombstones is empty: they hold no content
+    /// the user has not already asked to forget, and they report as zero
+    /// everywhere else.
+    ///
+    /// This is a full scan. It runs only on the non-force deletion path,
+    /// immediately before a purge that scans the same table anyway.
+    pub fn count_live_records_in_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<u64, StorageError> {
+        let ns = namespace_id.get();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(META_TABLE)?;
+
+        let mut count = 0u64;
+        for result in table.iter()? {
+            let (_, value) = result?;
+            let record = DiskRecord::from_bytes(value.value())?;
+            if record.namespace_id == ns && record.phase != DecayPhase::Tombstone {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Every `META_TABLE` row belonging to `ns`, tombstones included.
     fn scan_namespace_records(&self, ns: u32) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
         let read_txn = self.db.begin_read()?;
@@ -1400,6 +1439,72 @@ mod tests {
         record.id = *id.as_bytes();
         store.insert(id, &record).expect("insert");
         id
+    }
+
+    // ── the non-force emptiness guard ────────────────────────────────
+
+    /// The check and the effect have to read the same source of truth.
+    /// `count_memories_in_namespace` walks NAMESPACE_INDEX; the purge
+    /// scans META_TABLE. A record whose index entry went missing — the
+    /// corruption `list_memories_filtered` explicitly tolerates — was
+    /// therefore invisible to the "is this namespace empty?" guard and
+    /// destroyed anyway by the purge that guard was protecting it from.
+    #[test]
+    fn w54_the_emptiness_guard_sees_a_record_the_namespace_index_lost() {
+        let (_dir, store) = open_store();
+        let orphan = insert(&store, 1, 0, &[]);
+
+        // Drop the index entry, keeping the META_TABLE row.
+        {
+            let write_txn = store.db.begin_write().expect("begin write");
+            {
+                let mut ns_idx = write_txn
+                    .open_multimap_table(NAMESPACE_INDEX)
+                    .expect("open namespace index");
+                ns_idx
+                    .remove(1, orphan.as_bytes().as_slice())
+                    .expect("remove index entry");
+            }
+            write_txn.commit().expect("commit");
+        }
+
+        let ns = NamespaceId::new(1);
+        assert_eq!(
+            store
+                .count_memories_in_namespace(ns)
+                .expect("index-driven count"),
+            0,
+            "the setup did not actually orphan the record"
+        );
+        assert_eq!(
+            store
+                .count_live_records_in_namespace(ns)
+                .expect("scan-driven count"),
+            1,
+            "the guard cannot see a record the purge will destroy"
+        );
+        assert_eq!(
+            store.purge_namespace_records(ns, 100).expect("purge").len(),
+            1,
+            "the purge and the guard disagree about what is in the namespace"
+        );
+    }
+
+    /// The rule the guard deliberately keeps: a namespace holding only
+    /// tombstones is empty, because they report as zero everywhere else
+    /// and hold no content the user has not already forgotten.
+    #[test]
+    fn w55_tombstones_do_not_make_a_namespace_non_empty() {
+        let (_dir, store) = open_store();
+        let dead = insert(&store, 1, 0, &[]);
+        store.tombstone(dead).expect("tombstone");
+
+        assert_eq!(
+            store
+                .count_live_records_in_namespace(NamespaceId::new(1))
+                .expect("count"),
+            0
+        );
     }
 
     // ── purge_namespace_records ──────────────────────────────────────

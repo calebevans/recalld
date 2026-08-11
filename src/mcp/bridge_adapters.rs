@@ -1956,9 +1956,17 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                     // and those tombstones hold no content the user has
                     // not already asked to forget. The purge still reaps
                     // them, and the result reports how many.
+                    //
+                    // `count_live_records_in_namespace`, NOT
+                    // `count_memories_in_namespace`: the latter walks
+                    // NAMESPACE_INDEX while the destruction scans
+                    // META_TABLE, so a record whose index entry is
+                    // missing was invisible to the check and destroyed
+                    // by the effect. The guard applies the purge's own
+                    // predicate.
                     let live = storage_w
                         .meta_store()
-                        .count_memories_in_namespace(config.id)
+                        .count_live_records_in_namespace(config.id)
                         .map_err(|e| {
                             DeleteFailure::nothing_destroyed(bridge::BridgeError::Storage(
                                 e.to_string(),
