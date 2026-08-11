@@ -13,8 +13,8 @@
 //! delegates its content-limit checks here so the two cannot diverge.
 
 use super::constants::{
-    FULL_TEXT_MAX_BYTES, MAX_EMOTIONS, MAX_ENTITIES, MAX_TAGS, MAX_TOPICS,
-    NAMESPACE_NAME_MAX_BYTES, SUMMARY_MAX_BYTES,
+    EMOTION_MAX_BYTES, ENTITY_MAX_BYTES, FULL_TEXT_MAX_BYTES, MAX_EMOTIONS, MAX_ENTITIES, MAX_TAGS,
+    MAX_TOPICS, NAMESPACE_NAME_MAX_BYTES, SUMMARY_MAX_BYTES, TAG_MAX_BYTES, TOPIC_MAX_BYTES,
 };
 use super::error::ValidationError;
 
@@ -35,8 +35,15 @@ pub struct MemoryInputRef<'a> {
 /// Validate every content limit on a store request.
 ///
 /// Checks run in a fixed order — summary emptiness, summary length,
-/// full text length, then the array counts — so a request violating
-/// several limits always reports the same one.
+/// full text length, then the array counts, then the per-element
+/// lengths — so a request violating several limits always reports the
+/// same one.
+///
+/// The per-element limits are what keep the request envelope bounded
+/// (the frame headroom in [`crate::daemon::protocol`] is computed from
+/// them) and what keep an over-long label from being merged into an
+/// over-long `entity/<label>` tag that the storage layer would then
+/// drop. See [`ENTITY_MAX_BYTES`] for the prefix reservation.
 pub fn validate_memory_input(input: MemoryInputRef<'_>) -> Result<(), ValidationError> {
     if input.summary.is_empty() {
         return Err(ValidationError::SummaryEmpty);
@@ -49,6 +56,32 @@ pub fn validate_memory_input(input: MemoryInputRef<'_>) -> Result<(), Validation
     validate_count("entities", input.entities.len(), MAX_ENTITIES)?;
     validate_count("topics", input.topics.len(), MAX_TOPICS)?;
     validate_count("emotions", input.emotions.len(), MAX_EMOTIONS)?;
+    validate_item_lens("tags", input.tags, TAG_MAX_BYTES)?;
+    validate_item_lens("entities", input.entities, ENTITY_MAX_BYTES)?;
+    validate_item_lens("topics", input.topics, TOPIC_MAX_BYTES)?;
+    validate_item_lens("emotions", input.emotions, EMOTION_MAX_BYTES)?;
+    Ok(())
+}
+
+/// Check that every element of an array field fits within `max_bytes`
+/// UTF-8 bytes, reporting the first that does not by index.
+pub fn validate_item_lens(
+    field: &'static str,
+    items: &[String],
+    max_bytes: usize,
+) -> Result<(), ValidationError> {
+    for (index, item) in items.iter().enumerate() {
+        let bytes = item.len();
+        if bytes > max_bytes {
+            return Err(ValidationError::ItemTooLong {
+                field,
+                index,
+                bytes,
+                chars: item.chars().count(),
+                max_bytes,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -128,6 +161,7 @@ pub fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::constants::{EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, TOPIC_TAG_PREFIX};
     use super::*;
 
     fn input(summary: &str) -> MemoryInputRef<'_> {
@@ -262,6 +296,135 @@ mod tests {
                     assert!(result.is_ok(), "{field} at {max} should be accepted");
                 }
             }
+        }
+    }
+
+    // ── Per-element lengths ──────────────────────────────────────────
+
+    /// The four array fields and the per-element byte limit each one
+    /// enforces.
+    const ITEM_LIMITS: [(&str, usize); 4] = [
+        ("tags", TAG_MAX_BYTES),
+        ("entities", ENTITY_MAX_BYTES),
+        ("topics", TOPIC_MAX_BYTES),
+        ("emotions", EMOTION_MAX_BYTES),
+    ];
+
+    /// Build an input whose `field` array holds exactly `items`.
+    fn with_field<'a>(summary: &'a str, field: &str, items: &'a [String]) -> MemoryInputRef<'a> {
+        let mut inp = input(summary);
+        match field {
+            "tags" => inp.tags = items,
+            "entities" => inp.entities = items,
+            "topics" => inp.topics = items,
+            _ => inp.emotions = items,
+        }
+        inp
+    }
+
+    #[test]
+    fn item_length_boundary_is_inclusive() {
+        for (field, max) in ITEM_LIMITS {
+            let at = vec!["a".repeat(max)];
+            assert!(
+                validate_memory_input(with_field("ok", field, &at)).is_ok(),
+                "{field} at {max} bytes should be accepted"
+            );
+
+            let over = vec!["a".repeat(max + 1)];
+            let err = validate_memory_input(with_field("ok", field, &over)).unwrap_err();
+            assert_eq!(err.field(), Some(field));
+            match err {
+                ValidationError::ItemTooLong {
+                    index,
+                    bytes,
+                    max_bytes,
+                    ..
+                } => {
+                    assert_eq!(index, 0);
+                    assert_eq!(bytes, max + 1);
+                    assert_eq!(max_bytes, max);
+                }
+                other => panic!("unexpected error for {field}: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn item_error_names_the_offending_index() {
+        let items = vec![
+            "fine".to_string(),
+            "also-fine".to_string(),
+            "x".repeat(TAG_MAX_BYTES + 1),
+        ];
+        let err = validate_memory_input(with_field("ok", "tags", &items)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("tags[2] is 129 bytes"), "{msg}");
+        assert!(msg.contains("128-byte limit"), "{msg}");
+    }
+
+    #[test]
+    fn item_limit_counts_bytes_not_characters() {
+        // 61 em dashes = 61 characters but 183 bytes: over every
+        // per-element limit while looking short to a caller counting
+        // characters.
+        let label = "—".repeat(61);
+        assert_eq!(label.len(), 183);
+        let items = vec![label];
+        let err = validate_memory_input(with_field("ok", "entities", &items)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("entities[0] is 183 bytes (61 characters)"),
+            "{msg}"
+        );
+        assert!(msg.contains(HINT), "{msg}");
+    }
+
+    #[test]
+    fn item_at_limit_in_multibyte_characters_is_accepted() {
+        // 40 em dashes = 120 bytes, the tightest per-element limit.
+        let label = "—".repeat(40);
+        assert_eq!(label.len(), EMOTION_MAX_BYTES);
+        let items = vec![label];
+        for (field, _) in ITEM_LIMITS {
+            assert!(
+                validate_memory_input(with_field("ok", field, &items)).is_ok(),
+                "{field} should accept 120 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn count_is_reported_before_item_length() {
+        let mut items = strings(MAX_TAGS + 1);
+        items[0] = "x".repeat(TAG_MAX_BYTES + 1);
+        let err = validate_memory_input(with_field("ok", "tags", &items)).unwrap_err();
+        assert!(matches!(err, ValidationError::TooManyItems { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_max_length_label_still_fits_its_derived_tag() {
+        // The reason `entities`/`topics`/`emotions` get a tighter limit
+        // than `tags`: the merge step prepends a prefix, and a derived
+        // tag over `TAG_MAX_BYTES` used to be dropped without a word.
+        let cases = [
+            ("entities", ENTITY_TAG_PREFIX, ENTITY_MAX_BYTES),
+            ("topics", TOPIC_TAG_PREFIX, TOPIC_MAX_BYTES),
+            ("emotions", EMOTION_TAG_PREFIX, EMOTION_MAX_BYTES),
+        ];
+        for (field, prefix, max) in cases {
+            let items = vec!["a".repeat(max)];
+            assert!(validate_memory_input(with_field("ok", field, &items)).is_ok());
+            let derived = format!("{prefix}{}", items[0]);
+            assert!(
+                derived.len() <= TAG_MAX_BYTES,
+                "{field}: derived tag is {} bytes",
+                derived.len()
+            );
+            assert!(
+                crate::model::Tag::new(&derived).is_ok(),
+                "{field}: derived tag must survive Tag::new"
+            );
         }
     }
 

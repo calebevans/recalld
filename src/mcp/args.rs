@@ -1409,6 +1409,34 @@ mod tests {
     }
 
     #[test]
+    fn d8b_per_element_length_limits_reach_both_mcp_doors() {
+        // `store_memory` and each item of `store_memories` come through
+        // here, so this covers both MCP entry points.
+        let long_tag = "a".repeat(129);
+        let err = parse_store_input(&json!({ "summary": "s", "tags": ["ok", long_tag] }), NS)
+            .unwrap_err();
+        assert_eq!(err.field, "tags");
+        assert!(err.message.contains("tags[1] is 129 bytes"), "{err}");
+        assert!(err.message.contains("128-byte limit"), "{err}");
+
+        // Labels are tighter than tags by the width of the prefix the
+        // merge step prepends — 121 bytes for `entity/`.
+        let long_entity = "a".repeat(122);
+        let item = json!({ "summary": "s", "entities": [long_entity] });
+        let err = parse_store_input(&item, NS).unwrap_err();
+        assert_eq!(err.field, "entities");
+        assert!(err.message.contains("121-byte limit"), "{err}");
+
+        // The batch door reports the same failure.
+        let err = parse_store_item(&item, 3, NS).unwrap_err();
+        assert_eq!(err.field, "entities");
+
+        // Exactly at the limit is accepted.
+        let at_limit = json!({ "summary": "s", "entities": ["a".repeat(121)] });
+        assert!(parse_store_input(&at_limit, NS).is_ok());
+    }
+
+    #[test]
     fn d9_non_object_items_are_rejected_by_shape() {
         for value in [
             json!("hello"),

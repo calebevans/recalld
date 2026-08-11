@@ -105,22 +105,16 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         };
 
         // Build proper filter from query tags/entities (Issue 2)
-        let mut require_tags: Vec<Tag> = query
-            .include_tags
-            .iter()
-            .filter_map(|t| Tag::new(t).ok())
-            .collect();
+        let mut require_tags: Vec<Tag> =
+            crate::model::parse_tags_lossy("search.includeTags", &query.include_tags);
         // Convert entities to entity/ tags (Issue 4)
         for e in &query.entities {
             if let Ok(tag) = Tag::new(&format!("entity/{}", e.to_lowercase())) {
                 require_tags.push(tag);
             }
         }
-        let exclude_tags: Vec<Tag> = query
-            .exclude_tags
-            .iter()
-            .filter_map(|t| Tag::new(t).ok())
-            .collect();
+        let exclude_tags: Vec<Tag> =
+            crate::model::parse_tags_lossy("search.excludeTags", &query.exclude_tags);
         let phases: Vec<DecayPhase> = query
             .decay_phases
             .as_ref()
@@ -326,7 +320,12 @@ impl state::StorageEngine for StorageEngineAdapter {
         let id = MemoryId::new();
         let now = chrono::Utc::now().timestamp_millis();
         let ts = created_at.unwrap_or(now);
-        let parsed_tags: Vec<Tag> = tags.iter().filter_map(|t| Tag::new(t).ok()).collect();
+        // Over-long tags cannot reach this point: the shared request
+        // validator bounds every tag and reserves the `entity/` /
+        // `topic/` / `emotion/` prefix out of the label limits. A drop
+        // here therefore means a tag outside `Tag`'s alphabet, and it
+        // is logged rather than swallowed.
+        let parsed_tags: Vec<Tag> = crate::model::parse_tags_lossy("create_memory.tags", tags);
 
         let mut record = DiskRecord {
             version: DiskRecord::CURRENT_VERSION,

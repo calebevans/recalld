@@ -381,6 +381,19 @@ async fn dispatch(
         "store_memory" => {
             let input: StoreInput = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            // The in-process callers validate before they send, but the
+            // socket is its own entry point: without this, an over-long
+            // tag arriving here would be dropped by the storage layer
+            // and the call would still report success.
+            crate::model::validate_memory_input(crate::model::MemoryInputRef {
+                summary: &input.summary,
+                full_text: input.full_text.as_deref(),
+                tags: &input.tags,
+                entities: &input.entities,
+                topics: &input.topics,
+                emotions: &input.emotions,
+            })
+            .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let result = storage.store_memory(input).await?;
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }

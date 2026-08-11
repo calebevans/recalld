@@ -19,7 +19,9 @@ use super::errors::AppError;
 use super::models::*;
 use super::state::{AppState, QueryInput, SearchQuery};
 use crate::health::report as health_report_compute;
-use crate::model::constants::MAX_BATCH_MEMORIES;
+use crate::model::constants::{
+    EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, MAX_BATCH_MEMORIES, TOPIC_TAG_PREFIX,
+};
 use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
 use crate::model::validation::{MemoryInputRef, validate_memory_input, validate_namespace_name};
@@ -107,21 +109,23 @@ pub async fn create_memory(
     }
 
     // --- Merge entities/topics/emotions into tags (Issue 8) ---
+    // The prefixes come from `constants` because the label length limits
+    // reserve room for exactly these bytes.
     let mut merged_tags = req.tags.clone();
     for entity in &req.entities {
-        let tag = format!("entity/{}", entity.to_lowercase());
+        let tag = format!("{ENTITY_TAG_PREFIX}{}", entity.to_lowercase());
         if !merged_tags.contains(&tag) {
             merged_tags.push(tag);
         }
     }
     for topic in &req.topics {
-        let tag = format!("topic/{}", topic.to_lowercase());
+        let tag = format!("{TOPIC_TAG_PREFIX}{}", topic.to_lowercase());
         if !merged_tags.contains(&tag) {
             merged_tags.push(tag);
         }
     }
     for emotion in &req.emotions {
-        let tag = format!("emotion/{}", emotion.to_lowercase());
+        let tag = format!("{EMOTION_TAG_PREFIX}{}", emotion.to_lowercase());
         if !merged_tags.contains(&tag) {
             merged_tags.push(tag);
         }
@@ -484,11 +488,8 @@ pub async fn list_memories(
 
     // Issue 19: Use list_memories_filtered() for server-side pagination when namespace is given.
     // Build require_tags from tags + entities (Issue 21).
-    let mut require_tags: Vec<crate::model::Tag> = params
-        .tags
-        .iter()
-        .filter_map(|t| crate::model::Tag::new(t).ok())
-        .collect();
+    let mut require_tags: Vec<crate::model::Tag> =
+        crate::model::parse_tags_lossy("list_memories.tags", &params.tags);
     for entity in &params.entities {
         if let Ok(tag) = crate::model::Tag::new(&format!("entity/{}", entity.to_lowercase())) {
             require_tags.push(tag);
@@ -1270,7 +1271,7 @@ pub async fn batch_store(
             failed.push(BatchStoreFailure {
                 index,
                 error: e.to_string(),
-                field: None,
+                field: e.field().map(str::to_string),
             });
             continue;
         }
@@ -1317,19 +1318,19 @@ pub async fn batch_store(
         // Merge entities/topics/emotions into tags
         let mut merged_tags = mem_req.tags.clone();
         for entity in &mem_req.entities {
-            let tag = format!("entity/{}", entity.to_lowercase());
+            let tag = format!("{ENTITY_TAG_PREFIX}{}", entity.to_lowercase());
             if !merged_tags.contains(&tag) {
                 merged_tags.push(tag);
             }
         }
         for topic in &mem_req.topics {
-            let tag = format!("topic/{}", topic.to_lowercase());
+            let tag = format!("{TOPIC_TAG_PREFIX}{}", topic.to_lowercase());
             if !merged_tags.contains(&tag) {
                 merged_tags.push(tag);
             }
         }
         for emotion in &mem_req.emotions {
-            let tag = format!("emotion/{}", emotion.to_lowercase());
+            let tag = format!("{EMOTION_TAG_PREFIX}{}", emotion.to_lowercase());
             if !merged_tags.contains(&tag) {
                 merged_tags.push(tag);
             }

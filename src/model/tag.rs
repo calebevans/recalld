@@ -89,6 +89,42 @@ impl From<Tag> for String {
     }
 }
 
+/// Parse `raw` into [`Tag`]s, dropping — but never silencing — the
+/// elements that fail validation.
+///
+/// Every call site used to spell this `filter_map(|t| Tag::new(t).ok())`,
+/// so a store reported success while quietly keeping fewer tags than it
+/// was given, and a search silently ran with a weaker filter than the
+/// caller asked for. The drop is kept (rejecting a whole store over one
+/// malformed tag would be a harder break than the bug) but each one now
+/// leaves a `warn!` naming the field, the offending value and the
+/// reason.
+///
+/// [`TagError::TooLong`] is unreachable from a validated store request:
+/// [`validate_memory_input`](crate::model::validate_memory_input)
+/// rejects tags over [`TAG_MAX_BYTES`] and reserves the derived-tag
+/// prefix out of the `entities`/`topics`/`emotions` limits, so no
+/// request that validates can produce an over-long tag here. What
+/// remains reachable is the alphabet: `Tag::new` accepts only
+/// `[a-z0-9/_.:-]`, which the request validator deliberately does not
+/// duplicate (an entity named `José` is a legitimate thing to send).
+pub fn parse_tags_lossy(context: &str, raw: &[String]) -> Vec<Tag> {
+    raw.iter()
+        .filter_map(|t| match Tag::new(t) {
+            Ok(tag) => Some(tag),
+            Err(e) => {
+                tracing::warn!(
+                    context = %context,
+                    tag = %t,
+                    error = %e,
+                    "Dropping invalid tag"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// Structured metadata extracted from hierarchical tags.
 #[derive(Debug, Clone, Default)]
 pub struct StructuredMetadata {

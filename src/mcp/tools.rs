@@ -10,8 +10,8 @@ use crate::mcp::args;
 use crate::mcp::bridge::McpBridge;
 use crate::mcp::protocol::{ToolAnnotations, ToolCallResult, ToolInfo};
 use crate::model::constants::{
-    FULL_TEXT_MAX_BYTES, MAX_BATCH_MEMORIES, MAX_EMOTIONS, MAX_ENTITIES, MAX_TAGS, MAX_TOPICS,
-    SUMMARY_MAX_BYTES,
+    EMOTION_MAX_BYTES, ENTITY_MAX_BYTES, FULL_TEXT_MAX_BYTES, MAX_BATCH_MEMORIES, MAX_EMOTIONS,
+    MAX_ENTITIES, MAX_TAGS, MAX_TOPICS, SUMMARY_MAX_BYTES, TAG_MAX_BYTES, TOPIC_MAX_BYTES,
 };
 use crate::model::validation::validate_namespace_name;
 
@@ -101,25 +101,28 @@ fn store_memory_def() -> ToolInfo {
                 },
                 "tags": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    // Per-element `maxLength` counts code points, so like
+                    // the `summary` guard above it is strictly looser
+                    // than the server's byte limit.
+                    "items": { "type": "string", "maxLength": TAG_MAX_BYTES },
                     "maxItems": MAX_TAGS,
                     "description": "Categorization tags, e.g. [\"topic/rust\", \"type/observation\"]"
                 },
                 "entities": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "maxLength": ENTITY_MAX_BYTES },
                     "maxItems": MAX_ENTITIES,
                     "description": "Named entities (people, places, orgs, titles) mentioned in this memory. Used for search indexing and graph linking."
                 },
                 "topics": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "maxLength": TOPIC_MAX_BYTES },
                     "maxItems": MAX_TOPICS,
                     "description": "Topic keywords describing what the memory is about, e.g. [\"rust\", \"cooking\", \"career\"]"
                 },
                 "emotions": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "maxLength": EMOTION_MAX_BYTES },
                     "maxItems": MAX_EMOTIONS,
                     "description": "Emotional tone if relevant, e.g. [\"happy\", \"anxious\", \"grateful\"]"
                 },
@@ -212,25 +215,25 @@ fn store_memories_def() -> ToolInfo {
                             },
                             "tags": {
                                 "type": "array",
-                                "items": { "type": "string" },
+                                "items": { "type": "string", "maxLength": TAG_MAX_BYTES },
                                 "maxItems": MAX_TAGS,
                                 "description": "Categorization tags, e.g. [\"topic/rust\", \"type/observation\"]"
                             },
                             "entities": {
                                 "type": "array",
-                                "items": { "type": "string" },
+                                "items": { "type": "string", "maxLength": ENTITY_MAX_BYTES },
                                 "maxItems": MAX_ENTITIES,
                                 "description": "Named entities (people, places, orgs, titles) mentioned in this memory."
                             },
                             "topics": {
                                 "type": "array",
-                                "items": { "type": "string" },
+                                "items": { "type": "string", "maxLength": TOPIC_MAX_BYTES },
                                 "maxItems": MAX_TOPICS,
                                 "description": "Topic keywords describing what the memory is about"
                             },
                             "emotions": {
                                 "type": "array",
-                                "items": { "type": "string" },
+                                "items": { "type": "string", "maxLength": EMOTION_MAX_BYTES },
                                 "maxItems": MAX_EMOTIONS,
                                 "description": "Emotional tone if relevant"
                             },
@@ -1286,6 +1289,20 @@ mod tests {
                 props["fullText"]["maxLength"].as_u64(),
                 Some(FULL_TEXT_MAX_BYTES as u64)
             );
+            // Per-element limits: an over-long label would otherwise be
+            // merged into an over-long derived tag and dropped.
+            for (field, max) in [
+                ("tags", TAG_MAX_BYTES),
+                ("entities", ENTITY_MAX_BYTES),
+                ("topics", TOPIC_MAX_BYTES),
+                ("emotions", EMOTION_MAX_BYTES),
+            ] {
+                assert_eq!(
+                    props[field]["items"]["maxLength"].as_u64(),
+                    Some(max as u64),
+                    "{field}"
+                );
+            }
         }
         assert_eq!(
             batch["properties"]["memories"]["maxItems"].as_u64(),

@@ -74,7 +74,51 @@ pub const TAG_MAX_BYTES: usize = 128;
 /// Maximum byte length of a single entity, topic, or emotion label
 /// (UTF-8). Bounds the worst-case serialized request size; see
 /// [`crate::daemon::protocol`].
+///
+/// This is the ceiling; the effective per-field limits are
+/// [`ENTITY_MAX_BYTES`], [`TOPIC_MAX_BYTES`] and [`EMOTION_MAX_BYTES`],
+/// which additionally reserve room for the derived tag prefix.
 pub const LABEL_MAX_BYTES: usize = 128;
+
+// ── Derived tag prefixes ─────────────────────────────────────────────
+//
+// `entities`, `topics` and `emotions` are merged into `tags` as
+// `<prefix><lowercased label>` *after* validation. `Tag::new` then
+// rejects anything longer than `TAG_MAX_BYTES`, and the merge sites
+// dropped such tags without a word. Reserving the prefix in the label
+// limit is what makes a request that validates impossible to truncate
+// later.
+
+/// Prefix of the tag derived from an `entities` label.
+pub const ENTITY_TAG_PREFIX: &str = "entity/";
+/// Prefix of the tag derived from a `topics` label.
+pub const TOPIC_TAG_PREFIX: &str = "topic/";
+/// Prefix of the tag derived from an `emotions` label.
+pub const EMOTION_TAG_PREFIX: &str = "emotion/";
+
+/// The label budget left by `prefix`: never more than
+/// [`LABEL_MAX_BYTES`], and never enough to push `<prefix><label>` past
+/// [`TAG_MAX_BYTES`].
+///
+/// Lowercasing can in principle change a string's byte length, but only
+/// for characters [`Tag::new`](crate::model::Tag::new) rejects outright
+/// (its alphabet is `[a-z0-9/_.:-]`), so comparing the raw label's
+/// length here is sound.
+const fn label_max_bytes(prefix: &str) -> usize {
+    let room = TAG_MAX_BYTES - prefix.len();
+    if room < LABEL_MAX_BYTES {
+        room
+    } else {
+        LABEL_MAX_BYTES
+    }
+}
+
+/// Maximum byte length of a single `entities` label (UTF-8).
+pub const ENTITY_MAX_BYTES: usize = label_max_bytes(ENTITY_TAG_PREFIX);
+/// Maximum byte length of a single `topics` label (UTF-8).
+pub const TOPIC_MAX_BYTES: usize = label_max_bytes(TOPIC_TAG_PREFIX);
+/// Maximum byte length of a single `emotions` label (UTF-8).
+pub const EMOTION_MAX_BYTES: usize = label_max_bytes(EMOTION_TAG_PREFIX);
 
 // ── Structured Metadata Limits ───────────────────────────────────────
 /// Maximum number of `entities` accepted on a single store request.

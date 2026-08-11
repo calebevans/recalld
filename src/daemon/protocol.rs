@@ -215,15 +215,22 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// fullText     1,048,576 x 6           = 6,291,456
 /// summary          2,000 x 6           =    12,000
 /// tags          64 x (128 x 6 + 3)     =    49,344
-/// ent+top+emo   96 x (128 x 6 + 3)     =    74,016
+/// ent+top+emo   96 x (<=128 x 6 + 3)   <    74,016
 /// namespace           64 x 6           =       384
 /// scaffold                             <     1,024
-///                               total  ~ 6,428,224  (6.13 MiB)
+///                               total  < 6,428,224  (6.13 MiB)
 /// ```
 ///
 /// 8 MiB is the smallest power of two that clears that with headroom: 2 MiB
 /// is not enough for a newline-heavy 1 MiB `fullText` (`\n` alone doubles),
 /// and 4 MiB sits under the worst case.
+///
+/// Those content limits are enforced by
+/// [`validate_memory_input`](crate::model::validate_memory_input), and the
+/// sum above is checked against a real serialized frame by
+/// `worst_case_valid_store_request_fits_in_one_frame` in this module's
+/// tests — so raising a content limit past this budget fails a test rather
+/// than surfacing as a store rejected at the transport.
 pub const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
 /// The frame limit a protocol v1 peer (recalld <= 0.1.10) enforces.
@@ -694,6 +701,78 @@ mod tests {
         assert!(matches!(back, BridgeError::TooLarge(_)), "got {back}");
         assert_eq!(back.to_string(), original.to_string());
         assert!(back.to_string().contains("9000000"));
+    }
+
+    /// The worst-case *valid* `store_memory` request must fit in one
+    /// frame.
+    ///
+    /// This is the arithmetic in [`MAX_MESSAGE_SIZE`]'s doc comment,
+    /// executed instead of asserted in prose. It fails the moment
+    /// anyone raises a content limit, adds an unbounded field to the
+    /// store payload, or lowers the frame limit — the collision that
+    /// would otherwise surface as a store rejected at the transport
+    /// after the caller was told its input was within limits.
+    #[test]
+    fn worst_case_valid_store_request_fits_in_one_frame() {
+        use crate::model::constants::{
+            EMOTION_MAX_BYTES, ENTITY_MAX_BYTES, FULL_TEXT_MAX_BYTES, MAX_EMOTIONS, MAX_ENTITIES,
+            MAX_TAGS, MAX_TOPICS, NAMESPACE_NAME_MAX_BYTES, SUMMARY_MAX_BYTES, TAG_MAX_BYTES,
+            TOPIC_MAX_BYTES,
+        };
+        use crate::model::validation::{MemoryInputRef, validate_memory_input};
+
+        // A control byte is the worst case for JSON: one byte of content
+        // becomes the six characters `\u0001` on the wire. Nothing in the shared
+        // validator rejects control bytes, so this is a request a client
+        // can really send.
+        let worst = |n: usize| "\u{1}".repeat(n);
+        let many =
+            |count: usize, len: usize| -> Vec<String> { (0..count).map(|_| worst(len)).collect() };
+
+        let summary = worst(SUMMARY_MAX_BYTES);
+        let full_text = worst(FULL_TEXT_MAX_BYTES);
+        let tags = many(MAX_TAGS, TAG_MAX_BYTES);
+        let entities = many(MAX_ENTITIES, ENTITY_MAX_BYTES);
+        let topics = many(MAX_TOPICS, TOPIC_MAX_BYTES);
+        let emotions = many(MAX_EMOTIONS, EMOTION_MAX_BYTES);
+
+        // Everything above is at, not over, the limits the entry points
+        // enforce — otherwise this would be measuring a request that can
+        // never be sent.
+        validate_memory_input(MemoryInputRef {
+            summary: &summary,
+            full_text: Some(&full_text),
+            tags: &tags,
+            entities: &entities,
+            topics: &topics,
+            emotions: &emotions,
+        })
+        .expect("the worst case must itself be a valid request");
+
+        let request = DaemonRequest {
+            jsonrpc: "2.0".into(),
+            id: u64::MAX,
+            method: "store_memory".into(),
+            params: serde_json::json!({
+                "summary": summary,
+                "fullText": full_text,
+                "tags": tags,
+                "entities": entities,
+                "topics": topics,
+                "emotions": emotions,
+                "namespace": "n".repeat(NAMESPACE_NAME_MAX_BYTES),
+                "parentId": "0195c9a4-1f4b-7c3a-9d21-4b7e5f6a8c90",
+                "supersedes": "0195c9a4-1f4b-7c3a-9d21-4b7e5f6a8c91",
+            }),
+        };
+
+        let encoded = serde_json::to_vec(&request).expect("request serializes");
+        assert!(
+            encoded.len() <= MAX_MESSAGE_SIZE,
+            "worst-case valid store request serializes to {} bytes, over the \
+             {MAX_MESSAGE_SIZE}-byte frame limit",
+            encoded.len()
+        );
     }
 
     #[test]

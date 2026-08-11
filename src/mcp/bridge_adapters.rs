@@ -99,11 +99,8 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             })??;
         };
 
-        let mut require_tags: Vec<crate::model::Tag> = query
-            .tags
-            .iter()
-            .filter_map(|t| crate::model::Tag::new(t).ok())
-            .collect();
+        let mut require_tags: Vec<crate::model::Tag> =
+            crate::model::parse_tags_lossy("recall_memories.tags", &query.tags);
         for e in &query.entities {
             if let Ok(tag) = crate::model::Tag::new(&format!("entity/{}", e.to_lowercase())) {
                 require_tags.push(tag);
@@ -659,22 +656,25 @@ impl bridge::StorageEngine for McpStorageAdapter {
             .map_err(map_link_error)?;
         }
 
-        // Convert structured metadata fields to tags and merge with explicit tags.
+        // Convert structured metadata fields to tags and merge with explicit
+        // tags. The prefixes come from `constants` because the label length
+        // limits reserve room for exactly these bytes.
+        use crate::model::constants::{EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, TOPIC_TAG_PREFIX};
         let mut merged_tags = input.tags.clone();
         for entity in &input.entities {
-            let tag = format!("entity/{}", entity.to_lowercase());
+            let tag = format!("{ENTITY_TAG_PREFIX}{}", entity.to_lowercase());
             if !merged_tags.contains(&tag) {
                 merged_tags.push(tag);
             }
         }
         for topic in &input.topics {
-            let tag = format!("topic/{}", topic.to_lowercase());
+            let tag = format!("{TOPIC_TAG_PREFIX}{}", topic.to_lowercase());
             if !merged_tags.contains(&tag) {
                 merged_tags.push(tag);
             }
         }
         for emotion in &input.emotions {
-            let tag = format!("emotion/{}", emotion.to_lowercase());
+            let tag = format!("{EMOTION_TAG_PREFIX}{}", emotion.to_lowercase());
             if !merged_tags.contains(&tag) {
                 merged_tags.push(tag);
             }
@@ -699,10 +699,13 @@ impl bridge::StorageEngine for McpStorageAdapter {
         };
 
         let now = chrono::Utc::now().timestamp_millis();
-        let parsed_tags: Vec<Tag> = merged_tags
-            .iter()
-            .filter_map(|t| Tag::new(t).ok())
-            .collect();
+        // Over-long tags cannot reach this point: the shared request
+        // validator bounds every tag and reserves the `entity/` /
+        // `topic/` / `emotion/` prefix out of the label limits. A drop
+        // here therefore means a tag outside `Tag`'s alphabet, and it
+        // is logged rather than swallowed.
+        let parsed_tags: Vec<Tag> =
+            crate::model::parse_tags_lossy("store_memory.tags", &merged_tags);
 
         let mut record = DiskRecord {
             version: DiskRecord::CURRENT_VERSION,
@@ -1243,11 +1246,8 @@ impl bridge::StorageEngine for McpStorageAdapter {
         input: bridge::ListMemoriesInput,
     ) -> Result<bridge::ListMemoriesResponse, bridge::BridgeError> {
         // Build tag filters: merge explicit tags + entity/topic tags for AND semantics.
-        let mut require_tags: Vec<crate::model::Tag> = input
-            .tags
-            .iter()
-            .filter_map(|t| crate::model::Tag::new(t).ok())
-            .collect();
+        let mut require_tags: Vec<crate::model::Tag> =
+            crate::model::parse_tags_lossy("list_memories.tags", &input.tags);
         for entity in &input.entities {
             if let Ok(tag) = crate::model::Tag::new(&format!("entity/{}", entity.to_lowercase())) {
                 require_tags.push(tag);

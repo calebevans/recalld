@@ -84,6 +84,24 @@ pub enum ValidationError {
         max: usize,
     },
 
+    /// One element of an array field exceeds its maximum byte length.
+    ///
+    /// Names the index as well as the field: the offending element is
+    /// otherwise impossible to identify in a 64-item array, and the
+    /// caller must be able to fix exactly the one that was rejected.
+    #[error(
+        "{field}[{index}] is {bytes} bytes ({chars} characters), which \
+         exceeds the {max_bytes}-byte limit.{}",
+        utf8_hint(*bytes, *chars)
+    )]
+    ItemTooLong {
+        field: &'static str,
+        index: usize,
+        bytes: usize,
+        chars: usize,
+        max_bytes: usize,
+    },
+
     /// A tag failed validation.
     #[error("invalid tag: {source}")]
     InvalidTag {
@@ -153,7 +171,8 @@ impl ValidationError {
         match self {
             ValidationError::SummaryEmpty => Some("summary"),
             ValidationError::FieldTooLong { field, .. }
-            | ValidationError::TooManyItems { field, .. } => Some(field),
+            | ValidationError::TooManyItems { field, .. }
+            | ValidationError::ItemTooLong { field, .. } => Some(field),
             ValidationError::InvalidTag { .. } => Some("tags"),
             ValidationError::DimensionMismatch { .. }
             | ValidationError::NonFiniteEmbedding { .. } => Some("embedding"),

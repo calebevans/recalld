@@ -757,10 +757,10 @@ Store a new memory.
 |---|---|---|---|
 | `summary` | string | Yes | Short description (max 2000 bytes of UTF-8; ~2000 ASCII characters, fewer with em dashes/curly quotes/emoji). |
 | `fullText` | string | No | Detailed content (max 1 MB = 1 048 576 bytes of UTF-8, counted on the raw text before JSON escaping). Dropped as memory decays to ghost phase. |
-| `tags` | string[] | No | Categorization tags, e.g. `["topic/rust", "type/observation"]`. Max 64. |
-| `entities` | string[] | No | Named entities (people, places, orgs). Used for search indexing and graph linking. Max 32. |
-| `topics` | string[] | No | Topic keywords, e.g. `["rust", "cooking"]`. Max 32. |
-| `emotions` | string[] | No | Emotional tone, e.g. `["happy", "anxious"]`. Max 32. |
+| `tags` | string[] | No | Categorization tags, e.g. `["topic/rust", "type/observation"]`. Max 64 items, 128 bytes of UTF-8 each. |
+| `entities` | string[] | No | Named entities (people, places, orgs). Used for search indexing and graph linking. Max 32 items, 121 bytes of UTF-8 each (the derived `entity/<label>` tag must fit the 128-byte tag limit). |
+| `topics` | string[] | No | Topic keywords, e.g. `["rust", "cooking"]`. Max 32 items, 122 bytes of UTF-8 each. |
+| `emotions` | string[] | No | Emotional tone, e.g. `["happy", "anxious"]`. Max 32 items, 120 bytes of UTF-8 each. |
 | `namespace` | string | No | Target namespace (default: `"default"`). |
 | `parentId` | string | No | UUID of an existing memory in the same namespace, linked as this memory's parent. The store fails if the target does not exist or is in a different namespace. |
 | `supersedes` | string | No | UUID of an existing memory in the same namespace that this one replaces. Recall REMOVES the old memory from results and returns this one in its place. The store fails if the target does not exist or is in a different namespace. |

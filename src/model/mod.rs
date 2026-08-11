@@ -35,5 +35,7 @@ pub use self::id::{MemoryId, NamespaceId};
 pub use self::memory::{AccessEvent, AccessKind, Memory};
 pub use self::namespace::{NamespaceConfig, PhaseThresholds};
 pub use self::record::{CachedRecord, DiskRecord};
-pub use self::tag::{StructuredMetadata, Tag, entity_overlap, parse_structured_tags};
+pub use self::tag::{
+    StructuredMetadata, Tag, entity_overlap, parse_structured_tags, parse_tags_lossy,
+};
 pub use self::validation::{MemoryInputRef, validate_memory_input};
