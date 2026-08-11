@@ -8,6 +8,7 @@ use crate::model::decay::DecayPhase;
 use crate::model::error::ValidationError;
 use crate::model::id::MemoryId;
 use crate::model::tag::Tag;
+use crate::model::validation::{validate_count, validate_text_len};
 
 // ═══════════════════════════════════════════════════════════════════════
 // AccessKind
@@ -118,36 +119,17 @@ impl Memory {
     /// consistent. This does NOT validate namespace existence or
     /// embedding dimensions (those require external context).
     pub fn validate(&self) -> Result<(), ValidationError> {
-        // Summary non-empty
+        // Content limits — delegated to the shared validators so this
+        // does not become a second source of truth alongside the
+        // request-time checks in `model::validation`.
         if self.summary.is_empty() {
             return Err(ValidationError::SummaryEmpty);
         }
-
-        // Summary length
-        if self.summary.len() > SUMMARY_MAX_BYTES {
-            return Err(ValidationError::SummaryTooLong {
-                len: self.summary.len(),
-                max: SUMMARY_MAX_BYTES,
-            });
-        }
-
-        // Full text length
+        validate_text_len("summary", &self.summary, SUMMARY_MAX_BYTES)?;
         if let Some(ref ft) = self.full_text {
-            if ft.len() > FULL_TEXT_MAX_BYTES {
-                return Err(ValidationError::FullTextTooLong {
-                    len: ft.len(),
-                    max: FULL_TEXT_MAX_BYTES,
-                });
-            }
+            validate_text_len("fullText", ft, FULL_TEXT_MAX_BYTES)?;
         }
-
-        // Tag count
-        if self.tags.len() > MAX_TAGS {
-            return Err(ValidationError::TooManyTags {
-                count: self.tags.len(),
-                max: MAX_TAGS,
-            });
-        }
+        validate_count("tags", self.tags.len(), MAX_TAGS)?;
 
         // Strength range
         if !(0.0..=1.0).contains(&self.strength) {

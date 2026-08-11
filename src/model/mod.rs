@@ -25,6 +25,7 @@ pub mod memory;
 pub mod namespace;
 pub mod record;
 pub mod tag;
+pub mod validation;
 
 // Re-export primary types at module level for convenience.
 pub use self::decay::DecayPhase;
@@ -35,3 +36,4 @@ pub use self::memory::{AccessEvent, AccessKind, Memory};
 pub use self::namespace::{NamespaceConfig, PhaseThresholds};
 pub use self::record::{CachedRecord, DiskRecord};
 pub use self::tag::{StructuredMetadata, Tag, entity_overlap, parse_structured_tags};
+pub use self::validation::{MemoryInputRef, validate_memory_input};

@@ -11,6 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use crate::model::error::ValidationError;
 use crate::serialization::ApiError;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -229,6 +230,29 @@ impl From<SearchError> for AppError {
     }
 }
 
+impl From<ValidationError> for AppError {
+    fn from(err: ValidationError) -> Self {
+        match &err {
+            // Embedding shape problems are semantically invalid rather
+            // than malformed — 422, matching the inline check in
+            // `create_memory`.
+            ValidationError::DimensionMismatch { .. }
+            | ValidationError::NonFiniteEmbedding { .. } => AppError::UnprocessableEntity {
+                message: err.to_string(),
+                field: err.field().map(Into::into),
+            },
+            ValidationError::NamespaceNotFound { name } => AppError::NotFound {
+                resource: "namespace",
+                id: name.clone(),
+            },
+            _ => AppError::BadRequest {
+                message: err.to_string(),
+                field: err.field().map(Into::into),
+            },
+        }
+    }
+}
+
 impl From<GraphError> for AppError {
     fn from(err: GraphError) -> Self {
         match &err {
@@ -243,5 +267,53 @@ impl From<GraphError> for AppError {
                 source: Box::new(err),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_error_becomes_bad_request_with_field() {
+        let source = ValidationError::FieldTooLong {
+            field: "summary",
+            bytes: 5700,
+            chars: 1900,
+            max_bytes: 2000,
+        };
+        let expected = source.to_string();
+        match AppError::from(source) {
+            AppError::BadRequest { message, field } => {
+                assert_eq!(field.as_deref(), Some("summary"));
+                assert_eq!(message, expected);
+                assert!(message.contains("5700 bytes (1900 characters)"));
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespace_not_found_becomes_not_found() {
+        let err = AppError::from(ValidationError::NamespaceNotFound {
+            name: "missing".to_string(),
+        });
+        match err {
+            AppError::NotFound { resource, id } => {
+                assert_eq!(resource, "namespace");
+                assert_eq!(id, "missing");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dimension_mismatch_becomes_unprocessable_entity() {
+        let err = AppError::from(ValidationError::DimensionMismatch {
+            expected: 1536,
+            actual: 768,
+            namespace: "default".to_string(),
+        });
+        assert!(matches!(err, AppError::UnprocessableEntity { .. }));
     }
 }

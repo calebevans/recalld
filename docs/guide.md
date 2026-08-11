@@ -754,8 +754,8 @@ Store a new memory.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `summary` | string | Yes | Short description (max 2000 chars). |
-| `fullText` | string | No | Detailed content (max 1 MB). Dropped as memory decays to ghost phase. |
+| `summary` | string | Yes | Short description (max 2000 bytes of UTF-8; ~2000 ASCII characters, fewer with em dashes/curly quotes/emoji). |
+| `fullText` | string | No | Detailed content (max 1 MB = 1 048 576 bytes of UTF-8, counted on the raw text before JSON escaping). Dropped as memory decays to ghost phase. |
 | `tags` | string[] | No | Categorization tags, e.g. `["topic/rust", "type/observation"]`. Max 64. |
 | `entities` | string[] | No | Named entities (people, places, orgs). Used for search indexing and graph linking. Max 32. |
 | `topics` | string[] | No | Topic keywords, e.g. `["rust", "cooking"]`. Max 32. |

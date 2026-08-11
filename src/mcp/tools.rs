@@ -8,6 +8,24 @@ use serde_json::json;
 
 use crate::mcp::bridge::McpBridge;
 use crate::mcp::protocol::{ToolAnnotations, ToolCallResult, ToolInfo};
+use crate::model::constants::{
+    FULL_TEXT_MAX_BYTES, MAX_BATCH_MEMORIES, MAX_EMOTIONS, MAX_ENTITIES, MAX_TAGS, MAX_TOPICS,
+    SUMMARY_MAX_BYTES,
+};
+use crate::model::validation::{MemoryInputRef, validate_memory_input, validate_namespace_name};
+
+/// Schema description for the `summary` field.
+///
+/// The limit is enforced in UTF-8 bytes; the previous wording said
+/// "chars", which made a 1,900-character em-dash summary look like it
+/// should fit when it is 5,700 bytes.
+const SUMMARY_DESC: &str = "Short description of the memory. Limit is 2000 UTF-8 bytes, \
+     which is 2000 ASCII characters but fewer for text containing em dashes, curly quotes, \
+     accents, or emoji (2-4 bytes each).";
+
+/// Schema description for the `fullText` field.
+const FULL_TEXT_DESC: &str = "Detailed content. Removed as memory decays to ghost phase. \
+     Limit is 1048576 UTF-8 bytes (1 MiB).";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Registry and dispatch
@@ -68,31 +86,40 @@ fn store_memory_def() -> ToolInfo {
             "properties": {
                 "summary": {
                     "type": "string",
-                    "description": "Short description of the memory (max 2000 chars)",
-                    "maxLength": 2000
+                    "description": SUMMARY_DESC,
+                    // Counts code points, and chars <= bytes always, so
+                    // this is strictly looser than the server's byte
+                    // limit — a useful client-side guard that can never
+                    // reject input the server would accept.
+                    "maxLength": SUMMARY_MAX_BYTES
                 },
                 "fullText": {
                     "type": "string",
-                    "description": "Detailed content. Removed as memory decays to ghost phase."
+                    "description": FULL_TEXT_DESC,
+                    "maxLength": FULL_TEXT_MAX_BYTES
                 },
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },
+                    "maxItems": MAX_TAGS,
                     "description": "Categorization tags, e.g. [\"topic/rust\", \"type/observation\"]"
                 },
                 "entities": {
                     "type": "array",
                     "items": { "type": "string" },
+                    "maxItems": MAX_ENTITIES,
                     "description": "Named entities (people, places, orgs, titles) mentioned in this memory. Used for search indexing and graph linking."
                 },
                 "topics": {
                     "type": "array",
                     "items": { "type": "string" },
+                    "maxItems": MAX_TOPICS,
                     "description": "Topic keywords describing what the memory is about, e.g. [\"rust\", \"cooking\", \"career\"]"
                 },
                 "emotions": {
                     "type": "array",
                     "items": { "type": "string" },
+                    "maxItems": MAX_EMOTIONS,
                     "description": "Emotional tone if relevant, e.g. [\"happy\", \"anxious\", \"grateful\"]"
                 },
                 "namespace": {
@@ -126,23 +153,10 @@ async fn handle_store_memory(bridge: &McpBridge, arguments: serde_json::Value) -
         None => return ToolCallResult::error("Missing required parameter: summary"),
     };
 
-    // Issue 2: Enforce summary length limit
-    if summary.len() > 2000 {
-        return ToolCallResult::error("Summary exceeds maximum length of 2000 characters");
-    }
-
     let full_text = arguments
         .get("fullText")
         .and_then(|v| v.as_str())
         .map(String::from);
-
-    // Issue 2: Enforce full_text length limit (1 MB)
-    const MAX_FULL_TEXT_BYTES: usize = 1_048_576;
-    if let Some(ref ft) = full_text {
-        if ft.len() > MAX_FULL_TEXT_BYTES {
-            return ToolCallResult::error("fullText exceeds maximum length of 1 MB");
-        }
-    }
 
     let tags: Vec<String> = arguments
         .get("tags")
@@ -161,19 +175,19 @@ async fn handle_store_memory(bridge: &McpBridge, arguments: serde_json::Value) -
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Issue 3: Enforce array size limits
-    if tags.len() > 64 {
-        return ToolCallResult::error("Too many tags (maximum 64)");
+    // Content limits — shared with the HTTP API so the two paths cannot
+    // disagree about what fits.
+    if let Err(e) = validate_memory_input(MemoryInputRef {
+        summary: &summary,
+        full_text: full_text.as_deref(),
+        tags: &tags,
+        entities: &entities,
+        topics: &topics,
+        emotions: &emotions,
+    }) {
+        return ToolCallResult::error(e.to_string());
     }
-    if entities.len() > 32 {
-        return ToolCallResult::error("Too many entities (maximum 32)");
-    }
-    if topics.len() > 32 {
-        return ToolCallResult::error("Too many topics (maximum 32)");
-    }
-    if emotions.len() > 32 {
-        return ToolCallResult::error("Too many emotions (maximum 32)");
-    }
+
     let namespace = arguments
         .get("namespace")
         .and_then(|v| v.as_str())
@@ -231,37 +245,42 @@ fn store_memories_def() -> ToolInfo {
                 "memories": {
                     "type": "array",
                     "description": "Array of memories to store (max 100 per call)",
-                    "maxItems": 100,
+                    "maxItems": MAX_BATCH_MEMORIES,
                     "items": {
                         "type": "object",
                         "properties": {
                             "summary": {
                                 "type": "string",
-                                "description": "Short description of the memory (max 2000 chars)",
-                                "maxLength": 2000
+                                "description": SUMMARY_DESC,
+                                "maxLength": SUMMARY_MAX_BYTES
                             },
                             "fullText": {
                                 "type": "string",
-                                "description": "Detailed content. Removed as memory decays to ghost phase."
+                                "description": FULL_TEXT_DESC,
+                                "maxLength": FULL_TEXT_MAX_BYTES
                             },
                             "tags": {
                                 "type": "array",
                                 "items": { "type": "string" },
+                                "maxItems": MAX_TAGS,
                                 "description": "Categorization tags, e.g. [\"topic/rust\", \"type/observation\"]"
                             },
                             "entities": {
                                 "type": "array",
                                 "items": { "type": "string" },
+                                "maxItems": MAX_ENTITIES,
                                 "description": "Named entities (people, places, orgs, titles) mentioned in this memory."
                             },
                             "topics": {
                                 "type": "array",
                                 "items": { "type": "string" },
+                                "maxItems": MAX_TOPICS,
                                 "description": "Topic keywords describing what the memory is about"
                             },
                             "emotions": {
                                 "type": "array",
                                 "items": { "type": "string" },
+                                "maxItems": MAX_EMOTIONS,
                                 "description": "Emotional tone if relevant"
                             },
                             "namespace": {
@@ -308,8 +327,10 @@ async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value)
         return ToolCallResult::error("Parameter 'memories' must not be empty");
     }
 
-    if memories_arr.len() > 100 {
-        return ToolCallResult::error("Too many memories (maximum 100 per call)");
+    if memories_arr.len() > MAX_BATCH_MEMORIES {
+        return ToolCallResult::error(format!(
+            "Too many memories (maximum {MAX_BATCH_MEMORIES} per call)"
+        ));
     }
 
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(memories_arr.len());
@@ -326,29 +347,10 @@ async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value)
             }
         };
 
-        if summary.len() > 2000 {
-            results.push(json!({
-                "index": index,
-                "error": "Summary exceeds maximum length of 2000 characters"
-            }));
-            continue;
-        }
-
         let full_text = item
             .get("fullText")
             .and_then(|v| v.as_str())
             .map(String::from);
-
-        const MAX_FULL_TEXT_BYTES: usize = 1_048_576;
-        if let Some(ref ft) = full_text {
-            if ft.len() > MAX_FULL_TEXT_BYTES {
-                results.push(json!({
-                    "index": index,
-                    "error": "fullText exceeds maximum length of 1 MB"
-                }));
-                continue;
-            }
-        }
 
         let tags: Vec<String> = item
             .get("tags")
@@ -367,31 +369,17 @@ async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value)
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
-        if tags.len() > 64 {
+        if let Err(e) = validate_memory_input(MemoryInputRef {
+            summary: &summary,
+            full_text: full_text.as_deref(),
+            tags: &tags,
+            entities: &entities,
+            topics: &topics,
+            emotions: &emotions,
+        }) {
             results.push(json!({
                 "index": index,
-                "error": "Too many tags (maximum 64)"
-            }));
-            continue;
-        }
-        if entities.len() > 32 {
-            results.push(json!({
-                "index": index,
-                "error": "Too many entities (maximum 32)"
-            }));
-            continue;
-        }
-        if topics.len() > 32 {
-            results.push(json!({
-                "index": index,
-                "error": "Too many topics (maximum 32)"
-            }));
-            continue;
-        }
-        if emotions.len() > 32 {
-            results.push(json!({
-                "index": index,
-                "error": "Too many emotions (maximum 32)"
+                "error": e.to_string()
             }));
             continue;
         }
@@ -1118,16 +1106,9 @@ async fn handle_create_namespace(
         None => return ToolCallResult::error("Missing required parameter: name"),
     };
 
-    // Issue 1: Server-side validation of namespace name
-    if name.is_empty()
-        || name.len() > 64
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return ToolCallResult::error(
-            "Invalid namespace name: must be 1-64 characters, alphanumeric, hyphens, or underscores only",
-        );
+    // Server-side validation of namespace name, shared with the HTTP API.
+    if let Err(e) = validate_namespace_name(&name) {
+        return ToolCallResult::error(e.to_string());
     }
 
     let embedding_dim = arguments
@@ -1346,5 +1327,74 @@ async fn handle_list_memories(bridge: &McpBridge, arguments: serde_json::Value) 
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
         },
         Err(e) => ToolCallResult::error(format!("List memories failed: {e}")),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `summary` sub-schema of each store tool, keyed by tool name.
+    fn summary_schemas() -> Vec<(&'static str, serde_json::Value)> {
+        let single = store_memory_def().input_schema["properties"]["summary"].clone();
+        let batch = store_memories_def().input_schema["properties"]["memories"]["items"]
+            ["properties"]["summary"]
+            .clone();
+        vec![("store_memory", single), ("store_memories", batch)]
+    }
+
+    #[test]
+    fn summary_schema_describes_the_limit_in_bytes_not_chars() {
+        for (tool, schema) in summary_schemas() {
+            let desc = schema["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tool}: summary has no description"));
+            assert!(desc.contains("bytes"), "{tool}: {desc}");
+            assert!(!desc.contains("chars"), "{tool}: {desc}");
+        }
+    }
+
+    #[test]
+    fn summary_schema_keeps_max_length_guard() {
+        // maxLength counts code points and chars <= bytes always, so
+        // 2000 is strictly looser than the server's byte limit; it can
+        // never reject something the server would accept.
+        for (tool, schema) in summary_schemas() {
+            assert_eq!(schema["maxLength"].as_u64(), Some(2000), "{tool}");
+        }
+    }
+
+    #[test]
+    fn array_fields_declare_max_items() {
+        let single = store_memory_def().input_schema;
+        let batch = store_memories_def().input_schema;
+        let batch_item = &batch["properties"]["memories"]["items"];
+        for props in [&single["properties"], &batch_item["properties"]] {
+            assert_eq!(props["tags"]["maxItems"].as_u64(), Some(MAX_TAGS as u64));
+            assert_eq!(
+                props["entities"]["maxItems"].as_u64(),
+                Some(MAX_ENTITIES as u64)
+            );
+            assert_eq!(
+                props["topics"]["maxItems"].as_u64(),
+                Some(MAX_TOPICS as u64)
+            );
+            assert_eq!(
+                props["emotions"]["maxItems"].as_u64(),
+                Some(MAX_EMOTIONS as u64)
+            );
+            assert_eq!(
+                props["fullText"]["maxLength"].as_u64(),
+                Some(FULL_TEXT_MAX_BYTES as u64)
+            );
+        }
+        assert_eq!(
+            batch["properties"]["memories"]["maxItems"].as_u64(),
+            Some(MAX_BATCH_MEMORIES as u64)
+        );
     }
 }

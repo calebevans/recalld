@@ -93,6 +93,14 @@ Configure per-project namespace defaults in a `.recalld.toml` file (see above), 
 
 ## Available tools
 
+### A note on limits
+
+Every length limit below is measured in **UTF-8 bytes, not characters**. For plain ASCII the two are the same, so a 2000-byte `summary` holds 2000 characters. Non-ASCII characters cost more: accented letters and curly quotes are 2-3 bytes, em dashes (`—`) are 3 bytes, and emoji are 4 bytes. A summary of 1900 em dashes is 5700 bytes and will be rejected. Rejection messages report both numbers, e.g. `summary is 5700 bytes (1900 characters), which exceeds the 2000-byte limit.`
+
+Array limits (`tags`, `entities`, `topics`, `emotions`) are plain item counts.
+
+> **Known limitation:** `entities`, `topics`, and `emotions` are converted into `entity/…`, `topic/…`, and `emotion/…` tags *after* validation runs, and the `tags` limit of 64 is checked against the tags you supplied. A memory that supplies 64 tags plus 32 entities, 32 topics, and 32 emotions can therefore end up with up to 160 tags stored. This is accepted today and is not treated as an error.
+
 ### store_memory
 
 Store a new observation, fact, or piece of context. The system automatically generates an embedding for semantic search. Memories decay over time unless reinforced.
@@ -101,8 +109,8 @@ Store a new observation, fact, or piece of context. The system automatically gen
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `summary` | string | yes | -- | Short description (max 2000 chars) |
-| `fullText` | string | no | -- | Detailed content. Dropped when memory decays to ghost phase. Max 1 MB. |
+| `summary` | string | yes | -- | Short description (max 2000 bytes of UTF-8; ~2000 ASCII characters, fewer with em dashes/curly quotes/emoji) |
+| `fullText` | string | no | -- | Detailed content. Dropped when memory decays to ghost phase. Max 1 MB = 1 048 576 bytes of UTF-8, counted on the raw text before JSON escaping. |
 | `tags` | string[] | no | `[]` | Categorization tags, e.g. `["topic/rust", "type/observation"]`. Max 64. |
 | `entities` | string[] | no | `[]` | Named entities (people, places, orgs). Used for search indexing and graph linking. Max 32. |
 | `topics` | string[] | no | `[]` | Topic keywords, e.g. `["rust", "cooking"]`. Max 32. |
@@ -152,8 +160,8 @@ Each object in the `memories` array accepts:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `summary` | string | yes | -- | Short description (max 2000 chars) |
-| `fullText` | string | no | -- | Detailed content. Max 1 MB. |
+| `summary` | string | yes | -- | Short description (max 2000 bytes of UTF-8; ~2000 ASCII characters, fewer with em dashes/curly quotes/emoji) |
+| `fullText` | string | no | -- | Detailed content. Max 1 MB = 1 048 576 bytes of UTF-8, counted on the raw text before JSON escaping. |
 | `tags` | string[] | no | `[]` | Categorization tags. Max 64. |
 | `entities` | string[] | no | `[]` | Named entities. Max 32. |
 | `topics` | string[] | no | `[]` | Topic keywords. Max 32. |

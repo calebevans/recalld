@@ -46,16 +46,47 @@ pub const DEFAULT_SUMMARY_THRESHOLD: f32 = 0.3;
 pub const DEFAULT_GHOST_THRESHOLD: f32 = 0.05;
 
 // ── Content Limits ───────────────────────────────────────────────────
-/// Maximum byte length of `summary` (UTF-8).
+/// Maximum length of `summary`, measured in UTF-8 **bytes**, not
+/// characters. ASCII text gets 2,000 characters; text containing em
+/// dashes, curly quotes, accents, or emoji gets fewer, because those
+/// characters occupy 2-4 bytes each.
+///
+/// The limit exists because the on-disk record encodes the summary with
+/// a `u16` length prefix (see `DiskRecord::to_bytes` in
+/// [`crate::model::record`]); it must stay well below `u16::MAX`.
 pub const SUMMARY_MAX_BYTES: usize = 2_000;
-/// Maximum byte length of `full_text` (UTF-8). 1 MiB.
+/// Maximum length of `full_text`, measured in UTF-8 **bytes**, not
+/// characters. 1 MiB = 1,048,576 bytes.
+///
+/// This bounds the *raw* text, measured before JSON escaping. A request
+/// carrying the maximum `full_text` can serialize to considerably more
+/// than 1 MiB on the wire (`\n` doubles, control bytes expand up to 6x
+/// as `\u00XX`), which is why the daemon's frame limit sits well above
+/// it — see [`crate::daemon::protocol::MAX_MESSAGE_SIZE`].
 pub const FULL_TEXT_MAX_BYTES: usize = 1_048_576;
 
 // ── Tag Limits ───────────────────────────────────────────────────────
 /// Maximum number of tags per memory.
 pub const MAX_TAGS: usize = 64;
-/// Maximum byte length of a single tag (UTF-8).
+/// Maximum length of a single tag, measured in UTF-8 **bytes**, not
+/// characters.
 pub const TAG_MAX_BYTES: usize = 128;
+/// Maximum byte length of a single entity, topic, or emotion label
+/// (UTF-8). Bounds the worst-case serialized request size; see
+/// [`crate::daemon::protocol`].
+pub const LABEL_MAX_BYTES: usize = 128;
+
+// ── Structured Metadata Limits ───────────────────────────────────────
+/// Maximum number of `entities` accepted on a single store request.
+pub const MAX_ENTITIES: usize = 32;
+/// Maximum number of `topics` accepted on a single store request.
+pub const MAX_TOPICS: usize = 32;
+/// Maximum number of `emotions` accepted on a single store request.
+pub const MAX_EMOTIONS: usize = 32;
+
+// ── Batch Limits ─────────────────────────────────────────────────────
+/// Maximum number of memories accepted in a single batch store call.
+pub const MAX_BATCH_MEMORIES: usize = 100;
 
 // ── Access History ───────────────────────────────────────────────────
 /// Maximum number of `AccessEvent` entries retained per memory.
@@ -66,7 +97,9 @@ pub const ACCESS_HISTORY_MAX: usize = 32;
 pub const DEFAULT_DESIRED_RETENTION: f32 = 0.9;
 
 // ── Namespace ────────────────────────────────────────────────────────
-/// Maximum byte length of a namespace name.
+/// Maximum length of a namespace name, measured in UTF-8 **bytes**, not
+/// characters. Namespace names are restricted to ASCII (they are
+/// filesystem-adjacent), so for valid names bytes and characters agree.
 pub const NAMESPACE_NAME_MAX_BYTES: usize = 64;
 
 /// Default embedding dimensionality (OpenAI text-embedding-3-small).

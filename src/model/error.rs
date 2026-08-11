@@ -30,28 +30,59 @@ pub enum TagError {
 // ValidationError
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Returns a clarifying sentence when a value's byte length differs
+/// from its character count, and an empty string otherwise.
+///
+/// Length limits in Recalld are measured in UTF-8 bytes. For pure ASCII
+/// input that is indistinguishable from a character count, so the hint
+/// would be noise; for text containing multi-byte characters it is the
+/// whole explanation.
+fn utf8_hint(bytes: usize, chars: usize) -> &'static str {
+    if bytes == chars {
+        ""
+    } else {
+        " Limits are measured in UTF-8 bytes, not characters: \
+         non-ASCII characters such as em dashes and curly quotes \
+         count as 2-4 bytes each."
+    }
+}
+
 /// Errors from `Memory::validate()` and memory creation validation.
 ///
-/// Each variant carries a machine-readable `code()` suitable for the
-/// JSON error response `"error"` field, plus a human-readable message
-/// via `Display`.
+/// Each variant renders a human-readable message via `Display`. Variants
+/// that pertain to a specific request field also expose that field's
+/// camelCase wire name via [`ValidationError::field`], suitable for the
+/// JSON error response `"field"` member.
 #[derive(Debug, Error)]
 pub enum ValidationError {
     /// Summary field is empty.
     #[error("summary must not be empty")]
     SummaryEmpty,
 
-    /// Summary exceeds the maximum byte length.
-    #[error("summary is {len} bytes, max is {max}")]
-    SummaryTooLong { len: usize, max: usize },
+    /// A text field exceeds its maximum byte length.
+    ///
+    /// Carries both units so the message can explain the difference:
+    /// the limit is on UTF-8 bytes, but callers usually think in
+    /// characters.
+    #[error(
+        "{field} is {bytes} bytes ({chars} characters), which exceeds \
+         the {max_bytes}-byte limit.{}",
+        utf8_hint(*bytes, *chars)
+    )]
+    FieldTooLong {
+        field: &'static str,
+        bytes: usize,
+        chars: usize,
+        max_bytes: usize,
+    },
 
-    /// Full text exceeds the maximum byte length.
-    #[error("full_text is {len} bytes, max is {max}")]
-    FullTextTooLong { len: usize, max: usize },
-
-    /// Too many tags on a single memory.
-    #[error("too many tags: {count}, max is {max}")]
-    TooManyTags { count: usize, max: usize },
+    /// An array field has more items than allowed.
+    #[error("{field} has {count} items, which exceeds the maximum of {max}")]
+    TooManyItems {
+        field: &'static str,
+        count: usize,
+        max: usize,
+    },
 
     /// A tag failed validation.
     #[error("invalid tag: {source}")]
@@ -105,14 +136,38 @@ pub enum ValidationError {
 
     /// Namespace name is invalid (empty, too long, or bad characters).
     #[error(
-        "namespace name must be 1-{max} characters, \
-             alphanumeric/hyphens/underscores"
+        "namespace name must be 1-{max} bytes (UTF-8) of ASCII \
+             alphanumerics, hyphens, or underscores"
     )]
     InvalidNamespaceName { max: usize },
 
     /// Decay rate multiplier is negative.
     #[error("decay_rate_multiplier must be >= 0.0, got {value}")]
     InvalidDecayMultiplier { value: f32 },
+}
+
+impl ValidationError {
+    /// The camelCase wire name of the request field this error concerns,
+    /// or `None` for errors not attributable to a single input field.
+    pub fn field(&self) -> Option<&'static str> {
+        match self {
+            ValidationError::SummaryEmpty => Some("summary"),
+            ValidationError::FieldTooLong { field, .. }
+            | ValidationError::TooManyItems { field, .. } => Some(field),
+            ValidationError::InvalidTag { .. } => Some("tags"),
+            ValidationError::DimensionMismatch { .. }
+            | ValidationError::NonFiniteEmbedding { .. } => Some("embedding"),
+            ValidationError::NamespaceNotFound { .. } => Some("namespace"),
+            ValidationError::InvalidNamespaceName { .. } => Some("name"),
+            ValidationError::InvalidStability { .. } => Some("initialStability"),
+            ValidationError::InvalidDecayMultiplier { .. } => Some("decayRateMultiplier"),
+            ValidationError::StrengthOutOfRange(_)
+            | ValidationError::DecayStrengthOutOfRange(_)
+            | ValidationError::StabilityOutOfRange { .. }
+            | ValidationError::DifficultyOutOfRange { .. }
+            | ValidationError::TimestampOrdering { .. } => None,
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

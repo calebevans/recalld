@@ -19,9 +19,10 @@ use super::errors::AppError;
 use super::models::*;
 use super::state::{AppState, QueryInput, SearchQuery};
 use crate::health::report as health_report_compute;
-use crate::model::constants::NAMESPACE_NAME_MAX_BYTES;
+use crate::model::constants::MAX_BATCH_MEMORIES;
 use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
+use crate::model::validation::{MemoryInputRef, validate_memory_input, validate_namespace_name};
 use crate::serialization::{
     ApiResponse, MemoryResponse, NamespaceRequest, NamespaceResponse, SearchHit, SearchRequest,
     SearchResponse,
@@ -51,7 +52,8 @@ fn health_report_cache()
 /// POST /memories -- create a new memory.
 ///
 /// Steps:
-/// 1. Validate request: summary non-empty, tags <= 64, namespace exists.
+/// 1. Validate request content limits (see [`validate_memory_input`]);
+///    all length limits are UTF-8 bytes, not characters.
 /// 2. Resolve namespace by name -> NamespaceId.
 /// 3. Generate embedding if not provided (calls embedding provider).
 /// 4. Validate embedding dimensionality against namespace config.
@@ -66,32 +68,14 @@ pub async fn create_memory(
     let start = Instant::now();
 
     // --- Validation ---
-    if req.summary.is_empty() {
-        return Err(AppError::BadRequest {
-            message: "summary must not be empty".into(),
-            field: Some("summary".into()),
-        });
-    }
-    if req.summary.len() > 2000 {
-        return Err(AppError::BadRequest {
-            message: "summary exceeds 2,000 byte limit".into(),
-            field: Some("summary".into()),
-        });
-    }
-    if let Some(ref text) = req.full_text {
-        if text.len() > 1_048_576 {
-            return Err(AppError::BadRequest {
-                message: "full_text exceeds 1 MB limit".into(),
-                field: Some("fullText".into()),
-            });
-        }
-    }
-    if req.tags.len() > 64 {
-        return Err(AppError::BadRequest {
-            message: "too many tags (max 64)".into(),
-            field: Some("tags".into()),
-        });
-    }
+    validate_memory_input(MemoryInputRef {
+        summary: &req.summary,
+        full_text: req.full_text.as_deref(),
+        tags: &req.tags,
+        entities: &req.entities,
+        topics: &req.topics,
+        emotions: &req.emotions,
+    })?;
 
     // --- Resolve namespace ---
     let ns = state
@@ -914,7 +898,8 @@ pub async fn list_namespaces(
 /// POST /namespaces -- create a new namespace.
 ///
 /// Steps:
-/// 1. Validate name format (1-64 chars, alphanumeric + hyphens + underscores).
+/// 1. Validate name format (1-64 UTF-8 bytes, ASCII alphanumeric +
+///    hyphens + underscores).
 /// 2. Check for duplicate name.
 /// 3. Register namespace with fixed embedding dimensionality.
 /// 4. Return 201 with namespace details.
@@ -925,25 +910,7 @@ pub async fn create_namespace(
     let start = Instant::now();
 
     // Validate name format
-    if req.name.is_empty() || req.name.len() > NAMESPACE_NAME_MAX_BYTES {
-        return Err(AppError::BadRequest {
-            message: format!("namespace name must be 1-{NAMESPACE_NAME_MAX_BYTES} characters")
-                .into(),
-            field: Some("name".into()),
-        });
-    }
-    if !req
-        .name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(AppError::BadRequest {
-            message:
-                "namespace name may only contain alphanumeric characters, hyphens, and underscores"
-                    .into(),
-            field: Some("name".into()),
-        });
-    }
+    validate_namespace_name(&req.name)?;
 
     // Validate embedding dimensions if provided
     if let Some(dim) = req.embedding_dim {
@@ -1252,9 +1219,9 @@ pub async fn batch_store(
         });
     }
 
-    if req.memories.len() > 100 {
+    if req.memories.len() > MAX_BATCH_MEMORIES {
         return Err(AppError::BadRequest {
-            message: "batch size exceeds 100".into(),
+            message: format!("batch size exceeds the maximum of {MAX_BATCH_MEMORIES}"),
             field: Some("memories".into()),
         });
     }
@@ -1262,8 +1229,21 @@ pub async fn batch_store(
     let mut created = Vec::with_capacity(req.memories.len());
 
     for mem_req in req.memories {
-        // Validate
-        if mem_req.summary.is_empty() {
+        // Validate. This endpoint silently skips invalid items rather
+        // than failing the whole batch, so an error here is a `continue`
+        // — but the limits themselves are the shared ones, which keeps
+        // an oversized summary from reaching the u16-prefixed on-disk
+        // record encoder.
+        if validate_memory_input(MemoryInputRef {
+            summary: &mem_req.summary,
+            full_text: mem_req.full_text.as_deref(),
+            tags: &mem_req.tags,
+            entities: &mem_req.entities,
+            topics: &mem_req.topics,
+            emotions: &mem_req.emotions,
+        })
+        .is_err()
+        {
             continue;
         }
 

@@ -11,6 +11,8 @@ use crate::cli::output::{
     ForgetResult, HealthReportView, InspectView, ListResult, MemoryView, NamespaceStatsView,
     NamespaceView, ReinforceResult, SearchResult, StatusView, StoreResult, SweepResult,
 };
+use crate::model::constants::SUMMARY_MAX_BYTES;
+use crate::model::validation::truncate_on_char_boundary;
 
 /// HTTP client for the Recalld API server.
 ///
@@ -116,10 +118,14 @@ impl RecalldClient {
             parent_id: Option<&'a uuid::Uuid>,
         }
 
-        // If text exceeds 2,000 bytes, treat it as full_text and let
-        // the server generate a summary. Otherwise, use it as the summary.
-        let (summary, full_text) = if text.len() > 2000 {
-            (&text[..200], Some(text)) // Use first 200 chars as provisional summary
+        // If text exceeds the summary byte limit, treat it as full_text
+        // and let the server generate a summary. Otherwise, use it as
+        // the summary.
+        let (summary, full_text) = if text.len() > SUMMARY_MAX_BYTES {
+            // First 200 UTF-8 *bytes*, cut on a character boundary —
+            // slicing `&text[..200]` panics when byte 200 lands inside a
+            // multi-byte character.
+            (truncate_on_char_boundary(text, 200), Some(text))
         } else {
             (text, None)
         };
