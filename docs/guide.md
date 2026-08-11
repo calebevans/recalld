@@ -814,7 +814,10 @@ each with its id, score, and summary (truncated to 240 bytes).
   duplicate. It is not configurable: the right value is a property of the
   embedding model, not of the deployment.
 - **Scope.** Full- and summary-phase memories in the same namespace only —
-  the same set auto-linking considers.
+  the same set auto-linking considers. The phase is re-checked against the
+  stored record when the report is built, so a memory that has decayed or been
+  deleted since it was indexed is dropped rather than reported with an empty
+  summary.
 - **The recovery.** The warning arrives after the write, so acting on it
   means undoing: `forget_memory` on the id you just created, then either
   `reinforce_memory` on the existing memory (nothing new to say) or

@@ -60,8 +60,14 @@ fn health_report_cache()
 ///
 /// Never fails a create: every error path inside
 /// [`find_near_duplicates`](crate::search::find_near_duplicates) yields no
-/// matches, and a summary that will not load yields an empty string rather
-/// than dropping the match.
+/// matches.
+///
+/// The Full/Summary guarantee is enforced HERE, not by the
+/// `decay_phases` filter `find_near_duplicates` hands the vector index:
+/// `FlatVectorIndex` writes each entry's `decay_phase` once at add time
+/// (always Full) and `VectorIndex::update_metadata` has no callers, so
+/// that filter is inert in production. A candidate whose record is
+/// missing or past Summary is dropped here instead.
 async fn near_duplicate_report(
     state: &AppState,
     embedding: &[f32],
@@ -72,7 +78,7 @@ async fn near_duplicate_report(
         DUPLICATE_SIMILARITY_THRESHOLD, MAX_NEAR_DUPLICATE_MATCHES,
         NEAR_DUPLICATE_SUMMARY_MAX_BYTES,
     };
-    use crate::model::{NearDuplicateMatch, NearDuplicateReport, truncate_summary};
+    use crate::model::{DecayPhase, NearDuplicateMatch, NearDuplicateReport, truncate_summary};
 
     if !check_duplicates.unwrap_or(true) {
         return None;
@@ -94,16 +100,19 @@ async fn near_duplicate_report(
         // access — the endpoints that count a read call `record_access`
         // separately afterwards. Loading a summary to warn about a
         // duplicate is not a retrieval of that memory.
-        let summary = state
-            .cache
-            .get_or_load(id, state.storage.as_ref())
-            .await
-            .map(|r| r.summary.clone())
-            .unwrap_or_default();
+        let Some(record) = state.cache.get_or_load(id, state.storage.as_ref()).await else {
+            // Hard-deleted, and the vector index has not caught up.
+            continue;
+        };
+        // Ghost has no summary left to show and Tombstone is deleted;
+        // neither is something to be told it duplicates.
+        if !matches!(record.phase, DecayPhase::Full | DecayPhase::Summary) {
+            continue;
+        }
         matches.push(NearDuplicateMatch {
             id,
             score,
-            summary: truncate_summary(&summary, NEAR_DUPLICATE_SUMMARY_MAX_BYTES),
+            summary: truncate_summary(&record.summary, NEAR_DUPLICATE_SUMMARY_MAX_BYTES),
         });
     }
 

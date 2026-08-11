@@ -621,53 +621,68 @@ impl McpStorageAdapter {
             return None;
         }
 
-        let mut summaries: std::collections::HashMap<MemoryId, String> =
+        // Summary AND phase. The phase is the load-bearing half: the
+        // `decay_phases` filter `find_near_duplicates` passes to the
+        // vector index is INERT, because `FlatVectorIndex` writes each
+        // entry's `decay_phase` once at add time (always Full) and
+        // `VectorIndex::update_metadata` has no callers. Without a check
+        // here, a Ghost — which has no summary left — and a
+        // hard-deleted memory both get reported as near-duplicates with
+        // an empty summary, and the tool description then tells the
+        // agent to reinforce them.
+        let mut hydrated: std::collections::HashMap<MemoryId, (String, DecayPhase)> =
             std::collections::HashMap::new();
         let mut misses: Vec<MemoryId> = Vec::new();
         for (id, _) in &candidates {
             match self.cache.get(*id).await {
                 Some(cached) => {
-                    summaries.insert(*id, cached.summary.clone());
+                    hydrated.insert(*id, (cached.summary.clone(), cached.phase));
                 }
                 None => misses.push(*id),
             }
         }
 
-        // One blocking hop for every miss, not one per miss.
+        // One blocking hop for every miss, not one per miss. A record
+        // that is not there at all stays out of `hydrated` and is
+        // dropped below: it was hard-deleted and the vector index has
+        // not caught up.
         if !misses.is_empty() {
             let storage = self.storage.clone();
-            let loaded: Vec<(MemoryId, String)> = tokio::task::spawn_blocking(move || {
-                let storage_r = match storage.read() {
-                    Ok(s) => s,
-                    Err(_) => return Vec::new(),
-                };
-                misses
-                    .iter()
-                    .map(|&mid| {
-                        let summary = storage_r
-                            .get_record(mid)
-                            .ok()
-                            .flatten()
-                            .map(|r| r.summary)
-                            .unwrap_or_default();
-                        (mid, summary)
-                    })
-                    .collect()
-            })
-            .await
-            .unwrap_or_default();
-            summaries.extend(loaded);
+            let loaded: Vec<(MemoryId, (String, DecayPhase))> =
+                tokio::task::spawn_blocking(move || {
+                    let storage_r = match storage.read() {
+                        Ok(s) => s,
+                        Err(_) => return Vec::new(),
+                    };
+                    misses
+                        .iter()
+                        .filter_map(|&mid| {
+                            let record = storage_r.get_record(mid).ok().flatten()?;
+                            Some((mid, (record.summary, record.phase)))
+                        })
+                        .collect()
+                })
+                .await
+                .unwrap_or_default();
+            hydrated.extend(loaded);
         }
 
         let matches: Vec<NearDuplicateMatch> = candidates
             .into_iter()
-            .map(|(id, score)| NearDuplicateMatch {
-                id,
-                score,
-                summary: truncate_summary(
-                    summaries.get(&id).map(String::as_str).unwrap_or_default(),
-                    NEAR_DUPLICATE_SUMMARY_MAX_BYTES,
-                ),
+            .filter_map(|(id, score)| {
+                // Full and Summary only, matching what the (inert)
+                // index-level filter claims and what the docs promise.
+                // Ghost has no summary left to show and Tombstone is
+                // deleted; neither is something to be told it duplicates.
+                let (summary, phase) = hydrated.get(&id)?;
+                if !matches!(phase, DecayPhase::Full | DecayPhase::Summary) {
+                    return None;
+                }
+                Some(NearDuplicateMatch {
+                    id,
+                    score,
+                    summary: truncate_summary(summary, NEAR_DUPLICATE_SUMMARY_MAX_BYTES),
+                })
             })
             .collect();
 
@@ -2661,6 +2676,77 @@ mod tests {
         assert_eq!(report.matches[0].id.to_string(), first.id);
         assert!(report.matches[0].score >= 0.85, "{:?}", report.matches[0]);
         assert_eq!(report.matches[0].summary, "the first fact");
+    }
+
+    /// The guarantee the docs make and the index could not keep.
+    /// `find_near_duplicates` asks the vector index for Full and Summary
+    /// only, but `FlatVectorIndex` writes each entry's `decay_phase`
+    /// once at add time — always Full — and `VectorIndex::update_metadata`
+    /// has no callers, so that filter is inert in production. A ghosted
+    /// memory was reported as a near-duplicate with an EMPTY summary,
+    /// and `store_memory`'s description then told the agent to reinforce
+    /// it.
+    #[tokio::test]
+    async fn w62_a_ghosted_memory_is_not_reported_as_a_near_duplicate() {
+        let fx = Fixture::new();
+        let adapter = fx.storage_adapter();
+        let first = adapter
+            .store_memory(store_input("the first fact", "default", unit_x()))
+            .await
+            .expect("first store succeeds");
+        let first_id = MemoryId::from_uuid(uuid::Uuid::parse_str(&first.id).expect("uuid"));
+
+        // Decay it to Ghost. The vector-index entry keeps saying Full,
+        // which is the whole point.
+        fx.storage
+            .read()
+            .expect("storage lock")
+            .update_decay_state(first_id, DecayPhase::Ghost, 0.1, 0.1, 1.0, false)
+            .expect("ghost the memory");
+        fx.cache.invalidate(first_id).await;
+
+        let second = adapter
+            .store_memory(store_input("the same fact again", "default", unit_x()))
+            .await
+            .expect("second store succeeds");
+
+        assert!(
+            second.near_duplicates.is_none(),
+            "a ghosted memory was reported as a near-duplicate: {:?}",
+            second.near_duplicates
+        );
+    }
+
+    /// The same guarantee for a memory whose record is gone entirely.
+    /// A hard delete that the in-memory vector index has not caught up
+    /// with used to surface as a match with an empty summary.
+    #[tokio::test]
+    async fn w63_a_hard_deleted_memory_is_not_reported_as_a_near_duplicate() {
+        let fx = Fixture::new();
+        let adapter = fx.storage_adapter();
+        let first = adapter
+            .store_memory(store_input("the first fact", "default", unit_x()))
+            .await
+            .expect("first store succeeds");
+        let first_id = MemoryId::from_uuid(uuid::Uuid::parse_str(&first.id).expect("uuid"));
+
+        fx.storage
+            .write()
+            .expect("storage lock")
+            .delete_memory(first_id)
+            .expect("hard delete");
+        fx.cache.invalidate(first_id).await;
+
+        let second = adapter
+            .store_memory(store_input("the same fact again", "default", unit_x()))
+            .await
+            .expect("second store succeeds");
+
+        assert!(
+            second.near_duplicates.is_none(),
+            "a hard-deleted memory was reported as a near-duplicate: {:?}",
+            second.near_duplicates
+        );
     }
 
     #[tokio::test]

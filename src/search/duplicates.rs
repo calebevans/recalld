@@ -21,6 +21,20 @@ static UNNORMALIZED_WARNED: AtomicBool = AtomicBool::new(false);
 /// Find existing memories at least `threshold` similar to `embedding`,
 /// closest first, at most `limit` of them.
 ///
+/// # Candidates, not a report
+///
+/// The phase filter below is a cheap PREFILTER and nothing more.
+/// [`FlatVectorIndex`] writes each entry's `decay_phase` once, at
+/// [`add`](crate::search::VectorIndex::add) time — always
+/// [`DecayPhase::Full`] — and
+/// [`update_metadata`](crate::search::VectorIndex::update_metadata) has
+/// no callers, so in production the entry's phase is a snapshot of the
+/// moment it was indexed rather than the memory's phase now. Every
+/// caller must therefore re-check the phase on the record it hydrates,
+/// and drop candidates whose record is missing or past
+/// [`DecayPhase::Summary`]. That is where the Full/Summary guarantee is
+/// actually kept.
+///
 /// Deliberately **not** [`QueryEngine::similar`](crate::search::QueryEngine):
 /// that requires the memory to already exist, and it records an associative
 /// access on every result it returns. At store time that would age every
@@ -72,6 +86,10 @@ pub fn find_near_duplicates(
         // namespace stay comparable. Ghost has no summary left to show and
         // Tombstone is deleted; neither is something to be told it
         // duplicates.
+        //
+        // A PREFILTER only — see the note on this function. It catches
+        // nothing in production, because nothing ever updates an entry's
+        // stored phase; the hydration step is what enforces this.
         decay_phases: Some(vec![DecayPhase::Full.as_u8(), DecayPhase::Summary.as_u8()]),
         // Prunes the result heap, not the dot products — the scan is
         // O(index) either way.

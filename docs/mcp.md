@@ -319,7 +319,10 @@ per-call knob would hand the caller a lever to silence the warning.
 
 **Scope.** Full- and summary-phase memories in the *same namespace* only --
 the same set auto-linking considers. Ghost-phase memories have no summary left
-to show and tombstoned ones are deleted.
+to show and tombstoned ones are deleted. The phase is re-checked against the
+stored record when the report is built, so a memory that has decayed or been
+deleted since it was indexed is dropped rather than reported with an empty
+summary.
 
 **The recovery.** The warning arrives after the write, so acting on it means
 undoing:
