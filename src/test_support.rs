@@ -187,6 +187,36 @@ impl Fixture {
             .expect("tombstone memory");
     }
 
+    /// The MCP namespace adapter over this fixture's storage.
+    pub(crate) fn namespace_adapter(&self) -> crate::mcp::bridge_adapters::McpNamespaceAdapter {
+        crate::mcp::bridge_adapters::McpNamespaceAdapter::new(self.storage.clone(), chrono_tz::UTC)
+    }
+
+    /// The MCP storage adapter over this fixture's storage.
+    ///
+    /// `McpStorageAdapter::new` takes nine subsystems. The read paths
+    /// exercised by these tests touch only `storage` and `timezone`, but
+    /// the constructor is not going to grow a second form for tests, so
+    /// the remaining seven are built here once — empty and real, not
+    /// mocked.
+    pub(crate) fn storage_adapter(&self) -> crate::mcp::bridge_adapters::McpStorageAdapter {
+        crate::mcp::bridge_adapters::McpStorageAdapter::new(
+            self.storage.clone(),
+            self.cache.clone(),
+            Arc::new(crate::embedding::PassthroughProvider::new(DIM)),
+            Arc::new(tokio::sync::RwLock::new(
+                crate::search::FlatVectorIndex::new(DIM),
+            )),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::search::FtsIndex::new(self.path()).expect("open fts index"),
+            )),
+            Arc::new(tokio::sync::RwLock::new(crate::search::EntityIndex::new())),
+            self.graph.clone(),
+            Arc::new(crate::config::RecalldConfig::default()),
+            chrono_tz::UTC,
+        )
+    }
+
     pub(crate) fn edge_count(&self, id: MemoryId) -> u16 {
         self.storage
             .read()

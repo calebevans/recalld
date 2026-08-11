@@ -1,8 +1,8 @@
 //! MCP tool definitions and handlers for Recalld memory operations.
 //!
-//! Defines 10 tools: store_memory, store_memories, recall_memories, get_memory,
+//! Defines 11 tools: store_memory, store_memories, recall_memories, get_memory,
 //! reinforce_memory, forget_memory, find_similar_memories, create_namespace,
-//! namespace_stats, list_memories.
+//! namespace_stats, list_memories, list_namespaces.
 
 use serde_json::json;
 
@@ -46,8 +46,29 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
         create_namespace_def(),
         namespace_stats_def(),
         list_memories_def(),
+        list_namespaces_def(),
     ]
 }
+
+/// Every tool name [`dispatch_tool`] has an arm for.
+///
+/// Kept next to the match so a definition added without a dispatch arm —
+/// which advertises a tool that then answers "Unknown tool" — fails a
+/// test rather than a caller.
+#[cfg(test)]
+const DISPATCHED: [&str; 11] = [
+    "store_memory",
+    "store_memories",
+    "recall_memories",
+    "get_memory",
+    "reinforce_memory",
+    "forget_memory",
+    "find_similar_memories",
+    "create_namespace",
+    "namespace_stats",
+    "list_memories",
+    "list_namespaces",
+];
 
 /// Dispatch a tool call by name to the appropriate handler.
 pub async fn dispatch_tool(
@@ -66,6 +87,7 @@ pub async fn dispatch_tool(
         "create_namespace" => handle_create_namespace(bridge, arguments).await,
         "namespace_stats" => handle_namespace_stats(bridge, arguments).await,
         "list_memories" => handle_list_memories(bridge, arguments).await,
+        "list_namespaces" => handle_list_namespaces(bridge, arguments).await,
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -1227,6 +1249,49 @@ async fn handle_list_memories(bridge: &McpBridge, arguments: serde_json::Value) 
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Tool 11: list_namespaces
+// ═══════════════════════════════════════════════════════════════════════
+
+fn list_namespaces_def() -> ToolInfo {
+    ToolInfo {
+        name: "list_namespaces".to_string(),
+        title: Some("List Namespaces".to_string()),
+        description: "List every memory namespace with its ID, embedding dimensions, live \
+            memory count, and creation date. Call this first when you do not know which \
+            namespaces exist, before targeting one with list_memories, list_tags, or \
+            namespace_stats. Counts exclude deleted (tombstoned) memories."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {}
+        }),
+        annotations: Some(ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+/// The response is the bare serialization of `Vec<NamespaceInfo>`, not a
+/// `{"namespaces": [...], "total": n}` envelope. Reusing the type
+/// unchanged makes this tool and the `recalld://namespaces` resource
+/// provably the same payload, and `total` is the array length.
+async fn handle_list_namespaces(
+    bridge: &McpBridge,
+    _arguments: serde_json::Value,
+) -> ToolCallResult {
+    match bridge.namespaces.list_namespaces().await {
+        Ok(namespaces) => match ToolCallResult::json(&namespaces) {
+            Ok(r) => r,
+            Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+        },
+        Err(e) => ToolCallResult::error(format!("List namespaces failed: {e}")),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1305,6 +1370,95 @@ mod tests {
         assert_eq!(
             batch["properties"]["memories"]["maxItems"].as_u64(),
             Some(MAX_BATCH_MEMORIES as u64)
+        );
+    }
+
+    // ── Registry shape ───────────────────────────────────────────────
+
+    #[test]
+    fn t34_every_tool_definition_has_a_unique_name() {
+        let mut names: Vec<String> = tool_definitions().into_iter().map(|t| t.name).collect();
+        let before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            before,
+            "duplicate tool name in tool_definitions"
+        );
+    }
+
+    /// The count the module doc, the README and the guide all repeat. If
+    /// it moves, they have to move with it.
+    #[test]
+    fn t35_declares_eleven_tools() {
+        assert_eq!(tool_definitions().len(), 11);
+    }
+
+    /// A definition without a dispatch arm advertises a tool that answers
+    /// "Unknown tool". Cheap to catch here, expensive to catch in the
+    /// field.
+    #[test]
+    fn t36_every_declared_tool_has_a_dispatch_arm() {
+        for tool in tool_definitions() {
+            assert!(
+                DISPATCHED.contains(&tool.name.as_str()),
+                "{} is declared but has no dispatch arm",
+                tool.name
+            );
+        }
+        assert_eq!(DISPATCHED.len(), tool_definitions().len());
+    }
+
+    /// The published bound and the enforced bound are the same constant,
+    /// so a client that trusts the schema cannot be told its request was
+    /// out of range.
+    #[test]
+    fn t37_listing_schema_limits_match_their_constants() {
+        let list = list_memories_def().input_schema;
+        assert_eq!(
+            list["properties"]["limit"]["maximum"].as_u64(),
+            Some(MAX_LIST_LIMIT as u64)
+        );
+        assert_eq!(
+            list["properties"]["limit"]["default"].as_u64(),
+            Some(DEFAULT_LIST_LIMIT as u64)
+        );
+        assert_eq!(list["properties"]["limit"]["minimum"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn t38_read_only_tools_declare_the_read_only_hint() {
+        const READ_ONLY: [&str; 6] = [
+            "recall_memories",
+            "get_memory",
+            "find_similar_memories",
+            "namespace_stats",
+            "list_memories",
+            "list_namespaces",
+        ];
+        for tool in tool_definitions() {
+            let Some(annotations) = tool.annotations else {
+                panic!("{} has no annotations", tool.name);
+            };
+            let expected = READ_ONLY.contains(&tool.name.as_str());
+            assert_eq!(
+                annotations.read_only_hint,
+                Some(expected),
+                "{} read_only_hint",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn t39_list_namespaces_takes_no_parameters() {
+        let schema = list_namespaces_def().input_schema;
+        assert_eq!(schema["type"].as_str(), Some("object"));
+        assert_eq!(
+            schema["properties"].as_object().map(|o| o.len()),
+            Some(0),
+            "list_namespaces must not require the caller to know anything first"
         );
     }
 }

@@ -1344,16 +1344,26 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             let namespaces = storage_r
                 .list_namespaces()
                 .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
-            Ok(namespaces
-                .into_iter()
-                .map(|ns| bridge::NamespaceInfo {
+            // `memory_count` was hardcoded to 0 here, so both this tool
+            // and the `recalld://namespaces` resource reported every
+            // namespace as empty. Counting live members costs one point
+            // lookup per member and agrees with `list_memories.total` by
+            // construction.
+            let mut out = Vec::with_capacity(namespaces.len());
+            for ns in namespaces {
+                let memory_count = storage_r
+                    .meta_store()
+                    .count_memories_in_namespace(ns.id)
+                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+                out.push(bridge::NamespaceInfo {
                     id: ns.id.get(),
                     name: ns.name.clone(),
                     embedding_dim: ns.embedding_dim as u16,
-                    memory_count: 0,
+                    memory_count,
                     created_at: format_timestamp(ns.created_at, tz),
-                })
-                .collect())
+                });
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
@@ -1408,6 +1418,8 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                 id: assigned_id.get(),
                 name: input_name,
                 embedding_dim: dim as u16,
+                // Not a placeholder: a namespace created one line ago is
+                // empty.
                 memory_count: 0,
                 created_at: format_timestamp(now, tz),
             })
@@ -1532,5 +1544,80 @@ impl bridge::HealthChecker for McpHealthAdapter {
             uptime_secs: self.started_at.elapsed().as_secs(),
             subsystems,
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::bridge::NamespaceRegistry;
+    use crate::test_support::{Fixture, MemorySpec};
+
+    fn default_ns() -> NamespaceId {
+        NamespaceId::new(1)
+    }
+
+    /// Find one namespace in a `list_namespaces` result by name.
+    fn find<'a>(namespaces: &'a [bridge::NamespaceInfo], name: &str) -> &'a bridge::NamespaceInfo {
+        namespaces
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("namespace '{name}' missing from list_namespaces"))
+    }
+
+    // ── list_namespaces ──────────────────────────────────────────────
+
+    /// The regression: `memory_count` was hardcoded to 0, so every
+    /// namespace reported as empty no matter what it held.
+    #[tokio::test]
+    async fn a41_list_namespaces_reports_the_live_memory_count() {
+        let fx = Fixture::new();
+        for _ in 0..3 {
+            fx.insert_memory().await;
+        }
+
+        let namespaces = fx.namespace_adapter().list_namespaces().await.unwrap();
+        assert_eq!(find(&namespaces, "default").memory_count, 3);
+    }
+
+    #[tokio::test]
+    async fn a42_list_namespaces_excludes_tombstoned_memories() {
+        let fx = Fixture::new();
+        let doomed = fx.insert_memory().await;
+        fx.insert_memory().await;
+        fx.tombstone(doomed);
+
+        let namespaces = fx.namespace_adapter().list_namespaces().await.unwrap();
+        assert_eq!(find(&namespaces, "default").memory_count, 1);
+    }
+
+    #[tokio::test]
+    async fn a43_list_namespaces_reports_zero_for_an_empty_namespace() {
+        let fx = Fixture::new();
+        fx.create_namespace("empty");
+        // A memory in `default` must not be counted against `empty`.
+        fx.insert_memory().await;
+
+        let namespaces = fx.namespace_adapter().list_namespaces().await.unwrap();
+        assert_eq!(find(&namespaces, "empty").memory_count, 0);
+        assert_eq!(find(&namespaces, "default").memory_count, 1);
+    }
+
+    /// Each namespace is counted on its own members, not on the whole
+    /// database.
+    #[tokio::test]
+    async fn a43b_counts_are_per_namespace() {
+        let fx = Fixture::new();
+        let other = fx.create_namespace("other");
+        fx.insert_memory_with(MemorySpec::new(other)).await;
+        fx.insert_memory_with(MemorySpec::new(default_ns())).await;
+
+        let namespaces = fx.namespace_adapter().list_namespaces().await.unwrap();
+        assert_eq!(find(&namespaces, "other").memory_count, 1);
+        assert_eq!(find(&namespaces, "default").memory_count, 1);
     }
 }

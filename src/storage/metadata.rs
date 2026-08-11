@@ -565,6 +565,49 @@ impl MetadataStore {
         Ok(ids)
     }
 
+    /// Number of live (non-tombstoned) memories in `namespace_id`.
+    ///
+    /// Applies the same predicate as [`list_memories_filtered`] with no
+    /// filters — walk `NAMESPACE_INDEX`, load each record, skip
+    /// `Tombstone` — so `list_namespaces[].memoryCount`,
+    /// `namespace_stats.memoryCount` and `list_memories.total` agree *by
+    /// construction* rather than by invariant.
+    ///
+    /// One point lookup per member of the namespace, not a scan of the
+    /// database.
+    ///
+    /// [`memories_in_namespace`](Self::memories_in_namespace)`.len()`
+    /// would be cheaper — index cardinality only, no `META_TABLE` reads —
+    /// and `tombstone` does remove from the index, so the two agree in
+    /// practice. But they diverge for an index entry whose `META_TABLE`
+    /// row is missing, which `list_memories_filtered` explicitly
+    /// tolerates, and the whole point here is that this count agrees with
+    /// what a caller can actually list.
+    pub fn count_memories_in_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<u64, StorageError> {
+        let read_txn = self.db.begin_read()?;
+        let ns_table = read_txn.open_multimap_table(NAMESPACE_INDEX)?;
+        let meta_table = read_txn.open_table(META_TABLE)?;
+
+        let mut count = 0u64;
+        for result in ns_table.get(namespace_id.get())? {
+            let value = result?;
+            let bytes: [u8; 16] = value.value().try_into().map_err(|_| {
+                StorageError::CorruptIndex("invalid UUID length in namespace index".into())
+            })?;
+            let Some(record_value) = meta_table.get(bytes.as_slice())? else {
+                continue;
+            };
+            if DiskRecord::from_bytes(record_value.value())?.phase != DecayPhase::Tombstone {
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
     /// List memories in a namespace with optional tag/entity/time filters,
     /// sorted by creation date (newest first) with offset/limit pagination.
     ///
