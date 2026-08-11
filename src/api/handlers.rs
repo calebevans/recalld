@@ -47,6 +47,69 @@ fn health_report_cache()
     CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
+/// Build the near-duplicate advisory for a memory about to be created.
+///
+/// Shared by the single and batch create endpoints so the two HTTP doors
+/// cannot drift, and mirroring `McpStorageAdapter::store_memory` so the
+/// HTTP and MCP doors cannot either. `MemoryResponse.supersedes` exists
+/// for exactly that reason.
+///
+/// **Call this BEFORE the memory is indexed.** `state.search.index_memory`
+/// puts the new vector in the index; run after that and the memory matches
+/// itself at score 1.0.
+///
+/// Never fails a create: every error path inside
+/// [`find_near_duplicates`](crate::search::find_near_duplicates) yields no
+/// matches, and a summary that will not load yields an empty string rather
+/// than dropping the match.
+async fn near_duplicate_report(
+    state: &AppState,
+    embedding: &[f32],
+    namespace_id: NamespaceId,
+    check_duplicates: Option<bool>,
+) -> Option<crate::model::NearDuplicateReport> {
+    use crate::model::constants::{
+        DUPLICATE_SIMILARITY_THRESHOLD, MAX_NEAR_DUPLICATE_MATCHES,
+        NEAR_DUPLICATE_SUMMARY_MAX_BYTES,
+    };
+    use crate::model::{NearDuplicateMatch, NearDuplicateReport, truncate_summary};
+
+    if !check_duplicates.unwrap_or(true) {
+        return None;
+    }
+
+    let candidates = state
+        .search
+        .near_duplicates(
+            embedding,
+            namespace_id,
+            DUPLICATE_SIMILARITY_THRESHOLD as f32,
+            MAX_NEAR_DUPLICATE_MATCHES,
+        )
+        .await;
+
+    let mut matches = Vec::with_capacity(candidates.len());
+    for (id, score) in candidates {
+        // `get_or_load` reads through the cache without recording an
+        // access — the endpoints that count a read call `record_access`
+        // separately afterwards. Loading a summary to warn about a
+        // duplicate is not a retrieval of that memory.
+        let summary = state
+            .cache
+            .get_or_load(id, state.storage.as_ref())
+            .await
+            .map(|r| r.summary.clone())
+            .unwrap_or_default();
+        matches.push(NearDuplicateMatch {
+            id,
+            score,
+            summary: truncate_summary(&summary, NEAR_DUPLICATE_SUMMARY_MAX_BYTES),
+        });
+    }
+
+    NearDuplicateReport::from_matches(DUPLICATE_SIMILARITY_THRESHOLD, matches)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Memory CRUD
 // ═══════════════════════════════════════════════════════════════════════
@@ -160,6 +223,12 @@ pub async fn create_memory(
         }
     };
 
+    // --- Near-duplicate advisory ---
+    // Before the write, so the new memory is not yet in the vector index
+    // and cannot match itself. See `near_duplicate_report`.
+    let near_duplicates =
+        near_duplicate_report(&state, &embedding, ns.id, req.check_duplicates).await;
+
     // --- Persist ---
     // Resolve initial stability: use caller-provided value, or fall back
     // to the namespace's configured initial_stability (matching the MCP
@@ -250,6 +319,7 @@ pub async fn create_memory(
     let mut response = MemoryResponse::from_cached(&memory, ns.name.clone());
     response.full_text = req.full_text;
     response.supersedes = supersedes_outcome;
+    response.near_duplicates = near_duplicates;
     let took = start.elapsed().as_micros() as u64;
 
     Ok((
@@ -1372,6 +1442,13 @@ pub async fn batch_store(
             }
         };
 
+        // Near-duplicate advisory, before this item is indexed. Items are
+        // created in order and each is indexed before the next is checked,
+        // so an intra-batch duplicate is reported too — same property the
+        // MCP batch tool has.
+        let near_duplicates =
+            near_duplicate_report(&state, &embedding, ns.id, mem_req.check_duplicates).await;
+
         // Persist — resolve initial stability from namespace config (matching MCP)
         let resolved_stability = mem_req.initial_stability.unwrap_or(ns.initial_stability);
         let memory = match state
@@ -1468,6 +1545,7 @@ pub async fn batch_store(
             id: memory.id,
             namespace: ns.name.clone(),
             supersedes: supersedes_outcome,
+            near_duplicates,
         });
     }
 

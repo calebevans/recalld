@@ -181,6 +181,17 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             .collect())
     }
 
+    async fn near_duplicates(
+        &self,
+        embedding: &[f32],
+        namespace_id: NamespaceId,
+        threshold: f32,
+        limit: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        let index = self.vector_index.read().await;
+        crate::search::find_near_duplicates(&index, embedding, namespace_id, threshold, limit)
+    }
+
     async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId) {
         use crate::search::{VectorIndex, VectorMetadata};
         let mut index = self.vector_index.write().await;

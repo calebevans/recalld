@@ -75,6 +75,15 @@ pub struct CreateMemoryApiRequest {
     /// the memory is backdated to this time instead of using the current time.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<i64>,
+
+    /// Whether to check the new memory against existing ones and report
+    /// near-duplicates on the response. Absent means enabled.
+    ///
+    /// `Option<bool>` rather than `bool` with a `default_true`: a bare
+    /// `#[serde(default)]` on a `bool` is `false`, which would silently
+    /// disable the check for every client that predates the field.
+    #[serde(default)]
+    pub check_duplicates: Option<bool>,
 }
 
 /// Default namespace name for request types.
@@ -583,6 +592,10 @@ pub struct BatchStoreResult {
     /// What became of the requested `supersedes` link, if one was asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<crate::model::SupersedesOutcome>,
+    /// Existing memories that closely resemble this item. Absent when
+    /// nothing crossed the threshold or the item disabled the check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub near_duplicates: Option<crate::model::NearDuplicateReport>,
 }
 
 /// A batch item that was rejected, and why.

@@ -137,6 +137,14 @@ pub struct MemoryResponse {
     /// named a target — so GET, search and list bodies are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<crate::model::SupersedesOutcome>,
+
+    /// Existing memories that closely resemble this one.
+    ///
+    /// Like `supersedes`, only the create endpoint populates this, and
+    /// only when something crossed the threshold — so GET, search and list
+    /// bodies are unchanged. Advisory: the memory was created regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_duplicates: Option<crate::model::NearDuplicateReport>,
 }
 
 impl MemoryResponse {
@@ -166,6 +174,7 @@ impl MemoryResponse {
             embedding: None,
             access_history: None,
             supersedes: None,
+            near_duplicates: None,
         }
     }
 }
@@ -333,4 +342,74 @@ pub struct NamespaceResponse {
     pub created_at: i64,
     /// Total number of memories in this namespace.
     pub memory_count: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{NearDuplicateMatch, NearDuplicateReport};
+
+    /// A `MemoryResponse` as every read endpoint produces it.
+    fn response() -> MemoryResponse {
+        let record = CachedRecord {
+            id: MemoryId::new(),
+            namespace_id: crate::model::NamespaceId::new(1),
+            created_at: 0,
+            last_accessed_at: 0,
+            phase: DecayPhase::Full,
+            strength: 1.0,
+            decay_strength: 1.0,
+            stability: 1.0,
+            difficulty: 5.0,
+            is_permastore: false,
+            edge_count: 0,
+            summary: "a fact".to_string(),
+            tags: Vec::new(),
+            vector_slot: 0,
+            entities: Vec::new(),
+        };
+        MemoryResponse::from_cached(&record, "default".to_string())
+    }
+
+    /// Only the create endpoint populates the advisory, so GET, search and
+    /// list bodies have to be byte-identical to what they were.
+    #[test]
+    fn g30_a_read_response_omits_the_near_duplicate_report() {
+        let encoded = serde_json::to_value(response()).expect("encodes");
+        assert!(encoded.get("nearDuplicates").is_none(), "{encoded}");
+    }
+
+    /// Same wire shape as the MCP door's report — the two create paths
+    /// must not drift.
+    #[test]
+    fn g30b_a_populated_report_round_trips_with_camel_case_keys() {
+        let target = MemoryId::new();
+        let mut memory = response();
+        memory.near_duplicates = NearDuplicateReport::from_matches(
+            0.85,
+            vec![NearDuplicateMatch {
+                id: target,
+                score: 0.9,
+                summary: "an older phrasing".to_string(),
+            }],
+        );
+
+        let encoded = serde_json::to_value(&memory).expect("encodes");
+        let report = &encoded["nearDuplicates"];
+        assert_eq!(report["threshold"], serde_json::json!(0.85));
+        assert_eq!(
+            report["matches"][0]["id"],
+            serde_json::json!(target.to_string())
+        );
+        assert_eq!(report["matches"][0]["summary"], "an older phrasing");
+
+        let decoded: MemoryResponse = serde_json::from_value(encoded).expect("decodes");
+        let report = decoded.near_duplicates.expect("report preserved");
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(report.matches[0].id, target);
+    }
 }

@@ -43,6 +43,24 @@ pub trait SearchPipeline: Send + Sync {
     /// Execute a search query, returning scored results.
     async fn search(&self, query: SearchQuery) -> Result<Vec<ResolvedSearchResult>, SearchError>;
 
+    /// Find existing memories at or above `threshold` similarity to a
+    /// pre-computed embedding, closest first, at most `limit` of them.
+    ///
+    /// Distinct from [`search`](Self::search) in the one way that matters
+    /// at store time: it records no accesses on what it returns, so
+    /// checking a new memory for duplicates does not age every
+    /// neighbour's decay schedule.
+    ///
+    /// Never errors — the caller is an advisory field that must not fail a
+    /// create.
+    async fn near_duplicates(
+        &self,
+        embedding: &[f32],
+        namespace_id: NamespaceId,
+        threshold: f32,
+        limit: usize,
+    ) -> Vec<(MemoryId, f32)>;
+
     /// Index a memory's embedding in the vector index.
     async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId);
 
