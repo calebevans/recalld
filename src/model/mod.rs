@@ -18,6 +18,7 @@
 
 pub mod constants;
 pub mod decay;
+pub mod duplicates;
 pub mod edge;
 pub mod error;
 pub mod id;
@@ -29,6 +30,7 @@ pub mod validation;
 
 // Re-export primary types at module level for convenience.
 pub use self::decay::DecayPhase;
+pub use self::duplicates::{NearDuplicateMatch, NearDuplicateReport, truncate_summary};
 pub use self::edge::{EdgeType, SupersedesOutcome, SupersedesStatus};
 pub use self::error::{DecodeError, TagError, ValidationError};
 pub use self::id::{MemoryId, NamespaceId};

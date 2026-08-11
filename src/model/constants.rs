@@ -132,6 +132,34 @@ pub const MAX_EMOTIONS: usize = 32;
 /// Maximum number of memories accepted in a single batch store call.
 pub const MAX_BATCH_MEMORIES: usize = 100;
 
+// ── Near-Duplicate Detection ─────────────────────────────────────────
+/// Cosine similarity at or above which two memories count as
+/// near-duplicates of each other.
+///
+/// One number, three surfaces: the `find_similar_memories` scan mode, the
+/// REST duplicate scan, and the advisory a store returns. They have to
+/// agree, or "duplicate" means two different things inside one namespace.
+///
+/// Declared `f64`, not `f32`, and that is load-bearing: this value is
+/// embedded in published JSON schemas via `json!`, and `serde_json` widens
+/// an `f32` to `f64` on the way in — `0.85f32` serializes as
+/// `0.8500000238418579`, silently changing the schema clients read. `f64`
+/// also matches [`crate::config::GraphConfig::auto_link_threshold`] and the
+/// `.as_f64()` used to parse the override. Cast to `f32` at the use sites.
+pub const DUPLICATE_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+/// Maximum near-duplicate matches reported on a single store.
+///
+/// Three, not one: one match hides "this is the fourth restatement of the
+/// same fact". Three shows a cluster forming and is still cheap.
+pub const MAX_NEAR_DUPLICATE_MATCHES: usize = 3;
+
+/// Byte budget for each reported near-duplicate's summary.
+///
+/// Summaries are capped at [`SUMMARY_MAX_BYTES`], so three untruncated ones
+/// would be a 6 KB tax on a store response.
+pub const NEAR_DUPLICATE_SUMMARY_MAX_BYTES: usize = 240;
+
 // ── Listing Limits ───────────────────────────────────────────────────
 //
 // Named because two places have to agree about each one: the `default`

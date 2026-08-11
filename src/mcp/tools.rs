@@ -10,9 +10,10 @@ use crate::mcp::args;
 use crate::mcp::bridge::McpBridge;
 use crate::mcp::protocol::{ToolAnnotations, ToolCallResult, ToolInfo};
 use crate::model::constants::{
-    DEFAULT_LIST_LIMIT, DEFAULT_TAG_LIMIT, EMOTION_MAX_BYTES, ENTITY_MAX_BYTES,
-    FULL_TEXT_MAX_BYTES, MAX_BATCH_MEMORIES, MAX_EMOTIONS, MAX_ENTITIES, MAX_LIST_LIMIT,
-    MAX_TAG_LIMIT, MAX_TAGS, MAX_TOPICS, SUMMARY_MAX_BYTES, TAG_MAX_BYTES, TOPIC_MAX_BYTES,
+    DEFAULT_LIST_LIMIT, DEFAULT_TAG_LIMIT, DUPLICATE_SIMILARITY_THRESHOLD, EMOTION_MAX_BYTES,
+    ENTITY_MAX_BYTES, FULL_TEXT_MAX_BYTES, MAX_BATCH_MEMORIES, MAX_EMOTIONS, MAX_ENTITIES,
+    MAX_LIST_LIMIT, MAX_TAG_LIMIT, MAX_TAGS, MAX_TOPICS, SUMMARY_MAX_BYTES, TAG_MAX_BYTES,
+    TOPIC_MAX_BYTES,
 };
 use crate::model::validation::validate_namespace_name;
 
@@ -849,7 +850,9 @@ fn find_similar_memories_def() -> ToolInfo {
                 "threshold": {
                     "type": "number",
                     "description": "Similarity threshold for \"scan\" mode duplicate detection (0.0-1.0, default: 0.85)",
-                    "default": 0.85,
+                    // `f64`, so this serializes as `0.85` and not as the
+                    // widened `0.8500000238418579` an `f32` would produce.
+                    "default": DUPLICATE_SIMILARITY_THRESHOLD,
                     "minimum": 0.0,
                     "maximum": 1.0
                 },
@@ -961,7 +964,7 @@ async fn handle_find_similar_scan(
     let threshold = arguments
         .get("threshold")
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.85) as f32;
+        .unwrap_or(DUPLICATE_SIMILARITY_THRESHOLD) as f32;
 
     if !(0.0..=1.0).contains(&threshold) {
         return ToolCallResult::error("threshold must be between 0.0 and 1.0");
@@ -1451,6 +1454,21 @@ mod tests {
         assert_eq!(
             batch["properties"]["memories"]["maxItems"].as_u64(),
             Some(MAX_BATCH_MEMORIES as u64)
+        );
+    }
+
+    /// `json!` widens an `f32` to `f64` on the way into a `Value`, so a
+    /// threshold declared `0.85f32` publishes as `0.8500000238418579` —
+    /// a schema change nobody made and nobody would notice. The constant
+    /// is `f64` for exactly this reason; this test is what keeps it that
+    /// way.
+    #[test]
+    fn d23_scan_mode_threshold_default_serializes_as_a_clean_decimal() {
+        let schema = find_similar_memories_def().input_schema;
+        assert_eq!(
+            schema["properties"]["threshold"]["default"],
+            json!(0.85),
+            "threshold default is not a clean decimal"
         );
     }
 

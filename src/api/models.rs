@@ -620,7 +620,7 @@ pub struct ScanDuplicatesRequest {
 }
 
 fn default_duplicate_threshold() -> f32 {
-    0.85
+    crate::model::constants::DUPLICATE_SIMILARITY_THRESHOLD as f32
 }
 
 fn default_max_scan() -> usize {

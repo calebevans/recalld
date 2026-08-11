@@ -12,6 +12,9 @@
 mod index;
 mod simd;
 
+// Near-duplicate detection at store time.
+mod duplicates;
+
 // CS-26: FTS5 full-text search (replaces custom BM25)
 mod fts;
 
@@ -29,6 +32,9 @@ mod response;
 // --- CS-14 re-exports ---
 pub use index::{FilterEntry, FlatVectorIndex, TagInterner};
 pub use simd::{dot_product_simd, is_normalized, normalize_l2};
+
+// --- Near-duplicate detection ---
+pub use duplicates::find_near_duplicates;
 
 // --- CS-26 re-exports ---
 pub use fts::FtsIndex;
