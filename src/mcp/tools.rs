@@ -7,7 +7,7 @@
 use serde_json::json;
 
 use crate::mcp::args;
-use crate::mcp::bridge::McpBridge;
+use crate::mcp::bridge::{McpBridge, StoredMemory};
 use crate::mcp::protocol::{ToolAnnotations, ToolCallResult, ToolInfo};
 use crate::model::constants::{
     DEFAULT_LIST_LIMIT, DEFAULT_TAG_LIMIT, DUPLICATE_SIMILARITY_THRESHOLD, EMOTION_MAX_BYTES,
@@ -104,10 +104,24 @@ fn store_memory_def() -> ToolInfo {
     ToolInfo {
         name: "store_memory".to_string(),
         title: Some("Store Memory".to_string()),
+        // The near-duplicate half of this description teaches the
+        // RECOVERY, not just the warning. The check is post-hoc by
+        // construction — the memory is already stored when the report
+        // arrives — so an agent told only "these look similar" has no
+        // action available and will ignore it.
         description: "Store a new observation, fact, or piece of context as a memory. \
             The system automatically generates an embedding for semantic search. \
             Use tags to categorize (e.g., \"topic/rust\", \"project/recalld\"). \
-            Memories decay naturally over time unless reinforced."
+            Memories decay naturally over time unless reinforced. \
+            The memory is always stored, but the result may carry a `nearDuplicates` \
+            object listing existing memories at cosine similarity 0.85 or higher. \
+            Act on it rather than ignoring it: if the new memory restates one of them, \
+            call `forget_memory` on the id you just created, then either \
+            `reinforce_memory` on the existing memory (nothing new to say) or \
+            `store_memory` again with `supersedes` set to the existing id (the fact \
+            changed). Leave both only when they are genuinely distinct facts that \
+            happen to read alike. Pass `checkDuplicates: false` to skip the check \
+            during bulk ingestion."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -165,6 +179,11 @@ fn store_memory_def() -> ToolInfo {
                 "supersedes": {
                     "type": "string",
                     "description": "UUID of an existing memory in the same namespace that this one replaces. Recall returns this memory in place of the old one. The store fails if the target does not exist or is in a different namespace."
+                },
+                "checkDuplicates": {
+                    "type": "boolean",
+                    "description": "Report existing memories that closely resemble this one (default: true). Never blocks the store; it only adds a `nearDuplicates` object to the result. Set false for bulk ingestion, where one similarity scan per memory is not worth paying.",
+                    "default": true
                 }
             },
             "required": ["summary"]
@@ -218,7 +237,13 @@ fn store_memories_def() -> ToolInfo {
         title: Some("Store Memories (Batch)".to_string()),
         description: "Store multiple memories in a single call. Each item has the \
             same schema as store_memory. Returns an array of results, one per \
-            input memory. Saves round trips for bulk ingestion."
+            input memory. Saves round trips for bulk ingestion. \
+            Items are stored in order and each is indexed before the next is \
+            checked, so a result entry may carry a `nearDuplicates` object naming \
+            an earlier item of the same batch as well as pre-existing memories. \
+            The recovery is the same as for store_memory: forget the new id and \
+            either reinforce the existing memory or re-store it with `supersedes`. \
+            Set `checkDuplicates: false` on an item to skip its check."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -276,6 +301,11 @@ fn store_memories_def() -> ToolInfo {
                             "supersedes": {
                                 "type": "string",
                                 "description": "UUID of an existing memory in the same namespace that this one replaces. The store fails if the target does not exist or is in a different namespace."
+                            },
+                            "checkDuplicates": {
+                                "type": "boolean",
+                                "description": "Report existing memories that closely resemble this one (default: true). Never blocks the store; it only adds a `nearDuplicates` object to this item's result. Set false for bulk ingestion, where one similarity scan per memory is not worth paying.",
+                                "default": true
                             }
                         },
                         "required": ["summary"]
@@ -291,6 +321,57 @@ fn store_memories_def() -> ToolInfo {
             open_world_hint: Some(false),
         }),
     }
+}
+
+/// Build one `store_memories` result entry.
+///
+/// Hand-built rather than `serde_json::to_value(stored)` because a batch
+/// entry additionally carries its `index`, and existing consumers key off
+/// that shape.
+///
+/// Extracted into a pure function so the hand-built JSON can be tested
+/// against `StoredMemory`'s own serialization. `json!` ignores
+/// `skip_serializing_if`, so every optional field on `StoredMemory` has to
+/// be inserted conditionally here or it is silently missing from batch
+/// results while the single-memory tool emits it. That is a class of bug,
+/// not one instance — `supersedes` was the first, `nearDuplicates` the
+/// second, and the test is what stops the third.
+fn store_result_entry(index: usize, stored: &StoredMemory) -> serde_json::Value {
+    let mut entry = json!({
+        "index": index,
+        "id": stored.id,
+        "namespace": stored.namespace,
+        "phase": stored.phase,
+        "strength": stored.strength,
+        "stability": stored.stability,
+        "createdAt": stored.created_at,
+    });
+
+    let optional: [(&str, Option<serde_json::Value>); 2] = [
+        (
+            "supersedes",
+            stored
+                .supersedes
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
+        ),
+        (
+            "nearDuplicates",
+            stored
+                .near_duplicates
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
+        ),
+    ];
+    if let Some(obj) = entry.as_object_mut() {
+        for (key, value) in optional {
+            if let Some(value) = value {
+                obj.insert(key.to_string(), value);
+            }
+        }
+    }
+
+    entry
 }
 
 async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
@@ -339,29 +420,7 @@ async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value)
         };
 
         match bridge.storage.store_memory(input).await {
-            Ok(stored) => {
-                let mut entry = json!({
-                    "index": index,
-                    "id": stored.id,
-                    "namespace": stored.namespace,
-                    "phase": stored.phase,
-                    "strength": stored.strength,
-                    "stability": stored.stability,
-                    "createdAt": stored.created_at,
-                });
-                // `json!` ignores `skip_serializing_if`, so insert the outcome
-                // only when there is one. Otherwise every batch item would
-                // carry a `"supersedes": null` that the single-memory tool,
-                // which serializes `StoredMemory` directly, does not emit.
-                if let Some(outcome) = &stored.supersedes {
-                    if let (Some(obj), Ok(value)) =
-                        (entry.as_object_mut(), serde_json::to_value(outcome))
-                    {
-                        obj.insert("supersedes".to_string(), value);
-                    }
-                }
-                results.push(entry);
-            }
+            Ok(stored) => results.push(store_result_entry(index, &stored)),
             Err(e) => {
                 results.push(json!({
                     "index": index,
@@ -1457,6 +1516,58 @@ mod tests {
         );
     }
 
+    // ── near-duplicate advisory ──────────────────────────────────────
+
+    /// The `checkDuplicates` sub-schema of each store tool, keyed by tool
+    /// name — same shape as [`summary_schemas`], and for the same reason:
+    /// the two schemas are written out separately and drift silently.
+    fn check_duplicates_schemas() -> Vec<(&'static str, serde_json::Value)> {
+        let single = store_memory_def().input_schema["properties"]["checkDuplicates"].clone();
+        let batch = store_memories_def().input_schema["properties"]["memories"]["items"]
+            ["properties"]["checkDuplicates"]
+            .clone();
+        vec![("store_memory", single), ("store_memories", batch)]
+    }
+
+    #[test]
+    fn d21_both_store_tools_declare_check_duplicates_defaulting_to_true() {
+        for (tool, schema) in check_duplicates_schemas() {
+            assert_eq!(schema["type"], json!("boolean"), "{tool}");
+            assert_eq!(
+                schema["default"],
+                json!(true),
+                "{tool}: the opt-out must advertise itself as on by default"
+            );
+            assert!(
+                schema["description"]
+                    .as_str()
+                    .is_some_and(|d| !d.is_empty()),
+                "{tool}: checkDuplicates has no description"
+            );
+        }
+    }
+
+    /// The warning is post-hoc, so the description has to name both the
+    /// field the caller will see and the recovery that acts on it. A
+    /// description that mentions neither leaves the agent with a report it
+    /// has no instruction to use.
+    #[test]
+    fn d22_store_memory_description_names_the_report_and_the_recovery() {
+        let description = store_memory_def().description;
+        for needle in [
+            "nearDuplicates",
+            "supersedes",
+            "forget_memory",
+            "reinforce_memory",
+            "checkDuplicates",
+        ] {
+            assert!(
+                description.contains(needle),
+                "store_memory description does not mention {needle}: {description}"
+            );
+        }
+    }
+
     /// `json!` widens an `f32` to `f64` on the way into a `Value`, so a
     /// threshold declared `0.85f32` publishes as `0.8500000238418579` —
     /// a schema change nobody made and nobody would notice. The constant
@@ -1470,6 +1581,77 @@ mod tests {
             json!(0.85),
             "threshold default is not a clean decimal"
         );
+    }
+
+    // ── The batch trap ───────────────────────────────────────────────
+
+    fn stored_memory(
+        supersedes: Option<crate::model::SupersedesOutcome>,
+        near_duplicates: Option<crate::model::NearDuplicateReport>,
+    ) -> StoredMemory {
+        StoredMemory {
+            id: "0195e2c0-0000-7000-8000-000000000001".to_string(),
+            namespace: "default".to_string(),
+            phase: "Full".to_string(),
+            strength: 1.0,
+            stability: 3.7145,
+            created_at: "2026-08-11T12:00:00Z".to_string(),
+            supersedes,
+            near_duplicates,
+        }
+    }
+
+    /// `json!` ignores `skip_serializing_if`, so a batch entry is built by
+    /// hand and every optional field has to be re-remembered there. This
+    /// compares the hand-built entry against `StoredMemory`'s own
+    /// serialization: every key the single-memory tool emits must appear
+    /// in the batch entry with an equal value.
+    ///
+    /// It would have caught the original `supersedes` omission, and it
+    /// catches the next field somebody adds to `StoredMemory` without
+    /// touching `store_result_entry`.
+    #[test]
+    fn e24_batch_entry_carries_every_field_the_single_store_serializes() {
+        let stored = stored_memory(
+            Some(crate::model::SupersedesOutcome::new(
+                crate::model::MemoryId::new(),
+                crate::model::SupersedesStatus::Applied,
+            )),
+            crate::model::NearDuplicateReport::from_matches(
+                0.85,
+                vec![crate::model::NearDuplicateMatch {
+                    id: crate::model::MemoryId::new(),
+                    score: 0.91,
+                    summary: "an older phrasing".to_string(),
+                }],
+            ),
+        );
+
+        let direct = serde_json::to_value(&stored).expect("StoredMemory serializes");
+        let batch = store_result_entry(7, &stored);
+
+        for (key, value) in direct.as_object().expect("direct output is an object") {
+            // `createdAt` is the one renamed key: `StoredMemory` and the
+            // batch entry agree on it, so nothing to special-case.
+            assert_eq!(
+                batch.get(key),
+                Some(value),
+                "batch entry is missing or disagrees about '{key}'"
+            );
+        }
+        assert_eq!(batch["index"], json!(7));
+    }
+
+    /// The other half: an absent optional field must be ABSENT, not
+    /// `null`, so the batch shape matches what `store_memory` emits for
+    /// the same store.
+    #[test]
+    fn e25_batch_entry_omits_absent_optional_fields() {
+        let batch = store_result_entry(0, &stored_memory(None, None));
+        let obj = batch.as_object().expect("entry is an object");
+
+        assert!(!obj.contains_key("supersedes"), "{batch}");
+        assert!(!obj.contains_key("nearDuplicates"), "{batch}");
     }
 
     // ── Registry shape ───────────────────────────────────────────────
