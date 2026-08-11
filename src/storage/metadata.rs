@@ -1016,33 +1016,198 @@ impl MetadataStore {
         Ok(config)
     }
 
-    /// Drain all memories belonging to a namespace.
+    /// Remove every memory record belonging to a namespace, live and
+    /// tombstoned alike, together with its tag and namespace index
+    /// entries.
     ///
-    /// Processes in batches of 1,000 to avoid holding a write lock
-    /// for too long. Returns the list of deleted DiskRecords.
-    pub fn drain_namespace_memories(
+    /// # DESTRUCTIVE AND IRREVERSIBLE
+    ///
+    /// There is no undo and no backup. Returns the removed
+    /// `(MemoryId, DiskRecord)` pairs so the caller can free vector
+    /// slots and clean the FTS, vector and entity indexes, none of
+    /// which this store can reach.
+    ///
+    /// # Why a `META_TABLE` scan and not `NAMESPACE_INDEX`
+    ///
+    /// [`tombstone`](Self::tombstone) unlinks a record from
+    /// `NAMESPACE_INDEX` while leaving its `META_TABLE` row in place, so
+    /// an index-driven walk structurally cannot see tombstones — and
+    /// tombstones are exactly the rows nothing else ever reclaims. The
+    /// full scan is the only way to reach them. `record.namespace_id` is
+    /// the filter.
+    ///
+    /// # Chunking, and what the caller owes it
+    ///
+    /// Removal is committed in chunks of `batch_size` rather than one
+    /// transaction, so a large namespace does not hold the write lock
+    /// for the whole purge. That makes the operation *resumable but not
+    /// atomic*: an interrupted purge leaves a live namespace holding
+    /// fewer memories. The caller must therefore delete the
+    /// `NAMESPACE_TABLE` row **after** this returns, never before —
+    /// deleting it first turns a crash mid-purge into orphan records
+    /// belonging to a namespace that no longer exists.
+    pub fn purge_namespace_records(
         &self,
         namespace_id: NamespaceId,
-    ) -> Result<Vec<DiskRecord>, StorageError> {
-        let mut all_deleted = Vec::new();
+        batch_size: usize,
+    ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+        // chunks(0) panics, and a zero batch would never terminate
+        // anyway.
+        let batch_size = batch_size.max(1);
+        let ns = namespace_id.get();
 
-        loop {
-            let batch_ids = {
-                let ids = self.memories_in_namespace(namespace_id)?;
-                if ids.is_empty() {
-                    break;
+        // Pass 1: read scan. Collects tombstones as well as live rows.
+        let victims: Vec<(MemoryId, DiskRecord)> = {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(META_TABLE)?;
+            let mut found = Vec::new();
+            for result in table.iter()? {
+                let (key_bytes, value) = result?;
+                let record = DiskRecord::from_bytes(value.value())?;
+                if record.namespace_id != ns {
+                    continue;
                 }
-                ids.into_iter().take(1000).collect::<Vec<_>>()
-            };
+                let uuid = uuid::Uuid::from_slice(key_bytes.value())
+                    .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
+                found.push((MemoryId::from_uuid(uuid), record));
+            }
+            found
+        };
 
-            for id in batch_ids {
-                if let Some(record) = self.delete(id)? {
-                    all_deleted.push(record);
+        if victims.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pass 2: chunked removal.
+        for chunk in victims.chunks(batch_size) {
+            let write_txn = self.db.begin_write()?;
+            {
+                let mut meta = write_txn.open_table(META_TABLE)?;
+                let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
+                let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+
+                for (id, record) in chunk {
+                    let key = id.as_bytes().as_slice();
+                    meta.remove(key)?;
+                    for tag in &record.tags {
+                        tags.remove(tag.as_str(), key)?;
+                    }
+                    // A tombstoned record was already unlinked from
+                    // NAMESPACE_INDEX; removing again is a no-op.
+                    ns_idx.remove(ns, key)?;
+                }
+            }
+            write_txn.commit()?;
+        }
+
+        // The whole namespace is gone, so drop its bitmaps wholesale
+        // rather than slot by slot.
+        {
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+            pi.remove_namespace(ns);
+        }
+
+        Ok(victims)
+    }
+}
+
+// ── Batch Tombstoning ───────────────────────────────────────────────
+
+/// What [`MetadataStore::batch_tombstone`] did to one requested id.
+#[derive(Debug, Clone)]
+pub enum TombstoneOutcome {
+    /// The record was live and has been tombstoned. Carries the record
+    /// **as it was before the strip**, so the caller still has the
+    /// vector slot to free and the tags to clean out of the entity
+    /// index — both of which the stripped record no longer holds.
+    Tombstoned(DiskRecord),
+    /// No record exists for this id.
+    NotFound,
+    /// The record exists but was already in the Tombstone phase.
+    AlreadyTombstoned,
+}
+
+impl MetadataStore {
+    /// Tombstone many memories in a single write transaction.
+    ///
+    /// Returns one outcome per input id, in input order. A per-id miss
+    /// (`NotFound`, `AlreadyTombstoned`) is an outcome, not an error,
+    /// and does not abort the batch; only a genuine storage fault
+    /// aborts, in which case the transaction is dropped and *nothing*
+    /// is tombstoned.
+    ///
+    /// # Duplicate ids are safe by construction
+    ///
+    /// The second occurrence of an id reads back the first occurrence's
+    /// uncommitted write from within the same transaction, sees
+    /// `DecayPhase::Tombstone`, and reports `AlreadyTombstoned`. Since
+    /// only `Tombstoned` carries a record, a caller that frees a vector
+    /// slot per `Tombstoned` outcome cannot free the same slot twice —
+    /// which would build a cycle in the free list and underflow
+    /// `live_count`.
+    pub fn batch_tombstone(&self, ids: &[MemoryId]) -> Result<Vec<TombstoneOutcome>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut outcomes = Vec::with_capacity(ids.len());
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut meta = write_txn.open_table(META_TABLE)?;
+            let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
+            let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+
+            for id in ids {
+                let key = id.as_bytes().as_slice();
+
+                let existing = match meta.get(key)? {
+                    Some(value) => DiskRecord::from_bytes(value.value())?,
+                    None => {
+                        outcomes.push(TombstoneOutcome::NotFound);
+                        continue;
+                    }
+                };
+
+                if existing.phase == DecayPhase::Tombstone {
+                    outcomes.push(TombstoneOutcome::AlreadyTombstoned);
+                    continue;
+                }
+
+                let mut stripped = existing.clone();
+                stripped.summary = String::new();
+                stripped.tags = Vec::new();
+                stripped.text_offset = 0;
+                stripped.text_length = 0;
+                stripped.phase = DecayPhase::Tombstone;
+                stripped.strength = 0.0;
+                stripped.decay_strength = 0.0;
+
+                meta.insert(key, stripped.to_bytes().as_slice())?;
+
+                for tag in &existing.tags {
+                    tags.remove(tag.as_str(), key)?;
+                }
+                ns_idx.remove(existing.namespace_id, key)?;
+
+                outcomes.push(TombstoneOutcome::Tombstoned(existing));
+            }
+        }
+        write_txn.commit()?;
+
+        // Phase bitmaps only after the commit: a bitmap update rolled
+        // forward against a transaction that never landed would point
+        // the decay sweep at slots that are still live.
+        {
+            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+            for outcome in &outcomes {
+                if let TombstoneOutcome::Tombstoned(record) = outcome {
+                    pi.remove(record.namespace_id, record.vector_slot, record.phase);
                 }
             }
         }
 
-        Ok(all_deleted)
+        Ok(outcomes)
     }
 }
 
@@ -1095,5 +1260,285 @@ impl MetadataStore {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         Ok(table.get(id.as_bytes().as_slice())?.is_some())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Tag;
+
+    fn open_store() -> (tempfile::TempDir, MetadataStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MetadataStore::open(&dir.path().join("meta.db")).expect("open meta.db");
+        (dir, store)
+    }
+
+    /// A live, Full-phase record in `namespace_id` occupying `slot`.
+    fn record_in(namespace_id: u32, slot: u32, tags: &[&str]) -> DiskRecord {
+        DiskRecord {
+            version: DiskRecord::CURRENT_VERSION,
+            id: [0u8; 16],
+            namespace_id,
+            created_at: 0,
+            last_accessed_at: 0,
+            phase: DecayPhase::Full,
+            strength: 1.0,
+            decay_strength: 1.0,
+            stability: 1.0,
+            difficulty: 5.0,
+            is_permastore: 0,
+            vector_slot: slot,
+            edge_count: 0,
+            summary: "fixture".into(),
+            tags: tags
+                .iter()
+                .map(|t| Tag::new(*t).expect("valid tag"))
+                .collect(),
+            access_history: Vec::new(),
+            text_offset: 0,
+            text_length: 0,
+        }
+    }
+
+    fn insert(store: &MetadataStore, namespace_id: u32, slot: u32, tags: &[&str]) -> MemoryId {
+        let id = MemoryId::new();
+        let mut record = record_in(namespace_id, slot, tags);
+        record.id = *id.as_bytes();
+        store.insert(id, &record).expect("insert");
+        id
+    }
+
+    // ── purge_namespace_records ──────────────────────────────────────
+
+    /// The whole reason this scans META_TABLE instead of walking
+    /// NAMESPACE_INDEX: `tombstone` unlinks the record from that index,
+    /// so an index-driven purge cannot see a tombstone — and tombstones
+    /// are the rows nothing else in the system ever reclaims.
+    #[test]
+    fn w01_purge_removes_live_and_tombstoned_rows_of_the_target_namespace_only() {
+        let (_dir, store) = open_store();
+
+        let live = insert(&store, 1, 0, &[]);
+        let dead = insert(&store, 1, 1, &[]);
+        store.tombstone(dead).expect("tombstone");
+        let survivor = insert(&store, 2, 0, &[]);
+
+        let purged = store
+            .purge_namespace_records(NamespaceId::new(1), 100)
+            .expect("purge");
+
+        assert_eq!(purged.len(), 2, "both the live row and the tombstone");
+        let purged_ids: Vec<MemoryId> = purged.iter().map(|(id, _)| *id).collect();
+        assert!(purged_ids.contains(&live));
+        assert!(purged_ids.contains(&dead), "the tombstone was not reached");
+
+        assert!(store.get(live).expect("get").is_none());
+        assert!(store.get(dead).expect("get").is_none());
+        assert!(
+            store.get(survivor).expect("get").is_some(),
+            "a record in another namespace was destroyed"
+        );
+    }
+
+    #[test]
+    fn w02_purge_clears_the_tag_index() {
+        let (_dir, store) = open_store();
+
+        insert(&store, 1, 0, &["topic/doomed"]);
+        insert(&store, 2, 0, &["topic/kept"]);
+
+        store
+            .purge_namespace_records(NamespaceId::new(1), 100)
+            .expect("purge");
+
+        assert!(
+            store
+                .memories_with_tag("topic/doomed")
+                .expect("tag")
+                .is_empty(),
+            "tag index still points at purged records"
+        );
+        assert_eq!(store.memories_with_tag("topic/kept").expect("tag").len(), 1);
+    }
+
+    #[test]
+    fn w03_purge_clears_the_namespace_index() {
+        let (_dir, store) = open_store();
+
+        insert(&store, 1, 0, &[]);
+        insert(&store, 1, 1, &[]);
+        insert(&store, 2, 0, &[]);
+
+        store
+            .purge_namespace_records(NamespaceId::new(1), 100)
+            .expect("purge");
+
+        assert!(
+            store
+                .memories_in_namespace(NamespaceId::new(1))
+                .expect("ns index")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .memories_in_namespace(NamespaceId::new(2))
+                .expect("ns index")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn w04_purge_of_an_unknown_or_empty_namespace_is_an_empty_ok() {
+        let (_dir, store) = open_store();
+        insert(&store, 1, 0, &[]);
+
+        assert!(
+            store
+                .purge_namespace_records(NamespaceId::new(9), 100)
+                .expect("purge")
+                .is_empty()
+        );
+        assert_eq!(store.count().expect("count"), 1, "nothing else was touched");
+    }
+
+    /// Chunking is what keeps a large purge off the write lock. It must
+    /// not also be what makes a large purge incomplete.
+    #[test]
+    fn w05_purge_chunking_removes_every_record() {
+        let (_dir, store) = open_store();
+        for slot in 0..5 {
+            insert(&store, 1, slot, &[]);
+        }
+
+        let purged = store
+            .purge_namespace_records(NamespaceId::new(1), 2)
+            .expect("purge");
+
+        assert_eq!(purged.len(), 5);
+        assert_eq!(store.count().expect("count"), 0);
+    }
+
+    // ── batch_tombstone ──────────────────────────────────────────────
+
+    #[test]
+    fn w06_batch_tombstone_reports_one_outcome_per_id_in_input_order() {
+        let (_dir, store) = open_store();
+
+        let live = insert(&store, 1, 0, &[]);
+        let already = insert(&store, 1, 1, &[]);
+        store.tombstone(already).expect("tombstone");
+        let missing = MemoryId::new();
+
+        let outcomes = store
+            .batch_tombstone(&[missing, live, already])
+            .expect("batch tombstone");
+
+        assert!(matches!(outcomes[0], TombstoneOutcome::NotFound));
+        assert!(matches!(outcomes[1], TombstoneOutcome::Tombstoned(_)));
+        assert!(matches!(outcomes[2], TombstoneOutcome::AlreadyTombstoned));
+    }
+
+    /// A double free of one vector slot builds a cycle in the on-disk
+    /// free list and underflows `live_count`, handing the same slot to
+    /// two memories. The batch is the only place a caller can hit it, so
+    /// the batch is where it has to be impossible: the second occurrence
+    /// reads the first's uncommitted write and reports
+    /// `AlreadyTombstoned`, which carries no record and so frees no slot.
+    #[test]
+    fn w07_a_duplicate_id_in_one_batch_yields_exactly_one_tombstoned_outcome() {
+        let (_dir, store) = open_store();
+        let id = insert(&store, 1, 7, &[]);
+
+        let outcomes = store.batch_tombstone(&[id, id]).expect("batch tombstone");
+
+        assert!(matches!(outcomes[0], TombstoneOutcome::Tombstoned(_)));
+        assert!(matches!(outcomes[1], TombstoneOutcome::AlreadyTombstoned));
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, TombstoneOutcome::Tombstoned(_)))
+                .count(),
+            1,
+            "a caller freeing one slot per Tombstoned outcome would double-free"
+        );
+    }
+
+    /// The batch path is a second implementation of `tombstone`. It has
+    /// to leave the database in the state the single-record path would.
+    #[test]
+    fn w08_batch_tombstone_leaves_the_same_state_as_the_single_record_path() {
+        let (_dir, store) = open_store();
+
+        let single = insert(&store, 1, 0, &["topic/alpha"]);
+        let batched = insert(&store, 1, 1, &["topic/beta"]);
+
+        store.tombstone(single).expect("tombstone");
+        let outcomes = store.batch_tombstone(&[batched]).expect("batch tombstone");
+
+        let TombstoneOutcome::Tombstoned(pre_strip) = &outcomes[0] else {
+            panic!("expected Tombstoned, got {:?}", outcomes[0]);
+        };
+        assert_eq!(
+            pre_strip.vector_slot, 1,
+            "the outcome must carry the PRE-strip record, or the caller has no slot to free"
+        );
+        assert_eq!(pre_strip.tags.len(), 1, "pre-strip tags must survive");
+
+        for id in [single, batched] {
+            let record = store.get(id).expect("get").expect("record survives");
+            assert_eq!(record.phase, DecayPhase::Tombstone);
+            assert!(record.summary.is_empty());
+            assert!(record.tags.is_empty());
+        }
+
+        assert!(
+            store
+                .memories_with_tag("topic/alpha")
+                .expect("tag")
+                .is_empty()
+        );
+        assert!(
+            store
+                .memories_with_tag("topic/beta")
+                .expect("tag")
+                .is_empty()
+        );
+        assert!(
+            store
+                .memories_in_namespace(NamespaceId::new(1))
+                .expect("ns index")
+                .is_empty()
+        );
+        assert!(
+            store
+                .ids_in_phase(DecayPhase::Full)
+                .expect("phase")
+                .is_empty(),
+            "phase bitmaps still claim both slots are live"
+        );
+    }
+
+    #[test]
+    fn w09_batch_tombstone_of_an_empty_slice_is_an_empty_ok() {
+        let (_dir, store) = open_store();
+        let id = insert(&store, 1, 0, &[]);
+
+        assert!(
+            store
+                .batch_tombstone(&[])
+                .expect("batch tombstone")
+                .is_empty()
+        );
+        assert_eq!(
+            store.get(id).expect("get").expect("record").phase,
+            DecayPhase::Full,
+            "an empty batch must not open a transaction that changes anything"
+        );
     }
 }

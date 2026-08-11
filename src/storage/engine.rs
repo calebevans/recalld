@@ -342,6 +342,8 @@ impl RedbStorageEngine {
     /// 1. Rebuild phase index from meta.db.
     /// 2. Validate fulltext.dat header.
     /// 3. Clean up orphaned edges.
+    /// 4. Sweep namespace directories left behind by an interrupted
+    ///    namespace deletion.
     fn startup_validation(&mut self) -> Result<(), StorageError> {
         tracing::info!("Running storage startup validation...");
 
@@ -362,8 +364,167 @@ impl RedbStorageEngine {
             );
         }
 
+        // 4. Sweep orphaned namespace directories. Deliberately not
+        //    allowed to fail startup: this is disk hygiene, and a
+        //    database that refuses to open because a stray directory
+        //    could not be inspected is a far worse outcome than the
+        //    wasted space.
+        match self.sweep_orphan_namespace_dirs() {
+            Ok(removed) if removed > 0 => {
+                tracing::warn!(
+                    removed,
+                    "Removed orphaned namespace directories left by an interrupted \
+                     namespace deletion"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Orphaned-namespace-directory sweep failed; continuing startup"
+                );
+            }
+        }
+
         tracing::info!("Storage startup validation complete");
         Ok(())
+    }
+
+    /// Remove namespace directories that belong to no live namespace.
+    ///
+    /// Cleans up after a `purge_namespace` that was interrupted between
+    /// deleting the `NAMESPACE_TABLE` row and removing the directory.
+    /// Returns the number of directories removed.
+    ///
+    /// # Why this cannot delete a live namespace
+    ///
+    /// [`open`](Self::open) step 6 calls `VectorManager::open_or_create`
+    /// for **every** namespace in `NAMESPACE_TABLE`, and
+    /// `open_or_create` creates the directory. That runs before step 7,
+    /// which is this. So at sweep time every live namespace provably
+    /// has a directory on disk and a name in `live`; there is no window
+    /// in which a live-but-not-yet-opened namespace could be swept.
+    ///
+    /// # Guards, and why each one is here
+    ///
+    /// `db_path` is user-configurable and may hold directories that have
+    /// nothing to do with recalld, so "the name matches no live
+    /// namespace" is not on its own a licence to recurse and delete.
+    /// Every candidate must additionally:
+    ///
+    /// - be a real directory. Types come from `read_dir`, which does
+    ///   **not** follow symlinks, so a symlink pointing outside
+    ///   `db_path` is reported as a symlink and skipped rather than
+    ///   followed into someone else's tree.
+    /// - have a UTF-8 name (a name we cannot compare against `live` is
+    ///   a name we cannot prove is dead).
+    /// - not start with `.` — dotfile directories are conventionally
+    ///   somebody else's state.
+    /// - **contain `vectors.dat` and nothing else.** This is the load-
+    ///   bearing guard: it is the shape this code writes, so anything
+    ///   else in there is evidence the directory was not created by us.
+    ///
+    /// Anything that fails a guard is logged and left strictly alone.
+    fn sweep_orphan_namespace_dirs(&self) -> Result<usize, StorageError> {
+        let live: HashSet<String> = self
+            .meta_store
+            .list_namespaces()?
+            .into_iter()
+            .map(|ns| ns.name)
+            .collect();
+
+        let mut removed = 0usize;
+
+        for entry in std::fs::read_dir(&self.db_path)? {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Could not read a data-directory entry; skipping");
+                    continue;
+                }
+            };
+
+            // read_dir file types do not follow symlinks.
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "Could not stat a data-directory entry; skipping"
+                    );
+                    continue;
+                }
+            }
+
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    "Data-directory entry has a non-UTF-8 name; leaving it alone"
+                );
+                continue;
+            };
+
+            if name.starts_with('.') || live.contains(name) {
+                continue;
+            }
+
+            let dir = entry.path();
+            if !Self::looks_like_a_namespace_dir(&dir) {
+                tracing::warn!(
+                    path = %dir.display(),
+                    "Directory in the data directory matches no namespace but does not \
+                     have the shape of one; leaving it alone"
+                );
+                continue;
+            }
+
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    tracing::info!(
+                        namespace = name,
+                        path = %dir.display(),
+                        "Removed orphaned namespace directory"
+                    );
+                    removed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "Failed to remove orphaned namespace directory"
+                    );
+                }
+            }
+        }
+
+        Ok(removed)
+    }
+
+    /// Whether `dir` has exactly the shape this code creates for a
+    /// namespace: one entry, named `vectors.dat`.
+    ///
+    /// Conservative on every uncertainty — an unreadable directory, an
+    /// unreadable entry, or a non-UTF-8 name all answer `false`, which
+    /// means "leave it alone".
+    fn looks_like_a_namespace_dir(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+
+        let mut saw_vectors = false;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            if entry.file_name() != std::ffi::OsStr::new("vectors.dat") {
+                return false;
+            }
+            saw_vectors = true;
+        }
+        saw_vectors
     }
 
     /// Return a reference to the underlying MetadataStore.
@@ -393,6 +554,195 @@ impl RedbStorageEngine {
         &self.db_path
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Namespace purge
+// ═══════════════════════════════════════════════════════════════════════
+
+/// What [`RedbStorageEngine::purge_namespace`] destroyed.
+#[derive(Debug)]
+pub struct PurgedNamespace {
+    /// The configuration of the namespace that was removed.
+    pub config: NamespaceConfig,
+    /// Every record removed, as it was on disk. The caller needs these
+    /// to clean the indexes storage cannot reach.
+    pub records: Vec<(MemoryId, DiskRecord)>,
+    /// How many of `records` were live (not tombstoned).
+    pub live_removed: usize,
+    /// How many of `records` were already tombstones.
+    pub tombstones_removed: usize,
+    /// Edge rows deleted from edges.db, counting edges in which a
+    /// purged memory was the target as well as the source.
+    pub edges_removed: usize,
+    /// Whether the namespace's vector directory was removed. `false`
+    /// means it was already gone, or a guard refused to touch it.
+    pub directory_removed: bool,
+}
+
+impl RedbStorageEngine {
+    /// Destroy a namespace: its records, its edges, its configuration
+    /// row and its vector file.
+    ///
+    /// # DESTRUCTIVE AND IRREVERSIBLE
+    ///
+    /// Every memory in the namespace is gone when this returns. There
+    /// is no undo and no backup. Callers are expected to have obtained
+    /// explicit confirmation before getting here.
+    ///
+    /// # The caller must finish the job
+    ///
+    /// This method can only reach what storage owns. The returned
+    /// records are the caller's input for cleaning the FTS index, the
+    /// in-memory vector index, the entity index and the relationship
+    /// graph — none of which this layer holds a handle to. Skip that and
+    /// the namespace is gone from disk but still burning top-k slots in
+    /// every search.
+    ///
+    /// # Ordering, and what a crash costs
+    ///
+    /// 1. Purge `META_TABLE` rows (chunked).
+    /// 2. Purge edges.
+    /// 3. Delete the `NAMESPACE_TABLE` row. **Point of no return.**
+    /// 4. Drop the `VectorStore`, then remove the directory.
+    ///
+    /// A crash before (3) leaves a live namespace holding fewer
+    /// memories: ugly, but consistent, and re-running the call finishes
+    /// it. A crash after (3) leaves an orphan directory and orphan FTS
+    /// rows — wasted disk, no wrong answers — and the directory is
+    /// reclaimed by the boot sweep in `startup_validation`.
+    ///
+    /// No crash marker is needed. Namespace ids are never recycled and
+    /// `NAMESPACE_TABLE` is authoritative, so "the row is gone" is
+    /// itself the durable record that the namespace is dead.
+    pub fn purge_namespace(
+        &mut self,
+        namespace_id: NamespaceId,
+    ) -> Result<PurgedNamespace, StorageError> {
+        let config = self
+            .meta_store
+            .get_namespace(namespace_id)?
+            .ok_or(StorageError::NamespaceNotFound(namespace_id.get()))?;
+
+        tracing::info!(
+            namespace = %config.name,
+            namespace_id = namespace_id.get(),
+            "Purging namespace (destructive, irreversible)"
+        );
+
+        // 1. Records. This is the pass that reaches tombstones.
+        let records = self
+            .meta_store
+            .purge_namespace_records(namespace_id, PURGE_CHUNK_SIZE)?;
+
+        let live_removed = records
+            .iter()
+            .filter(|(_, r)| r.phase != DecayPhase::Tombstone)
+            .count();
+        let tombstones_removed = records.len() - live_removed;
+
+        // 2. Edges. `remove_all_edges` covers both directions, so an
+        //    edge from a surviving memory into a purged one goes too.
+        let mut edges_removed = 0usize;
+        for (id, _) in &records {
+            edges_removed += self.edge_store.remove_all_edges(*id)?;
+        }
+
+        // 3. Configuration row. Point of no return.
+        self.meta_store.delete_namespace(namespace_id)?;
+
+        // 4. Vector file. The store must be dropped before the unlink:
+        //    it holds an fs2 exclusive lock and a live mmap.
+        let store = self.vector_manager.remove(namespace_id);
+        drop(store);
+
+        let directory_removed = self.remove_namespace_dir(&config.name);
+
+        tracing::info!(
+            namespace = %config.name,
+            namespace_id = namespace_id.get(),
+            live_removed,
+            tombstones_removed,
+            edges_removed,
+            directory_removed,
+            "Namespace purge complete"
+        );
+
+        Ok(PurgedNamespace {
+            config,
+            records,
+            live_removed,
+            tombstones_removed,
+            edges_removed,
+            directory_removed,
+        })
+    }
+
+    /// Remove one namespace's vector directory. Returns whether it was
+    /// actually removed.
+    ///
+    /// Unlike the boot sweep this joins a name straight onto `db_path`
+    /// rather than walking `read_dir`, so it does its own symlink check:
+    /// `remove_dir_all` follows a symlinked *root*, and a namespace
+    /// directory replaced by a symlink would hand it an arbitrary tree
+    /// to delete.
+    ///
+    /// Never returns an error. Step 3 of the purge has already
+    /// committed by the time this runs, so a failure here is wasted disk
+    /// to be logged and swept at next boot, not a reason to report the
+    /// deletion as failed.
+    fn remove_namespace_dir(&self, name: &str) -> bool {
+        let dir = self.db_path.join(name);
+
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "Could not stat namespace directory; leaving it on disk"
+                );
+                return false;
+            }
+        };
+
+        if metadata.file_type().is_symlink() {
+            tracing::warn!(
+                path = %dir.display(),
+                "Namespace directory is a symlink; refusing to follow it. Remove the \
+                 link target by hand if it really is namespace data."
+            );
+            return false;
+        }
+
+        if !metadata.is_dir() {
+            tracing::warn!(
+                path = %dir.display(),
+                "Namespace path is not a directory; leaving it alone"
+            );
+            return false;
+        }
+
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "Failed to remove namespace directory; it will be swept at next startup"
+                );
+                false
+            }
+        }
+    }
+}
+
+/// How many records one `purge_namespace_records` transaction commits.
+///
+/// Bounds how long a purge holds the redb write lock. Small enough that
+/// a concurrent reader is not stalled for seconds; large enough that a
+/// hundred-thousand-record namespace is not a hundred thousand fsyncs.
+const PURGE_CHUNK_SIZE: usize = 1_000;
 
 // ═══════════════════════════════════════════════════════════════════════
 // StorageEngine Implementation
@@ -782,5 +1132,246 @@ impl StorageEngine for RedbStorageEngine {
 
     fn persist_phase_index(&self) -> Result<(), StorageError> {
         self.meta_store.persist_phase_index()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::EdgeType;
+
+    const DIM: usize = 4;
+
+    fn open_engine(dir: &Path) -> RedbStorageEngine {
+        RedbStorageEngine::open(dir).expect("open engine")
+    }
+
+    fn make_namespace(engine: &mut RedbStorageEngine, name: &str) -> NamespaceId {
+        let mut config = NamespaceConfig::default_namespace(0);
+        config.name = name.to_string();
+        config.embedding_dim = DIM as u32;
+        engine.create_namespace(&config).expect("create namespace")
+    }
+
+    fn add_memory(engine: &mut RedbStorageEngine, namespace_id: NamespaceId) -> MemoryId {
+        let id = MemoryId::new();
+        let mut record = DiskRecord {
+            version: DiskRecord::CURRENT_VERSION,
+            id: *id.as_bytes(),
+            namespace_id: namespace_id.get(),
+            created_at: 0,
+            last_accessed_at: 0,
+            phase: DecayPhase::Full,
+            strength: 1.0,
+            decay_strength: 1.0,
+            stability: 1.0,
+            difficulty: 5.0,
+            is_permastore: 0,
+            vector_slot: 0,
+            edge_count: 0,
+            summary: "fixture".into(),
+            tags: Vec::new(),
+            access_history: Vec::new(),
+            text_offset: 0,
+            text_length: 0,
+        };
+        engine
+            .insert_memory(id, namespace_id, &mut record, &[0.0; DIM], None)
+            .expect("insert memory");
+        id
+    }
+
+    /// The directory shape the boot sweep recognizes, planted by hand.
+    fn plant_orphan_dir(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("create orphan dir");
+        std::fs::write(dir.join("vectors.dat"), b"not really a vector file")
+            .expect("write vectors.dat");
+        dir
+    }
+
+    // ── purge_namespace ──────────────────────────────────────────────
+
+    #[test]
+    fn w13_purge_removes_records_edges_the_config_row_and_the_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let ns = make_namespace(&mut engine, "scratch");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .add_edge(a, b, EdgeType::Associative, 0.5, false, 0)
+            .expect("add edge");
+
+        let purged = engine.purge_namespace(ns).expect("purge");
+
+        assert_eq!(purged.config.name, "scratch");
+        assert_eq!(purged.records.len(), 2);
+        assert_eq!(purged.live_removed, 2);
+        assert_eq!(purged.tombstones_removed, 0);
+        assert_eq!(purged.edges_removed, 1);
+        assert!(purged.directory_removed);
+
+        assert!(engine.get_record(a).expect("get").is_none());
+        assert!(engine.get_record(b).expect("get").is_none());
+        assert!(engine.get_namespace(ns).expect("get namespace").is_none());
+        assert!(engine.load_all_edges().expect("edges").is_empty());
+        assert!(!dir.path().join("scratch").exists());
+    }
+
+    /// An edge from a surviving memory *into* a purged one is as dead as
+    /// one that starts there. Leaving it behind would point the graph at
+    /// a memory that no longer exists.
+    #[test]
+    fn w14_purge_removes_edges_that_point_into_the_namespace_from_outside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let keep = make_namespace(&mut engine, "keep");
+        let doomed = make_namespace(&mut engine, "doomed");
+        let survivor = add_memory(&mut engine, keep);
+        let victim = add_memory(&mut engine, doomed);
+        engine
+            .add_edge(survivor, victim, EdgeType::Associative, 0.5, false, 0)
+            .expect("add edge");
+
+        let purged = engine.purge_namespace(doomed).expect("purge");
+
+        assert_eq!(purged.edges_removed, 1);
+        assert!(engine.load_all_edges().expect("edges").is_empty());
+        assert!(
+            engine.get_record(survivor).expect("get").is_some(),
+            "the surviving memory was destroyed along with the edge"
+        );
+    }
+
+    /// A purge that resumes after a crash between the config-row delete
+    /// and the unlink finds no directory. That is a completed deletion,
+    /// not a failure.
+    #[test]
+    fn w15_purge_tolerates_a_directory_that_is_already_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let ns = make_namespace(&mut engine, "scratch");
+        add_memory(&mut engine, ns);
+
+        // Drop the store first, exactly as the purge would.
+        drop(engine.vector_manager_mut().remove(ns));
+        std::fs::remove_dir_all(dir.path().join("scratch")).expect("remove dir early");
+
+        let purged = engine.purge_namespace(ns).expect("purge");
+        assert!(!purged.directory_removed);
+        assert_eq!(purged.records.len(), 1);
+    }
+
+    #[test]
+    fn w16_boot_sweep_removes_a_namespace_shaped_directory_with_no_live_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let _engine = open_engine(dir.path());
+        }
+        let orphan = plant_orphan_dir(dir.path(), "ghost-namespace");
+
+        let _engine = open_engine(dir.path());
+        assert!(!orphan.exists(), "orphan directory survived the boot sweep");
+    }
+
+    /// `db_path` is user-configurable and may hold directories that are
+    /// nothing to do with recalld. "Matches no live namespace" is not on
+    /// its own a licence to recurse and delete.
+    #[test]
+    fn w17_boot_sweep_leaves_a_directory_that_is_not_shaped_like_a_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let _engine = open_engine(dir.path());
+        }
+
+        let with_extra = plant_orphan_dir(dir.path(), "not-ours");
+        std::fs::write(with_extra.join("important.txt"), b"someone else's data")
+            .expect("write extra file");
+
+        let no_vectors = dir.path().join("empty-dir");
+        std::fs::create_dir_all(&no_vectors).expect("create dir");
+
+        let dotted = plant_orphan_dir(dir.path(), ".hidden-state");
+
+        let _engine = open_engine(dir.path());
+
+        assert!(with_extra.join("important.txt").exists());
+        assert!(no_vectors.exists());
+        assert!(dotted.exists());
+    }
+
+    /// THE catastrophic-regression test. The boot sweep deletes
+    /// directories, it runs unattended on every open, and its blast
+    /// radius if it misjudges "live" is every memory in the database.
+    ///
+    /// What makes it safe is an ordering guarantee: `open` step 6 opens
+    /// (and thereby creates) a directory for every namespace in
+    /// `NAMESPACE_TABLE` before step 7 runs the sweep, so at sweep time
+    /// every live namespace has both a directory and a name in `live`.
+    #[test]
+    fn w18_boot_sweep_leaves_every_live_namespace_directory_on_a_plain_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ids = Vec::new();
+
+        {
+            let mut engine = open_engine(dir.path());
+            for name in ["default", "work", "personal"] {
+                let ns = make_namespace(&mut engine, name);
+                ids.push(add_memory(&mut engine, ns));
+            }
+        }
+
+        let engine = open_engine(dir.path());
+
+        for name in ["default", "work", "personal"] {
+            let ns_dir = dir.path().join(name);
+            assert!(
+                ns_dir.join("vectors.dat").exists(),
+                "the boot sweep destroyed live namespace '{name}'"
+            );
+        }
+        for id in ids {
+            assert!(
+                engine.get_record(id).expect("get").is_some(),
+                "a live record went missing across a plain reopen"
+            );
+        }
+    }
+
+    /// The crash-recovery shape from D5: everything about the namespace
+    /// is gone after a restart, including the edges that pointed at it.
+    #[test]
+    fn w19_a_purged_namespace_stays_gone_across_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        {
+            let mut engine = open_engine(dir.path());
+            let ns = make_namespace(&mut engine, "scratch");
+            let a = add_memory(&mut engine, ns);
+            let b = add_memory(&mut engine, ns);
+            engine
+                .add_edge(a, b, EdgeType::Associative, 0.5, false, 0)
+                .expect("add edge");
+            engine.purge_namespace(ns).expect("purge");
+        }
+
+        let engine = open_engine(dir.path());
+        assert!(
+            engine
+                .get_namespace_by_name("scratch")
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(!dir.path().join("scratch").exists());
+        assert!(engine.load_all_edges().expect("edges").is_empty());
+        assert_eq!(engine.count().expect("count"), 0);
     }
 }
