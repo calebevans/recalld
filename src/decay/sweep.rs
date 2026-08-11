@@ -1299,6 +1299,36 @@ impl DecaySweepRunner {
                     }
                 }
                 // Delete metadata record (requires write lock).
+                //
+                // KNOWN LEAK — documented, not yet fixed.
+                //
+                // This is the system's only hard delete, and it cleans
+                // only what storage owns: the meta.db row, the vector
+                // slot and the edge rows. The four indexes that live
+                // outside storage are untouched, because
+                // `DecaySweepRunner` holds handles to none of them:
+                //
+                // - the FTS5 row survives, and survives *restart* —
+                //   system startup only rebuilds the FTS index when it
+                //   is empty, so the row is permanent;
+                // - the `FlatVectorIndex` entry survives until the
+                //   process exits;
+                // - the entity-index entry survives until restart.
+                //
+                // The damage is degraded recall, not wrong answers:
+                // search hydrates its candidates from meta.db, and an id
+                // with no record hydrates to nothing and is dropped. So
+                // an orphan row spends a top-k slot and returns no
+                // result.
+                //
+                // Fixing it means threading vector_index, fts_index and
+                // entity_index through `DecaySweepRunner::new`, the
+                // `start()` clone block, `execute_sweep` and into this
+                // path — a change to code that runs unattended on a
+                // background timer, which wants its own review rather
+                // than a ride along with a delete-path change.
+                // `FtsIndex::remove_namespace` is the manual remedy in
+                // the meantime.
                 {
                     let mut storage_w = storage_clone
                         .write()

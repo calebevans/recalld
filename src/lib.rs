@@ -34,6 +34,7 @@ pub mod embedding;
 pub mod error;
 pub mod graph;
 pub mod health;
+pub(crate) mod index_cleanup;
 pub mod mcp;
 pub mod model;
 pub mod rif;

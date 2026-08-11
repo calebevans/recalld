@@ -586,6 +586,18 @@ impl McpStorageAdapter {
         }
     }
 
+    /// Borrow this adapter's out-of-storage indexes for
+    /// [`crate::index_cleanup::purge_from_indexes`].
+    fn index_handles(&self) -> crate::index_cleanup::IndexHandles<'_> {
+        crate::index_cleanup::IndexHandles {
+            cache: &self.cache,
+            vector_index: &self.vector_index,
+            fts_index: &self.fts_index,
+            entity_index: &self.entity_index,
+            graph: &self.graph,
+        }
+    }
+
     /// Turn raw `(id, score)` candidates into a caller-facing report,
     /// loading each summary from the cache and falling back to storage.
     ///
@@ -762,7 +774,11 @@ impl bridge::StorageEngine for McpStorageAdapter {
             Some(emb) => emb,
             None => {
                 let mut embed_text = match &input.full_text {
-                    Some(ft) => format!("{}\n\n{}", input.summary, ft),
+                    Some(ft) => format!(
+                        "{}
+\n{}",
+                        input.summary, ft
+                    ),
                     None => input.summary.clone(),
                 };
                 if !merged_tags.is_empty() {
@@ -1184,48 +1200,18 @@ impl bridge::StorageEngine for McpStorageAdapter {
             return Ok(false);
         };
 
-        // 2. Invalidate cache entry.
-        self.cache.invalidate(id).await;
-
-        // 3. Remove from FTS5 index.
-        {
-            let fts = self.fts_index.lock().await;
-            if let Err(e) = fts.remove(id) {
-                tracing::warn!(
-                    memory_id = %id,
-                    %e,
-                    "FTS5 removal failed (non-fatal)"
-                );
-            }
-        }
-
-        // 4. Remove from vector index.
-        {
-            use crate::search::VectorIndex;
-            let mut vi = self.vector_index.write().await;
-            if let Err(e) = vi.remove(id) {
-                tracing::warn!(
-                    memory_id = %id,
-                    %e,
-                    "vector index removal failed (non-fatal)"
-                );
-            }
-        }
-
-        // 5. Remove from entity index.
-        {
-            let metadata = crate::model::parse_structured_tags(&existing_record.tags);
-            if !metadata.entities.is_empty() {
-                let mut ei = self.entity_index.write().await;
-                ei.remove(id, &metadata.entities);
-            }
-        }
-
-        // 6. Update graph node phase to Tombstone (keep node and edges).
-        {
-            let mut graph_w = self.graph.write().await;
-            let _ = graph_w.update_node_state(id, DecayPhase::Tombstone, 0.0);
-        }
+        // 2. Cache and the four indexes storage cannot reach. Shared
+        //    with the HTTP delete path and with namespace deletion, so
+        //    the three cannot drift apart again. `existing_record` is
+        //    the PRE-strip record, which is what keeps the entity names
+        //    reachable.
+        crate::index_cleanup::purge_from_indexes(
+            &self.index_handles(),
+            std::slice::from_ref(&(id, existing_record)),
+            crate::index_cleanup::FtsAction::PerRecord,
+            crate::index_cleanup::GraphAction::MarkTombstoned,
+        )
+        .await;
 
         Ok(true)
     }
@@ -2377,5 +2363,60 @@ mod tests {
             .expect("second store succeeds");
 
         assert!(second.near_duplicates.is_none());
+    }
+
+    // ── delete_memory: the shared index cleanup ──────────────────────
+
+    /// Pins the refactor onto `index_cleanup::purge_from_indexes`. These
+    /// four removals used to be hand-written here; they are now shared
+    /// with the HTTP path and with namespace deletion, and the whole
+    /// point of sharing them is that all three keep doing all four.
+    #[tokio::test]
+    async fn w25_delete_memory_still_clears_every_index_and_marks_the_graph_node() {
+        let fx = Fixture::new();
+        let adapter = fx.storage_adapter();
+
+        let mut input = store_input("a fact about Sarah", "default", unit_x());
+        input.entities = vec!["Sarah".to_string()];
+        let stored = adapter.store_memory(input).await.expect("store");
+        let id =
+            MemoryId::from_uuid(uuid::Uuid::parse_str(&stored.id).expect("stored id is a uuid"));
+
+        // Everything is indexed before the delete.
+        assert!(
+            fx.graph.read().await.contains(&id),
+            "precondition: the store created a graph node"
+        );
+        assert!(
+            !fx.fts_index.lock().await.is_empty().expect("fts"),
+            "precondition: the memory is in the FTS index"
+        );
+        assert_eq!(fx.entity_index.read().await.len(), 1);
+
+        assert!(adapter.delete_memory(id).await.expect("delete"));
+
+        assert!(
+            fx.fts_index.lock().await.is_empty().expect("fts"),
+            "FTS row survived the delete"
+        );
+        assert_eq!(
+            {
+                use crate::search::VectorIndex;
+                fx.vector_index.read().await.len()
+            },
+            0,
+            "vector index entry survived the delete"
+        );
+        assert_eq!(
+            fx.entity_index.read().await.len(),
+            0,
+            "entity index entry survived the delete"
+        );
+
+        let graph_r = fx.graph.read().await;
+        let node = graph_r
+            .get_node(&id)
+            .expect("graph node is kept, not removed");
+        assert_eq!(node.decay_phase, DecayPhase::Tombstone);
     }
 }

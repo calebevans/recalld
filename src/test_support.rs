@@ -71,6 +71,13 @@ pub(crate) struct Fixture {
     pub(crate) graph: SharedGraph,
     pub(crate) storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
     pub(crate) cache: Arc<crate::cache::CacheManager>,
+    /// Held on the fixture, not built per adapter call, so a test can
+    /// assert on the same index the adapter under test just wrote to.
+    pub(crate) vector_index: Arc<tokio::sync::RwLock<crate::search::FlatVectorIndex>>,
+    /// See [`vector_index`](Self::vector_index).
+    pub(crate) fts_index: Arc<tokio::sync::Mutex<crate::search::FtsIndex>>,
+    /// See [`vector_index`](Self::vector_index).
+    pub(crate) entity_index: Arc<tokio::sync::RwLock<crate::search::EntityIndex>>,
     _dir: tempfile::TempDir,
 }
 
@@ -88,6 +95,8 @@ impl Fixture {
             engine.create_namespace(&config).expect("create namespace");
         }
 
+        let fts_index = crate::search::FtsIndex::new(dir.path()).expect("open fts index");
+
         Self {
             graph: Arc::new(tokio::sync::RwLock::new(
                 crate::graph::RelationshipGraph::new(),
@@ -100,21 +109,39 @@ impl Fixture {
                 },
                 None,
             )),
+            vector_index: Arc::new(tokio::sync::RwLock::new(
+                crate::search::FlatVectorIndex::new(DIM),
+            )),
+            fts_index: Arc::new(tokio::sync::Mutex::new(fts_index)),
+            entity_index: Arc::new(tokio::sync::RwLock::new(crate::search::EntityIndex::new())),
             _dir: dir,
         }
     }
 
-    /// The temp directory backing this fixture's storage files.
+    /// The temp directory backing this fixture's storage files. Also the
+    /// storage engine's `db_path`, so namespace directories hang
+    /// directly off it.
     pub(crate) fn path(&self) -> &Path {
         self._dir.path()
+    }
+
+    /// Where a namespace's `vectors.dat` directory lives.
+    pub(crate) fn namespace_dir(&self, name: &str) -> std::path::PathBuf {
+        self.path().join(name)
     }
 
     /// Create an extra namespace, so a test can prove a per-namespace
     /// count really is per-namespace.
     pub(crate) fn create_namespace(&self, name: &str) -> NamespaceId {
+        self.with_namespace(name, DIM)
+    }
+
+    /// [`create_namespace`](Self::create_namespace) with an explicit
+    /// embedding width.
+    pub(crate) fn with_namespace(&self, name: &str, dim: usize) -> NamespaceId {
         let mut config = crate::model::NamespaceConfig::default_namespace(0);
         config.name = name.to_string();
-        config.embedding_dim = DIM as u32;
+        config.embedding_dim = dim as u32;
         self.storage
             .write()
             .expect("storage lock")
@@ -122,10 +149,28 @@ impl Fixture {
             .expect("create namespace")
     }
 
+    /// The on-disk record for `id`, or `None` if it was hard-deleted.
+    pub(crate) fn record(&self, id: MemoryId) -> Option<crate::model::DiskRecord> {
+        self.storage
+            .read()
+            .expect("storage lock")
+            .get_record(id)
+            .expect("get record")
+    }
+
     /// Writes a memory to storage and gives it a graph node, which is
     /// the state an explicit edge is applied against.
     pub(crate) async fn insert_memory(&self) -> MemoryId {
         self.insert_memory_with(MemorySpec::new(ns())).await
+    }
+
+    /// A live memory in `namespace` carrying `tags`.
+    pub(crate) async fn insert_memory_in(&self, namespace: NamespaceId, tags: &[&str]) -> MemoryId {
+        self.insert_memory_with(MemorySpec {
+            tags,
+            ..MemorySpec::new(namespace)
+        })
+        .await
     }
 
     /// [`insert_memory`](Self::insert_memory) with every field a test might
@@ -194,23 +239,18 @@ impl Fixture {
 
     /// The MCP storage adapter over this fixture's storage.
     ///
-    /// `McpStorageAdapter::new` takes nine subsystems. The read paths
-    /// exercised by these tests touch only `storage` and `timezone`, but
-    /// the constructor is not going to grow a second form for tests, so
-    /// the remaining seven are built here once — empty and real, not
-    /// mocked.
+    /// `McpStorageAdapter::new` takes nine subsystems. They are built
+    /// here once — empty and real, not mocked — and the index handles
+    /// come off the fixture, so a test can assert against the very index
+    /// the adapter wrote to.
     pub(crate) fn storage_adapter(&self) -> crate::mcp::bridge_adapters::McpStorageAdapter {
         crate::mcp::bridge_adapters::McpStorageAdapter::new(
             self.storage.clone(),
             self.cache.clone(),
             Arc::new(crate::embedding::PassthroughProvider::new(DIM)),
-            Arc::new(tokio::sync::RwLock::new(
-                crate::search::FlatVectorIndex::new(DIM),
-            )),
-            Arc::new(tokio::sync::Mutex::new(
-                crate::search::FtsIndex::new(self.path()).expect("open fts index"),
-            )),
-            Arc::new(tokio::sync::RwLock::new(crate::search::EntityIndex::new())),
+            self.vector_index.clone(),
+            self.fts_index.clone(),
+            self.entity_index.clone(),
             self.graph.clone(),
             Arc::new(crate::config::RecalldConfig::default()),
             chrono_tz::UTC,
