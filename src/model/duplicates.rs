@@ -50,14 +50,21 @@ pub struct NearDuplicateReport {
     /// The similarity at or above which a memory was included. Carried so
     /// the object is self-describing and a caller need not know which
     /// constant the server was built with.
-    pub threshold: f32,
+    ///
+    /// `f64` for the same reason
+    /// [`DUPLICATE_SIMILARITY_THRESHOLD`](crate::model::constants::DUPLICATE_SIMILARITY_THRESHOLD)
+    /// is: this is that constant echoed onto the wire, and an `f32` would
+    /// publish it as `0.8500000238418579`. `score` below stays `f32`
+    /// because it is a genuine `f32` computation, not a round number
+    /// travelling through a narrower type than it was written in.
+    pub threshold: f64,
     /// Closest matches first.
     pub matches: Vec<NearDuplicateMatch>,
 }
 
 impl NearDuplicateReport {
     /// Build a report, or `None` when there is nothing to report.
-    pub fn from_matches(threshold: f32, matches: Vec<NearDuplicateMatch>) -> Option<Self> {
+    pub fn from_matches(threshold: f64, matches: Vec<NearDuplicateMatch>) -> Option<Self> {
         if matches.is_empty() {
             None
         } else {

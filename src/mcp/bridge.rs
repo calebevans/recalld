@@ -272,6 +272,22 @@ pub struct StoreInput {
     pub parent_id: Option<MemoryId>,
     /// ID of an older memory this one replaces.
     pub supersedes: Option<MemoryId>,
+    /// Whether to check the new memory against existing ones and report
+    /// near-duplicates. Absent means enabled.
+    ///
+    /// `#[serde(default)]` is load-bearing, and in the *opposite*
+    /// direction from the one on [`StoredMemory::supersedes`]: this struct
+    /// is deserialized straight off the daemon socket, so an older client
+    /// sends a payload without this key. Without the attribute, every
+    /// store from such a client becomes a hard parse failure rather than a
+    /// store with the default behaviour.
+    ///
+    /// `Option<bool>` rather than `bool` with a `default_true` function:
+    /// a bare `#[serde(default)]` on a `bool` yields `false`, which would
+    /// silently disable the feature for every pre-existing client. The
+    /// `Option` makes "unset" explicit, matching `initial_stability`.
+    #[serde(default)]
+    pub check_duplicates: Option<bool>,
 }
 
 /// Result of storing a memory.
@@ -299,6 +315,13 @@ pub struct StoredMemory {
     /// decode it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<crate::model::SupersedesOutcome>,
+    /// Existing memories that closely resemble this one.
+    ///
+    /// Absent when nothing crossed the threshold, when the caller passed
+    /// `checkDuplicates: false`, or when the namespace's vectors are not
+    /// L2-normalized. Advisory only: the memory was stored regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_duplicates: Option<crate::model::NearDuplicateReport>,
 }
 
 /// A full memory record returned by get.
@@ -787,6 +810,107 @@ mod tests {
         assert_eq!(outcome.target, target);
         assert_eq!(outcome.status, SupersedesStatus::AppliedNotDurable);
         assert_eq!(outcome.detail.as_deref(), Some("disk write failed"));
+    }
+
+    // ── near-duplicate wire format ───────────────────────────────────
+
+    fn store_input_json() -> serde_json::Value {
+        json!({
+            "summary": "a fact",
+            "fullText": null,
+            "tags": [],
+            "namespace": "default",
+            "embedding": null,
+            "initialStability": null,
+            "parentId": null,
+            "supersedes": null,
+        })
+    }
+
+    /// Response-side back-compat, matching the `supersedes` guard above: a
+    /// new client must decode a response from a daemon that predates the
+    /// field.
+    #[test]
+    fn b11_stored_memory_decodes_a_payload_without_near_duplicates() {
+        let decoded: StoredMemory =
+            serde_json::from_value(stored_memory_json()).expect("old daemon payload decodes");
+
+        assert!(decoded.near_duplicates.is_none());
+    }
+
+    /// A store with nothing to report serialises exactly as before, so an
+    /// existing client sees an unchanged response shape rather than a new
+    /// `"nearDuplicates": null`.
+    #[test]
+    fn b12_an_absent_report_is_omitted_from_the_output() {
+        let stored: StoredMemory =
+            serde_json::from_value(stored_memory_json()).expect("payload decodes");
+
+        let encoded = serde_json::to_value(&stored).expect("encodes");
+        assert!(encoded.get("nearDuplicates").is_none());
+    }
+
+    /// The key names are the wire contract; camelCase on every level.
+    #[test]
+    fn b13_a_report_round_trips_with_camel_case_keys() {
+        let target = MemoryId::new();
+        let mut stored: StoredMemory =
+            serde_json::from_value(stored_memory_json()).expect("payload decodes");
+        stored.near_duplicates = crate::model::NearDuplicateReport::from_matches(
+            0.85,
+            vec![crate::model::NearDuplicateMatch {
+                id: target,
+                score: 0.93,
+                summary: "an older phrasing of the same fact".to_string(),
+            }],
+        );
+
+        let encoded = serde_json::to_value(&stored).expect("encodes");
+        let report = &encoded["nearDuplicates"];
+        // `threshold` is `f64`, so the round number stays round. `score`
+        // is a genuine `f32` similarity and widens on the way out, which
+        // is why only this one is compared approximately.
+        assert_eq!(report["threshold"], json!(0.85));
+        assert_eq!(report["matches"][0]["id"], json!(target.to_string()));
+        let score = report["matches"][0]["score"]
+            .as_f64()
+            .expect("score is a number");
+        assert!((score - 0.93).abs() < 1e-6, "{score}");
+        assert_eq!(
+            report["matches"][0]["summary"],
+            json!("an older phrasing of the same fact")
+        );
+
+        let decoded: StoredMemory = serde_json::from_value(encoded).expect("decodes");
+        let report = decoded.near_duplicates.expect("report preserved");
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(report.matches[0].id, target);
+    }
+
+    /// The REQUEST-side guard, and the direction the `supersedes` recipe
+    /// does not cover. `StoreInput` is deserialized straight off the daemon
+    /// socket, so an older client sends a payload without `checkDuplicates`.
+    /// Without `#[serde(default)]` every one of its stores becomes a hard
+    /// parse failure — a break, not a graceful degradation.
+    #[test]
+    fn b14_store_input_decodes_a_payload_without_check_duplicates() {
+        let decoded: StoreInput =
+            serde_json::from_value(store_input_json()).expect("old client payload decodes");
+
+        assert!(decoded.check_duplicates.is_none());
+        assert_eq!(decoded.summary, "a fact");
+    }
+
+    #[test]
+    fn b15_check_duplicates_round_trips_on_a_store_input() {
+        let mut payload = store_input_json();
+        payload["checkDuplicates"] = json!(false);
+
+        let decoded: StoreInput = serde_json::from_value(payload).expect("decodes");
+        assert_eq!(decoded.check_duplicates, Some(false));
+
+        let encoded = serde_json::to_value(&decoded).expect("encodes");
+        assert_eq!(encoded["checkDuplicates"], json!(false));
     }
 
     // ── namespace_stats wire format ──────────────────────────────────

@@ -585,6 +585,82 @@ impl McpStorageAdapter {
             timezone,
         }
     }
+
+    /// Turn raw `(id, score)` candidates into a caller-facing report,
+    /// loading each summary from the cache and falling back to storage.
+    ///
+    /// Only runs when candidates were found, so the record loads are
+    /// conditional on the warning actually firing rather than a cost every
+    /// store pays. The common case is a cache hit — the memories most
+    /// likely to duplicate a new one are the ones just written.
+    ///
+    /// A summary that cannot be loaded yields an empty string rather than
+    /// dropping the match: "there is something very like this, id X" is
+    /// still the useful half of the advisory.
+    async fn hydrate_near_duplicates(
+        &self,
+        candidates: Vec<(MemoryId, f32)>,
+        threshold: f64,
+    ) -> Option<crate::model::NearDuplicateReport> {
+        use crate::model::constants::NEAR_DUPLICATE_SUMMARY_MAX_BYTES;
+        use crate::model::{NearDuplicateMatch, NearDuplicateReport, truncate_summary};
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut summaries: std::collections::HashMap<MemoryId, String> =
+            std::collections::HashMap::new();
+        let mut misses: Vec<MemoryId> = Vec::new();
+        for (id, _) in &candidates {
+            match self.cache.get(*id).await {
+                Some(cached) => {
+                    summaries.insert(*id, cached.summary.clone());
+                }
+                None => misses.push(*id),
+            }
+        }
+
+        // One blocking hop for every miss, not one per miss.
+        if !misses.is_empty() {
+            let storage = self.storage.clone();
+            let loaded: Vec<(MemoryId, String)> = tokio::task::spawn_blocking(move || {
+                let storage_r = match storage.read() {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
+                misses
+                    .iter()
+                    .map(|&mid| {
+                        let summary = storage_r
+                            .get_record(mid)
+                            .ok()
+                            .flatten()
+                            .map(|r| r.summary)
+                            .unwrap_or_default();
+                        (mid, summary)
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_default();
+            summaries.extend(loaded);
+        }
+
+        let matches: Vec<NearDuplicateMatch> = candidates
+            .into_iter()
+            .map(|(id, score)| NearDuplicateMatch {
+                id,
+                score,
+                summary: truncate_summary(
+                    summaries.get(&id).map(String::as_str).unwrap_or_default(),
+                    NEAR_DUPLICATE_SUMMARY_MAX_BYTES,
+                ),
+            })
+            .collect();
+
+        NearDuplicateReport::from_matches(threshold, matches)
+    }
 }
 
 #[async_trait]
@@ -594,6 +670,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
         input: bridge::StoreInput,
     ) -> Result<bridge::StoredMemory, bridge::BridgeError> {
         use crate::model::Tag;
+        use crate::model::constants::{DUPLICATE_SIMILARITY_THRESHOLD, MAX_NEAR_DUPLICATE_MATCHES};
         use crate::model::record::DiskRecord;
 
         // Resolve namespace.
@@ -696,6 +773,35 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     .await
                     .map_err(|e| bridge::BridgeError::Internal(e.to_string()))?
             }
+        };
+
+        // Near-duplicate advisory.
+        //
+        // Runs BEFORE the write, for two reasons. The embedding is already
+        // in hand, so there is no second embed round-trip. And the new
+        // memory is not in the vector index yet — `index.add` is ~70 lines
+        // below — so it cannot match itself and no self-filter is needed.
+        // Moving this below the write silently turns every store into its
+        // own duplicate at score 1.0.
+        //
+        // Nothing here can fail the store: `find_near_duplicates` swallows
+        // every error path by contract, and `hydrate_near_duplicates`
+        // degrades to an empty summary rather than propagating.
+        let near_duplicates = if input.check_duplicates.unwrap_or(true) {
+            let candidates = {
+                let index = self.vector_index.read().await;
+                crate::search::find_near_duplicates(
+                    &index,
+                    &embedding,
+                    ns_config.id,
+                    DUPLICATE_SIMILARITY_THRESHOLD as f32,
+                    MAX_NEAR_DUPLICATE_MATCHES,
+                )
+            }; // index read lock released before the awaits below
+            self.hydrate_near_duplicates(candidates, DUPLICATE_SIMILARITY_THRESHOLD)
+                .await
+        } else {
+            None
         };
 
         let now = chrono::Utc::now().timestamp_millis();
@@ -935,6 +1041,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             stability: record.stability,
             created_at: format_timestamp(record.created_at, self.timezone),
             supersedes: supersedes_outcome,
+            near_duplicates,
         })
     }
 
@@ -1688,6 +1795,7 @@ impl bridge::HealthChecker for McpHealthAdapter {
 mod tests {
     use super::*;
     use crate::mcp::bridge::{NamespaceRegistry, StorageEngine as BridgeStorageEngine};
+    use crate::model::constants::DUPLICATE_SIMILARITY_THRESHOLD;
     use crate::test_support::{Fixture, MemorySpec};
 
     fn default_ns() -> NamespaceId {
@@ -2162,5 +2270,112 @@ mod tests {
         assert!(response.entities.items.is_empty());
         assert!(response.topics.items.is_empty());
         assert!(response.emotions.items.is_empty());
+    }
+
+    // ── near-duplicate advisory ──────────────────────────────────────
+    //
+    // These route through `PassthroughProvider` and `StoreInput.embedding`
+    // — the exact un-validated caller-vector path the normalization guard
+    // exists for. The vectors are unit vectors, so they pass that guard,
+    // which also demonstrates the guard is not quietly disabling the
+    // feature for everyone.
+
+    /// A store with a caller-supplied embedding, defaults elsewhere.
+    fn store_input(summary: &str, namespace: &str, embedding: Vec<f32>) -> bridge::StoreInput {
+        bridge::StoreInput {
+            summary: summary.to_string(),
+            full_text: None,
+            tags: Vec::new(),
+            entities: Vec::new(),
+            topics: Vec::new(),
+            emotions: Vec::new(),
+            namespace: namespace.to_string(),
+            embedding: Some(embedding),
+            initial_stability: None,
+            parent_id: None,
+            supersedes: None,
+            check_duplicates: None,
+        }
+    }
+
+    fn unit_x() -> Vec<f32> {
+        vec![1.0, 0.0, 0.0, 0.0]
+    }
+
+    /// The ordering guard, and the only test that catches it. The check
+    /// runs before `index.add`; move it below and the new memory finds
+    /// itself at score 1.0 and every store reports a duplicate.
+    #[tokio::test]
+    async fn f26_a_store_does_not_report_itself_as_its_own_duplicate() {
+        let fx = Fixture::new();
+        let stored = fx
+            .storage_adapter()
+            .store_memory(store_input("the first fact", "default", unit_x()))
+            .await
+            .expect("store succeeds");
+
+        assert!(
+            stored.near_duplicates.is_none(),
+            "a store into an empty namespace reported itself: {:?}",
+            stored.near_duplicates
+        );
+    }
+
+    /// End to end, hydration included: the summary comes back, so the
+    /// caller can judge the duplicate without a second round trip.
+    #[tokio::test]
+    async fn f27_a_second_store_of_the_same_embedding_reports_the_first() {
+        let fx = Fixture::new();
+        let adapter = fx.storage_adapter();
+        let first = adapter
+            .store_memory(store_input("the first fact", "default", unit_x()))
+            .await
+            .expect("first store succeeds");
+
+        let second = adapter
+            .store_memory(store_input("the same fact again", "default", unit_x()))
+            .await
+            .expect("second store succeeds");
+
+        let report = second.near_duplicates.expect("duplicate reported");
+        assert_eq!(report.threshold, DUPLICATE_SIMILARITY_THRESHOLD);
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(report.matches[0].id.to_string(), first.id);
+        assert!(report.matches[0].score >= 0.85, "{:?}", report.matches[0]);
+        assert_eq!(report.matches[0].summary, "the first fact");
+    }
+
+    #[tokio::test]
+    async fn f28_check_duplicates_false_suppresses_the_report() {
+        let fx = Fixture::new();
+        let adapter = fx.storage_adapter();
+        adapter
+            .store_memory(store_input("the first fact", "default", unit_x()))
+            .await
+            .expect("first store succeeds");
+
+        let mut input = store_input("the same fact again", "default", unit_x());
+        input.check_duplicates = Some(false);
+        let second = adapter.store_memory(input).await.expect("store succeeds");
+
+        assert!(second.near_duplicates.is_none());
+    }
+
+    #[tokio::test]
+    async fn f29_a_duplicate_in_another_namespace_is_not_reported() {
+        let fx = Fixture::new();
+        fx.create_namespace("other");
+        let adapter = fx.storage_adapter();
+        adapter
+            .store_memory(store_input("the first fact", "default", unit_x()))
+            .await
+            .expect("first store succeeds");
+
+        let second = adapter
+            .store_memory(store_input("the same fact again", "other", unit_x()))
+            .await
+            .expect("second store succeeds");
+
+        assert!(second.near_duplicates.is_none());
     }
 }

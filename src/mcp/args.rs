@@ -642,8 +642,8 @@ pub fn reject_client_markup(field: &str, text: &str) -> Result<(), ArgError> {
 /// Checks run in a fixed order so that an argument object broken in
 /// several ways always reports the same failure: object-ness, then
 /// `summary` (presence, type, markup), `fullText` (type, markup), the
-/// four array fields, `namespace`, `parentId`, `supersedes`, and
-/// finally the shared content limits from
+/// four array fields, `namespace`, `parentId`, `supersedes`,
+/// `checkDuplicates`, and finally the shared content limits from
 /// [`validate_memory_input`](crate::model::validation::validate_memory_input).
 pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreInput, ArgError> {
     if !item.is_object() {
@@ -670,6 +670,7 @@ pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreI
 
     let parent_id = opt_uuid(item, "parentId")?;
     let supersedes = opt_uuid(item, "supersedes")?;
+    let check_duplicates = opt_bool(item, "checkDuplicates")?;
 
     validate_memory_input(MemoryInputRef {
         summary: &summary,
@@ -693,6 +694,7 @@ pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreI
         initial_stability: None,
         parent_id,
         supersedes,
+        check_duplicates,
     })
 }
 
@@ -1494,6 +1496,51 @@ mod tests {
         assert_eq!(from_nulls.emotions, from_absent.emotions);
         assert_eq!(from_nulls.parent_id, from_absent.parent_id);
         assert_eq!(from_nulls.supersedes, from_absent.supersedes);
+    }
+
+    /// The opt-out reaches `StoreInput`. One construction site, so this
+    /// covers the batch path too — `parse_store_item` delegates here.
+    #[test]
+    fn c19_parse_store_input_carries_check_duplicates() {
+        let item = json!({ "summary": "s", "checkDuplicates": false });
+        assert_eq!(
+            parse_store_input(&item, NS).unwrap().check_duplicates,
+            Some(false)
+        );
+
+        let item = json!({ "summary": "s", "checkDuplicates": true });
+        assert_eq!(
+            parse_store_input(&item, NS).unwrap().check_duplicates,
+            Some(true)
+        );
+    }
+
+    /// Absent means unset, not `false`. The adapter reads unset as
+    /// enabled; a `Some(false)` here would silently disable the check for
+    /// every caller that never heard of the parameter.
+    #[test]
+    fn c20_check_duplicates_is_none_when_absent_or_null() {
+        assert!(
+            parse_store_input(&json!({ "summary": "s" }), NS)
+                .unwrap()
+                .check_duplicates
+                .is_none()
+        );
+        assert!(
+            parse_store_input(&json!({ "summary": "s", "checkDuplicates": null }), NS)
+                .unwrap()
+                .check_duplicates
+                .is_none()
+        );
+    }
+
+    /// `"false"` is a client bug, and JavaScript-style truthiness would
+    /// read it as `true` — turning an opt-out into an opt-in.
+    #[test]
+    fn c18_check_duplicates_rejects_a_stringly_typed_boolean() {
+        let err = parse_store_input(&json!({ "summary": "s", "checkDuplicates": "false" }), NS)
+            .unwrap_err();
+        assert_eq!(err.field, "checkDuplicates");
     }
 
     #[test]
