@@ -132,6 +132,23 @@ pub const MAX_EMOTIONS: usize = 32;
 /// Maximum number of memories accepted in a single batch store call.
 pub const MAX_BATCH_MEMORIES: usize = 100;
 
+// ── Listing Limits ───────────────────────────────────────────────────
+//
+// Named because two places have to agree about each one: the `default`
+// and `maximum` a tool publishes in its JSON schema, and the bound the
+// argument parser enforces. When those drift the schema stops describing
+// the server, and a client that trusts the schema starts getting errors
+// it was told could not happen. A schema test asserts the pairing.
+
+/// Default page size of a `list_memories` call.
+pub const DEFAULT_LIST_LIMIT: usize = 50;
+/// Largest page size a `list_memories` call may ask for.
+pub const MAX_LIST_LIMIT: usize = 200;
+/// Default number of labels returned per bucket by `list_tags`.
+pub const DEFAULT_TAG_LIMIT: usize = 50;
+/// Largest number of labels per bucket a `list_tags` call may ask for.
+pub const MAX_TAG_LIMIT: usize = 500;
+
 // ── Access History ───────────────────────────────────────────────────
 /// Maximum number of `AccessEvent` entries retained per memory.
 pub const ACCESS_HISTORY_MAX: usize = 32;

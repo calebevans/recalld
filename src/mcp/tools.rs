@@ -10,8 +10,9 @@ use crate::mcp::args;
 use crate::mcp::bridge::McpBridge;
 use crate::mcp::protocol::{ToolAnnotations, ToolCallResult, ToolInfo};
 use crate::model::constants::{
-    EMOTION_MAX_BYTES, ENTITY_MAX_BYTES, FULL_TEXT_MAX_BYTES, MAX_BATCH_MEMORIES, MAX_EMOTIONS,
-    MAX_ENTITIES, MAX_TAGS, MAX_TOPICS, SUMMARY_MAX_BYTES, TAG_MAX_BYTES, TOPIC_MAX_BYTES,
+    DEFAULT_LIST_LIMIT, EMOTION_MAX_BYTES, ENTITY_MAX_BYTES, FULL_TEXT_MAX_BYTES,
+    MAX_BATCH_MEMORIES, MAX_EMOTIONS, MAX_ENTITIES, MAX_LIST_LIMIT, MAX_TAGS, MAX_TOPICS,
+    SUMMARY_MAX_BYTES, TAG_MAX_BYTES, TOPIC_MAX_BYTES,
 };
 use crate::model::validation::validate_namespace_name;
 
@@ -470,11 +471,18 @@ async fn handle_recall_memories(
         .get("limit")
         .and_then(|v| v.as_u64())
         .unwrap_or(10) as usize;
-    let namespace = arguments
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| bridge.default_namespace().to_string());
+    let namespace = match args::namespace_or(&arguments, bridge.default_namespace()) {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::warn!(
+                tool = "recall_memories",
+                field = %e.field,
+                error = %e.message,
+                "Rejected malformed MCP tool arguments"
+            );
+            return ToolCallResult::error(e.to_string());
+        }
+    };
     let tags: Vec<String> = arguments
         .get("tags")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -912,11 +920,18 @@ async fn handle_find_similar_scan(
     bridge: &McpBridge,
     arguments: &serde_json::Value,
 ) -> ToolCallResult {
-    let namespace = arguments
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| bridge.default_namespace().to_string());
+    let namespace = match args::namespace_or(arguments, bridge.default_namespace()) {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::warn!(
+                tool = "find_similar_memories",
+                field = %e.field,
+                error = %e.message,
+                "Rejected malformed MCP tool arguments"
+            );
+            return ToolCallResult::error(e.to_string());
+        }
+    };
 
     let threshold = arguments
         .get("threshold")
@@ -1090,11 +1105,18 @@ async fn handle_namespace_stats(
     bridge: &McpBridge,
     arguments: serde_json::Value,
 ) -> ToolCallResult {
-    let namespace = arguments
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| bridge.default_namespace().to_string());
+    let namespace = match args::namespace_or(&arguments, bridge.default_namespace()) {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::warn!(
+                tool = "namespace_stats",
+                field = %e.field,
+                error = %e.message,
+                "Rejected malformed MCP tool arguments"
+            );
+            return ToolCallResult::error(e.to_string());
+        }
+    };
 
     match bridge.namespaces.namespace_stats(&namespace).await {
         Ok(stats) => match ToolCallResult::json(&stats) {
@@ -1129,10 +1151,13 @@ fn list_memories_def() -> ToolInfo {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum results per page (default: 50, max: 200)",
-                    "default": 50,
+                    "description": format!(
+                        "Maximum results per page (default: {DEFAULT_LIST_LIMIT}, \
+                         max: {MAX_LIST_LIMIT}). A larger value is rejected, not clamped."
+                    ),
+                    "default": DEFAULT_LIST_LIMIT,
                     "minimum": 1,
-                    "maximum": 200
+                    "maximum": MAX_LIST_LIMIT
                 },
                 "offset": {
                     "type": "integer",
@@ -1176,58 +1201,20 @@ fn list_memories_def() -> ToolInfo {
 }
 
 async fn handle_list_memories(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
-    let namespace = arguments
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| bridge.default_namespace().to_string());
-
-    let limit = arguments
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize;
-    let limit = limit.min(200);
-
-    let offset = arguments
-        .get("offset")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-
-    let tags: Vec<String> = arguments
-        .get("tags")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let entities: Vec<String> = arguments
-        .get("entities")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    // Parse time range values: accept either integer (millis) or ISO 8601 string.
-    let time_range_start = match arguments.get("timeRangeStart") {
-        Some(v) => match crate::time::parse_time_value(v) {
-            Some(Ok(ms)) => Some(ms),
-            Some(Err(e)) => return ToolCallResult::error(format!("Invalid timeRangeStart: {e}")),
-            None => None,
-        },
-        None => None,
-    };
-    let time_range_end = match arguments.get("timeRangeEnd") {
-        Some(v) => match crate::time::parse_time_value(v) {
-            Some(Ok(ms)) => Some(ms),
-            Some(Err(e)) => return ToolCallResult::error(format!("Invalid timeRangeEnd: {e}")),
-            None => None,
-        },
-        None => None,
-    };
-
-    let input = crate::mcp::bridge::ListMemoriesInput {
-        namespace,
-        limit,
-        offset,
-        tags,
-        entities,
-        time_range_start,
-        time_range_end,
+    // Every wrong-typed or out-of-range argument is rejected in `args`,
+    // so this handler cannot silently list the default namespace or
+    // silently return a smaller page than was asked for.
+    let input = match args::parse_list_memories_input(&arguments, bridge.default_namespace()) {
+        Ok(input) => input,
+        Err(e) => {
+            tracing::warn!(
+                tool = "list_memories",
+                field = %e.field,
+                error = %e.message,
+                "Rejected malformed MCP tool arguments"
+            );
+            return ToolCallResult::error(e.to_string());
+        }
     };
 
     match bridge.storage.list_memories(input).await {

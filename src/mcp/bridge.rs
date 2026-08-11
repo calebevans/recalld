@@ -360,6 +360,17 @@ pub struct ListMemoriesInput {
     pub time_range_end: Option<i64>,
 }
 
+/// Input for a tag-vocabulary listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTagsInput {
+    /// Namespace to count within, or `None` for every namespace.
+    pub namespace: Option<String>,
+    /// Maximum labels returned *per bucket*. Each bucket also reports the
+    /// untruncated total, so a truncated answer still states its own size.
+    pub limit: usize,
+}
+
 /// A single memory entry in a list response (lightweight, no full_text).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
