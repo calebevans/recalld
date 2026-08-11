@@ -466,6 +466,7 @@ impl state::StorageEngine for StorageEngineAdapter {
             let all_records = storage_r.scan_all()?;
 
             let mut memory_count: u64 = 0;
+            let mut tombstone_count: u64 = 0;
             let mut phase_1_count: u64 = 0;
             let mut phase_2_count: u64 = 0;
             let mut phase_3_count: u64 = 0;
@@ -477,12 +478,23 @@ impl state::StorageEngine for StorageEngineAdapter {
                 if NamespaceId::new(record.namespace_id) != namespace_id {
                     continue;
                 }
+
+                // Mirrors the MCP path exactly: a tombstoned record is not
+                // a memory, and counting it dragged avg_strength toward
+                // zero while still contributing its (unzeroed) permastore
+                // flag and edge count.
+                if record.phase == DecayPhase::Tombstone {
+                    tombstone_count += 1;
+                    continue;
+                }
                 memory_count += 1;
 
                 match record.phase {
                     DecayPhase::Full => phase_1_count += 1,
                     DecayPhase::Summary => phase_2_count += 1,
                     DecayPhase::Ghost => phase_3_count += 1,
+                    // Unreachable: skipped above. An arm, not an
+                    // `unreachable!()` -- this is a read path.
                     DecayPhase::Tombstone => {}
                 }
 
@@ -502,6 +514,7 @@ impl state::StorageEngine for StorageEngineAdapter {
 
             Ok(state::NamespaceStats {
                 memory_count,
+                tombstone_count,
                 phase_1_count,
                 phase_2_count,
                 phase_3_count,
@@ -1237,9 +1250,15 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
                 Err(_) => return Vec::new(),
             };
 
+            // Live memories only. Counting tombstones here made every
+            // namespace listing disagree with what a caller could actually
+            // fetch from it.
             let mut counts = std::collections::HashMap::<u32, u64>::new();
             if let Ok(all_records) = storage_r.scan_all() {
                 for (_id, record) in &all_records {
+                    if record.phase == DecayPhase::Tombstone {
+                        continue;
+                    }
                     *counts.entry(record.namespace_id).or_default() += 1;
                 }
             }

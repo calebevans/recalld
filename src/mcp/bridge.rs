@@ -501,17 +501,33 @@ pub struct NamespaceInfo {
 pub struct NamespaceStats {
     /// Namespace name.
     pub name: String,
-    /// Total number of memories.
+    /// Number of live memories. Excludes tombstoned records, and always
+    /// equals `phase_counts.full + .summary + .ghost`.
     pub memory_count: u64,
+    /// Number of tombstoned records still occupying a metadata row.
+    ///
+    /// Reported rather than silently dropped: a namespace showing one
+    /// live memory where eleven were stored has ten tombstones, and an
+    /// agent auditing it needs to see that rather than guess whether
+    /// something was lost to a bug.
+    ///
+    /// `#[serde(default)]` because this type round-trips the daemon
+    /// socket in both directions — without it a new client decoding an
+    /// old daemon's response would fail outright, which is strictly worse
+    /// than the wrong number it replaces.
+    #[serde(default)]
+    pub tombstone_count: u64,
     /// Memory counts broken down by decay phase.
     pub phase_counts: PhaseCounts,
-    /// Number of memories in permastore.
+    /// Number of live memories in permastore.
     pub permastore_count: u64,
-    /// Average memory strength across all memories.
+    /// Average memory strength across the live memories.
     pub avg_strength: f32,
-    /// Total number of graph edges.
+    /// Total number of graph edges on the live memories.
     pub edge_count: u64,
-    /// Total bytes used by vector storage.
+    /// Logical bytes of live vector data
+    /// (`memory_count` x `embeddingDim` x 4). NOT the size of
+    /// `vectors.dat`, which retains freed slots until compaction.
     pub vector_bytes: u64,
 }
 
@@ -771,6 +787,55 @@ mod tests {
         assert_eq!(outcome.target, target);
         assert_eq!(outcome.status, SupersedesStatus::AppliedNotDurable);
         assert_eq!(outcome.detail.as_deref(), Some("disk write failed"));
+    }
+
+    // ── namespace_stats wire format ──────────────────────────────────
+
+    /// Back-compat guard for the daemon protocol. `NamespaceStats` is
+    /// round-tripped through serde in BOTH directions, so a new client
+    /// must still decode a response from a daemon that predates
+    /// `tombstoneCount`. Without `#[serde(default)]` the call would fail
+    /// outright -- strictly worse than the wrong number it replaces.
+    #[test]
+    fn namespace_stats_decodes_a_payload_without_the_tombstone_count() {
+        let decoded: NamespaceStats = serde_json::from_value(json!({
+            "name": "default",
+            "memoryCount": 3,
+            "phaseCounts": { "full": 3, "summary": 0, "ghost": 0 },
+            "permastoreCount": 0,
+            "avgStrength": 1.0,
+            "edgeCount": 0,
+            "vectorBytes": 128,
+        }))
+        .expect("old daemon payload decodes");
+
+        assert_eq!(decoded.tombstone_count, 0);
+        assert_eq!(decoded.memory_count, 3);
+    }
+
+    #[test]
+    fn namespace_stats_round_trips_the_tombstone_count() {
+        let stats = NamespaceStats {
+            name: "default".into(),
+            memory_count: 1,
+            tombstone_count: 10,
+            phase_counts: PhaseCounts {
+                full: 1,
+                summary: 0,
+                ghost: 0,
+            },
+            permastore_count: 0,
+            avg_strength: 0.8,
+            edge_count: 0,
+            vector_bytes: 16,
+        };
+
+        let encoded = serde_json::to_value(&stats).expect("encodes");
+        assert_eq!(encoded["tombstoneCount"], json!(10));
+
+        let decoded: NamespaceStats = serde_json::from_value(encoded).expect("decodes");
+        assert_eq!(decoded.tombstone_count, 10);
+        assert_eq!(decoded.memory_count, 1);
     }
 
     // ── list_tags wire format ────────────────────────────────────────

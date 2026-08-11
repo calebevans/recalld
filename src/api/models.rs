@@ -174,8 +174,16 @@ pub struct NamespaceStatsResponse {
     /// Namespace integer ID.
     pub id: u32,
 
-    /// Total memory count in this namespace.
+    /// Number of live memories in this namespace. Excludes tombstoned
+    /// records, and always equals the sum of `phaseCounts`.
     pub memory_count: u64,
+
+    /// Number of tombstoned records still occupying a metadata row.
+    ///
+    /// Reported rather than folded into `memoryCount`: a namespace showing
+    /// one live memory where eleven were stored has ten tombstones, and an
+    /// operator auditing it needs to see that rather than guess.
+    pub tombstone_count: u64,
 
     /// Breakdown by decay phase.
     pub phase_counts: PhaseCounts,
@@ -183,16 +191,18 @@ pub struct NamespaceStatsResponse {
     /// Number of permastore memories.
     pub permastore_count: u64,
 
-    /// Average decay strength across all memories.
+    /// Average decay strength across the live memories.
     pub avg_strength: f32,
 
-    /// Total edge count for memories in this namespace.
+    /// Total edge count for the live memories in this namespace.
     pub edge_count: u64,
 
     /// Embedding dimensionality.
     pub embedding_dim: u32,
 
-    /// Disk space used by this namespace's vectors in bytes.
+    /// Logical bytes of live vector data
+    /// (`memoryCount` x `embeddingDim` x 4). NOT the size of
+    /// `vectors.dat`, which retains freed slots until compaction.
     pub vector_bytes: u64,
 }
 

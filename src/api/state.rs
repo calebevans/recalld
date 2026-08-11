@@ -391,8 +391,10 @@ pub struct ReinforceResult {
 /// Statistics for a single namespace, returned by storage.
 #[derive(Debug, Clone)]
 pub struct NamespaceStats {
-    /// Total memory count.
+    /// Number of live memories. Excludes tombstoned records.
     pub memory_count: u64,
+    /// Number of tombstoned records still occupying a metadata row.
+    pub tombstone_count: u64,
     /// Memories in Full phase (phase 1).
     pub phase_1_count: u64,
     /// Memories in Summary phase (phase 2).

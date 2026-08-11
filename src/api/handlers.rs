@@ -1007,6 +1007,7 @@ pub async fn namespace_stats(
         name: ns.name,
         id: ns.id.get(),
         memory_count: stats.memory_count,
+        tombstone_count: stats.tombstone_count,
         phase_counts: PhaseCounts {
             full: stats.phase_1_count,
             summary: stats.phase_2_count,

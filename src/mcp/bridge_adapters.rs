@@ -1567,6 +1567,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                 .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
 
             let mut memory_count: u64 = 0;
+            let mut tombstone_count: u64 = 0;
             let mut full_count: u64 = 0;
             let mut summary_count: u64 = 0;
             let mut ghost_count: u64 = 0;
@@ -1578,12 +1579,27 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                 if NamespaceId::new(record.namespace_id) != ns.id {
                     continue;
                 }
+
+                // Tombstoned records were counted into `memory_count`,
+                // which made it disagree with `list_memories.total`, and
+                // then dragged every derived figure with them: `tombstone`
+                // zeroes strength and decay_strength but LEAVES
+                // is_permastore and edge_count intact, so a deleted memory
+                // still counted as permastore, still contributed its edges,
+                // and pulled avg_strength toward zero.
+                if record.phase == DecayPhase::Tombstone {
+                    tombstone_count += 1;
+                    continue;
+                }
                 memory_count += 1;
 
                 match record.phase {
                     DecayPhase::Full => full_count += 1,
                     DecayPhase::Summary => summary_count += 1,
                     DecayPhase::Ghost => ghost_count += 1,
+                    // Unreachable: skipped above. Left as an arm rather
+                    // than an `unreachable!()` because this is a read path
+                    // and a corrupt record must not panic a stats call.
                     DecayPhase::Tombstone => {}
                 }
 
@@ -1606,6 +1622,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             Ok(bridge::NamespaceStats {
                 name: ns_name,
                 memory_count,
+                tombstone_count,
                 phase_counts: bridge::PhaseCounts {
                     full: full_count,
                     summary: summary_count,
@@ -1735,6 +1752,188 @@ mod tests {
         let namespaces = fx.namespace_adapter().list_namespaces().await.unwrap();
         assert_eq!(find(&namespaces, "other").memory_count, 1);
         assert_eq!(find(&namespaces, "default").memory_count, 1);
+    }
+
+    // ── namespace_stats ──────────────────────────────────────────────
+
+    /// The regression: tombstoned records were counted as memories, so
+    /// `memoryCount` disagreed with what `list_memories` would return and
+    /// there was no way to tell a deleted memory from a lost one.
+    #[tokio::test]
+    async fn a44_namespace_stats_excludes_tombstones_and_reports_them_separately() {
+        let fx = Fixture::new();
+        let a = fx.insert_memory().await;
+        let b = fx.insert_memory().await;
+        fx.insert_memory().await;
+        fx.tombstone(a);
+        fx.tombstone(b);
+
+        let stats = fx
+            .namespace_adapter()
+            .namespace_stats("default")
+            .await
+            .unwrap();
+        assert_eq!(stats.memory_count, 1);
+        assert_eq!(stats.tombstone_count, 2);
+    }
+
+    /// The tell: `memoryCount` is assertable against the phase breakdown,
+    /// which it was not while tombstones were folded into it.
+    #[tokio::test]
+    async fn a45_memory_count_equals_the_sum_of_the_phase_counts() {
+        let fx = Fixture::new();
+        for phase in [DecayPhase::Full, DecayPhase::Summary, DecayPhase::Ghost] {
+            fx.insert_memory_with(MemorySpec {
+                phase,
+                ..MemorySpec::new(default_ns())
+            })
+            .await;
+        }
+        let doomed = fx.insert_memory().await;
+        fx.tombstone(doomed);
+
+        let stats = fx
+            .namespace_adapter()
+            .namespace_stats("default")
+            .await
+            .unwrap();
+        let p = &stats.phase_counts;
+        assert_eq!(stats.memory_count, p.full + p.summary + p.ghost);
+        assert_eq!(stats.memory_count, 3);
+    }
+
+    /// `tombstone` zeroes `decay_strength`, so counting tombstones dragged
+    /// the average toward zero: one live memory at 0.8 beside two
+    /// tombstones reported ~0.27.
+    #[tokio::test]
+    async fn a46_avg_strength_ignores_tombstoned_zero_strength_rows() {
+        let fx = Fixture::new();
+        fx.insert_memory_with(MemorySpec {
+            decay_strength: 0.8,
+            ..MemorySpec::new(default_ns())
+        })
+        .await;
+        for _ in 0..2 {
+            let doomed = fx.insert_memory().await;
+            fx.tombstone(doomed);
+        }
+
+        let stats = fx
+            .namespace_adapter()
+            .namespace_stats("default")
+            .await
+            .unwrap();
+        assert!(
+            (stats.avg_strength - 0.8).abs() < 1e-5,
+            "expected ~0.8, got {}",
+            stats.avg_strength
+        );
+    }
+
+    #[tokio::test]
+    async fn a47_vector_bytes_counts_only_live_memories() {
+        let fx = Fixture::new();
+        fx.insert_memory().await;
+        let doomed = fx.insert_memory().await;
+        fx.tombstone(doomed);
+
+        let stats = fx
+            .namespace_adapter()
+            .namespace_stats("default")
+            .await
+            .unwrap();
+        // One live memory x DIM dimensions x 4 bytes per f32. A
+        // tombstone's slot is freed, so it occupies no live vector bytes.
+        assert_eq!(stats.vector_bytes, crate::test_support::DIM as u64 * 4);
+    }
+
+    /// `MetadataStore::tombstone` zeroes summary, tags and strength but
+    /// LEAVES `is_permastore` and `edge_count` intact, so these two only
+    /// come out right because the record is skipped entirely.
+    #[tokio::test]
+    async fn a48_edge_and_permastore_counts_exclude_tombstones() {
+        let fx = Fixture::new();
+        let doomed = fx
+            .insert_memory_with(MemorySpec {
+                is_permastore: true,
+                edge_count: 2,
+                ..MemorySpec::new(default_ns())
+            })
+            .await;
+        fx.insert_memory_with(MemorySpec {
+            is_permastore: true,
+            edge_count: 3,
+            ..MemorySpec::new(default_ns())
+        })
+        .await;
+        fx.tombstone(doomed);
+
+        let stats = fx
+            .namespace_adapter()
+            .namespace_stats("default")
+            .await
+            .unwrap();
+        assert_eq!(stats.permastore_count, 1);
+        assert_eq!(stats.edge_count, 3);
+    }
+
+    /// The three numbers a caller can compare have to agree after a
+    /// delete, or one of them is lying.
+    #[tokio::test]
+    async fn a49_stats_agree_with_list_memories_and_list_namespaces() {
+        let fx = Fixture::new();
+        for _ in 0..3 {
+            fx.insert_memory().await;
+        }
+        let doomed = fx.insert_memory().await;
+        fx.tombstone(doomed);
+
+        let stats = fx
+            .namespace_adapter()
+            .namespace_stats("default")
+            .await
+            .unwrap();
+        let listed = fx
+            .storage_adapter()
+            .list_memories(bridge::ListMemoriesInput {
+                namespace: "default".into(),
+                limit: 50,
+                offset: 0,
+                tags: Vec::new(),
+                entities: Vec::new(),
+                time_range_start: None,
+                time_range_end: None,
+            })
+            .await
+            .unwrap();
+        let namespaces = fx.namespace_adapter().list_namespaces().await.unwrap();
+
+        assert_eq!(stats.memory_count, 3);
+        assert_eq!(listed.total, 3);
+        assert_eq!(find(&namespaces, "default").memory_count, 3);
+    }
+
+    #[tokio::test]
+    async fn a50_namespace_stats_are_scoped_to_one_namespace() {
+        let fx = Fixture::new();
+        let other = fx.create_namespace("other");
+        fx.insert_memory_with(MemorySpec::new(default_ns())).await;
+        for _ in 0..2 {
+            fx.insert_memory_with(MemorySpec::new(other)).await;
+        }
+
+        let default_stats = fx
+            .namespace_adapter()
+            .namespace_stats("default")
+            .await
+            .unwrap();
+        let other_stats = fx
+            .namespace_adapter()
+            .namespace_stats("other")
+            .await
+            .unwrap();
+        assert_eq!(default_stats.memory_count, 1);
+        assert_eq!(other_stats.memory_count, 2);
     }
 
     // ── list_tags (live storage) ─────────────────────────────────────
