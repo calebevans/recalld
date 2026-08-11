@@ -747,7 +747,9 @@ Shows decay forecast, at-risk memories, and storage breakdown.
 
 ## 6. MCP Tools Reference
 
-recalld exposes 12 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
+recalld exposes 14 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
+
+Deletion is worth reading before you use it. `forget_memory` and `forget_memories` do not free anything: a forgotten memory keeps its record and its graph edges for the life of the database, because the decay sweep never reclaims a tombstone. `delete_namespace` is the only operation that does — and it destroys everything else in the namespace along with them, with no undo and no backup.
 
 ### `store_memory`
 
@@ -886,6 +888,14 @@ Delete a memory's content. The memory moves to the Tombstone phase: its summary,
 |---|---|---|---|
 | `id` | string | Yes | Memory UUID to forget. The memory moves to the Tombstone phase; its graph edges are kept and its UUID is never reused. |
 
+### `forget_memories`
+
+Delete several memories in one call. Each moves to the Tombstone phase exactly as `forget_memory` describes. Returns one result per input id, in the order given; `deleted: false` means the id was unknown or the memory had already been forgotten.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `ids` | string[] | Yes | Memory UUIDs to forget (1-100). Each moves to the Tombstone phase; graph edges are kept and UUIDs are never reused. |
+
 ### `find_similar_memories`
 
 Find memories semantically similar to a given memory, or scan a namespace for duplicate clusters. Two modes: `single` (default) finds memories similar to one id; `scan` detects duplicate clusters across a namespace.
@@ -911,6 +921,19 @@ Create a new memory namespace.
 | `initialStability` | number | No | Starting stability in days for new memories (default: 3.7145). |
 | `desiredRetention` | number | No | Target retention rate 0.0-1.0 (default: 0.9). |
 | `decayRateMultiplier` | number | No | Per-namespace decay rate multiplier. 1.0 = normal, 2.0 = 2x slower, 0.0 = disabled. Omit to inherit global setting. |
+
+### `delete_namespace`
+
+**Destructive and irreversible. There is no undo and no backup.** Destroys a namespace and everything in it: every memory, every graph edge touching one, its search index entries, and its vector file on disk.
+
+A namespace that still holds live memories is refused unless you pass `force: true`; the refusal names the count and touches nothing. A namespace holding only tombstones counts as empty and deletes without `force` — the response reports those separately as `tombstonesPurged`.
+
+This is the only operation that reclaims tombstones. The `default` namespace cannot be deleted, with or without `force`, and whether or not it is empty: it is recreated on every startup under the same directory name but with a new namespace id, so deleting it would leave a stale `vectors.dat` that the recreated namespace could silently reuse.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Namespace to delete (1-64 chars). The `default` namespace cannot be deleted. |
+| `force` | boolean | No | Delete the namespace even if it still holds memories (default: false). Forced deletion permanently destroys every memory in it and removes its vector file from disk. |
 
 ### `namespace_stats`
 

@@ -44,6 +44,7 @@ By default, Claude Code will prompt you for approval each time an MCP tool is ca
       "mcp__recalld__get_memory",
       "mcp__recalld__reinforce_memory",
       "mcp__recalld__forget_memory",
+      "mcp__recalld__forget_memories",
       "mcp__recalld__find_similar_memories",
       "mcp__recalld__create_namespace",
       "mcp__recalld__namespace_stats",
@@ -124,6 +125,10 @@ Request bodies over `server.max_body_bytes` (10 MB by default) are rejected with
 Configure per-project namespace defaults in a `.recalld.toml` file (see above), not CLI flags.
 
 ## Available tools
+
+### A note on deletion
+
+`forget_memory` and `forget_memories` move a memory to the Tombstone phase: content erased, but the record and its graph edges kept so relationship chains stay intact, and the UUID never reused. **Tombstones are never reclaimed by the decay sweep** — they persist for the life of the database. `delete_namespace` is the only operation that reclaims them.
 
 ### A note on limits
 
@@ -633,6 +638,108 @@ Response:
 {
   "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "deleted": true
+}
+```
+
+---
+
+### forget_memories
+
+Delete several memories in a single call. Each moves to the Tombstone phase exactly as `forget_memory` describes: content erased, record and graph edges kept, UUID never reused, never reclaimed by the decay sweep.
+
+Returns one result per input id, in the order given. A `deleted: false` result means the id was unknown or the memory had already been forgotten. A malformed UUID becomes a per-item error and does not fail the rest of the batch.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `ids` | string[] | yes | -- | Memory UUIDs to forget. 1-100 items. Each moves to the Tombstone phase; its graph edges are kept and its UUID is never reused. |
+
+#### Example
+
+Request:
+
+```json
+{
+  "ids": [
+    "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "not-a-uuid"
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "results": [
+    { "index": 0, "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "deleted": true },
+    { "index": 1, "error": "Invalid UUID: not-a-uuid", "field": "ids[1]" }
+  ],
+  "total": 2,
+  "deleted": 1,
+  "errors": 1
+}
+```
+
+---
+
+### delete_namespace
+
+**Destructive and irreversible. There is no undo and no backup.**
+
+Destroys a namespace and everything in it: every memory, every graph edge touching one (including edges that point into the namespace from outside), its full-text and vector index entries, and its vector file on disk.
+
+A namespace that still holds live memories is refused unless you pass `force: true`. The refusal names the count and touches nothing.
+
+A namespace holding only tombstones counts as empty and deletes without `force`. Those records hold no content — they have already been forgotten — and they report as `memoryCount: 0` everywhere else. The purge still reclaims them, and the response reports how many as `tombstonesPurged`.
+
+This is the **only** operation that reclaims tombstones. A memory deleted with `forget_memory` keeps its record and its graph edges for the life of the database; the decay sweep never removes them.
+
+The `default` namespace cannot be deleted, with or without `force`, and whether or not it is empty. It is recreated on every startup under the same directory name but with a new namespace id, so deleting it would leave a stale `vectors.dat` that the recreated namespace could silently reuse.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | string | yes | -- | Namespace to delete (1-64 chars). The `default` namespace cannot be deleted. |
+| `force` | boolean | no | `false` | Delete the namespace even if it still holds memories. Without this, a non-empty namespace is refused. Forced deletion permanently destroys every memory in the namespace and removes its vector file from disk. |
+
+#### Example
+
+Request:
+
+```json
+{
+  "name": "scratch",
+  "force": true
+}
+```
+
+Response:
+
+```json
+{
+  "name": "scratch",
+  "id": 4,
+  "deleted": true,
+  "memoriesDeleted": 128,
+  "tombstonesPurged": 12,
+  "edgesRemoved": 341,
+  "ftsRowsRemoved": 128,
+  "vectorFileRemoved": true
+}
+```
+
+Refusal (a non-empty namespace without `force`):
+
+```json
+{
+  "isError": true,
+  "content": [{
+    "type": "text",
+    "text": "Namespace 'scratch' still holds 12 memories. Deleting it permanently destroys them and removes its vector file from disk; there is no undo and no backup. Re-run with force: true to proceed."
+  }]
 }
 ```
 

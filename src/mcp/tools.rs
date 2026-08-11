@@ -2027,6 +2027,172 @@ mod tests {
         assert_eq!(tool_definitions().len(), 14);
     }
 
+    /// A bridge whose every method fails. The point is to reach
+    /// [`dispatch_tool`]'s match arms without standing up a real system:
+    /// what a handler does after it finds its arm is somebody else's
+    /// test, but *finding* the arm is this one's.
+    struct Unroutable;
+
+    macro_rules! refuse {
+        () => {
+            Err(crate::mcp::bridge::BridgeError::Internal(
+                "stub".to_string(),
+            ))
+        };
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::bridge::SearchPipeline for Unroutable {
+        async fn search(
+            &self,
+            _: crate::mcp::bridge::SearchInput,
+        ) -> Result<crate::mcp::bridge::SearchResponse, crate::mcp::bridge::BridgeError> {
+            refuse!()
+        }
+        async fn find_similar(
+            &self,
+            _: crate::model::MemoryId,
+            _: usize,
+            _: Option<f32>,
+            _: bool,
+        ) -> Result<Vec<crate::mcp::bridge::SearchHit>, crate::mcp::bridge::BridgeError> {
+            refuse!()
+        }
+        async fn scan_duplicates(
+            &self,
+            _: &str,
+            _: f32,
+            _: usize,
+        ) -> Result<Vec<crate::mcp::bridge::DuplicateCluster>, crate::mcp::bridge::BridgeError>
+        {
+            refuse!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::bridge::StorageEngine for Unroutable {
+        async fn store_memory(
+            &self,
+            _: crate::mcp::bridge::StoreInput,
+        ) -> Result<StoredMemory, crate::mcp::bridge::BridgeError> {
+            refuse!()
+        }
+        async fn get_memory(
+            &self,
+            _: crate::model::MemoryId,
+        ) -> Result<Option<crate::mcp::bridge::MemoryRecord>, crate::mcp::bridge::BridgeError>
+        {
+            refuse!()
+        }
+        async fn delete_memory(
+            &self,
+            _: crate::model::MemoryId,
+        ) -> Result<bool, crate::mcp::bridge::BridgeError> {
+            refuse!()
+        }
+        async fn delete_memories(
+            &self,
+            _: &[crate::model::MemoryId],
+        ) -> Result<Vec<bool>, crate::mcp::bridge::BridgeError> {
+            refuse!()
+        }
+        async fn reinforce_memory(
+            &self,
+            _: crate::model::MemoryId,
+            _: u8,
+        ) -> Result<crate::mcp::bridge::ReinforceResult, crate::mcp::bridge::BridgeError> {
+            refuse!()
+        }
+        async fn list_memories(
+            &self,
+            _: crate::mcp::bridge::ListMemoriesInput,
+        ) -> Result<crate::mcp::bridge::ListMemoriesResponse, crate::mcp::bridge::BridgeError>
+        {
+            refuse!()
+        }
+        async fn list_tags(
+            &self,
+            _: crate::mcp::bridge::ListTagsInput,
+        ) -> Result<crate::mcp::bridge::ListTagsResponse, crate::mcp::bridge::BridgeError> {
+            refuse!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::bridge::NamespaceRegistry for Unroutable {
+        async fn list_namespaces(
+            &self,
+        ) -> Result<Vec<crate::mcp::bridge::NamespaceInfo>, crate::mcp::bridge::BridgeError>
+        {
+            refuse!()
+        }
+        async fn create_namespace(
+            &self,
+            _: crate::mcp::bridge::CreateNamespaceInput,
+        ) -> Result<crate::mcp::bridge::NamespaceInfo, crate::mcp::bridge::BridgeError> {
+            refuse!()
+        }
+        async fn namespace_stats(
+            &self,
+            _: &str,
+        ) -> Result<crate::mcp::bridge::NamespaceStats, crate::mcp::bridge::BridgeError> {
+            refuse!()
+        }
+        async fn delete_namespace(
+            &self,
+            _: crate::mcp::bridge::DeleteNamespaceInput,
+        ) -> Result<crate::mcp::bridge::DeleteNamespaceResult, crate::mcp::bridge::BridgeError>
+        {
+            refuse!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::bridge::HealthChecker for Unroutable {
+        async fn check_health(&self) -> crate::mcp::bridge::HealthStatus {
+            unreachable!("no tool reaches the health checker")
+        }
+    }
+
+    fn unroutable_bridge() -> McpBridge {
+        let stub = std::sync::Arc::new(Unroutable);
+        McpBridge {
+            search: stub.clone(),
+            storage: stub.clone(),
+            namespaces: stub.clone(),
+            health: stub,
+            default_namespace: "default".to_string(),
+            timezone: chrono_tz::UTC,
+        }
+    }
+
+    /// [`DISPATCHED`] is hand-maintained next to the match, so it can
+    /// drift from the match itself. This one goes through the real
+    /// [`dispatch_tool`]: a declared tool with no arm answers "Unknown
+    /// tool", and the point of declaring it was that it would not.
+    #[tokio::test]
+    async fn w40_dispatch_tool_routes_every_declared_tool() {
+        let bridge = unroutable_bridge();
+
+        for tool in tool_definitions() {
+            let result = dispatch_tool(&bridge, &tool.name, json!({})).await;
+            let rendered = serde_json::to_string(&result).expect("result serializes");
+            assert!(
+                !rendered.contains("Unknown tool"),
+                "{} is declared but dispatch_tool does not route it",
+                tool.name
+            );
+        }
+
+        let unknown = dispatch_tool(&bridge, "no_such_tool", json!({})).await;
+        assert!(
+            serde_json::to_string(&unknown)
+                .expect("result serializes")
+                .contains("Unknown tool"),
+            "the unknown-tool path stopped reporting unknown tools"
+        );
+    }
+
     /// A definition without a dispatch arm advertises a tool that answers
     /// "Unknown tool". Cheap to catch here, expensive to catch in the
     /// field.
