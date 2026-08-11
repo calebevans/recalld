@@ -185,7 +185,7 @@ Store a new observation, fact, or piece of context. The system automatically gen
 | `emotions` | string[] | no | `[]` | Emotional tone, e.g. `["happy", "anxious"]`. Max 32. |
 | `namespace` | string | no | `"default"` | Memory partition |
 | `parentId` | string | no | -- | UUID of parent memory for hierarchical linking |
-| `supersedes` | string | no | -- | UUID of an older memory this one replaces. The old memory is deprioritized in search. |
+| `supersedes` | string | no | -- | UUID of an existing memory in the same namespace that this one replaces. Recall returns this memory **in place of** the old one. The store fails if the target does not exist or is in a different namespace. See [supersedes semantics](#supersedes-semantics). |
 
 #### Example
 
@@ -213,6 +213,40 @@ Response:
 ```
 
 ---
+
+#### supersedes semantics
+
+`supersedes` is a *desired end state*, not an event, and the store result always
+says what actually happened to the link.
+
+**Preconditions, checked before anything is written.** The target must exist and
+must live in the same namespace as the new memory, and a memory cannot supersede
+itself. Violating any of these fails the whole store -- no memory is created.
+Checking up front is what keeps a rejected link from leaving an orphaned memory
+behind. A *tombstoned* (deleted) target is fine: correcting a memory you just
+deleted is legitimate.
+
+**Idempotent.** Superseding the same memory twice is not an error; the second
+call reports `alreadyApplied`.
+
+**The result reports the outcome.** Every successful store carries a
+`supersedes` object:
+
+| Field | Description |
+|---|---|
+| `target` | The memory that was superseded. |
+| `status` | `applied`, `alreadyApplied`, `appliedNotDurable`, or `failed`. |
+| `detail` | Explanation, present for every status except `applied`. |
+
+`applied` means the edge was created and written to disk. `alreadyApplied` means
+it was already in place. `appliedNotDurable` means the edge is active for the
+running process but could not be persisted, so it will be lost on restart.
+`failed` means no edge exists; the memory was still stored.
+
+At recall, a superseded memory is replaced by its replacement **only when the
+replacement passes the query's own filters** -- namespace above all. If it does
+not, the original is returned instead, so a result is never dropped with nothing
+in its place.
 
 ### store_memories
 
@@ -799,7 +833,7 @@ Reinforce memories when they prove useful:
 - **After successful recall:** If you searched for something and the result was exactly what you needed, reinforce with quality 3 or 4.
 - **After applying context:** If a recalled memory helped you give better advice, reinforce it.
 - **Correct wrong memories:** If a recalled memory was inaccurate, either reinforce with quality 1 (weakens it) or use `forget_memory` to delete it outright, then store the corrected version.
-- **Use `supersedes`:** When storing a correction, pass the old memory's ID as `supersedes` so the old one is deprioritized rather than deleted.
+- **Use `supersedes`:** When storing a correction, pass the old memory's ID as `supersedes` so recall returns the correction instead of the stale memory. The old memory is kept on disk, not deleted.
 
 Memories that reach high stability (>1500 days) enter permastore and stop decaying.
 

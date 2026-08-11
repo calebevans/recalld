@@ -554,6 +554,12 @@ pub struct BatchStoreResponse {
     pub created: Vec<BatchStoreResult>,
     /// Total number successfully created.
     pub total: u64,
+    /// Items that were not created, in request order.
+    ///
+    /// Omitted when everything succeeded, so a fully successful response
+    /// body is byte-identical to what earlier versions returned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<BatchStoreFailure>,
 }
 
 /// Result for a single batch store item.
@@ -564,6 +570,26 @@ pub struct BatchStoreResult {
     pub id: MemoryId,
     /// Namespace name.
     pub namespace: String,
+    /// What became of the requested `supersedes` link, if one was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<crate::model::SupersedesOutcome>,
+}
+
+/// A batch item that was rejected, and why.
+///
+/// Batch store previously dropped every failure on the floor: a `continue`
+/// with no record of what happened. `index` refers to the item's position
+/// in the request's `memories` array.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchStoreFailure {
+    /// Position of the rejected item in the request array.
+    pub index: usize,
+    /// Human-readable reason.
+    pub error: String,
+    /// The request field at fault, when the failure names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════

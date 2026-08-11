@@ -471,7 +471,10 @@ The `QueryEngine` orchestrates a 9-stage search pipeline. All subsystem dependen
     v
   [8a] Compute composite score
   [8b] Apply temporal boost (Gaussian falloff around query time range)
-  [8c] Resolve supersedes chains (replace outdated with current version)
+  [8c] Resolve supersedes chains (replace outdated with current version
+       WHEN THE REPLACEMENT PASSES THE QUERY'S FILTERS; otherwise the
+       original is kept, so a result is never dropped with nothing in
+       its place)
   [8d] Sort descending, truncate to limit
     |
     v

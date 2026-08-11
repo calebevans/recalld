@@ -29,7 +29,7 @@ pub mod validation;
 
 // Re-export primary types at module level for convenience.
 pub use self::decay::DecayPhase;
-pub use self::edge::EdgeType;
+pub use self::edge::{EdgeType, SupersedesOutcome, SupersedesStatus};
 pub use self::error::{DecodeError, TagError, ValidationError};
 pub use self::id::{MemoryId, NamespaceId};
 pub use self::memory::{AccessEvent, AccessKind, Memory};

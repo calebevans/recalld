@@ -762,8 +762,38 @@ Store a new memory.
 | `topics` | string[] | No | Topic keywords, e.g. `["rust", "cooking"]`. Max 32. |
 | `emotions` | string[] | No | Emotional tone, e.g. `["happy", "anxious"]`. Max 32. |
 | `namespace` | string | No | Target namespace (default: `"default"`). |
-| `parentId` | string | No | UUID of parent memory to create a hierarchical link. |
-| `supersedes` | string | No | UUID of an older memory this one replaces. The old memory is deprioritized in search. |
+| `parentId` | string | No | UUID of an existing memory in the same namespace, linked as this memory's parent. The store fails if the target does not exist or is in a different namespace. |
+| `supersedes` | string | No | UUID of an existing memory in the same namespace that this one replaces. Recall REMOVES the old memory from results and returns this one in its place. The store fails if the target does not exist or is in a different namespace. |
+
+#### supersedes semantics
+
+`supersedes` is a *desired end state*, not an event, and the store result
+always says what actually happened to the link.
+
+- **Preconditions, checked before anything is written.** The target must
+  exist and must live in the same namespace as the new memory, and a memory
+  cannot supersede itself. Violating any of these fails the whole store —
+  no memory is created. Checking up front is what keeps a rejected link
+  from leaving an orphaned memory behind. A *tombstoned* (deleted) target is
+  fine: correcting a memory you just deleted is a legitimate thing to do.
+- **Idempotent.** Storing the same correction twice is not an error; the
+  second call reports `alreadyApplied`.
+- **Reported, never silent.** When the request names a target, the store
+  result carries a `supersedes` object:
+
+  | Field | Description |
+  |---|---|
+  | `target` | The memory that was superseded. |
+  | `status` | `applied`, `alreadyApplied`, `appliedNotDurable`, or `failed`. |
+  | `detail` | Explanation, present for every status except `applied`. |
+
+  `applied` means the edge was created and written to disk.
+  `alreadyApplied` means it was already in place. `appliedNotDurable` means
+  the edge is active for the running process but could not be persisted, so
+  it will be lost on restart. `failed` means no edge exists; the memory was
+  still stored.
+- **Counted.** The new memory's `edgeCount` includes the supersedes edge.
+  Memories stored before this behaviour existed are not backfilled.
 
 ### `store_memories`
 
@@ -771,7 +801,7 @@ Store multiple memories in a single call. Each item has the same schema as `stor
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `memories` | array | Yes | Array of memory objects (max 100 per call). Each object has the same fields as `store_memory`. |
+| `memories` | array | Yes | Array of memory objects (max 100 per call). Each object has the same fields as `store_memory`, including `supersedes` and its preconditions. |
 
 ### `recall_memories`
 

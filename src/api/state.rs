@@ -197,6 +197,33 @@ pub trait RelationshipGraph: Send + Sync {
         edge_type: &str,
     ) -> Result<(), GraphError>;
 
+    /// Validate a caller-specified link target (`supersedes`, `parentId`)
+    /// before the new memory is written.
+    ///
+    /// Called pre-write so a bad target rejects the request outright rather
+    /// than leaving an orphaned record behind a 4xx. Pass `None` for
+    /// `new_id` when the ID has not been minted yet; that skips the
+    /// self-reference check, which is vacuous in that case.
+    async fn check_link_target(
+        &self,
+        field: &'static str,
+        new_id: Option<MemoryId>,
+        target: MemoryId,
+        expected_ns: NamespaceId,
+    ) -> Result<(), crate::graph::LinkError>;
+
+    /// Create and persist the `Supersedes` edge for a memory that has
+    /// already been written.
+    ///
+    /// Cannot fail: the record is committed by this point, so the outcome
+    /// is reported rather than raised. See
+    /// [`SupersedesStatus`](crate::model::SupersedesStatus).
+    async fn apply_supersedes_edge(
+        &self,
+        new_id: MemoryId,
+        target: MemoryId,
+    ) -> crate::model::SupersedesOutcome;
+
     /// Tombstone a memory's graph node (set phase to Tombstone, strength to 0).
     /// Unlike full removal, this preserves the node and edges for graph traversal.
     async fn tombstone_node(&self, id: MemoryId) -> Result<(), GraphError>;

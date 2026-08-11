@@ -526,6 +526,46 @@ impl RelationshipGraph {
         self.edges.len()
     }
 
+    /// Follow incoming `Supersedes` edges to the newest version of `id`.
+    ///
+    /// A `Supersedes` edge runs source (new) -> target (old), so the memory
+    /// that replaces `id` is the *source* of an incoming edge. The walk
+    /// repeats until it reaches a memory nothing supersedes.
+    ///
+    /// Returns `None` when `id` is already current, and also when the chain
+    /// contains a cycle. A cycle has no newest version, so substituting an
+    /// arbitrary node from inside it would make recall return a different
+    /// memory depending on hash iteration order; returning the original
+    /// memory unchanged is the only stable answer.
+    pub fn supersedes_terminal(&self, id: &MemoryId) -> Option<MemoryId> {
+        /// Hop ceiling, a second guard behind the cycle check. Real
+        /// correction chains are a handful of links at most.
+        const MAX_HOPS: usize = 10;
+
+        let mut visited: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
+        visited.insert(*id);
+
+        let mut current = *id;
+        for _ in 0..MAX_HOPS {
+            let replacement = self.incoming_edges(&current).into_iter().find_map(|edge| {
+                if edge.edge_type == EdgeType::Supersedes {
+                    self.nodes.get(edge.source).map(|n| n.memory_id)
+                } else {
+                    None
+                }
+            });
+
+            match replacement {
+                // Revisiting a node means the chain loops.
+                Some(next) if !visited.insert(next) => return None,
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+
+        if current == *id { None } else { Some(current) }
+    }
+
     /// Read-only access to an edge by key.
     pub fn get_edge(&self, key: EdgeKey) -> Option<&GraphEdge> {
         self.edges.get(key)
@@ -769,5 +809,148 @@ impl RelationshipGraph {
     /// that need to work with keys directly.
     pub fn resolve(&self, memory_id: &MemoryId) -> Option<NodeKey> {
         self.id_index.get(memory_id).copied()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a graph holding `n` fresh Full-phase nodes in one namespace.
+    fn graph_with_nodes(n: usize) -> (RelationshipGraph, Vec<MemoryId>) {
+        let mut graph = RelationshipGraph::new();
+        let ns = NamespaceId::new(1);
+        let ids: Vec<MemoryId> = (0..n).map(|_| MemoryId::new()).collect();
+        for id in &ids {
+            graph
+                .add_node(*id, ns, DecayPhase::Full, 1.0, 0)
+                .expect("fresh id");
+        }
+        (graph, ids)
+    }
+
+    /// Add a Supersedes edge meaning "`new` replaces `old`".
+    fn supersede(
+        graph: &mut RelationshipGraph,
+        new: MemoryId,
+        old: MemoryId,
+    ) -> Result<EdgeKey, GraphError> {
+        graph.add_edge(new, old, EdgeType::Supersedes, 1.0, false)
+    }
+
+    /// An edge to a memory that is not in the graph is refused, which is
+    /// what makes pre-validating the target worth doing.
+    #[test]
+    fn supersedes_edge_to_missing_target_errors() {
+        let (mut graph, ids) = graph_with_nodes(1);
+        let missing = MemoryId::new();
+
+        let err = supersede(&mut graph, ids[0], missing).unwrap_err();
+
+        assert!(matches!(err, GraphError::MemoryNotFound(id) if id == missing));
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    /// The exact edge shape `supersedes_terminal` depends on: the new
+    /// memory is the SOURCE of an edge incoming to the old one.
+    #[test]
+    fn valid_target_creates_edge_with_new_memory_as_source() {
+        let (mut graph, ids) = graph_with_nodes(2);
+        let (new, old) = (ids[0], ids[1]);
+
+        supersede(&mut graph, new, old).expect("both nodes present");
+
+        let incoming = graph.incoming_edges(&old);
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].edge_type, EdgeType::Supersedes);
+        assert_eq!(
+            graph.nodes.get(incoming[0].source).map(|n| n.memory_id),
+            Some(new)
+        );
+    }
+
+    /// Storing the same correction twice is idempotent at the graph level.
+    /// The store path reports this as `alreadyApplied`, not as an error:
+    /// supersedes is a desired end state, and the end state is in place.
+    #[test]
+    fn duplicate_supersedes_edge_is_rejected_as_already_existing() {
+        let (mut graph, ids) = graph_with_nodes(2);
+        let (new, old) = (ids[0], ids[1]);
+
+        supersede(&mut graph, new, old).expect("first insert");
+        let err = supersede(&mut graph, new, old).unwrap_err();
+
+        assert!(matches!(err, GraphError::EdgeExists(_, _)));
+        assert_eq!(graph.edge_count(), 1);
+    }
+
+    /// A chain of corrections resolves to its newest member, not to the
+    /// first hop.
+    #[test]
+    fn supersedes_terminal_follows_the_chain_to_the_newest_version() {
+        let (mut graph, ids) = graph_with_nodes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        supersede(&mut graph, a, b).expect("a replaces b");
+        supersede(&mut graph, c, a).expect("c replaces a");
+
+        assert_eq!(graph.supersedes_terminal(&b), Some(c));
+        assert_eq!(graph.supersedes_terminal(&a), Some(c));
+    }
+
+    /// A memory nothing has replaced resolves to nothing, so recall leaves
+    /// it alone.
+    #[test]
+    fn supersedes_terminal_is_none_for_a_current_memory() {
+        let (mut graph, ids) = graph_with_nodes(2);
+        supersede(&mut graph, ids[0], ids[1]).expect("a replaces b");
+
+        assert_eq!(graph.supersedes_terminal(&ids[0]), None);
+    }
+
+    /// Regression guard for the cycle detection. A two-node cycle cannot be
+    /// built through `add_edge` (its duplicate check spans both directions)
+    /// but `rebuild_from_storage` inserts edges.db rows without that check,
+    /// so a restart can materialise one. Before cycle detection this walked
+    /// the full hop cap and substituted whichever node it happened to land
+    /// on; now it terminates with "no newest version".
+    #[test]
+    fn supersedes_terminal_returns_none_on_a_cycle() {
+        let (mut graph, ids) = graph_with_nodes(2);
+        let (a, b) = (ids[0], ids[1]);
+
+        let edge = |source, target| crate::storage::PersistedEdge {
+            source,
+            target,
+            edge_type: EdgeType::Supersedes,
+            weight: 1.0,
+            auto_created: false,
+            created_at: 0,
+        };
+        let loaded =
+            crate::graph::rebuild_from_storage(&mut graph, [edge(a, b), edge(b, a)].into_iter());
+        assert_eq!(loaded, 2);
+
+        assert_eq!(graph.supersedes_terminal(&a), None);
+        assert_eq!(graph.supersedes_terminal(&b), None);
+    }
+
+    /// A longer cycle terminates too, and reports the same "no answer".
+    #[test]
+    fn supersedes_terminal_returns_none_on_a_three_node_cycle() {
+        let (mut graph, ids) = graph_with_nodes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        supersede(&mut graph, a, b).expect("a replaces b");
+        supersede(&mut graph, b, c).expect("b replaces c");
+        supersede(&mut graph, c, a).expect("c replaces a");
+
+        assert_eq!(graph.supersedes_terminal(&a), None);
+        assert_eq!(graph.supersedes_terminal(&b), None);
+        assert_eq!(graph.supersedes_terminal(&c), None);
     }
 }

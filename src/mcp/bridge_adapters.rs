@@ -20,6 +20,25 @@ use crate::time::format_timestamp;
 use super::bridge;
 use crate::storage::StorageEngine as StorageEngineTrait;
 
+/// Map an explicit-link validation failure onto the bridge error the tool
+/// layer already knows how to render.
+///
+/// The distinction that matters to a caller: `NotFound` and `InvalidInput`
+/// mean "fix your request", while `Internal` and `Storage` mean "this one is
+/// ours". `tools.rs` surfaces all four through its existing
+/// `Failed to store memory: {e}` path, so no error handling changes there.
+fn map_link_error(e: crate::graph::LinkError) -> bridge::BridgeError {
+    use crate::graph::LinkError;
+    match e {
+        LinkError::TargetNotFound { .. } => bridge::BridgeError::NotFound(e.to_string()),
+        LinkError::NamespaceMismatch { .. } | LinkError::SelfReference { .. } => {
+            bridge::BridgeError::InvalidInput(e.to_string())
+        }
+        LinkError::TargetMissingFromGraph { .. } => bridge::BridgeError::Internal(e.to_string()),
+        LinkError::Lookup { .. } => bridge::BridgeError::Storage(e.to_string()),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // McpSearchAdapter
 // ═══════════════════════════════════════════════════════════════════════
@@ -601,6 +620,45 @@ impl bridge::StorageEngine for McpStorageAdapter {
             })??
         };
 
+        // The ID is minted here rather than just before the insert so the
+        // link pre-validation below can reject a self-reference. Minting is
+        // pure (UUIDv7 from the clock), so an early mint costs nothing.
+        let memory_id = MemoryId::new();
+
+        // Validate caller-specified links BEFORE anything is written.
+        //
+        // The record is committed to meta.db, fulltext.dat, vectors.dat, FTS
+        // and the cache further down; a link failure discovered after that
+        // would have to unwind all of it. Checking here makes "reject the
+        // whole store" free, and it also avoids paying for an embedding
+        // round-trip on a store that cannot succeed.
+        if let Some(parent_id) = input.parent_id {
+            crate::graph::check_link_target(
+                "parentId",
+                Some(memory_id),
+                parent_id,
+                ns_config.id,
+                &self.graph,
+                &self.storage,
+                &self.cache,
+            )
+            .await
+            .map_err(map_link_error)?;
+        }
+        if let Some(old_id) = input.supersedes {
+            crate::graph::check_link_target(
+                "supersedes",
+                Some(memory_id),
+                old_id,
+                ns_config.id,
+                &self.graph,
+                &self.storage,
+                &self.cache,
+            )
+            .await
+            .map_err(map_link_error)?;
+        }
+
         // Convert structured metadata fields to tags and merge with explicit tags.
         let mut merged_tags = input.tags.clone();
         for entity in &input.entities {
@@ -640,7 +698,6 @@ impl bridge::StorageEngine for McpStorageAdapter {
             }
         };
 
-        let memory_id = MemoryId::new();
         let now = chrono::Utc::now().timestamp_millis();
         let parsed_tags: Vec<Tag> = merged_tags
             .iter()
@@ -731,9 +788,8 @@ impl bridge::StorageEngine for McpStorageAdapter {
             }
         }
 
-        // Add node to the relationship graph (must happen BEFORE autolink).
-        // Track whether we need to persist a supersedes edge after releasing graph lock.
-        let mut supersedes_edge: Option<crate::storage::PersistedEdge> = None;
+        // Add node to the relationship graph (must happen BEFORE autolink,
+        // and before either explicit edge — both endpoints must exist).
         {
             let mut graph_w = self.graph.write().await;
             // Silently ignore DuplicateNode (should not happen for a new memory).
@@ -744,72 +800,35 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 1.0,
                 record.vector_slot,
             );
-
-            // Create supersedes edge: new memory → old memory.
-            if let Some(old_id) = input.supersedes {
-                if let Err(e) = graph_w.add_edge(
-                    memory_id,
-                    old_id,
-                    crate::model::EdgeType::Supersedes,
-                    1.0,
-                    false,
-                ) {
-                    tracing::warn!(
-                        memory_id = %memory_id,
-                        superseded = %old_id,
-                        %e,
-                        "supersedes edge failed (non-fatal)"
-                    );
-                } else {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    supersedes_edge = Some(crate::storage::PersistedEdge {
-                        source: memory_id,
-                        target: old_id,
-                        edge_type: crate::model::EdgeType::Supersedes,
-                        weight: 1.0,
-                        auto_created: false,
-                        created_at: now_ms,
-                    });
-                }
-            }
         } // graph write lock released
 
-        // Persist supersedes edge AFTER graph lock is released to avoid lock ordering inversion.
-        if let Some(persisted) = supersedes_edge {
-            let old_id = persisted.target;
-            let storage = self.storage.clone();
-            let persist_result = tokio::task::spawn_blocking(move || {
-                let storage_r = storage.read().map_err(|e| {
-                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-                })?;
-                storage_r
-                    .batch_add_edges(&[persisted])
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))
-            })
+        // Explicit links. Both targets were validated before the record was
+        // written, so anything that goes wrong here is a durability or
+        // idempotency detail, not a reason to fail a store that succeeded.
+        if let Some(parent_id) = input.parent_id {
+            crate::graph::apply_parent_edge(
+                parent_id,
+                memory_id,
+                &self.graph,
+                &self.storage,
+                &self.cache,
+            )
             .await;
-            match persist_result {
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        memory_id = %memory_id,
-                        superseded = %old_id,
-                        error = %e,
-                        "supersedes edge persistence failed (non-fatal)"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        memory_id = %memory_id,
-                        superseded = %old_id,
-                        error = %e,
-                        "supersedes edge persistence task panicked (non-fatal)"
-                    );
-                }
-                _ => {}
-            }
         }
+
+        let supersedes_outcome = match input.supersedes {
+            Some(old_id) => Some(
+                crate::graph::apply_supersedes_edge(
+                    memory_id,
+                    old_id,
+                    &self.graph,
+                    &self.storage,
+                    &self.cache,
+                )
+                .await,
+            ),
+            None => None,
+        };
 
         // Auto-link: discover and create edges to similar existing memories.
         if self.config.graph.autolink_enabled {
@@ -912,6 +931,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             strength: record.strength,
             stability: record.stability,
             created_at: format_timestamp(record.created_at, self.timezone),
+            supersedes: supersedes_outcome,
         })
     }
 

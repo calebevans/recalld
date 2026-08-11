@@ -130,11 +130,11 @@ fn store_memory_def() -> ToolInfo {
                 },
                 "parentId": {
                     "type": "string",
-                    "description": "UUID of parent memory to create a hierarchical link"
+                    "description": "UUID of an existing memory in the same namespace, linked as this memory's parent. The store fails if the target does not exist or is in a different namespace."
                 },
                 "supersedes": {
                     "type": "string",
-                    "description": "UUID of an older memory this one replaces. The old memory will be deprioritized in search results in favor of this one."
+                    "description": "UUID of an existing memory in the same namespace that this one replaces. Recall returns this memory in place of the old one. The store fails if the target does not exist or is in a different namespace."
                 }
             },
             "required": ["summary"]
@@ -241,11 +241,11 @@ fn store_memories_def() -> ToolInfo {
                             },
                             "parentId": {
                                 "type": "string",
-                                "description": "UUID of parent memory to create a hierarchical link"
+                                "description": "UUID of an existing memory in the same namespace, linked as this memory's parent. The store fails if the target does not exist or is in a different namespace."
                             },
                             "supersedes": {
                                 "type": "string",
-                                "description": "UUID of an older memory this one replaces"
+                                "description": "UUID of an existing memory in the same namespace that this one replaces. The store fails if the target does not exist or is in a different namespace."
                             }
                         },
                         "required": ["summary"]
@@ -318,6 +318,7 @@ async fn handle_store_memories(bridge: &McpBridge, arguments: serde_json::Value)
                     "strength": stored.strength,
                     "stability": stored.stability,
                     "createdAt": stored.created_at,
+                    "supersedes": stored.supersedes,
                 }));
             }
             Err(e) => {

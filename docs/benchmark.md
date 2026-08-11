@@ -83,7 +83,12 @@ outputs zero or more structured memories to store.
 - `entities` (required): people, places, proper nouns
 - `topics` (required): 1--5 topic keywords
 - `emotions` (optional): emotional tone
-- `supersedes` (optional): ID of a memory this one replaces
+- `supersedes` (optional): ID of a memory this one replaces. Over the MCP
+  and HTTP APIs the target must already exist and live in the same
+  namespace, or the store is rejected outright. The benchmark harness writes
+  through its own in-process path rather than those APIs, so an ID the model
+  invents is dropped rather than rejected — the memory is still stored, just
+  without the link.
 
 **Storage pipeline per memory:**
 1. Generate embedding from concatenation of summary + full_text + tags
@@ -91,7 +96,9 @@ outputs zero or more structured memories to store.
 3. Add to SIMD vector index
 4. Add to FTS5 full-text search index
 5. Add as a node in the memory graph
-6. If `supersedes` is set, add a Supersedes edge
+6. If `supersedes` is set, add a Supersedes edge from the new memory to the
+   old one. Recall then returns the new memory in place of the old one,
+   provided the new one also passes the query's filters
 7. Run automatic graph linking (similarity, entity, temporal)
 
 **Graph linking** (three types, all automatic):

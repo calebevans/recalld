@@ -472,29 +472,12 @@ impl GraphReader for SharedGraphReader {
     }
 
     fn superseded_by(&self, id: &MemoryId) -> Option<MemoryId> {
-        use crate::model::EdgeType;
         let graph = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.graph.read())
         });
-        // Follow the supersedes chain to the latest version.
-        // Supersedes edge: source (new) → target (old).
-        // So if `id` is the target of a Supersedes edge, the source is the replacement.
-        let mut current = *id;
-        for _ in 0..10 {
-            let edges = graph.incoming_edges(&current);
-            let replacement = edges.iter().find_map(|edge| {
-                if edge.edge_type == EdgeType::Supersedes {
-                    graph.nodes.get(edge.source).map(|n| n.memory_id)
-                } else {
-                    None
-                }
-            });
-            match replacement {
-                Some(next) => current = next,
-                None => break,
-            }
-        }
-        if current == *id { None } else { Some(current) }
+        // Chain-walking (and its cycle guard) lives on the graph itself,
+        // where it can be unit-tested against real nodes and edges.
+        graph.supersedes_terminal(id)
     }
 }
 

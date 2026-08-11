@@ -11,6 +11,7 @@
 
 pub mod activation;
 pub mod autolink;
+pub mod explicit_links;
 pub mod rebuild;
 mod structure;
 
@@ -34,6 +35,11 @@ pub use rebuild::rebuild_from_storage;
 pub use crate::rif::rif_edge_factor;
 // Re-export PersistedEdge from storage (the canonical definition)
 pub use crate::storage::PersistedEdge;
+
+// Re-export explicit (caller-specified) link validation and application
+pub use explicit_links::{
+    LinkError, apply_parent_edge, apply_supersedes_edge, check_link_target, validate_link_target,
+};
 
 // Re-export CS-11 auto-link types and functions
 pub use autolink::{

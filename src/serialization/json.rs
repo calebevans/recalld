@@ -130,6 +130,13 @@ pub struct MemoryResponse {
     /// Access history (included only when explicitly requested).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_history: Option<Vec<AccessEvent>>,
+
+    /// What became of the requested `supersedes` link.
+    ///
+    /// Only the create endpoint populates this, and only when the request
+    /// named a target — so GET, search and list bodies are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<crate::model::SupersedesOutcome>,
 }
 
 impl MemoryResponse {
@@ -158,6 +165,7 @@ impl MemoryResponse {
             edge_count: record.edge_count,
             embedding: None,
             access_history: None,
+            supersedes: None,
         }
     }
 }

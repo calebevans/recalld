@@ -25,6 +25,34 @@ use super::state;
 use crate::storage::StorageEngine as StorageEngineTrait;
 
 // ═══════════════════════════════════════════════════════════════════════
+// LinkError -> AppError
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A rejected `supersedes`/`parentId` target becomes a 422 naming the
+/// offending field — 422 is exactly the "syntactically fine, semantically
+/// impossible" case. The two internal-inconsistency variants are ours, not
+/// the caller's, so they become 500s instead.
+impl From<crate::graph::LinkError> for super::errors::AppError {
+    fn from(e: crate::graph::LinkError) -> Self {
+        use crate::graph::LinkError;
+        let field = e.field().to_string();
+        match e {
+            LinkError::TargetNotFound { .. }
+            | LinkError::NamespaceMismatch { .. }
+            | LinkError::SelfReference { .. } => super::errors::AppError::UnprocessableEntity {
+                message: e.to_string(),
+                field: Some(field),
+            },
+            LinkError::TargetMissingFromGraph { .. } | LinkError::Lookup { .. } => {
+                super::errors::AppError::Internal {
+                    source: Box::new(e),
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // SearchPipelineAdapter
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -844,14 +872,64 @@ impl state::RelationshipGraph for RelationshipGraphAdapter {
         drop(graph); // Release graph lock before storage
 
         let storage = self.storage.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(storage_r) = storage.read() {
-                let _ = storage_r.batch_add_edges(&[persisted]);
-            }
+        let persist = tokio::task::spawn_blocking(move || {
+            let storage_r = storage
+                .read()
+                .map_err(|e| format!("storage lock poisoned: {e}"))?;
+            storage_r
+                .batch_add_edges(&[persisted])
+                .map_err(|e| e.to_string())
         })
         .await;
 
+        // The edge is already live in the graph, so a persistence failure
+        // is not worth failing the caller over — but it does mean the edge
+        // disappears on restart, which is worth saying out loud.
+        let persist_error = match persist {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(e) => Some(format!("blocking task join error: {e}")),
+        };
+        if let Some(error) = persist_error {
+            tracing::warn!(
+                source_id = %from,
+                target_id = %to,
+                edge_type,
+                %error,
+                "edge is live in the graph but could not be persisted to edges.db; \
+                 it will be lost on restart"
+            );
+        }
+
         Ok(())
+    }
+
+    async fn check_link_target(
+        &self,
+        field: &'static str,
+        new_id: Option<MemoryId>,
+        target: MemoryId,
+        expected_ns: NamespaceId,
+    ) -> Result<(), crate::graph::LinkError> {
+        crate::graph::check_link_target(
+            field,
+            new_id,
+            target,
+            expected_ns,
+            &self.graph,
+            &self.storage,
+            &self.cache,
+        )
+        .await
+    }
+
+    async fn apply_supersedes_edge(
+        &self,
+        new_id: MemoryId,
+        target: MemoryId,
+    ) -> crate::model::SupersedesOutcome {
+        crate::graph::apply_supersedes_edge(new_id, target, &self.graph, &self.storage, &self.cache)
+            .await
     }
 
     async fn tombstone_node(&self, id: MemoryId) -> Result<(), crate::graph::GraphError> {

@@ -519,7 +519,7 @@ impl QueryEngine {
         timings.rank_us = stage_start.elapsed().as_micros() as u64;
 
         // -- Stage 8c: Supersedes Resolution ------------------------------
-        self.resolve_supersedes(&mut candidates, &query, &query_entities)
+        self.resolve_supersedes(&mut candidates, &query, &query_entities, ns_config.id)
             .await;
 
         candidates.sort_by(|a, b| {
@@ -729,81 +729,140 @@ impl QueryEngine {
         }
     }
 
-    /// Stage 8c: Resolve superseded memories by replacing them with current versions.
+    /// Stage 8c: Replace superseded memories with the versions that
+    /// replace them.
+    ///
+    /// Runs as PLAN -> VALIDATE -> COMMIT, and the ordering is the point:
+    /// a superseded memory is dropped **only** once its replacement has been
+    /// loaded and cleared every filter the query applies. Removing it any
+    /// earlier can leave the caller with neither memory — the correction
+    /// invisible and the original silently deleted from the results.
+    ///
+    /// Replacements are gated by the same [`Self::passes_filters`] that
+    /// stage 5 applies to every other candidate. That is what keeps a
+    /// replacement in another namespace out of these results: the graph
+    /// stores no namespace, so without this gate a cross-namespace
+    /// `Supersedes` edge would pull a foreign memory into the response.
+    ///
+    /// `min_score` still does not bind injected replacements, because their
+    /// `relevance_score` is `None` — identical to graph-expanded candidates,
+    /// and intentional: they are included for being current, not for
+    /// matching the query text.
     async fn resolve_supersedes(
         &self,
         candidates: &mut Vec<Candidate>,
         query: &SearchQuery,
         query_entities: &[String],
+        namespace_id: NamespaceId,
     ) {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
+
+        // -- Plan: which candidates are superseded, and by what. Nothing is
+        // removed here; that decision waits until the replacement is known
+        // to be usable.
+        let planned: Vec<(usize, MemoryId)> = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, candidate)| {
+                self.graph
+                    .superseded_by(&candidate.record.id)
+                    .map(|replacement_id| (idx, replacement_id))
+            })
+            .collect();
+
+        if planned.is_empty() {
+            return;
+        }
+
+        // Several superseded candidates can share one replacement; it
+        // inherits the best of their scores so it ranks at least as high as
+        // the memory it stands in for.
+        let mut inherited_scores: HashMap<MemoryId, f32> = HashMap::new();
+        for (idx, replacement_id) in &planned {
+            let score = candidates[*idx].composite_score;
+            inherited_scores
+                .entry(*replacement_id)
+                .and_modify(|best| *best = best.max(score))
+                .or_insert(score);
+        }
 
         let candidate_id_set: HashSet<MemoryId> = candidates.iter().map(|c| c.record.id).collect();
 
-        let mut to_remove: HashSet<usize> = HashSet::new();
-        let mut replacements_to_inject: Vec<(MemoryId, f32)> = Vec::new();
+        // A replacement already among the candidates passed stage 5 on its
+        // own, so it is eligible by construction.
+        let mut eligible: HashSet<MemoryId> = inherited_scores
+            .keys()
+            .copied()
+            .filter(|id| candidate_id_set.contains(id))
+            .collect();
 
-        for (idx, candidate) in candidates.iter().enumerate() {
-            if let Some(replacement_id) = self.graph.superseded_by(&candidate.record.id) {
-                to_remove.insert(idx);
-                if !candidate_id_set.contains(&replacement_id) {
-                    if let Some(entry) = replacements_to_inject
-                        .iter_mut()
-                        .find(|(id, _)| *id == replacement_id)
-                    {
-                        entry.1 = entry.1.max(candidate.composite_score);
-                    } else {
-                        replacements_to_inject.push((replacement_id, candidate.composite_score));
-                    }
+        let to_load: Vec<MemoryId> = inherited_scores
+            .keys()
+            .copied()
+            .filter(|id| !candidate_id_set.contains(id))
+            .collect();
+
+        // -- Validate: build each replacement, then subject it to the
+        // query's filters before letting it displace anything.
+        let mut injected: Vec<Candidate> = Vec::with_capacity(to_load.len());
+        if !to_load.is_empty() {
+            let records = match self.load_records(&to_load).await {
+                Ok(records) => records,
+                Err(e) => {
+                    // Without the replacements there is nothing to put in
+                    // the originals' place, so the originals stay.
+                    warn!(
+                        error = %e,
+                        count = to_load.len(),
+                        "failed to load supersedes replacements; keeping the superseded memories in the results"
+                    );
+                    return;
                 }
+            };
+
+            for record in records {
+                let inherited_score = inherited_scores.get(&record.id).copied().unwrap_or(0.0);
+                let effective_r = Self::compute_effective_r(&record);
+                let entity_score = if query_entities.is_empty() {
+                    0.0
+                } else {
+                    crate::model::entity_overlap(query_entities, &record.entities)
+                };
+
+                let mut replacement = Candidate::new(record);
+                replacement.effective_r = effective_r;
+                replacement.entity_score = entity_score;
+                replacement.composite_score =
+                    Self::compute_composite_score(&replacement).max(inherited_score);
+
+                // Tombstone, ghost, namespace, phase, strength, permastore
+                // and tag rules all live here — the same gate stage 5 uses.
+                if !Self::passes_filters(&replacement, query, namespace_id) {
+                    continue;
+                }
+
+                eligible.insert(replacement.record.id);
+                injected.push(replacement);
             }
         }
 
-        if !replacements_to_inject.is_empty() {
-            let load_ids: Vec<MemoryId> =
-                replacements_to_inject.iter().map(|(id, _)| *id).collect();
-
-            if let Ok(records) = self.load_records(&load_ids).await {
-                let score_map: std::collections::HashMap<MemoryId, f32> =
-                    replacements_to_inject.iter().cloned().collect();
-
-                for record in records {
-                    // Skip tombstoned and ghost memories.
-                    if record.phase == DecayPhase::Tombstone {
-                        continue;
-                    }
-                    if record.phase == DecayPhase::Ghost && !query.include_ghosts {
-                        continue;
-                    }
-
-                    let inherited_score = score_map.get(&record.id).copied().unwrap_or(0.0);
-                    let effective_r = Self::compute_effective_r(&record);
-
-                    let entity_score = if !query_entities.is_empty() {
-                        crate::model::entity_overlap(query_entities, &record.entities)
-                    } else {
-                        0.0
-                    };
-
-                    let mut replacement = Candidate::new(record);
-                    replacement.effective_r = effective_r;
-                    replacement.entity_score = entity_score;
-                    replacement.composite_score = Self::compute_composite_score(&replacement);
-                    replacement.composite_score = replacement.composite_score.max(inherited_score);
-
-                    candidates.push(replacement);
-                }
-            }
-        }
+        // -- Commit: drop only the candidates whose replacement made it.
+        let to_remove: HashSet<usize> = planned
+            .iter()
+            .filter(|(_, replacement_id)| eligible.contains(replacement_id))
+            .map(|(idx, _)| *idx)
+            .collect();
 
         if !to_remove.is_empty() {
-            let mut keep_idx = 0;
-            candidates.retain(|_| {
-                let keep = !to_remove.contains(&keep_idx);
-                keep_idx += 1;
-                keep
-            });
+            *candidates = std::mem::take(candidates)
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| !to_remove.contains(idx))
+                .map(|(_, candidate)| candidate)
+                .collect();
         }
+
+        candidates.extend(injected);
     }
 
     /// Retrieve a single memory by ID.
@@ -1172,5 +1231,437 @@ impl QueryEngine {
                 warn!("failed to record access events: {e}");
             }
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::model::Tag;
+
+    // -- Stubs ------------------------------------------------------------
+    //
+    // `resolve_supersedes` touches exactly three of the ten injected
+    // subsystems. The rest exist so a `QueryEngine` can be constructed and
+    // are wired to panic: if one ever starts being called, the test should
+    // say so rather than quietly return an empty answer.
+
+    /// Supersedes chains, pre-resolved to their terminal memory.
+    #[derive(Default)]
+    struct StubGraph {
+        terminal: HashMap<MemoryId, MemoryId>,
+    }
+
+    impl GraphReader for StubGraph {
+        fn neighbors(&self, _id: &MemoryId) -> Vec<MemoryId> {
+            Vec::new()
+        }
+
+        fn superseded_by(&self, id: &MemoryId) -> Option<MemoryId> {
+            self.terminal.get(id).copied()
+        }
+    }
+
+    /// Always misses, so every load goes through the metadata store.
+    struct StubCache;
+
+    impl RecordCache for StubCache {
+        fn get(&self, _id: &MemoryId) -> Option<CachedRecord> {
+            None
+        }
+    }
+
+    /// Backing store for replacement records, with a switch for making the
+    /// batch load fail.
+    #[derive(Default)]
+    struct StubMetaStore {
+        records: HashMap<MemoryId, CachedRecord>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl MetadataStore for StubMetaStore {
+        async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
+            Ok(self.records.get(id).cloned())
+        }
+
+        async fn get_batch(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>> {
+            if self.fail {
+                return Err(SearchError::MetadataError("meta.db unavailable".into()));
+            }
+            // Missing IDs are skipped, matching the real adapter.
+            Ok(ids
+                .iter()
+                .filter_map(|id| self.records.get(id).cloned())
+                .collect())
+        }
+    }
+
+    struct Unused;
+
+    #[async_trait::async_trait]
+    impl NamespaceResolver for Unused {
+        async fn resolve(&self, _name: &str) -> Result<NamespaceConfig> {
+            unreachable!("stage 8c does not resolve namespaces")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProviderRegistry for Unused {
+        async fn embed(&self, _namespace: &str, _text: &str) -> Result<Vec<f32>> {
+            unreachable!("stage 8c does not embed")
+        }
+    }
+
+    impl VectorIndexRegistry for Unused {
+        fn search(&self, _ns: NamespaceId, _q: &[f32], _k: usize) -> Result<Vec<ScoredResult>> {
+            unreachable!("stage 8c does not search vectors")
+        }
+
+        fn get_vector(&self, _id: MemoryId) -> Option<Vec<f32>> {
+            unreachable!("stage 8c does not read vectors")
+        }
+    }
+
+    impl FtsIndexRegistry for Unused {
+        fn search(&self, _ns: NamespaceId, _q: &str, _k: usize) -> Result<Vec<FtsResult>> {
+            unreachable!("stage 8c does not search FTS")
+        }
+    }
+
+    impl EntityIndexReader for Unused {
+        fn find_by_entities(
+            &self,
+            _ns: NamespaceId,
+            _entities: &[String],
+            _exclude: MemoryId,
+            _k: usize,
+        ) -> Result<Vec<EntityRecallResult>> {
+            unreachable!("stage 8c does not use entity recall")
+        }
+    }
+
+    impl RifProcessor for Unused {
+        fn compute_suppressions(
+            &self,
+            _retrieved: &[MemoryId],
+            _neighbors: &[MemoryId],
+        ) -> Vec<RifSuppression> {
+            unreachable!("stage 8c does not apply RIF")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AccessRecorder for Unused {
+        async fn record_access(&self, _id: MemoryId, _kind: AccessKind) -> Result<()> {
+            unreachable!("stage 8c does not record access")
+        }
+
+        async fn record_access_batch(&self, _a: &[(MemoryId, AccessKind)]) -> Result<()> {
+            unreachable!("stage 8c does not record access")
+        }
+    }
+
+    // -- Fixtures ---------------------------------------------------------
+
+    fn ns() -> NamespaceId {
+        NamespaceId::new(1)
+    }
+
+    fn other_ns() -> NamespaceId {
+        NamespaceId::new(2)
+    }
+
+    /// A Full-phase, strong, untagged record in namespace 1.
+    fn rec(id: MemoryId) -> CachedRecord {
+        CachedRecord {
+            id,
+            namespace_id: ns(),
+            created_at: 1_700_000_000_000,
+            last_accessed_at: 1_700_000_000_000,
+            phase: DecayPhase::Full,
+            strength: 0.9,
+            decay_strength: 0.9,
+            stability: 10.0,
+            difficulty: 5.0,
+            is_permastore: false,
+            summary: "a memory".to_string(),
+            tags: Vec::new(),
+            edge_count: 0,
+            vector_slot: 0,
+            entities: Vec::new(),
+        }
+    }
+
+    /// A candidate as stage 8 would leave it: scored and ranked.
+    fn candidate(record: CachedRecord, score: f32) -> Candidate {
+        let mut c = Candidate::new(record);
+        c.relevance_score = Some(score);
+        c.raw_vector_score = Some(score);
+        c.composite_score = score;
+        c
+    }
+
+    fn query(value: serde_json::Value) -> SearchQuery {
+        serde_json::from_value(value).expect("valid query")
+    }
+
+    fn engine(graph: StubGraph, meta: StubMetaStore) -> QueryEngine {
+        QueryEngine::new(
+            Arc::new(Unused),
+            Arc::new(Unused),
+            Arc::new(Unused),
+            Arc::new(Unused),
+            Arc::new(Unused),
+            Arc::new(StubCache),
+            Arc::new(meta),
+            Arc::new(graph),
+            Arc::new(Unused),
+            Arc::new(Unused),
+        )
+    }
+
+    /// Wire up "B is superseded by A", where A's record is `replacement`.
+    fn superseded_setup(old: MemoryId, replacement: CachedRecord) -> (StubGraph, StubMetaStore) {
+        let mut graph = StubGraph::default();
+        graph.terminal.insert(old, replacement.id);
+
+        let mut meta = StubMetaStore::default();
+        meta.records.insert(replacement.id, replacement);
+
+        (graph, meta)
+    }
+
+    fn ids(candidates: &[Candidate]) -> Vec<MemoryId> {
+        candidates.iter().map(|c| c.record.id).collect()
+    }
+
+    // -- Tests ------------------------------------------------------------
+
+    /// The headline behaviour: recall hands back the correction instead of
+    /// the memory it corrects, ranked no lower than what it replaced.
+    #[tokio::test]
+    async fn substitutes_an_eligible_replacement_for_the_superseded_memory() {
+        let (old, new) = (MemoryId::new(), MemoryId::new());
+        let (graph, meta) = superseded_setup(old, rec(new));
+        let engine = engine(graph, meta);
+
+        let mut candidates = vec![candidate(rec(old), 0.8)];
+        engine
+            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
+            .await;
+
+        assert_eq!(ids(&candidates), vec![new]);
+        assert!(candidates[0].composite_score >= 0.8);
+    }
+
+    /// When the replacement is already a hit in its own right, the old
+    /// memory still goes, and the new one is not duplicated.
+    #[tokio::test]
+    async fn replacement_already_among_the_candidates_appears_exactly_once() {
+        let (old, new) = (MemoryId::new(), MemoryId::new());
+        let (graph, meta) = superseded_setup(old, rec(new));
+        let engine = engine(graph, meta);
+
+        let mut candidates = vec![candidate(rec(old), 0.8), candidate(rec(new), 0.9)];
+        engine
+            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
+            .await;
+
+        assert_eq!(ids(&candidates), vec![new]);
+    }
+
+    /// A tombstoned replacement cannot be returned — and because it cannot,
+    /// the memory it replaces must survive. Dropping both would lose the
+    /// information entirely.
+    #[tokio::test]
+    async fn tombstoned_replacement_does_not_drop_the_original() {
+        let (old, new) = (MemoryId::new(), MemoryId::new());
+        let mut replacement = rec(new);
+        replacement.phase = DecayPhase::Tombstone;
+        let (graph, meta) = superseded_setup(old, replacement);
+        let engine = engine(graph, meta);
+
+        let mut candidates = vec![candidate(rec(old), 0.8)];
+        engine
+            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
+            .await;
+
+        assert_eq!(ids(&candidates), vec![old]);
+    }
+
+    /// Same reasoning for a ghost the query did not ask for.
+    #[tokio::test]
+    async fn ghost_replacement_is_kept_out_unless_ghosts_were_requested() {
+        let (old, new) = (MemoryId::new(), MemoryId::new());
+        let mut replacement = rec(new);
+        replacement.phase = DecayPhase::Ghost;
+        let (graph, meta) = superseded_setup(old, replacement);
+        let engine = engine(graph, meta);
+
+        let mut candidates = vec![candidate(rec(old), 0.8)];
+        engine
+            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
+            .await;
+
+        assert_eq!(ids(&candidates), vec![old]);
+    }
+
+    /// ...and when they were requested, the ghost does substitute.
+    #[tokio::test]
+    async fn ghost_replacement_substitutes_when_ghosts_are_included() {
+        let (old, new) = (MemoryId::new(), MemoryId::new());
+        let mut replacement = rec(new);
+        replacement.phase = DecayPhase::Ghost;
+        let (graph, meta) = superseded_setup(old, replacement);
+        let engine = engine(graph, meta);
+
+        let mut candidates = vec![candidate(rec(old), 0.8)];
+        engine
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q", "includeGhosts": true})),
+                &[],
+                ns(),
+            )
+            .await;
+
+        assert_eq!(ids(&candidates), vec![new]);
+    }
+
+    /// Namespace isolation regression. A `Supersedes` edge can point across
+    /// namespaces (older data, or a hand-written edges.db), and the graph
+    /// stores no namespace to catch it. Before replacements were run through
+    /// `passes_filters`, this stage injected the foreign memory straight
+    /// into the response — a cross-namespace data leak.
+    #[tokio::test]
+    async fn replacement_from_another_namespace_is_not_leaked() {
+        let (old, new) = (MemoryId::new(), MemoryId::new());
+        let mut replacement = rec(new);
+        replacement.namespace_id = other_ns();
+        let (graph, meta) = superseded_setup(old, replacement);
+        let engine = engine(graph, meta);
+
+        let mut candidates = vec![candidate(rec(old), 0.8)];
+        engine
+            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
+            .await;
+
+        assert_eq!(ids(&candidates), vec![old]);
+    }
+
+    /// The rest of the filter set binds replacements too: required tags,
+    /// minimum strength, and the phase whitelist.
+    #[tokio::test]
+    async fn replacement_failing_metadata_filters_is_not_substituted() {
+        /// (label, query, how to make the replacement fail that query).
+        type FilterCase = (&'static str, serde_json::Value, fn(&mut CachedRecord));
+
+        let cases: Vec<FilterCase> = vec![
+            (
+                "required tag missing",
+                json!({"text": "q", "filter": {"requireTags": ["project/recalld"]}}),
+                |_r| {},
+            ),
+            (
+                "below minimum strength",
+                json!({"text": "q", "filter": {"minStrength": 0.95}}),
+                |r| r.strength = 0.2,
+            ),
+            (
+                "phase not in whitelist",
+                json!({"text": "q", "filter": {"phases": ["summary"]}}),
+                |r| r.phase = DecayPhase::Full,
+            ),
+            (
+                "not permastore",
+                json!({"text": "q", "filter": {"permastoreOnly": true}}),
+                |r| r.is_permastore = false,
+            ),
+        ];
+
+        for (label, q, mutate) in cases {
+            let (old, new) = (MemoryId::new(), MemoryId::new());
+            let mut replacement = rec(new);
+            mutate(&mut replacement);
+            let (graph, meta) = superseded_setup(old, replacement);
+            let engine = engine(graph, meta);
+
+            // The superseded memory itself satisfies the filter, so only the
+            // replacement's eligibility is under test.
+            let mut original = rec(old);
+            original.tags = vec![Tag::new("project/recalld").unwrap()];
+            original.phase = DecayPhase::Summary;
+            original.is_permastore = true;
+
+            let mut candidates = vec![candidate(original, 0.8)];
+            engine
+                .resolve_supersedes(&mut candidates, &query(q), &[], ns())
+                .await;
+
+            assert_eq!(ids(&candidates), vec![old], "{label}");
+        }
+    }
+
+    /// If the replacement cannot be loaded, the original is all we have.
+    /// The old code swallowed the error and removed it anyway.
+    #[tokio::test]
+    async fn metadata_store_failure_keeps_the_superseded_memory() {
+        let (old, new) = (MemoryId::new(), MemoryId::new());
+        let (graph, mut meta) = superseded_setup(old, rec(new));
+        meta.fail = true;
+        let engine = engine(graph, meta);
+
+        let mut candidates = vec![candidate(rec(old), 0.8)];
+        engine
+            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
+            .await;
+
+        assert_eq!(ids(&candidates), vec![old]);
+    }
+
+    /// Likewise when the replacement's record simply is not there.
+    #[tokio::test]
+    async fn replacement_with_no_record_anywhere_keeps_the_superseded_memory() {
+        let old = MemoryId::new();
+        let mut graph = StubGraph::default();
+        graph.terminal.insert(old, MemoryId::new());
+        let engine = engine(graph, StubMetaStore::default());
+
+        let mut candidates = vec![candidate(rec(old), 0.8)];
+        engine
+            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
+            .await;
+
+        assert_eq!(ids(&candidates), vec![old]);
+    }
+
+    /// Two memories superseded by the same correction collapse into one
+    /// copy of it, carrying the better of the two scores.
+    #[tokio::test]
+    async fn many_superseded_memories_share_one_replacement() {
+        let (old_a, old_b, new) = (MemoryId::new(), MemoryId::new(), MemoryId::new());
+        let mut graph = StubGraph::default();
+        graph.terminal.insert(old_a, new);
+        graph.terminal.insert(old_b, new);
+        let mut meta = StubMetaStore::default();
+        meta.records.insert(new, rec(new));
+        let engine = engine(graph, meta);
+
+        let mut candidates = vec![candidate(rec(old_a), 0.5), candidate(rec(old_b), 0.85)];
+        engine
+            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
+            .await;
+
+        assert_eq!(ids(&candidates), vec![new]);
+        assert!(candidates[0].composite_score >= 0.85);
     }
 }

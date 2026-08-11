@@ -283,6 +283,15 @@ pub struct StoredMemory {
     pub stability: f32,
     /// Creation timestamp as ISO 8601 string.
     pub created_at: String,
+    /// What became of the requested `supersedes` link, when one was asked
+    /// for. Absent when the store named no target.
+    ///
+    /// `#[serde(default)]` is load-bearing, not decoration: this struct
+    /// round-trips through the daemon protocol, so a new client talking to
+    /// an older daemon receives a payload without this key and must still
+    /// decode it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<crate::model::SupersedesOutcome>,
 }
 
 /// A full memory record returned by get.
@@ -605,5 +614,93 @@ impl crate::mcp::server::McpHandler for McpBridge {
         uri: &str,
     ) -> Result<crate::mcp::protocol::ResourceReadResult, String> {
         crate::mcp::resources::dispatch_resource(self, uri).await
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::model::{MemoryId, SupersedesOutcome, SupersedesStatus};
+
+    fn stored_memory_json() -> serde_json::Value {
+        json!({
+            "id": "0195e2c0-0000-7000-8000-000000000001",
+            "namespace": "default",
+            "phase": "Full",
+            "strength": 1.0,
+            "stability": 3.7145,
+            "createdAt": "2026-08-11T12:00:00Z",
+        })
+    }
+
+    /// Back-compat guard for the daemon protocol. `StoredMemory` is
+    /// round-tripped through serde between client and daemon, so a new
+    /// client must still decode a response from a daemon that predates the
+    /// `supersedes` field. This is what `#[serde(default)]` buys.
+    #[test]
+    fn stored_memory_decodes_a_payload_without_the_supersedes_field() {
+        let decoded: StoredMemory =
+            serde_json::from_value(stored_memory_json()).expect("old daemon payload decodes");
+
+        assert!(decoded.supersedes.is_none());
+        assert_eq!(decoded.namespace, "default");
+    }
+
+    /// A store that named no target must serialise exactly as before, so
+    /// existing clients see an unchanged response shape.
+    #[test]
+    fn absent_supersedes_outcome_is_omitted_from_the_output() {
+        let stored: StoredMemory =
+            serde_json::from_value(stored_memory_json()).expect("payload decodes");
+
+        let encoded = serde_json::to_value(&stored).expect("encodes");
+        assert!(encoded.get("supersedes").is_none());
+    }
+
+    /// The status names are part of the wire contract in both directions.
+    #[test]
+    fn supersedes_status_round_trips_through_its_camel_case_names() {
+        let cases = [
+            (SupersedesStatus::Applied, "applied"),
+            (SupersedesStatus::AlreadyApplied, "alreadyApplied"),
+            (SupersedesStatus::AppliedNotDurable, "appliedNotDurable"),
+            (SupersedesStatus::Failed, "failed"),
+        ];
+
+        for (status, name) in cases {
+            assert_eq!(serde_json::to_value(status).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<SupersedesStatus>(json!(name)).unwrap(),
+                status
+            );
+        }
+    }
+
+    /// A populated outcome survives the daemon round trip intact.
+    #[test]
+    fn supersedes_outcome_round_trips_on_a_stored_memory() {
+        let target = MemoryId::new();
+        let mut stored: StoredMemory =
+            serde_json::from_value(stored_memory_json()).expect("payload decodes");
+        stored.supersedes = Some(SupersedesOutcome::with_detail(
+            target,
+            SupersedesStatus::AppliedNotDurable,
+            "disk write failed",
+        ));
+
+        let encoded = serde_json::to_value(&stored).expect("encodes");
+        assert_eq!(encoded["supersedes"]["status"], json!("appliedNotDurable"));
+
+        let decoded: StoredMemory = serde_json::from_value(encoded).expect("decodes");
+        let outcome = decoded.supersedes.expect("outcome preserved");
+        assert_eq!(outcome.target, target);
+        assert_eq!(outcome.status, SupersedesStatus::AppliedNotDurable);
+        assert_eq!(outcome.detail.as_deref(), Some("disk write failed"));
     }
 }

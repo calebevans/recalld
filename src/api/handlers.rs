@@ -55,12 +55,14 @@ fn health_report_cache()
 /// 1. Validate request content limits (see [`validate_memory_input`]);
 ///    all length limits are UTF-8 bytes, not characters.
 /// 2. Resolve namespace by name -> NamespaceId.
-/// 3. Generate embedding if not provided (calls embedding provider).
-/// 4. Validate embedding dimensionality against namespace config.
-/// 5. Persist to storage (meta.db, fulltext.dat, vectors.dat).
-/// 6. Insert into RAM cache and vector index.
-/// 7. If `parent_id` provided, create parent->child edge in graph.
-/// 8. Return 201 with the created memory.
+/// 3. Validate `parent_id` / `supersedes` targets, BEFORE any write, so a
+///    bad link returns 422 without leaving an orphaned memory behind.
+/// 4. Generate embedding if not provided (calls embedding provider).
+/// 5. Validate embedding dimensionality against namespace config.
+/// 6. Persist to storage (meta.db, fulltext.dat, vectors.dat).
+/// 7. Insert into RAM cache and vector index.
+/// 8. Create the `parent_id` and `supersedes` edges in the graph.
+/// 9. Return 201 with the created memory.
 pub async fn create_memory(
     State(state): State<AppState>,
     Json(req): Json<CreateMemoryApiRequest>,
@@ -85,6 +87,24 @@ pub async fn create_memory(
             resource: "namespace",
             id: req.namespace.clone(),
         })?;
+
+    // --- Validate caller-specified links BEFORE anything is written ---
+    //
+    // The memory is persisted further down; a link failure discovered after
+    // that would leave an orphaned record behind a 4xx (which is exactly
+    // what the parent edge used to do). Checking here also spares an
+    // embedding round-trip on a request that cannot succeed.
+    //
+    // `None` for the new ID: it does not exist until `create_memory`
+    // returns, so the self-reference check has nothing to compare against.
+    for (field, target) in [("parentId", req.parent_id), ("supersedes", req.supersedes)] {
+        if let Some(target) = target {
+            state
+                .graph
+                .check_link_target(field, None, target, ns.id)
+                .await?;
+        }
+    }
 
     // --- Merge entities/topics/emotions into tags (Issue 8) ---
     let mut merged_tags = req.tags.clone();
@@ -192,21 +212,25 @@ pub async fn create_memory(
         .await;
 
     // --- Parent edge ---
+    // Both explicit edges were validated before the record was written, so
+    // neither can fail the request from here — which is the point. A `?` at
+    // this line would return a 4xx with the memory already created.
     if let Some(parent_id) = req.parent_id {
-        state.graph.add_edge(parent_id, memory.id, "parent").await?;
-    }
-
-    // --- Supersedes edge (Issue 8) ---
-    if let Some(old_id) = req.supersedes {
-        if let Err(e) = state.graph.add_edge(memory.id, old_id, "supersedes").await {
-            tracing::warn!(
+        if let Err(e) = state.graph.add_edge(parent_id, memory.id, "parent").await {
+            tracing::error!(
                 memory_id = %memory.id,
-                superseded = %old_id,
+                parent = %parent_id,
                 %e,
-                "supersedes edge failed (non-fatal)"
+                "parent edge could not be created after pre-validation passed"
             );
         }
     }
+
+    // --- Supersedes edge (Issue 8) ---
+    let supersedes_outcome = match req.supersedes {
+        Some(old_id) => Some(state.graph.apply_supersedes_edge(memory.id, old_id).await),
+        None => None,
+    };
 
     // --- Autolink, entity-link, temporal-link (Issue 12) ---
     let created_at = req
@@ -226,6 +250,7 @@ pub async fn create_memory(
 
     let mut response = MemoryResponse::from_cached(&memory, ns.name.clone());
     response.full_text = req.full_text;
+    response.supersedes = supersedes_outcome;
     let took = start.elapsed().as_micros() as u64;
 
     Ok((
@@ -1227,30 +1252,67 @@ pub async fn batch_store(
     }
 
     let mut created = Vec::with_capacity(req.memories.len());
+    let mut failed: Vec<BatchStoreFailure> = Vec::new();
 
-    for mem_req in req.memories {
-        // Validate. This endpoint silently skips invalid items rather
-        // than failing the whole batch, so an error here is a `continue`
-        // — but the limits themselves are the shared ones, which keeps
-        // an oversized summary from reaching the u16-prefixed on-disk
-        // record encoder.
-        if validate_memory_input(MemoryInputRef {
+    for (index, mem_req) in req.memories.into_iter().enumerate() {
+        // A bad item skips rather than failing the whole batch, but it no
+        // longer skips silently: every `continue` below records why. The
+        // limits themselves are the shared ones, which keeps an oversized
+        // summary from reaching the u16-prefixed on-disk record encoder.
+        if let Err(e) = validate_memory_input(MemoryInputRef {
             summary: &mem_req.summary,
             full_text: mem_req.full_text.as_deref(),
             tags: &mem_req.tags,
             entities: &mem_req.entities,
             topics: &mem_req.topics,
             emotions: &mem_req.emotions,
-        })
-        .is_err()
-        {
+        }) {
+            failed.push(BatchStoreFailure {
+                index,
+                error: e.to_string(),
+                field: None,
+            });
             continue;
         }
 
         let ns = match state.namespaces.resolve(&mem_req.namespace) {
             Some(ns) => ns,
-            None => continue,
+            None => {
+                failed.push(BatchStoreFailure {
+                    index,
+                    error: format!("namespace '{}' not found", mem_req.namespace),
+                    field: Some("namespace".into()),
+                });
+                continue;
+            }
         };
+
+        // Validate caller-specified links before creating anything, so a
+        // rejected link leaves no orphaned memory behind.
+        let mut link_error: Option<crate::graph::LinkError> = None;
+        for (field, target) in [
+            ("parentId", mem_req.parent_id),
+            ("supersedes", mem_req.supersedes),
+        ] {
+            if let Some(target) = target {
+                if let Err(e) = state
+                    .graph
+                    .check_link_target(field, None, target, ns.id)
+                    .await
+                {
+                    link_error = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = link_error {
+            failed.push(BatchStoreFailure {
+                index,
+                error: e.to_string(),
+                field: Some(e.field().into()),
+            });
+            continue;
+        }
 
         // Merge entities/topics/emotions into tags
         let mut merged_tags = mem_req.tags.clone();
@@ -1277,6 +1339,16 @@ pub async fn batch_store(
         let embedding = match mem_req.embedding {
             Some(ref vec) => {
                 if vec.len() != ns.embedding_dim as usize {
+                    failed.push(BatchStoreFailure {
+                        index,
+                        error: format!(
+                            "embedding has {} dimensions, namespace '{}' requires {}",
+                            vec.len(),
+                            ns.name,
+                            ns.embedding_dim
+                        ),
+                        field: Some("embedding".into()),
+                    });
                     continue;
                 }
                 vec.clone()
@@ -1291,7 +1363,14 @@ pub async fn batch_store(
                 }
                 match state.search.embed_text(&embed_text, ns.id).await {
                     Ok(emb) => emb,
-                    Err(_) => continue,
+                    Err(e) => {
+                        failed.push(BatchStoreFailure {
+                            index,
+                            error: format!("failed to generate embedding: {e}"),
+                            field: None,
+                        });
+                        continue;
+                    }
                 }
             }
         };
@@ -1312,7 +1391,14 @@ pub async fn batch_store(
             .await
         {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                failed.push(BatchStoreFailure {
+                    index,
+                    error: e.to_string(),
+                    field: None,
+                });
+                continue;
+            }
         };
 
         // Cache + index
@@ -1352,10 +1438,23 @@ pub async fn batch_store(
             )
             .await;
 
-        // Supersedes edge
-        if let Some(old_id) = mem_req.supersedes {
-            let _ = state.graph.add_edge(memory.id, old_id, "supersedes").await;
+        // Explicit links. Both targets were validated before this item was
+        // created, so failures here are durability details, not rejections.
+        if let Some(parent_id) = mem_req.parent_id {
+            if let Err(e) = state.graph.add_edge(parent_id, memory.id, "parent").await {
+                tracing::error!(
+                    memory_id = %memory.id,
+                    parent = %parent_id,
+                    %e,
+                    "parent edge could not be created after pre-validation passed"
+                );
+            }
         }
+
+        let supersedes_outcome = match mem_req.supersedes {
+            Some(old_id) => Some(state.graph.apply_supersedes_edge(memory.id, old_id).await),
+            None => None,
+        };
 
         // Post-creation links
         let created_at = mem_req
@@ -1376,6 +1475,7 @@ pub async fn batch_store(
         created.push(BatchStoreResult {
             id: memory.id,
             namespace: ns.name.clone(),
+            supersedes: supersedes_outcome,
         });
     }
 
@@ -1385,7 +1485,11 @@ pub async fn batch_store(
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse {
-            data: BatchStoreResponse { created, total },
+            data: BatchStoreResponse {
+                created,
+                total,
+                failed,
+            },
             took_us: Some(took),
         }),
     ))
