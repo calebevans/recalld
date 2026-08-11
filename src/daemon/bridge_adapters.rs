@@ -116,6 +116,16 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
 
+    async fn delete_memories(&self, ids: &[MemoryId]) -> Result<Vec<bool>, BridgeError> {
+        let params = serde_json::to_value(protocol::DeleteMemoriesParams {
+            ids: ids.iter().map(|id| id.to_string()).collect(),
+        })
+        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let result = self.client.call("delete_memories", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
+    }
+
     async fn reinforce_memory(
         &self,
         id: MemoryId,

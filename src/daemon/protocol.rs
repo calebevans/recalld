@@ -74,6 +74,14 @@ pub struct DeleteMemoryParams {
     pub id: String,
 }
 
+/// Parameters for the `delete_memories` RPC method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteMemoriesParams {
+    /// Memory IDs to delete, in the order the caller supplied them.
+    /// The reply carries one flag per id in the same order.
+    pub ids: Vec<String>,
+}
+
 /// Parameters for the `reinforce_memory` RPC method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReinforceParams {

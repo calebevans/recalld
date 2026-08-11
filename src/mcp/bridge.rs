@@ -61,6 +61,15 @@ pub trait StorageEngine: Send + Sync {
     /// Delete a memory by ID. Returns `true` if the memory existed and was deleted.
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, BridgeError>;
 
+    /// Delete many memories in one pass.
+    ///
+    /// Returns one flag per input id, in input order. `false` means the
+    /// memory was missing **or** already tombstoned — the same
+    /// conflation [`delete_memory`](Self::delete_memory) already makes,
+    /// kept rather than replaced with a third state a caller would have
+    /// to learn for the batch alone.
+    async fn delete_memories(&self, ids: &[MemoryId]) -> Result<Vec<bool>, BridgeError>;
+
     /// Reinforce a memory with the given FSRS quality rating (1-4).
     async fn reinforce_memory(
         &self,

@@ -1,8 +1,8 @@
 //! MCP tool definitions and handlers for Recalld memory operations.
 //!
-//! Defines 12 tools: store_memory, store_memories, recall_memories, get_memory,
-//! reinforce_memory, forget_memory, find_similar_memories, create_namespace,
-//! namespace_stats, list_memories, list_namespaces, list_tags.
+//! Defines 13 tools: store_memory, store_memories, recall_memories, get_memory,
+//! reinforce_memory, forget_memory, forget_memories, find_similar_memories,
+//! create_namespace, namespace_stats, list_memories, list_namespaces, list_tags.
 
 use serde_json::json;
 
@@ -43,6 +43,7 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
         get_memory_def(),
         reinforce_memory_def(),
         forget_memory_def(),
+        forget_memories_def(),
         find_similar_memories_def(),
         create_namespace_def(),
         namespace_stats_def(),
@@ -58,13 +59,14 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
 /// which advertises a tool that then answers "Unknown tool" — fails a
 /// test rather than a caller.
 #[cfg(test)]
-const DISPATCHED: [&str; 12] = [
+const DISPATCHED: [&str; 13] = [
     "store_memory",
     "store_memories",
     "recall_memories",
     "get_memory",
     "reinforce_memory",
     "forget_memory",
+    "forget_memories",
     "find_similar_memories",
     "create_namespace",
     "namespace_stats",
@@ -86,6 +88,7 @@ pub async fn dispatch_tool(
         "get_memory" => handle_get_memory(bridge, arguments).await,
         "reinforce_memory" => handle_reinforce_memory(bridge, arguments).await,
         "forget_memory" => handle_forget_memory(bridge, arguments).await,
+        "forget_memories" => handle_forget_memories(bridge, arguments).await,
         "find_similar_memories" => handle_find_similar_memories(bridge, arguments).await,
         "create_namespace" => handle_create_namespace(bridge, arguments).await,
         "namespace_stats" => handle_namespace_stats(bridge, arguments).await,
@@ -872,6 +875,139 @@ async fn handle_forget_memory(bridge: &McpBridge, arguments: serde_json::Value) 
             }
         }
         Err(e) => ToolCallResult::error(format!("Failed to delete memory: {e}")),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tool 5b: forget_memories (batch)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn forget_memories_def() -> ToolInfo {
+    ToolInfo {
+        name: "forget_memories".to_string(),
+        title: Some("Forget Memories (Batch)".to_string()),
+        description: "Delete several memories in a single call. Each moves to the \
+            Tombstone phase exactly as forget_memory describes: content erased, \
+            record and graph edges kept, UUID never reused, never reclaimed by the \
+            decay sweep. Returns an array of results, one per input id, in the order \
+            given. A `deleted: false` result means the id was unknown or the memory \
+            had already been forgotten."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_BATCH_MEMORIES,
+                    "items": { "type": "string", "format": "uuid" },
+                    "description": "Memory UUIDs to forget. Each moves to the Tombstone \
+                        phase; its graph edges are kept and its UUID is never reused."
+                }
+            },
+            "required": ["ids"]
+        }),
+        annotations: Some(ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+async fn handle_forget_memories(
+    bridge: &McpBridge,
+    arguments: serde_json::Value,
+) -> ToolCallResult {
+    // Same guard order as store_memories: missing key, wrong type,
+    // empty, over cap.
+    let ids_val = match arguments.get("ids") {
+        Some(v) => v,
+        None => return ToolCallResult::error("Missing required parameter: ids"),
+    };
+
+    let ids_arr = match ids_val.as_array() {
+        Some(arr) => arr,
+        None => return ToolCallResult::error("Parameter 'ids' must be an array"),
+    };
+
+    if ids_arr.is_empty() {
+        return ToolCallResult::error("Parameter 'ids' must not be empty");
+    }
+
+    if ids_arr.len() > MAX_BATCH_MEMORIES {
+        return ToolCallResult::error(format!(
+            "Too many ids (maximum {MAX_BATCH_MEMORIES} per call)"
+        ));
+    }
+
+    // UUIDs are parsed here, not at the bridge, so one malformed id
+    // becomes a per-item error instead of failing the whole batch. Each
+    // valid id keeps its original index so the results can be merged
+    // back in caller order.
+    let mut results: Vec<serde_json::Value> = vec![serde_json::Value::Null; ids_arr.len()];
+    let mut parsed: Vec<(usize, crate::model::MemoryId)> = Vec::with_capacity(ids_arr.len());
+
+    for (index, item) in ids_arr.iter().enumerate() {
+        let Some(id_str) = item.as_str() else {
+            results[index] = json!({
+                "index": index,
+                "error": format!("Parameter 'ids[{index}]' must be a string"),
+                "field": format!("ids[{index}]"),
+            });
+            continue;
+        };
+        match uuid::Uuid::parse_str(id_str) {
+            Ok(uuid) => parsed.push((index, crate::model::MemoryId::from_uuid(uuid))),
+            Err(_) => {
+                results[index] = json!({
+                    "index": index,
+                    "error": format!("Invalid UUID: {id_str}"),
+                    "field": format!("ids[{index}]"),
+                });
+            }
+        }
+    }
+
+    if !parsed.is_empty() {
+        let ids: Vec<crate::model::MemoryId> = parsed.iter().map(|(_, id)| *id).collect();
+        match bridge.storage.delete_memories(&ids).await {
+            Ok(flags) => {
+                for ((index, id), deleted) in parsed.iter().zip(flags) {
+                    results[*index] = json!({
+                        "index": index,
+                        "id": id.to_string(),
+                        "deleted": deleted,
+                    });
+                }
+            }
+            Err(e) => {
+                for (index, id) in &parsed {
+                    results[*index] = json!({
+                        "index": index,
+                        "id": id.to_string(),
+                        "error": format!("Failed to delete memory: {e}"),
+                    });
+                }
+            }
+        }
+    }
+
+    let deleted_count = results
+        .iter()
+        .filter(|r| r.get("deleted").and_then(|v| v.as_bool()) == Some(true))
+        .count();
+    let error_count = results.iter().filter(|r| r.get("error").is_some()).count();
+    let response = json!({
+        "results": results,
+        "total": results.len(),
+        "deleted": deleted_count,
+        "errors": error_count,
+    });
+    match ToolCallResult::json(&response) {
+        Ok(r) => r,
+        Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
     }
 }
 
@@ -1665,6 +1801,26 @@ mod tests {
         assert!(!obj.contains_key("nearDuplicates"), "{batch}");
     }
 
+    // ── Batch forget ─────────────────────────────────────────────────
+
+    /// The published bound and the enforced bound are the same constant,
+    /// so a client that trusts the schema cannot be told its request was
+    /// out of range. `minItems` matters too: an empty array is an error,
+    /// not a no-op, and the schema has to say so.
+    #[test]
+    fn w37_forget_memories_ids_bounds_match_the_batch_constant() {
+        let ids = forget_memories_def().input_schema["properties"]["ids"].clone();
+        assert_eq!(ids["type"], json!("array"));
+        assert_eq!(ids["maxItems"].as_u64(), Some(MAX_BATCH_MEMORIES as u64));
+        assert_eq!(ids["minItems"].as_u64(), Some(1));
+        assert_eq!(ids["items"]["type"], json!("string"));
+        assert_eq!(ids["items"]["format"], json!("uuid"));
+        assert_eq!(
+            forget_memories_def().input_schema["required"],
+            json!(["ids"])
+        );
+    }
+
     // ── Destructive-tool descriptions ────────────────────────────────
 
     /// `forget_memory` used to promise a permanent delete. It does not
@@ -1708,8 +1864,8 @@ mod tests {
     /// The count the module doc, the README and the guide all repeat. If
     /// it moves, they have to move with it.
     #[test]
-    fn t35_declares_twelve_tools() {
-        assert_eq!(tool_definitions().len(), 12);
+    fn t35_declares_thirteen_tools() {
+        assert_eq!(tool_definitions().len(), 13);
     }
 
     /// A definition without a dispatch arm advertises a tool that answers

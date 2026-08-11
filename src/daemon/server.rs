@@ -448,6 +448,17 @@ async fn dispatch(
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
+        "delete_memories" => {
+            let p: DeleteMemoriesParams = serde_json::from_value(params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            let mut ids = Vec::with_capacity(p.ids.len());
+            for id in &p.ids {
+                ids.push(parse_memory_id(id)?);
+            }
+            let result = storage.delete_memories(&ids).await?;
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
+        }
+
         "reinforce_memory" => {
             let p: ReinforceParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
@@ -545,6 +556,9 @@ mod tests {
             unreachable!()
         }
         async fn delete_memory(&self, _: MemoryId) -> Result<bool, BridgeError> {
+            unreachable!()
+        }
+        async fn delete_memories(&self, _: &[MemoryId]) -> Result<Vec<bool>, BridgeError> {
             unreachable!()
         }
         async fn reinforce_memory(

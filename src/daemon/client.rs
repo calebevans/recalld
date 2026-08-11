@@ -47,6 +47,18 @@ const MAX_STALE_SKIPS: usize = 8;
 /// state on each call (`reinforce_memory` moves the FSRS schedule), or have
 /// a return value that is not idempotent even where the effect is
 /// (`delete_memory` returns whether the memory existed).
+///
+/// The destructive methods are excluded for a sharper reason than
+/// "mutating". `delete_memories` returns a per-id flag vector whose
+/// values all flip to false on a replay, so a caller that got no answer
+/// the first time cannot distinguish "nothing was deleted" from
+/// "everything was deleted, twice". `delete_namespace` is worse: it
+/// removes a directory from disk, and a replay after an unknown outcome
+/// could destroy a namespace of the same name that the user recreated in
+/// between. Neither belongs on this list, and neither belongs on
+/// `records_accesses_only` — the honest report for a destructive call
+/// with an unknown outcome is the "may or may not have been applied"
+/// warning.
 fn is_retry_safe(method: &str) -> bool {
     matches!(
         method,
@@ -988,6 +1000,7 @@ mod tests {
             "create_namespace",
             "reinforce_memory",
             "delete_memory",
+            "delete_memories",
             "shutdown",
             // Not mutations, but not effect-free either: both record an
             // access per result, which moves the decay schedule.
@@ -1007,6 +1020,22 @@ mod tests {
             "list_tags",
         ] {
             assert!(is_retry_safe(method), "{method} should be replayable");
+        }
+    }
+
+    /// The destructive methods must be on neither list.
+    /// `records_accesses_only` downgrades the caller's warning from "may
+    /// or may not have been applied" to "just ask again", which is the
+    /// wrong thing to tell someone whose namespace may have been
+    /// destroyed.
+    #[test]
+    fn w42_the_destructive_methods_are_neither_retry_safe_nor_access_only() {
+        for method in ["delete_memories", "delete_namespace"] {
+            assert!(!is_retry_safe(method), "{method} must not be replayed");
+            assert!(
+                !records_accesses_only(method),
+                "{method} is destructive, not merely access-recording"
+            );
         }
     }
 

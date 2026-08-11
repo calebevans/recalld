@@ -1216,6 +1216,79 @@ impl bridge::StorageEngine for McpStorageAdapter {
         Ok(true)
     }
 
+    async fn delete_memories(&self, ids: &[MemoryId]) -> Result<Vec<bool>, bridge::BridgeError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ONE spawn_blocking holding ONE storage.write() for the whole
+        // batch. 100 memories go from 100 redb commits (100 fsyncs) to
+        // one, and from ~700 lock acquisitions to a handful.
+        //
+        // `batch_tombstone` is also the single source of truth for
+        // liveness here: only a `Tombstoned` outcome frees a vector
+        // slot, and a duplicate id reports `AlreadyTombstoned`, so the
+        // same slot cannot be freed twice — which would cycle the
+        // on-disk free list and underflow `live_count`.
+        let (flags, purged) = {
+            let storage = self.storage.clone();
+            let ids = ids.to_vec();
+            tokio::task::spawn_blocking(move || {
+                let mut storage_w = storage.write().map_err(|e| {
+                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                })?;
+
+                let outcomes = storage_w
+                    .meta_store()
+                    .batch_tombstone(&ids)
+                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+
+                let mut flags = Vec::with_capacity(outcomes.len());
+                let mut purged: Vec<(MemoryId, crate::model::DiskRecord)> = Vec::new();
+
+                for (id, outcome) in ids.iter().zip(outcomes) {
+                    match outcome {
+                        crate::storage::metadata::TombstoneOutcome::Tombstoned(record) => {
+                            let ns_id = NamespaceId::new(record.namespace_id);
+                            if let Err(e) = storage_w.free_vector_slot(ns_id, record.vector_slot) {
+                                tracing::warn!(
+                                    memory_id = %id,
+                                    vector_slot = record.vector_slot,
+                                    %e,
+                                    "vector slot free failed (non-fatal)"
+                                );
+                            }
+                            flags.push(true);
+                            purged.push((*id, record));
+                        }
+                        crate::storage::metadata::TombstoneOutcome::NotFound
+                        | crate::storage::metadata::TombstoneOutcome::AlreadyTombstoned => {
+                            flags.push(false)
+                        }
+                    }
+                }
+
+                Ok::<_, bridge::BridgeError>((flags, purged))
+            })
+            .await
+            .map_err(|e| {
+                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
+            })??
+        };
+
+        // One pass over the indexes for the whole batch, with the
+        // PRE-strip records so the entity names are still there.
+        crate::index_cleanup::purge_from_indexes(
+            &self.index_handles(),
+            &purged,
+            crate::index_cleanup::FtsAction::PerRecord,
+            crate::index_cleanup::GraphAction::MarkTombstoned,
+        )
+        .await;
+
+        Ok(flags)
+    }
+
     async fn reinforce_memory(
         &self,
         id: MemoryId,
@@ -2418,5 +2491,110 @@ mod tests {
             .get_node(&id)
             .expect("graph node is kept, not removed");
         assert_eq!(node.decay_phase, DecayPhase::Tombstone);
+    }
+
+    // ── delete_memories (batch) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn w26_delete_memories_returns_one_flag_per_id_in_input_order() {
+        let fx = Fixture::new();
+        let adapter = fx.storage_adapter();
+
+        let live = fx.insert_memory().await;
+        let already = fx.insert_memory().await;
+        fx.tombstone(already);
+        let missing = MemoryId::new();
+
+        let flags = adapter
+            .delete_memories(&[missing, live, already])
+            .await
+            .expect("batch delete");
+
+        assert_eq!(flags, vec![false, true, false]);
+        assert_eq!(
+            fx.record(live).expect("record survives").phase,
+            DecayPhase::Tombstone
+        );
+    }
+
+    #[tokio::test]
+    async fn w27_delete_memories_clears_every_index_for_every_deleted_id() {
+        let fx = Fixture::new();
+        let adapter = fx.storage_adapter();
+
+        let mut ids = Vec::new();
+        for name in ["Sarah", "Miguel"] {
+            let mut input = store_input(&format!("a fact about {name}"), "default", unit_x());
+            input.entities = vec![name.to_string()];
+            let stored = adapter.store_memory(input).await.expect("store");
+            ids.push(MemoryId::from_uuid(
+                uuid::Uuid::parse_str(&stored.id).expect("stored id is a uuid"),
+            ));
+        }
+
+        assert_eq!(fx.entity_index.read().await.len(), 2);
+
+        let flags = adapter.delete_memories(&ids).await.expect("batch delete");
+        assert_eq!(flags, vec![true, true]);
+
+        assert!(fx.fts_index.lock().await.is_empty().expect("fts"));
+        assert_eq!(
+            {
+                use crate::search::VectorIndex;
+                fx.vector_index.read().await.len()
+            },
+            0
+        );
+        assert_eq!(fx.entity_index.read().await.len(), 0);
+        let graph_r = fx.graph.read().await;
+        for id in &ids {
+            assert_eq!(
+                graph_r.get_node(id).expect("node kept").decay_phase,
+                DecayPhase::Tombstone
+            );
+        }
+    }
+
+    /// Freeing one vector slot twice writes the slot's own index into
+    /// its next-pointer, turning the on-disk free list into a
+    /// self-cycle: the allocator then hands the same slot to two
+    /// different memories, and `live_count` underflows. The batch is the
+    /// only place a caller can present the same id twice, so this is
+    /// where it has to be impossible.
+    #[tokio::test]
+    async fn w28_a_duplicate_id_in_one_batch_frees_its_vector_slot_once() {
+        let fx = Fixture::new();
+        let adapter = fx.storage_adapter();
+        let id = fx.insert_memory().await;
+
+        let flags = adapter
+            .delete_memories(&[id, id])
+            .await
+            .expect("batch delete");
+        assert_eq!(flags, vec![true, false], "the second pass deleted it again");
+
+        // A corrupted free list shows up as the next two allocations
+        // landing on the same slot.
+        let first = adapter
+            .store_memory(store_input("after the batch", "default", unit_x()))
+            .await
+            .expect("store");
+        let second = adapter
+            .store_memory(store_input("and again", "default", unit_x()))
+            .await
+            .expect("store");
+
+        let slot_of = |stored: &bridge::StoredMemory| {
+            fx.record(MemoryId::from_uuid(
+                uuid::Uuid::parse_str(&stored.id).expect("uuid"),
+            ))
+            .expect("record")
+            .vector_slot
+        };
+        assert_ne!(
+            slot_of(&first),
+            slot_of(&second),
+            "two memories were handed the same vector slot: the free list is a cycle"
+        );
     }
 }
