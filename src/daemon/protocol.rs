@@ -74,6 +74,14 @@ pub struct DeleteMemoryParams {
     pub id: String,
 }
 
+/// Parameters for the `delete_memories` RPC method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteMemoriesParams {
+    /// Memory IDs to delete, in the order the caller supplied them.
+    /// The reply carries one flag per id in the same order.
+    pub ids: Vec<String>,
+}
+
 /// Parameters for the `reinforce_memory` RPC method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReinforceParams {
@@ -116,6 +124,8 @@ pub const ERR_SEARCH: i32 = -32004;
 pub const ERR_INTERNAL: i32 = -32603;
 /// RPC error code: the request or response did not fit in a protocol frame.
 pub const ERR_TOO_LARGE: i32 = -32005;
+/// RPC error code: the operation failed after destroying something.
+pub const ERR_PARTIALLY_APPLIED: i32 = -32006;
 
 // ── BridgeError conversion ───────────────────────────────────────────
 
@@ -146,6 +156,10 @@ impl From<&BridgeError> for DaemonRpcError {
                 code: ERR_TOO_LARGE,
                 message: msg.clone(),
             },
+            BridgeError::PartiallyApplied(msg) => DaemonRpcError {
+                code: ERR_PARTIALLY_APPLIED,
+                message: msg.clone(),
+            },
         }
     }
 }
@@ -159,6 +173,7 @@ impl DaemonRpcError {
             ERR_STORAGE => BridgeError::Storage(self.message),
             ERR_SEARCH => BridgeError::Search(self.message),
             ERR_TOO_LARGE => BridgeError::TooLarge(self.message),
+            ERR_PARTIALLY_APPLIED => BridgeError::PartiallyApplied(self.message),
             _ => BridgeError::Internal(self.message),
         }
     }

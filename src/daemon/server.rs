@@ -12,8 +12,9 @@ use super::lifecycle;
 use super::protocol::*;
 use crate::Recalld;
 use crate::mcp::bridge::{
-    BridgeError, CreateNamespaceInput, HealthChecker, ListMemoriesInput, NamespaceRegistry,
-    SearchInput, SearchPipeline, StorageEngine as BridgeStorageEngine, StoreInput,
+    BridgeError, CreateNamespaceInput, DeleteNamespaceInput, HealthChecker, ListMemoriesInput,
+    ListTagsInput, NamespaceRegistry, SearchInput, SearchPipeline,
+    StorageEngine as BridgeStorageEngine, StoreInput,
 };
 use crate::mcp::bridge_adapters::*;
 use crate::model::MemoryId;
@@ -53,8 +54,15 @@ impl DaemonServer {
             std::sync::Arc::new(system.config().clone()),
             tz,
         ));
-        let namespaces: Arc<dyn NamespaceRegistry> =
-            Arc::new(McpNamespaceAdapter::new(system.storage().clone(), tz));
+        let namespaces: Arc<dyn NamespaceRegistry> = Arc::new(McpNamespaceAdapter::new(
+            system.storage().clone(),
+            system.cache().clone(),
+            system.vector_index().clone(),
+            system.fts_index().clone(),
+            system.entity_index().clone(),
+            system.graph().clone(),
+            tz,
+        ));
         let health: Arc<dyn HealthChecker> =
             Arc::new(McpHealthAdapter::new(system.storage().clone()));
 
@@ -447,6 +455,27 @@ async fn dispatch(
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
+        "delete_memories" => {
+            let p: DeleteMemoriesParams = serde_json::from_value(params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            // The socket is its own entry point: the tool layer's cap is
+            // not on this path, and an uncapped batch is one write
+            // transaction over an unbounded id list.
+            if p.ids.len() > crate::model::constants::MAX_BATCH_MEMORIES {
+                return Err(BridgeError::InvalidInput(format!(
+                    "Too many ids ({}); the maximum is {} per call",
+                    p.ids.len(),
+                    crate::model::constants::MAX_BATCH_MEMORIES
+                )));
+            }
+            let mut ids = Vec::with_capacity(p.ids.len());
+            for id in &p.ids {
+                ids.push(parse_memory_id(id)?);
+            }
+            let result = storage.delete_memories(&ids).await?;
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
+        }
+
         "reinforce_memory" => {
             let p: ReinforceParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
@@ -462,6 +491,13 @@ async fn dispatch(
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
+        "list_tags" => {
+            let input: ListTagsInput = serde_json::from_value(params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            let result = storage.list_tags(input).await?;
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
+        }
+
         "list_namespaces" => {
             let result = namespaces.list_namespaces().await?;
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
@@ -471,6 +507,13 @@ async fn dispatch(
             let input: CreateNamespaceInput = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let result = namespaces.create_namespace(input).await?;
+            serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
+        }
+
+        "delete_namespace" => {
+            let input: DeleteNamespaceInput = serde_json::from_value(params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            let result = namespaces.delete_namespace(input).await?;
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
@@ -496,8 +539,9 @@ async fn dispatch(
 mod tests {
     use super::*;
     use crate::mcp::bridge::{
-        DuplicateCluster, HealthStatus, ListMemoriesResponse, MemoryRecord, NamespaceInfo,
-        NamespaceStats, ReinforceResult, SearchHit, SearchResponse, StoredMemory,
+        DeleteNamespaceResult, DuplicateCluster, HealthStatus, ListMemoriesResponse,
+        ListTagsResponse, MemoryRecord, NamespaceInfo, NamespaceStats, ReinforceResult, SearchHit,
+        SearchResponse, StoredMemory,
     };
 
     /// Stub subsystems for the dispatch tests. Only the unknown-method path
@@ -539,6 +583,9 @@ mod tests {
         async fn delete_memory(&self, _: MemoryId) -> Result<bool, BridgeError> {
             unreachable!()
         }
+        async fn delete_memories(&self, _: &[MemoryId]) -> Result<Vec<bool>, BridgeError> {
+            unreachable!()
+        }
         async fn reinforce_memory(
             &self,
             _: MemoryId,
@@ -550,6 +597,9 @@ mod tests {
             &self,
             _: ListMemoriesInput,
         ) -> Result<ListMemoriesResponse, BridgeError> {
+            unreachable!()
+        }
+        async fn list_tags(&self, _: ListTagsInput) -> Result<ListTagsResponse, BridgeError> {
             unreachable!()
         }
     }
@@ -566,6 +616,12 @@ mod tests {
             unreachable!()
         }
         async fn namespace_stats(&self, _: &str) -> Result<NamespaceStats, BridgeError> {
+            unreachable!()
+        }
+        async fn delete_namespace(
+            &self,
+            _: DeleteNamespaceInput,
+        ) -> Result<DeleteNamespaceResult, BridgeError> {
             unreachable!()
         }
     }
@@ -766,6 +822,28 @@ mod tests {
     }
 
     // 24
+    /// The tool layer caps a `forget_memories` batch at
+    /// `MAX_BATCH_MEMORIES`, but the socket is its own entry point and
+    /// never runs the tool handler. Without this the frame goes straight
+    /// to one write transaction over an unbounded id list — and the stub
+    /// `delete_memories` is `unreachable!()`, so reaching it fails the
+    /// test rather than passing it quietly.
+    #[tokio::test]
+    async fn w70_delete_memories_caps_the_batch_at_the_shared_constant() {
+        let over_cap: Vec<String> = (0..crate::model::constants::MAX_BATCH_MEMORIES + 1)
+            .map(|_| crate::model::MemoryId::new().to_string())
+            .collect();
+
+        let err = dispatch_stub("delete_memories", serde_json::json!({ "ids": over_cap }))
+            .await
+            .expect_err("an over-cap batch must be refused");
+
+        assert!(
+            matches!(err, BridgeError::InvalidInput(ref m) if m.contains("Too many ids")),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_unknown_method_returns_invalid_input() {
         let err = dispatch_stub("no_such_method", serde_json::json!({}))
@@ -773,6 +851,17 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, BridgeError::InvalidInput(_)), "{err}");
         assert!(err.to_string().contains("no_such_method"), "{err}");
+    }
+
+    /// `list_tags` params have no serde default for `limit`, so an empty
+    /// object is rejected at decode time -- which is also why the `Unused`
+    /// stub's `list_tags` is never reached.
+    #[tokio::test]
+    async fn dispatch_list_tags_rejects_params_it_cannot_decode() {
+        let err = dispatch_stub("list_tags", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidInput(_)), "{err}");
     }
 
     #[tokio::test]

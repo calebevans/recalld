@@ -747,7 +747,9 @@ Shows decay forecast, at-risk memories, and storage breakdown.
 
 ## 6. MCP Tools Reference
 
-recalld exposes 10 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
+recalld exposes 14 MCP tools. These are available to any MCP client (Claude Code, Cursor, etc.) when recalld is configured as an MCP server.
+
+Deletion is worth reading before you use it. `forget_memory` and `forget_memories` do not free anything: a forgotten memory keeps its record and its graph edges for the life of the database, because the decay sweep never reclaims a tombstone. `delete_namespace` is the only operation that does — and it destroys everything else in the namespace along with them, with no undo and no backup.
 
 ### `store_memory`
 
@@ -764,6 +766,7 @@ Store a new memory.
 | `namespace` | string | No | Target namespace (default: `"default"`). |
 | `parentId` | string | No | UUID of an existing memory in the same namespace, linked as this memory's parent. The store fails if the target does not exist or is in a different namespace. |
 | `supersedes` | string | No | UUID of an existing memory in the same namespace that this one replaces. Recall REMOVES the old memory from results and returns this one in its place. The store fails if the target does not exist or is in a different namespace. |
+| `checkDuplicates` | boolean | No | Report existing memories that closely resemble this one (default: `true`). Never blocks the store; it only adds a `nearDuplicates` object to the result. |
 
 #### supersedes semantics
 
@@ -795,13 +798,54 @@ always says what actually happened to the link.
 - **Counted.** The new memory's `edgeCount` includes the supersedes edge.
   Memories stored before this behaviour existed are not backfilled.
 
+#### Near-duplicate warnings
+
+Every store compares the new memory against what is already there. When
+something is at least 0.85 cosine similar, the result carries a
+`nearDuplicates` object naming up to three existing memories, closest first,
+each with its id, score, and summary (truncated to 240 bytes).
+
+- **Advisory, never a block.** The memory is stored either way. The field is
+  absent — not `null` — when nothing crossed the threshold, when
+  `checkDuplicates: false` was passed, or when the namespace's vectors are
+  not L2-normalized.
+- **0.85 is the same number `find_similar_memories` scan mode uses**, so the
+  two surfaces cannot disagree about whether a pair of memories is a
+  duplicate. It is not configurable: the right value is a property of the
+  embedding model, not of the deployment.
+- **Scope.** Full- and summary-phase memories in the same namespace only —
+  the same set auto-linking considers. The phase is re-checked against the
+  stored record when the report is built, so a memory that has decayed or been
+  deleted since it was indexed is dropped rather than reported with an empty
+  summary.
+- **The recovery.** The warning arrives after the write, so acting on it
+  means undoing: `forget_memory` on the id you just created, then either
+  `reinforce_memory` on the existing memory (nothing new to say) or
+  `store_memory` again with `supersedes` set to the existing id (the fact
+  changed). Leave both only when they are genuinely distinct facts that
+  happen to read alike.
+- **Cost.** The scan is a linear pass over every vector in the index — all
+  namespaces, since the index is one flat array with a per-entry namespace
+  filter — so it scales with the total number of memories, not with the size
+  of the namespace being written to. Pass `checkDuplicates: false` during
+  bulk ingestion.
+- **Batches catch themselves.** `store_memories` indexes each item before
+  checking the next, so a batch containing the same fact twice reports the
+  second against the first.
+- **Normalization caveat.** Scores are dot products, which are cosine
+  similarities only for L2-normalized vectors. In a `passthrough` namespace
+  the caller supplies the vectors and nothing validates them, so the check
+  verifies the query vector first and skips rather than reporting a number
+  that is not a similarity. The skip is logged at `debug` every time and at
+  `warn` once per process.
+
 ### `store_memories`
 
 Store multiple memories in a single call. Each item has the same schema as `store_memory`. Returns an array of results, one per input memory.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `memories` | array | Yes | Array of memory objects (max 100 per call). Each object has the same fields as `store_memory`, including `supersedes` and its preconditions. |
+| `memories` | array | Yes | Array of memory objects (max 100 per call). Each object has the same fields as `store_memory`, including `supersedes` and its preconditions, and `checkDuplicates` — both are set per item, and `nearDuplicates` is reported per result entry. |
 
 ### `recall_memories`
 
@@ -841,11 +885,19 @@ Strengthen a memory so it decays more slowly.
 
 ### `forget_memory`
 
-Permanently delete a memory.
+Delete a memory's content. The memory moves to the Tombstone phase: its summary, full text and tags are erased and it stops appearing in recall, but its record and its graph edges are kept so relationship chains stay intact, and its UUID is never reused. Tombstoned memories are never reclaimed by the decay sweep, so they persist for the life of the database.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `id` | string | Yes | Memory UUID to delete. |
+| `id` | string | Yes | Memory UUID to forget. The memory moves to the Tombstone phase; its graph edges are kept and its UUID is never reused. |
+
+### `forget_memories`
+
+Delete several memories in one call. Each moves to the Tombstone phase exactly as `forget_memory` describes. Returns one result per input id, in the order given; `deleted: false` means the id was unknown or the memory had already been forgotten.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `ids` | string[] | Yes | Memory UUIDs to forget (1-100). Each moves to the Tombstone phase; graph edges are kept and UUIDs are never reused. |
 
 ### `find_similar_memories`
 
@@ -873,9 +925,24 @@ Create a new memory namespace.
 | `desiredRetention` | number | No | Target retention rate 0.0-1.0 (default: 0.9). |
 | `decayRateMultiplier` | number | No | Per-namespace decay rate multiplier. 1.0 = normal, 2.0 = 2x slower, 0.0 = disabled. Omit to inherit global setting. |
 
+### `delete_namespace`
+
+**Destructive and irreversible. There is no undo and no backup.** Destroys a namespace and everything in it: every memory, every graph edge touching one, its search index entries, and its vector file on disk.
+
+A namespace that still holds live memories is refused unless you pass `force: true`; the refusal names the count and touches nothing. A namespace holding only tombstones counts as empty and deletes without `force` — the response reports those separately as `tombstonesPurged`.
+
+This is the only operation that reclaims tombstones. The `default` namespace cannot be deleted, with or without `force`, and whether or not it is empty: it is recreated on every startup under the same directory name but with a new namespace id, so deleting it would leave a stale `vectors.dat` that the recreated namespace could silently reuse.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Namespace to delete (1-64 chars). The `default` namespace cannot be deleted. |
+| `force` | boolean | No | Delete the namespace even if it still holds memories (default: false). Forced deletion permanently destroys every memory in it and removes its vector file from disk. |
+
 ### `namespace_stats`
 
-Get statistics for a memory namespace including total memory count, phase breakdown (full/summary/ghost), permastore count, average strength, edge count, and vector storage size.
+Get statistics for a memory namespace including the live memory count, tombstone count, phase breakdown (full/summary/ghost), permastore count, average strength, edge count, and vector storage size.
+
+`memoryCount` counts live memories only and always equals `full + summary + ghost`. Deleted memories appear separately as `tombstoneCount`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -894,6 +961,24 @@ List memories in a namespace with pagination and optional filters. Unlike `recal
 | `entities` | string[] | No | Only return memories mentioning ALL of these entities. |
 | `timeRangeStart` | integer or string | No | Lower bound: epoch ms (integer) or ISO 8601 string. Only memories created at or after this time are returned. |
 | `timeRangeEnd` | integer or string | No | Upper bound: epoch ms (integer) or ISO 8601 string. Only memories created at or before this time are returned. |
+
+A `limit` above the maximum is rejected, not clamped: silently returning 200 rows to a caller who asked for 1000 makes a paginating agent believe it has seen the whole namespace.
+
+### `list_namespaces`
+
+List every namespace with its ID, embedding dimensions, live memory count, and creation date. Call this first when you do not know which namespaces exist. Counts exclude deleted memories.
+
+Takes no parameters.
+
+### `list_tags`
+
+List the tag vocabulary with per-label memory counts, most common first. Use it to reuse an existing tag instead of inventing a near-duplicate. Results come in four buckets — plain `tags`, plus `entities`, `topics`, and `emotions` — with the derived buckets' prefixes stripped so their names can be passed straight back to `store_memory` or `list_memories`. Counts cover live memories only.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `namespace` | string | No | Namespace to count within (default: `"default"`). |
+| `allNamespaces` | boolean | No | Count across every namespace (default: `false`). Cannot be combined with an explicit `namespace`. |
+| `limit` | integer | No | Maximum labels per bucket (default: 50, max: 500). Each bucket also reports its untruncated total. |
 
 ---
 

@@ -75,6 +75,15 @@ pub struct CreateMemoryApiRequest {
     /// the memory is backdated to this time instead of using the current time.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<i64>,
+
+    /// Whether to check the new memory against existing ones and report
+    /// near-duplicates on the response. Absent means enabled.
+    ///
+    /// `Option<bool>` rather than `bool` with a `default_true`: a bare
+    /// `#[serde(default)]` on a `bool` is `false`, which would silently
+    /// disable the check for every client that predates the field.
+    #[serde(default)]
+    pub check_duplicates: Option<bool>,
 }
 
 /// Default namespace name for request types.
@@ -174,8 +183,16 @@ pub struct NamespaceStatsResponse {
     /// Namespace integer ID.
     pub id: u32,
 
-    /// Total memory count in this namespace.
+    /// Number of live memories in this namespace. Excludes tombstoned
+    /// records, and always equals the sum of `phaseCounts`.
     pub memory_count: u64,
+
+    /// Number of tombstoned records still occupying a metadata row.
+    ///
+    /// Reported rather than folded into `memoryCount`: a namespace showing
+    /// one live memory where eleven were stored has ten tombstones, and an
+    /// operator auditing it needs to see that rather than guess.
+    pub tombstone_count: u64,
 
     /// Breakdown by decay phase.
     pub phase_counts: PhaseCounts,
@@ -183,16 +200,18 @@ pub struct NamespaceStatsResponse {
     /// Number of permastore memories.
     pub permastore_count: u64,
 
-    /// Average decay strength across all memories.
+    /// Average decay strength across the live memories.
     pub avg_strength: f32,
 
-    /// Total edge count for memories in this namespace.
+    /// Total edge count for the live memories in this namespace.
     pub edge_count: u64,
 
     /// Embedding dimensionality.
     pub embedding_dim: u32,
 
-    /// Disk space used by this namespace's vectors in bytes.
+    /// Logical bytes of live vector data
+    /// (`memoryCount` x `embeddingDim` x 4). NOT the size of
+    /// `vectors.dat`, which retains freed slots until compaction.
     pub vector_bytes: u64,
 }
 
@@ -573,6 +592,10 @@ pub struct BatchStoreResult {
     /// What became of the requested `supersedes` link, if one was asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<crate::model::SupersedesOutcome>,
+    /// Existing memories that closely resemble this item. Absent when
+    /// nothing crossed the threshold or the item disabled the check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub near_duplicates: Option<crate::model::NearDuplicateReport>,
 }
 
 /// A batch item that was rejected, and why.
@@ -610,7 +633,7 @@ pub struct ScanDuplicatesRequest {
 }
 
 fn default_duplicate_threshold() -> f32 {
-    0.85
+    crate::model::constants::DUPLICATE_SIMILARITY_THRESHOLD as f32
 }
 
 fn default_max_scan() -> usize {

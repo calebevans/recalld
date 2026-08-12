@@ -802,4 +802,86 @@ impl VectorManager {
     pub fn iter(&self) -> impl Iterator<Item = (NamespaceId, &VectorStore)> {
         self.stores.iter().map(|(&id, store)| (id, store))
     }
+
+    /// Forget a namespace's store, handing it back to the caller.
+    ///
+    /// Returns `None` if the namespace was never opened.
+    ///
+    /// # The returned store is still holding the file
+    ///
+    /// A [`VectorStore`] owns an fs2 **exclusive advisory lock** on
+    /// `vectors.dat` and a live `Mmap` over it, and it has no close
+    /// method — both are released by its `Drop`. A caller that is about
+    /// to `remove_dir_all` the namespace directory **must drop the
+    /// returned store first**. On Windows the unlink fails outright
+    /// while the mapping is open; on Unix it succeeds but the lock and
+    /// the mapping survive against the now-unlinked inode, so a
+    /// namespace recreated under the same directory name would be
+    /// locked out by a file nobody can see.
+    ///
+    /// Returning the store rather than dropping it here is deliberate:
+    /// it puts the drop at the call site, next to the unlink it has to
+    /// precede.
+    #[must_use = "the returned store holds an exclusive lock and a live mmap; \
+                  drop it before removing the namespace directory"]
+    pub fn remove(&mut self, namespace_id: NamespaceId) -> Option<VectorStore> {
+        self.stores.remove(&namespace_id)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+
+    const DIM: usize = 4;
+
+    /// `VectorStore` holds an fs2 exclusive advisory lock and a live
+    /// mmap with no close method, so a namespace deletion that unlinks
+    /// the directory while the store is still alive leaves the lock held
+    /// against an inode nobody can see — and the next namespace created
+    /// under the same name cannot open its own file. Handing the store
+    /// back and dropping it at the call site is what releases both.
+    #[test]
+    fn w11_a_removed_store_releases_its_lock_so_the_directory_can_be_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut manager = VectorManager::new(dir.path().to_path_buf());
+        let ns = NamespaceId::new(1);
+
+        manager
+            .open_or_create(ns, "scratch", DIM)
+            .expect("open_or_create")
+            .insert_vector(&[1.0; DIM])
+            .expect("insert vector");
+
+        let store = manager.remove(ns);
+        assert!(store.is_some(), "the store was open, so it must come back");
+        drop(store);
+
+        let ns_dir = dir.path().join("scratch");
+        std::fs::remove_dir_all(&ns_dir).expect("remove namespace directory");
+        assert!(!ns_dir.exists());
+
+        // The real proof: a fresh store opens at the same path. If the
+        // lock or the mapping had survived, this would fail or hand back
+        // the old file's contents.
+        let recreated = manager
+            .open_or_create(ns, "scratch", DIM)
+            .expect("recreate at the same path");
+        assert_eq!(
+            recreated.slot_count(),
+            0,
+            "the recreated namespace inherited the deleted one's vectors"
+        );
+    }
+
+    #[test]
+    fn w12_removing_a_namespace_that_was_never_opened_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut manager = VectorManager::new(dir.path().to_path_buf());
+        assert!(manager.remove(NamespaceId::new(42)).is_none());
+    }
 }

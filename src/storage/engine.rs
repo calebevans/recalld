@@ -7,9 +7,11 @@
 //!
 //! See Spec 04 Section 7 for the design rationale.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
 
+use crate::model::validation::validate_namespace_name;
 use crate::model::{
     AccessKind, DecayPhase, DiskRecord, EdgeType, MemoryId, NamespaceConfig, NamespaceId,
 };
@@ -342,6 +344,8 @@ impl RedbStorageEngine {
     /// 1. Rebuild phase index from meta.db.
     /// 2. Validate fulltext.dat header.
     /// 3. Clean up orphaned edges.
+    /// 4. Sweep namespace directories left behind by an interrupted
+    ///    namespace deletion into quarantine.
     fn startup_validation(&mut self) -> Result<(), StorageError> {
         tracing::info!("Running storage startup validation...");
 
@@ -362,8 +366,233 @@ impl RedbStorageEngine {
             );
         }
 
+        // 4. Sweep orphaned namespace directories. Deliberately not
+        //    allowed to fail startup: this is disk hygiene, and a
+        //    database that refuses to open because a stray directory
+        //    could not be inspected is a far worse outcome than the
+        //    wasted space.
+        match self.sweep_orphan_namespace_dirs() {
+            Ok(removed) if removed > 0 => {
+                tracing::warn!(
+                    quarantined = removed,
+                    path = %self.db_path.join(QUARANTINE_DIR_NAME).display(),
+                    "Moved orphaned namespace directories left by an interrupted \
+                     namespace deletion into quarantine. Nothing was deleted; remove \
+                     the quarantine directory by hand once you are satisfied."
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Orphaned-namespace-directory sweep failed; continuing startup"
+                );
+            }
+        }
+
         tracing::info!("Storage startup validation complete");
         Ok(())
+    }
+
+    /// Quarantine namespace directories that belong to no live
+    /// namespace.
+    ///
+    /// Cleans up after a `purge_namespace` that was interrupted between
+    /// deleting the `NAMESPACE_TABLE` row and removing the directory.
+    /// Returns the number of directories moved.
+    ///
+    /// Directories are MOVED to `<db_path>/.orphaned/`, not deleted —
+    /// see [`quarantine_orphan_dir`](Self::quarantine_orphan_dir) for
+    /// why the delete had no lower bound.
+    ///
+    /// # Why this cannot delete a live namespace
+    ///
+    /// [`open`](Self::open) step 6 calls `VectorManager::open_or_create`
+    /// for **every** namespace in `NAMESPACE_TABLE`, and
+    /// `open_or_create` creates the directory. That runs before step 7,
+    /// which is this. So at sweep time every live namespace provably
+    /// has a directory on disk and a name in `live`; there is no window
+    /// in which a live-but-not-yet-opened namespace could be swept.
+    ///
+    /// # Guards, and why each one is here
+    ///
+    /// `db_path` is user-configurable and may hold directories that have
+    /// nothing to do with recalld, so "the name matches no live
+    /// namespace" is not on its own a licence to recurse and delete.
+    /// Every candidate must additionally:
+    ///
+    /// - be a real directory. Types come from `read_dir`, which does
+    ///   **not** follow symlinks, so a symlink pointing outside
+    ///   `db_path` is reported as a symlink and skipped rather than
+    ///   followed into someone else's tree.
+    /// - have a UTF-8 name (a name we cannot compare against `live` is
+    ///   a name we cannot prove is dead). The comparison itself is ASCII
+    ///   case-folded: on a case-insensitive filesystem the live
+    ///   namespace `Notes` and the directory `notes/` are the same
+    ///   directory, and an exact-string compare would call it dead.
+    /// - not start with `.` — dotfile directories are conventionally
+    ///   somebody else's state.
+    /// - **contain `vectors.dat` and nothing else.** This is the load-
+    ///   bearing guard: it is the shape this code writes, so anything
+    ///   else in there is evidence the directory was not created by us.
+    ///
+    /// Anything that fails a guard is logged and left strictly alone.
+    fn sweep_orphan_namespace_dirs(&self) -> Result<usize, StorageError> {
+        // Case-folded, because the identity that matters here is the
+        // one the FILESYSTEM uses and macOS APFS is case-insensitive by
+        // default. An exact-string compare let a live namespace named
+        // `Notes` fail to claim the directory `notes/` that it is
+        // actually reading and writing — and the shape guard passes,
+        // because it is genuinely a namespace directory. The sweep then
+        // deleted a live namespace's vectors, unattended, at boot.
+        //
+        // Folding is the conservative direction: it can only ever make
+        // this refuse to delete something, never delete more.
+        let live: HashSet<String> = self
+            .meta_store
+            .list_namespaces()?
+            .into_iter()
+            .map(|ns| ns.name.to_ascii_lowercase())
+            .collect();
+
+        let mut removed = 0usize;
+
+        for entry in std::fs::read_dir(&self.db_path)? {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Could not read a data-directory entry; skipping");
+                    continue;
+                }
+            };
+
+            // read_dir file types do not follow symlinks.
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "Could not stat a data-directory entry; skipping"
+                    );
+                    continue;
+                }
+            }
+
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    "Data-directory entry has a non-UTF-8 name; leaving it alone"
+                );
+                continue;
+            };
+
+            if name.starts_with('.') || live.contains(&name.to_ascii_lowercase()) {
+                continue;
+            }
+
+            let dir = entry.path();
+            if !Self::looks_like_a_namespace_dir(&dir) {
+                tracing::warn!(
+                    path = %dir.display(),
+                    "Directory in the data directory matches no namespace but does not \
+                     have the shape of one; leaving it alone"
+                );
+                continue;
+            }
+
+            match self.quarantine_orphan_dir(name, &dir) {
+                Ok(moved_to) => {
+                    tracing::info!(
+                        namespace = name,
+                        from = %dir.display(),
+                        to = %moved_to.display(),
+                        "Quarantined orphaned namespace directory"
+                    );
+                    removed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "Failed to quarantine orphaned namespace directory"
+                    );
+                }
+            }
+        }
+
+        Ok(removed)
+    }
+
+    /// Move an orphaned namespace directory into
+    /// `<db_path>/.orphaned/<name>-<timestamp>/` instead of deleting it.
+    /// Returns where it went.
+    ///
+    /// # Why a rename and not `remove_dir_all`
+    ///
+    /// The sweep's whole argument for being safe is "every live
+    /// namespace has a row in `NAMESPACE_TABLE`, so a directory with no
+    /// row is dead". That argument has no lower bound: if `meta.db` is
+    /// absent or restored from an older backup, `live` is EMPTY and
+    /// every namespace directory in the data directory is a candidate.
+    /// The guards all pass — they are real namespace directories — and
+    /// a recursive delete of all of them is unrecoverable.
+    ///
+    /// A rename keeps the entire hygiene benefit (the directories stop
+    /// occupying the data directory and stop being reopened) with none
+    /// of the blast radius: whatever the sweep got wrong is still on
+    /// disk, named, timestamped, and can be moved back.
+    ///
+    /// Refusing to sweep when `live` is empty was the alternative. It is
+    /// strictly weaker — it does nothing for the case where `live` is
+    /// merely STALE rather than empty, which is the same restored-backup
+    /// scenario one namespace later — and it would break the legitimate
+    /// case of a fresh database with a leftover directory.
+    fn quarantine_orphan_dir(&self, name: &str, dir: &Path) -> Result<PathBuf, std::io::Error> {
+        let quarantine = self.db_path.join(QUARANTINE_DIR_NAME);
+        std::fs::create_dir_all(&quarantine)?;
+
+        // Same filesystem by construction — both are under db_path — so
+        // this is a rename, not a copy.
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let mut dest = quarantine.join(format!("{name}-{stamp}"));
+        // Two sweeps in the same second must not merge into one
+        // directory, and `rename` onto an existing directory is not an
+        // error on every platform.
+        let mut attempt = 1u32;
+        while dest.exists() {
+            dest = quarantine.join(format!("{name}-{stamp}-{attempt}"));
+            attempt += 1;
+        }
+
+        std::fs::rename(dir, &dest)?;
+        Ok(dest)
+    }
+
+    /// Whether `dir` has exactly the shape this code creates for a
+    /// namespace: one entry, named `vectors.dat`.
+    ///
+    /// Conservative on every uncertainty — an unreadable directory, an
+    /// unreadable entry, or a non-UTF-8 name all answer `false`, which
+    /// means "leave it alone".
+    fn looks_like_a_namespace_dir(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+
+        let mut saw_vectors = false;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            if entry.file_name() != std::ffi::OsStr::new("vectors.dat") {
+                return false;
+            }
+            saw_vectors = true;
+        }
+        saw_vectors
     }
 
     /// Return a reference to the underlying MetadataStore.
@@ -393,6 +622,459 @@ impl RedbStorageEngine {
         &self.db_path
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Namespace purge
+// ═══════════════════════════════════════════════════════════════════════
+
+/// What [`RedbStorageEngine::purge_namespace`] destroyed.
+#[derive(Debug)]
+pub struct PurgedNamespace {
+    /// The configuration of the namespace that was removed.
+    pub config: NamespaceConfig,
+    /// Every record removed, as it was on disk. The caller needs these
+    /// to clean the indexes storage cannot reach.
+    pub records: Vec<(MemoryId, DiskRecord)>,
+    /// How many of `records` were live (not tombstoned).
+    pub live_removed: usize,
+    /// How many of `records` were already tombstones.
+    pub tombstones_removed: usize,
+    /// Edge rows deleted from edges.db, counting edges in which a
+    /// purged memory was the target as well as the source.
+    pub edges_removed: usize,
+    /// Surviving memories whose outgoing `edge_count` was corrected
+    /// because an edge of theirs pointed into the purged namespace, with
+    /// their new count. The caller owes these an invalidation: their
+    /// cached record still holds the old number.
+    pub peer_edge_counts: Vec<(MemoryId, u16)>,
+    /// Whether the namespace's vector directory was removed. `false`
+    /// means it was already gone, or a guard refused to touch it.
+    pub directory_removed: bool,
+}
+
+/// A [`RedbStorageEngine::purge_namespace`] that failed.
+///
+/// A purge is chunked and multi-step, so "it failed" says nothing about
+/// how much survived. `destroyed` is the answer, and it is not
+/// diagnostic decoration: those records are permanently gone from
+/// `META_TABLE` and still occupy the FTS, vector, entity and graph
+/// indexes, which only the caller can reach. Dropping the list strands
+/// them there forever — a retry cannot find them, because it looks in
+/// `META_TABLE`.
+#[derive(Debug)]
+pub struct NamespacePurgeError {
+    /// Records this purge destroyed before it stopped. Empty when it
+    /// failed before touching anything.
+    pub destroyed: Vec<(MemoryId, DiskRecord)>,
+    /// What stopped it.
+    pub source: StorageError,
+}
+
+impl NamespacePurgeError {
+    /// A failure that happened before any record was committed.
+    fn nothing_destroyed(source: StorageError) -> Self {
+        Self {
+            destroyed: Vec::new(),
+            source,
+        }
+    }
+
+    /// A failure that happened after `destroyed` was already gone.
+    fn partial(destroyed: Vec<(MemoryId, DiskRecord)>, source: StorageError) -> Self {
+        Self { destroyed, source }
+    }
+
+    /// Whether anything was destroyed before the failure. A caller that
+    /// reports a bare failure for this case is lying to its user.
+    pub fn is_partial(&self) -> bool {
+        !self.destroyed.is_empty()
+    }
+}
+
+impl std::fmt::Display for NamespacePurgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_partial() {
+            write!(
+                f,
+                "the namespace was PARTIALLY destroyed: {} memories are permanently \
+                 gone and the namespace still exists. Re-run the deletion to finish \
+                 it. Cause: {}",
+                self.destroyed.len(),
+                self.source
+            )
+        } else {
+            write!(f, "{}", self.source)
+        }
+    }
+}
+
+impl std::error::Error for NamespacePurgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl RedbStorageEngine {
+    /// Destroy a namespace: its records, its edges, its configuration
+    /// row and its vector file.
+    ///
+    /// # DESTRUCTIVE AND IRREVERSIBLE
+    ///
+    /// Every memory in the namespace is gone when this returns. There
+    /// is no undo and no backup. Callers are expected to have obtained
+    /// explicit confirmation before getting here.
+    ///
+    /// # The caller must finish the job
+    ///
+    /// This method can only reach what storage owns. The returned
+    /// records are the caller's input for cleaning the FTS index, the
+    /// in-memory vector index, the entity index and the relationship
+    /// graph — none of which this layer holds a handle to. Skip that and
+    /// the namespace is gone from disk but still burning top-k slots in
+    /// every search.
+    ///
+    /// # Ordering, and what a crash costs
+    ///
+    /// 1. Purge `META_TABLE` rows (chunked).
+    /// 2. Purge edges.
+    /// 3. Delete the `NAMESPACE_TABLE` row. **Point of no return.**
+    /// 4. Drop the `VectorStore`, then remove the directory.
+    ///
+    /// A crash before (3) leaves a live namespace holding fewer
+    /// memories: ugly, but consistent, and re-running the call finishes
+    /// it. A crash after (3) leaves an orphan directory and orphan FTS
+    /// rows — wasted disk, no wrong answers — and the directory is
+    /// reclaimed by the boot sweep in `startup_validation`.
+    ///
+    /// No crash marker is needed. Namespace ids are never recycled and
+    /// `NAMESPACE_TABLE` is authoritative, so "the row is gone" is
+    /// itself the durable record that the namespace is dead.
+    ///
+    /// # A failure is not the same as "nothing happened"
+    ///
+    /// Step 1 commits in chunks, so an ERROR — not merely a crash — part
+    /// of the way through has already destroyed everything up to that
+    /// point. The error type carries those records for exactly the
+    /// reason the success type does: without them the caller cannot
+    /// clean the indexes, and nothing ever can, because a retry finds
+    /// their `META_TABLE` rows already gone and reports an empty purge.
+    pub fn purge_namespace(
+        &mut self,
+        namespace_id: NamespaceId,
+    ) -> Result<PurgedNamespace, NamespacePurgeError> {
+        let config = match self.meta_store.get_namespace(namespace_id) {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                return Err(NamespacePurgeError::nothing_destroyed(
+                    StorageError::NamespaceNotFound(namespace_id.get()),
+                ));
+            }
+            Err(e) => return Err(NamespacePurgeError::nothing_destroyed(e)),
+        };
+
+        tracing::info!(
+            namespace = %config.name,
+            namespace_id = namespace_id.get(),
+            "Purging namespace (destructive, irreversible)"
+        );
+
+        // 1. Records. This is the pass that reaches tombstones.
+        let records = match self
+            .meta_store
+            .purge_namespace_records(namespace_id, PURGE_CHUNK_SIZE)
+        {
+            Ok(records) => records,
+            Err(partial) => {
+                tracing::error!(
+                    namespace = %config.name,
+                    destroyed = partial.destroyed.len(),
+                    error = %partial.source,
+                    "Namespace purge failed part-way; the records it had already \
+                     committed are permanently gone"
+                );
+                return Err(NamespacePurgeError {
+                    destroyed: partial.destroyed,
+                    source: partial.source,
+                });
+            }
+        };
+
+        let live_removed = records
+            .iter()
+            .filter(|(_, r)| r.phase != DecayPhase::Tombstone)
+            .count();
+        let tombstones_removed = records.len() - live_removed;
+
+        // From here on every record in `records` is already destroyed,
+        // so any failure hands them back rather than dropping them.
+        // 2. Edges. `remove_all_edges` covers both directions, so an
+        //    edge from a surviving memory into a purged one goes too —
+        //    and the survivor's cached outgoing count has to follow it.
+        let ids: Vec<MemoryId> = records.iter().map(|(id, _)| *id).collect();
+        let (edges_removed, peer_edge_counts) = match self.remove_edges_and_repair_peers(&ids) {
+            Ok(pair) => pair,
+            Err(e) => return Err(NamespacePurgeError::partial(records, e)),
+        };
+
+        // 3. Configuration row. Point of no return.
+        if let Err(e) = self.meta_store.delete_namespace(namespace_id) {
+            return Err(NamespacePurgeError::partial(records, e));
+        }
+
+        // 4. Vector file. The store must be dropped before the unlink:
+        //    it holds an fs2 exclusive lock and a live mmap.
+        let store = self.vector_manager.remove(namespace_id);
+        drop(store);
+
+        let directory_removed = self.remove_namespace_dir(&config.name);
+
+        tracing::info!(
+            namespace = %config.name,
+            namespace_id = namespace_id.get(),
+            live_removed,
+            tombstones_removed,
+            edges_removed,
+            directory_removed,
+            "Namespace purge complete"
+        );
+
+        Ok(PurgedNamespace {
+            config,
+            records,
+            live_removed,
+            tombstones_removed,
+            edges_removed,
+            peer_edge_counts,
+            directory_removed,
+        })
+    }
+
+    /// Remove every edge touching `ids`, and repair the outgoing
+    /// `edge_count` of every SURVIVING memory that had an edge into one
+    /// of them. Returns the edges removed and the `(peer, new_count)`
+    /// pairs that were rewritten.
+    ///
+    /// # Why anything needs repairing
+    ///
+    /// `DiskRecord.edge_count` counts OUTGOING edges and only the
+    /// source's count ever moves — see
+    /// `explicit_links::bump_edge_count`. Nothing in the system
+    /// decrements it, and until a memory is *destroyed* nothing needs
+    /// to: `tombstone` keeps the record and its edges, so the count
+    /// stays true.
+    ///
+    /// Destroying a memory breaks that. `survivor -> destroyed`
+    /// disappears from edges.db while the survivor's record goes on
+    /// counting it, permanently, and that number feeds degree
+    /// centrality and cache weight. Cross-namespace survivors are the
+    /// visible case — a namespace purge is the one operation that
+    /// removes edges from memories it is not deleting.
+    fn remove_edges_and_repair_peers(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<(usize, Vec<(MemoryId, u16)>), StorageError> {
+        let doomed: HashSet<MemoryId> = ids.iter().copied().collect();
+        let mut lost: HashMap<MemoryId, u16> = HashMap::new();
+        let mut edges_removed = 0usize;
+
+        for id in ids {
+            // Read before removing: these are the memories whose
+            // OUTGOING edge is about to vanish. A source that is itself
+            // doomed needs no repair — its record is going too.
+            for (source, _) in self.edge_store.get_incoming(*id)? {
+                if !doomed.contains(&source) {
+                    let entry = lost.entry(source).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                }
+            }
+            edges_removed += self.edge_store.remove_all_edges(*id)?;
+        }
+
+        let mut repaired = Vec::with_capacity(lost.len());
+        for (peer, n) in lost {
+            let Some(record) = self.meta_store.get(peer)? else {
+                continue;
+            };
+            let new_count = record.edge_count.saturating_sub(n);
+            self.meta_store.update_edge_count(peer, new_count)?;
+            repaired.push((peer, new_count));
+        }
+
+        Ok((edges_removed, repaired))
+    }
+
+    /// Resolve a namespace name to its directory under `db_path`,
+    /// refusing anything that is not exactly one ordinary path
+    /// component.
+    ///
+    /// `Path::join` does **not** normalize, so this is the whole
+    /// defence between a namespace name and an arbitrary directory:
+    /// `db_path.join("..")` is the parent of the data directory and
+    /// `db_path.join("")` is the data directory itself. Both are
+    /// `remove_dir_all` targets in [`Self::remove_namespace_dir`].
+    ///
+    /// Modelled on the check
+    /// [`VectorManager::open_or_create`](crate::storage::vectors::VectorManager::open_or_create)
+    /// already performs — the non-destructive path had no business
+    /// being the better-guarded one.
+    fn namespace_dir(&self, name: &str) -> Result<PathBuf, StorageError> {
+        let reject = |reason: &str| {
+            Err(StorageError::InvalidNamespaceName {
+                name: name.to_string(),
+                reason: reason.to_string(),
+            })
+        };
+
+        // Separators are refused explicitly rather than left to
+        // `components`: a backslash is a separator on Windows and an
+        // ordinary character on Unix, and a name that means two
+        // different paths on two platforms is not a name this may act
+        // on.
+        if name.is_empty() {
+            return reject("must not be empty");
+        }
+        if name.contains('/') || name.contains('\\') {
+            return reject("must not contain '/' or '\\'");
+        }
+
+        let mut components = Path::new(name).components();
+        let first_is_the_whole_name =
+            matches!(components.next(), Some(Component::Normal(c)) if c == OsStr::new(name));
+        if !first_is_the_whole_name || components.next().is_some() {
+            return reject(
+                "must be exactly one ordinary path component (not '.', '..', or a path)",
+            );
+        }
+
+        Ok(self.db_path.join(name))
+    }
+
+    /// Remove one namespace's vector directory. Returns whether it was
+    /// actually removed.
+    ///
+    /// Unlike the boot sweep this joins a name straight onto `db_path`
+    /// rather than walking `read_dir`, so it does its own guarding:
+    ///
+    /// - [`Self::namespace_dir`] refuses anything that is not one
+    ///   ordinary path component, which is what keeps `..` and `""`
+    ///   away from `remove_dir_all`.
+    /// - a symlink is refused rather than followed: `remove_dir_all`
+    ///   follows a symlinked *root*, and a namespace directory replaced
+    ///   by a symlink would hand it an arbitrary tree to delete.
+    /// - the canonicalized target must be a strict child of the
+    ///   canonicalized `db_path`. The component check already implies
+    ///   this; canonicalizing is what *proves* it, and proof is what a
+    ///   recursive delete is worth.
+    ///
+    /// Never returns an error. Step 3 of the purge has already
+    /// committed by the time this runs, so a failure here is wasted disk
+    /// to be logged and swept at next boot, not a reason to report the
+    /// deletion as failed.
+    fn remove_namespace_dir(&self, name: &str) -> bool {
+        let dir = match self.namespace_dir(name) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::error!(
+                    namespace = name,
+                    error = %e,
+                    "Refusing to remove a namespace directory for an unusable name"
+                );
+                return false;
+            }
+        };
+
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "Could not stat namespace directory; leaving it on disk"
+                );
+                return false;
+            }
+        };
+
+        if metadata.file_type().is_symlink() {
+            tracing::warn!(
+                path = %dir.display(),
+                "Namespace directory is a symlink; refusing to follow it. Remove the \
+                 link target by hand if it really is namespace data."
+            );
+            return false;
+        }
+
+        if !metadata.is_dir() {
+            tracing::warn!(
+                path = %dir.display(),
+                "Namespace path is not a directory; leaving it alone"
+            );
+            return false;
+        }
+
+        // The last word before the recursive delete: resolve both ends
+        // and require a strict parent/child relationship.
+        let canonical_base = match self.db_path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.db_path.display(),
+                    error = %e,
+                    "Could not canonicalize the data directory; leaving the namespace \
+                     directory on disk"
+                );
+                return false;
+            }
+        };
+        let canonical_dir = match dir.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "Could not canonicalize the namespace directory; leaving it on disk"
+                );
+                return false;
+            }
+        };
+        if canonical_dir.parent() != Some(canonical_base.as_path()) {
+            tracing::error!(
+                namespace = name,
+                path = %canonical_dir.display(),
+                base = %canonical_base.display(),
+                "Namespace directory does not resolve to a direct child of the data \
+                 directory; refusing to remove it"
+            );
+            return false;
+        }
+
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "Failed to remove namespace directory; it will be swept at next startup"
+                );
+                false
+            }
+        }
+    }
+}
+
+/// Where the boot sweep moves orphaned namespace directories.
+///
+/// Leading dot on purpose: the sweep skips dotfile directories, so its
+/// own quarantine can never become a candidate for the next sweep.
+const QUARANTINE_DIR_NAME: &str = ".orphaned";
+
+/// How many records one `purge_namespace_records` transaction commits.
+///
+/// Bounds how long a purge holds the redb write lock. Small enough that
+/// a concurrent reader is not stalled for seconds; large enough that a
+/// hundred-thousand-record namespace is not a hundred thousand fsyncs.
+const PURGE_CHUNK_SIZE: usize = 1_000;
 
 // ═══════════════════════════════════════════════════════════════════════
 // StorageEngine Implementation
@@ -510,8 +1192,9 @@ impl StorageEngine for RedbStorageEngine {
             let _ = vector_store.free_slot(record.vector_slot);
         }
 
-        // 3. Remove all edges involving this memory.
-        self.edge_store.remove_all_edges(id)?;
+        // 3. Remove all edges involving this memory, repairing the
+        //    outgoing count of every survivor that pointed at it.
+        self.remove_edges_and_repair_peers(&[id])?;
 
         // 4. Text.log space is reclaimed lazily via compaction.
 
@@ -623,12 +1306,45 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Namespaces ──────────────────────────────────────────────────
 
+    /// # The row must never outlive the directory
+    ///
+    /// This used to commit the `NAMESPACE_TABLE` row and only then ask
+    /// `open_or_create` whether the name could be a directory. A
+    /// rejected name therefore left a committed row for a namespace
+    /// whose directory can never be created — and [`Self::open`] step 6
+    /// calls `open_or_create` for **every** row and `?`-propagates, so
+    /// the next boot failed outright. One rejected `create_namespace`
+    /// call wedged the database.
+    ///
+    /// So: validate first, and roll the row back if the vector store
+    /// still refuses. Validation cannot see a directory already flocked
+    /// by another store or a full disk, and both wedge the boot in
+    /// exactly the same way.
     fn create_namespace(&mut self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
+        validate_namespace_name(&config.name).map_err(|e| StorageError::InvalidNamespaceName {
+            name: config.name.clone(),
+            reason: e.to_string(),
+        })?;
+
         let ns_id = self.meta_store.create_namespace(config)?;
 
         // Open/create the vector file for this namespace.
-        self.vector_manager
-            .open_or_create(ns_id, &config.name, config.embedding_dim as usize)?;
+        if let Err(e) =
+            self.vector_manager
+                .open_or_create(ns_id, &config.name, config.embedding_dim as usize)
+        {
+            if let Err(rollback) = self.meta_store.delete_namespace(ns_id) {
+                tracing::error!(
+                    namespace = %config.name,
+                    namespace_id = ns_id.get(),
+                    error = %rollback,
+                    "Could not roll back the namespace row after its vector store failed \
+                     to open. The next startup will fail to open this namespace; remove \
+                     the row by hand."
+                );
+            }
+            return Err(e.into());
+        }
 
         Ok(ns_id)
     }
@@ -782,5 +1498,700 @@ impl StorageEngine for RedbStorageEngine {
 
     fn persist_phase_index(&self) -> Result<(), StorageError> {
         self.meta_store.persist_phase_index()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::EdgeType;
+
+    const DIM: usize = 4;
+
+    fn open_engine(dir: &Path) -> RedbStorageEngine {
+        RedbStorageEngine::open(dir).expect("open engine")
+    }
+
+    fn make_namespace(engine: &mut RedbStorageEngine, name: &str) -> NamespaceId {
+        let mut config = NamespaceConfig::default_namespace(0);
+        config.name = name.to_string();
+        config.embedding_dim = DIM as u32;
+        engine.create_namespace(&config).expect("create namespace")
+    }
+
+    fn add_memory(engine: &mut RedbStorageEngine, namespace_id: NamespaceId) -> MemoryId {
+        let id = MemoryId::new();
+        let mut record = DiskRecord {
+            version: DiskRecord::CURRENT_VERSION,
+            id: *id.as_bytes(),
+            namespace_id: namespace_id.get(),
+            created_at: 0,
+            last_accessed_at: 0,
+            phase: DecayPhase::Full,
+            strength: 1.0,
+            decay_strength: 1.0,
+            stability: 1.0,
+            difficulty: 5.0,
+            is_permastore: 0,
+            vector_slot: 0,
+            edge_count: 0,
+            summary: "fixture".into(),
+            tags: Vec::new(),
+            access_history: Vec::new(),
+            text_offset: 0,
+            text_length: 0,
+        };
+        engine
+            .insert_memory(id, namespace_id, &mut record, &[0.0; DIM], None)
+            .expect("insert memory");
+        id
+    }
+
+    /// The directory shape the boot sweep recognizes, planted by hand.
+    /// True when `root` lives on a case-insensitive filesystem, as APFS on
+    /// macOS is by default.
+    ///
+    /// Tests that plant a case variant of a live namespace's directory have
+    /// to know this: on such a filesystem the variant is not a second
+    /// directory, it is the same one, so planting into it overwrites the
+    /// live namespace's real `vectors.dat`.
+    fn filesystem_is_case_insensitive(root: &Path) -> bool {
+        let probe = root.join("CaseProbe");
+        std::fs::create_dir_all(&probe).expect("create case probe");
+        let insensitive = root.join("caseprobe").exists();
+        std::fs::remove_dir_all(&probe).expect("remove case probe");
+        insensitive
+    }
+
+    fn plant_orphan_dir(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("create orphan dir");
+        std::fs::write(dir.join("vectors.dat"), b"not really a vector file")
+            .expect("write vectors.dat");
+        dir
+    }
+
+    // ── purge_namespace ──────────────────────────────────────────────
+
+    #[test]
+    fn w13_purge_removes_records_edges_the_config_row_and_the_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let ns = make_namespace(&mut engine, "scratch");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .add_edge(a, b, EdgeType::Associative, 0.5, false, 0)
+            .expect("add edge");
+
+        let purged = engine.purge_namespace(ns).expect("purge");
+
+        assert_eq!(purged.config.name, "scratch");
+        assert_eq!(purged.records.len(), 2);
+        assert_eq!(purged.live_removed, 2);
+        assert_eq!(purged.tombstones_removed, 0);
+        assert_eq!(purged.edges_removed, 1);
+        assert!(purged.directory_removed);
+
+        assert!(engine.get_record(a).expect("get").is_none());
+        assert!(engine.get_record(b).expect("get").is_none());
+        assert!(engine.get_namespace(ns).expect("get namespace").is_none());
+        assert!(engine.load_all_edges().expect("edges").is_empty());
+        assert!(!dir.path().join("scratch").exists());
+    }
+
+    /// An edge from a surviving memory *into* a purged one is as dead as
+    /// one that starts there. Leaving it behind would point the graph at
+    /// a memory that no longer exists.
+    #[test]
+    fn w14_purge_removes_edges_that_point_into_the_namespace_from_outside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let keep = make_namespace(&mut engine, "keep");
+        let doomed = make_namespace(&mut engine, "doomed");
+        let survivor = add_memory(&mut engine, keep);
+        let victim = add_memory(&mut engine, doomed);
+        engine
+            .add_edge(survivor, victim, EdgeType::Associative, 0.5, false, 0)
+            .expect("add edge");
+
+        let purged = engine.purge_namespace(doomed).expect("purge");
+
+        assert_eq!(purged.edges_removed, 1);
+        assert!(engine.load_all_edges().expect("edges").is_empty());
+        assert!(
+            engine.get_record(survivor).expect("get").is_some(),
+            "the surviving memory was destroyed along with the edge"
+        );
+    }
+
+    /// A purge that resumes after a crash between the config-row delete
+    /// and the unlink finds no directory. That is a completed deletion,
+    /// not a failure.
+    #[test]
+    fn w15_purge_tolerates_a_directory_that_is_already_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let ns = make_namespace(&mut engine, "scratch");
+        add_memory(&mut engine, ns);
+
+        // Drop the store first, exactly as the purge would.
+        drop(engine.vector_manager_mut().remove(ns));
+        std::fs::remove_dir_all(dir.path().join("scratch")).expect("remove dir early");
+
+        let purged = engine.purge_namespace(ns).expect("purge");
+        assert!(!purged.directory_removed);
+        assert_eq!(purged.records.len(), 1);
+    }
+
+    #[test]
+    fn w16_boot_sweep_removes_a_namespace_shaped_directory_with_no_live_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let _engine = open_engine(dir.path());
+        }
+        let orphan = plant_orphan_dir(dir.path(), "ghost-namespace");
+
+        let _engine = open_engine(dir.path());
+        assert!(
+            !orphan.exists(),
+            "orphan directory was left in the data directory"
+        );
+        assert_eq!(
+            quarantined(dir.path()).len(),
+            1,
+            "the orphan was destroyed rather than quarantined"
+        );
+    }
+
+    /// The sweep's safety argument — "no NAMESPACE_TABLE row means dead"
+    /// — has no lower bound: an absent or restored-from-backup meta.db
+    /// makes `live` empty and EVERY namespace directory a candidate.
+    /// Every guard passes, because they really are namespace
+    /// directories. Quarantine is what makes that survivable.
+    #[test]
+    fn w59_a_swept_directory_is_moved_not_destroyed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let mut engine = open_engine(dir.path());
+            make_namespace(&mut engine, "irreplaceable");
+            std::fs::write(
+                dir.path().join("irreplaceable").join("vectors.dat"),
+                b"the only copy",
+            )
+            .expect("write vectors.dat");
+        }
+
+        // The restored-backup shape: the namespace rows are gone, the
+        // directories are not.
+        std::fs::remove_file(dir.path().join("meta.db")).expect("remove meta.db");
+
+        {
+            let _engine = open_engine(dir.path());
+        }
+
+        let survivors = quarantined(dir.path());
+        assert_eq!(survivors.len(), 1, "{survivors:?}");
+        assert!(
+            survivors[0]
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("irreplaceable-")),
+            "the quarantined directory must be named after the namespace: {survivors:?}"
+        );
+        assert_eq!(
+            std::fs::read(survivors[0].join("vectors.dat")).expect("read"),
+            b"the only copy",
+            "the quarantined directory does not hold the original contents"
+        );
+    }
+
+    /// The quarantine directory must never become the next sweep's
+    /// candidate, or the recovery copy is swept into a copy of itself
+    /// every boot.
+    #[test]
+    fn w60_the_quarantine_directory_is_not_itself_swept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let _engine = open_engine(dir.path());
+        }
+        plant_orphan_dir(dir.path(), "ghost");
+
+        {
+            let _engine = open_engine(dir.path());
+        }
+        let after_first = quarantined(dir.path());
+        assert_eq!(after_first.len(), 1);
+
+        {
+            let _engine = open_engine(dir.path());
+        }
+        assert_eq!(
+            quarantined(dir.path()),
+            after_first,
+            "the second boot moved the quarantine"
+        );
+    }
+
+    /// Everything currently in `<db_path>/.orphaned/`, sorted.
+    fn quarantined(db_path: &Path) -> Vec<PathBuf> {
+        let quarantine = db_path.join(QUARANTINE_DIR_NAME);
+        let Ok(entries) = std::fs::read_dir(&quarantine) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        out.sort();
+        out
+    }
+
+    /// `db_path` is user-configurable and may hold directories that are
+    /// nothing to do with recalld. "Matches no live namespace" is not on
+    /// its own a licence to recurse and delete.
+    #[test]
+    fn w17_boot_sweep_leaves_a_directory_that_is_not_shaped_like_a_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let _engine = open_engine(dir.path());
+        }
+
+        let with_extra = plant_orphan_dir(dir.path(), "not-ours");
+        std::fs::write(with_extra.join("important.txt"), b"someone else's data")
+            .expect("write extra file");
+
+        let no_vectors = dir.path().join("empty-dir");
+        std::fs::create_dir_all(&no_vectors).expect("create dir");
+
+        let dotted = plant_orphan_dir(dir.path(), ".hidden-state");
+
+        let _engine = open_engine(dir.path());
+
+        assert!(with_extra.join("important.txt").exists());
+        assert!(no_vectors.exists());
+        assert!(dotted.exists());
+    }
+
+    /// THE catastrophic-regression test. The boot sweep deletes
+    /// directories, it runs unattended on every open, and its blast
+    /// radius if it misjudges "live" is every memory in the database.
+    ///
+    /// What makes it safe is an ordering guarantee: `open` step 6 opens
+    /// (and thereby creates) a directory for every namespace in
+    /// `NAMESPACE_TABLE` before step 7 runs the sweep, so at sweep time
+    /// every live namespace has both a directory and a name in `live`.
+    #[test]
+    fn w18_boot_sweep_leaves_every_live_namespace_directory_on_a_plain_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ids = Vec::new();
+
+        {
+            let mut engine = open_engine(dir.path());
+            for name in ["default", "work", "personal"] {
+                let ns = make_namespace(&mut engine, name);
+                ids.push(add_memory(&mut engine, ns));
+            }
+        }
+
+        let engine = open_engine(dir.path());
+
+        for name in ["default", "work", "personal"] {
+            let ns_dir = dir.path().join(name);
+            assert!(
+                ns_dir.join("vectors.dat").exists(),
+                "the boot sweep destroyed live namespace '{name}'"
+            );
+        }
+        for id in ids {
+            assert!(
+                engine.get_record(id).expect("get").is_some(),
+                "a live record went missing across a plain reopen"
+            );
+        }
+    }
+
+    /// The crash-recovery shape from D5: everything about the namespace
+    /// is gone after a restart, including the edges that pointed at it.
+    #[test]
+    fn w19_a_purged_namespace_stays_gone_across_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        {
+            let mut engine = open_engine(dir.path());
+            let ns = make_namespace(&mut engine, "scratch");
+            let a = add_memory(&mut engine, ns);
+            let b = add_memory(&mut engine, ns);
+            engine
+                .add_edge(a, b, EdgeType::Associative, 0.5, false, 0)
+                .expect("add edge");
+            engine.purge_namespace(ns).expect("purge");
+        }
+
+        let engine = open_engine(dir.path());
+        assert!(
+            engine
+                .get_namespace_by_name("scratch")
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(!dir.path().join("scratch").exists());
+        assert!(engine.load_all_edges().expect("edges").is_empty());
+        assert_eq!(engine.count().expect("count"), 0);
+    }
+
+    // ── peer edge counts ─────────────────────────────────────────────
+
+    /// `edge_count` counts OUTGOING edges. A purge removes the edge
+    /// `survivor -> purged` from edges.db but used to leave the
+    /// survivor's record still counting it — permanently, and in a
+    /// number that feeds degree centrality and cache weight. The
+    /// cross-namespace case is the one a user sees: the survivor is not
+    /// in the namespace being deleted and nothing else will ever touch
+    /// its record.
+    #[test]
+    fn w56_a_purge_repairs_the_outgoing_edge_count_of_a_surviving_peer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let keep_ns = make_namespace(&mut engine, "keep");
+        let doomed_ns = make_namespace(&mut engine, "doomed");
+
+        let survivor = add_memory(&mut engine, keep_ns);
+        let other_survivor = add_memory(&mut engine, keep_ns);
+        let doomed_a = add_memory(&mut engine, doomed_ns);
+        let doomed_b = add_memory(&mut engine, doomed_ns);
+
+        // Two edges into the doomed namespace and one that stays.
+        for target in [doomed_a, doomed_b, other_survivor] {
+            engine
+                .add_edge(survivor, target, EdgeType::Associative, 0.5, false, 0)
+                .expect("add edge");
+        }
+        engine.update_edge_count(survivor, 3).expect("seed count");
+
+        let purged = engine.purge_namespace(doomed_ns).expect("purge");
+
+        assert_eq!(
+            engine
+                .get_record(survivor)
+                .expect("get")
+                .expect("record")
+                .edge_count,
+            1,
+            "the survivor still counts edges that no longer exist"
+        );
+        assert_eq!(purged.peer_edge_counts, vec![(survivor, 1)]);
+    }
+
+    /// A peer that is itself being purged needs no repair, and must not
+    /// be reported as one: its record is gone.
+    #[test]
+    fn w57_a_purge_does_not_repair_a_peer_it_is_also_destroying() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let ns = make_namespace(&mut engine, "doomed");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .add_edge(a, b, EdgeType::Associative, 0.5, false, 0)
+            .expect("add edge");
+        engine.update_edge_count(a, 1).expect("seed count");
+
+        let purged = engine.purge_namespace(ns).expect("purge");
+
+        assert!(purged.peer_edge_counts.is_empty(), "{purged:?}");
+    }
+
+    /// The same repair on the single-memory hard delete, which removes
+    /// edges for exactly the same reason and had exactly the same gap.
+    #[test]
+    fn w58_a_hard_delete_repairs_the_outgoing_edge_count_of_a_surviving_peer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let ns = make_namespace(&mut engine, "scratch");
+        let survivor = add_memory(&mut engine, ns);
+        let doomed = add_memory(&mut engine, ns);
+        engine
+            .add_edge(survivor, doomed, EdgeType::Associative, 0.5, false, 0)
+            .expect("add edge");
+        engine.update_edge_count(survivor, 1).expect("seed count");
+
+        engine.delete_memory(doomed).expect("delete");
+
+        assert_eq!(
+            engine
+                .get_record(survivor)
+                .expect("get")
+                .expect("record")
+                .edge_count,
+            0,
+            "the survivor still counts an edge that no longer exists"
+        );
+    }
+
+    // ── namespace name → directory ───────────────────────────────────
+
+    /// `Path::join` does **not** normalize, so `db_path.join("..")` is
+    /// the parent of the data directory and `remove_dir_all` on it takes
+    /// everything recalld owns — and everything that happens to sit
+    /// beside it. The old guard checked only symlink-and-is-dir, both of
+    /// which `..` passes.
+    #[test]
+    fn w45_a_dot_dot_name_cannot_delete_the_parent_of_the_data_directory() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let db_path = outer.path().join("data");
+        std::fs::create_dir_all(&db_path).expect("create data dir");
+        let bystander = outer.path().join("someone-elses-files");
+        std::fs::create_dir_all(&bystander).expect("create bystander");
+
+        let engine = open_engine(&db_path);
+
+        assert!(
+            !engine.remove_namespace_dir(".."),
+            "'..' was accepted as a namespace directory name"
+        );
+        assert!(
+            bystander.exists(),
+            "the parent of the data directory was destroyed"
+        );
+        assert!(
+            db_path.join("meta.db").exists(),
+            "the database was destroyed"
+        );
+    }
+
+    /// The one that needs no `..` and no daemon frame. `db_path.join("")`
+    /// **is** `db_path`, `VectorManager::open_or_create` accepted `""`,
+    /// so the namespace was live and healthy — and deleting it pointed
+    /// `remove_dir_all` at the whole database.
+    #[test]
+    fn w46_an_empty_name_cannot_delete_the_data_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = open_engine(dir.path());
+
+        assert!(
+            !engine.remove_namespace_dir(""),
+            "'' was accepted as a namespace directory name"
+        );
+        assert!(db_is_intact(dir.path()), "the database was destroyed");
+    }
+
+    #[test]
+    fn w47_only_a_single_ordinary_path_component_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = open_engine(dir.path());
+
+        for bad in [
+            "",
+            ".",
+            "..",
+            "/",
+            "sub/dir",
+            "..\\up",
+            "scratch/",
+            "./scratch",
+        ] {
+            assert!(
+                engine.namespace_dir(bad).is_err(),
+                "{bad:?} was accepted as a namespace directory name"
+            );
+        }
+
+        assert_eq!(
+            engine.namespace_dir("scratch").expect("a plain name"),
+            dir.path().join("scratch")
+        );
+    }
+
+    /// `create_namespace` used to commit the `NAMESPACE_TABLE` row and
+    /// only THEN ask `open_or_create` whether the name could be a
+    /// directory. The caller saw an error and the row survived — and
+    /// [`RedbStorageEngine::open`] step 6 `?`-propagates that same
+    /// rejection for every row, so one bad `create_namespace` call meant
+    /// the database would not start again.
+    #[test]
+    fn w48_a_rejected_name_leaves_no_row_and_the_database_still_opens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        {
+            let mut engine = open_engine(dir.path());
+            for bad in ["", "..", "a/b", "has space", "ünïcode", &"x".repeat(65)] {
+                let mut config = NamespaceConfig::default_namespace(0);
+                config.name = bad.to_string();
+                config.embedding_dim = DIM as u32;
+
+                engine
+                    .create_namespace(&config)
+                    .expect_err(&format!("{bad:?} must be rejected"));
+
+                assert!(
+                    engine
+                        .list_namespaces()
+                        .expect("list")
+                        .iter()
+                        .all(|ns| ns.name != bad),
+                    "{bad:?} left a NAMESPACE_TABLE row behind"
+                );
+            }
+        }
+
+        RedbStorageEngine::open(dir.path())
+            .expect("a rejected create_namespace must not wedge the next startup");
+    }
+
+    // ── case-insensitive namespace identity ──────────────────────────
+
+    /// Chain A. On a case-insensitive filesystem `notes/` and `Notes/`
+    /// are one directory, so two rows pointing at it is two namespaces
+    /// sharing one `vectors.dat`. The uniqueness check compared names
+    /// exactly and let the second row in.
+    #[test]
+    fn w49_a_namespace_name_differing_only_in_case_is_a_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        make_namespace(&mut engine, "notes");
+
+        for collision in ["Notes", "NOTES", "nOtEs"] {
+            let mut config = NamespaceConfig::default_namespace(0);
+            config.name = collision.to_string();
+            config.embedding_dim = DIM as u32;
+            let err = engine
+                .create_namespace(&config)
+                .expect_err("a case-variant name must collide");
+            assert!(
+                matches!(err, StorageError::DuplicateName(_)),
+                "{collision}: {err}"
+            );
+        }
+
+        assert_eq!(engine.list_namespaces().expect("list").len(), 1);
+    }
+
+    /// The lookup has to agree with the uniqueness rule, or
+    /// `create_namespace` reports "duplicate" and `namespace_stats`
+    /// reports "not found" for the same string.
+    #[test]
+    fn w50_a_namespace_resolves_by_name_regardless_of_case() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "notes");
+
+        for spelling in ["notes", "Notes", "NOTES"] {
+            assert_eq!(
+                engine
+                    .get_namespace_by_name(spelling)
+                    .expect("lookup")
+                    .map(|c| c.id),
+                Some(ns),
+                "{spelling} did not resolve"
+            );
+        }
+    }
+
+    /// The unattended half of chain A. A live namespace whose directory
+    /// differs from its row only in case used to be invisible to the
+    /// sweep's exact-string compare, and the shape guard cannot save it
+    /// — it really is a namespace directory. Boot then deleted a live
+    /// namespace's vectors.
+    #[test]
+    fn w51_the_boot_sweep_does_not_delete_a_case_variant_live_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Probe before the engine exists, so the throwaway directory cannot
+        // be seen by the boot sweep.
+        let case_insensitive = filesystem_is_case_insensitive(dir.path());
+
+        {
+            let mut engine = open_engine(dir.path());
+            make_namespace(&mut engine, "Notes");
+            // On a case-sensitive filesystem the lowercase variant has to be
+            // planted, so that the sweep is made to choose between deleting
+            // it and recognising it as the live namespace's directory.
+            //
+            // On a case-insensitive one there is nothing to plant: creating
+            // `Notes` already produced the directory `notes` resolves to.
+            // Planting would write a stub over the live namespace's real
+            // vectors.dat and the reopen below would fail to parse it --
+            // which is exactly how this test used to fail on macOS while
+            // passing on Linux.
+            if !case_insensitive {
+                plant_orphan_dir(dir.path(), "notes");
+            }
+        }
+
+        let _engine = open_engine(dir.path());
+
+        assert!(
+            dir.path().join("notes").join("vectors.dat").exists(),
+            "the boot sweep destroyed a live namespace's vectors"
+        );
+    }
+
+    // ── partial purge ────────────────────────────────────────────────
+
+    /// A failure before anything was committed must say so, or the
+    /// caller cleans indexes for records that still exist.
+    #[test]
+    fn w52_a_purge_that_destroyed_nothing_reports_nothing_destroyed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+
+        let err = engine
+            .purge_namespace(NamespaceId::new(999))
+            .expect_err("an unknown namespace cannot be purged");
+
+        assert!(!err.is_partial(), "{err}");
+        assert!(err.destroyed.is_empty());
+        assert!(
+            !err.to_string().contains("PARTIALLY"),
+            "a failure that destroyed nothing must not claim otherwise: {err}"
+        );
+    }
+
+    /// The other half of the contract, and the one that matters: an
+    /// error that arrives after chunks have committed carries them, and
+    /// says what the caller has to do about it. Without this the records
+    /// are gone from meta.db, still in every index, and unreachable by a
+    /// retry — which looks in meta.db and finds nothing.
+    #[test]
+    fn w53_a_partial_purge_carries_its_destroyed_records_and_asks_for_a_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "scratch");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+
+        let destroyed: Vec<(MemoryId, DiskRecord)> = [a, b]
+            .into_iter()
+            .map(|id| (id, engine.get_record(id).expect("get").expect("record")))
+            .collect();
+
+        let err = NamespacePurgeError::partial(
+            destroyed,
+            StorageError::CorruptIndex("simulated mid-purge fault".into()),
+        );
+
+        assert!(err.is_partial());
+        assert_eq!(err.destroyed.len(), 2);
+        let message = err.to_string();
+        assert!(message.contains("PARTIALLY destroyed"), "{message}");
+        assert!(message.contains('2'), "the count must be in it: {message}");
+        assert!(message.contains("Re-run"), "{message}");
+    }
+
+    /// Whether the database files a purge must never touch are all still
+    /// where they belong.
+    fn db_is_intact(db_path: &Path) -> bool {
+        db_path.join("meta.db").exists()
+            && db_path.join("edges.db").exists()
+            && db_path.join("fulltext.dat").exists()
     }
 }

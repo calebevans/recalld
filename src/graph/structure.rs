@@ -635,6 +635,13 @@ impl RelationshipGraph {
             };
         };
         let Some(node) = self.nodes.get(node_key) else {
+            // Same stale-index case as `remove_memory`: the entry has to
+            // go, or `contains` keeps claiming the memory is here.
+            tracing::warn!(
+                memory_id = %memory_id,
+                "Graph id_index named a node that does not exist; dropping the stale entry"
+            );
+            self.id_index.remove(&memory_id);
             return RemovalResult {
                 removed_edges: Vec::new(),
                 bridge_created: None,
@@ -694,9 +701,50 @@ impl RelationshipGraph {
             }
         }
 
-        // Remove all edges connected to this node
-        // Re-fetch the node since we may have mutated other nodes above
-        let node = self.nodes.get(node_key).expect("node still exists");
+        // Remove the node and its edges. Re-resolves the node key,
+        // since the bridge above may have mutated other nodes.
+        let removed_edges = self.remove_memory(memory_id);
+
+        RemovalResult {
+            removed_edges,
+            bridge_created,
+        }
+    }
+
+    /// Remove a memory's node and every edge incident to it, creating
+    /// no bridge. Returns the removed edges so the caller can delete
+    /// them from edges.db.
+    ///
+    /// Returns an empty vec if the memory has no node.
+    ///
+    /// # When to use this instead of bridging
+    ///
+    /// Use it when the memory is going away because its whole
+    /// **namespace** is going away. Bridging exists to preserve a chain
+    /// through a memory that decayed out from under it — the
+    /// relationship was real and only the waypoint is gone. In a
+    /// namespace deletion the relationship is exactly what the user
+    /// asked to erase, so manufacturing a new edge between two survivors
+    /// on the strength of it would resurrect, in summary form, the thing
+    /// that was just destroyed.
+    pub fn remove_memory(&mut self, memory_id: MemoryId) -> Vec<GraphEdge> {
+        let Some(&node_key) = self.id_index.get(&memory_id) else {
+            return Vec::new();
+        };
+        let Some(node) = self.nodes.get(node_key) else {
+            // An id_index key whose node is gone. Bailing out left the
+            // stale entry in place forever, so `contains` went on saying
+            // the memory was in the graph and every later removal took
+            // this same branch and did nothing. Removing it is the whole
+            // job that is left to do.
+            tracing::warn!(
+                memory_id = %memory_id,
+                "Graph id_index named a node that does not exist; dropping the stale entry"
+            );
+            self.id_index.remove(&memory_id);
+            return Vec::new();
+        };
+
         let all_edge_keys: Vec<EdgeKey> = node
             .outgoing
             .iter()
@@ -726,10 +774,7 @@ impl RelationshipGraph {
         self.nodes.remove(node_key);
         self.id_index.remove(&memory_id);
 
-        RemovalResult {
-            removed_edges,
-            bridge_created,
-        }
+        removed_edges
     }
 }
 
@@ -831,6 +876,38 @@ mod tests {
                 .expect("fresh id");
         }
         (graph, ids)
+    }
+
+    /// A stale `id_index` entry — a key whose `nodes` slot is gone —
+    /// used to make both removal paths bail out WITHOUT dropping it. So
+    /// `contains` went on reporting the memory as present, every later
+    /// removal took the same branch and did nothing, and the entry
+    /// outlived the process.
+    #[test]
+    fn w72_removal_drops_an_id_index_entry_whose_node_is_gone() {
+        for with_bridging in [false, true] {
+            let (mut graph, ids) = graph_with_nodes(1);
+            let id = ids[0];
+
+            // Remove the node behind the index's back.
+            let key = *graph.id_index.get(&id).expect("indexed");
+            graph.nodes.remove(key);
+            assert!(
+                graph.contains(&id),
+                "the setup did not create a stale entry"
+            );
+
+            if with_bridging {
+                graph.remove_memory_with_bridging(id);
+            } else {
+                graph.remove_memory(id);
+            }
+
+            assert!(
+                !graph.contains(&id),
+                "with_bridging={with_bridging}: the stale id_index entry survived"
+            );
+        }
     }
 
     /// Add a Supersedes edge meaning "`new` replaces `old`".
@@ -952,5 +1029,54 @@ mod tests {
         assert_eq!(graph.supersedes_terminal(&a), None);
         assert_eq!(graph.supersedes_terminal(&b), None);
         assert_eq!(graph.supersedes_terminal(&c), None);
+    }
+
+    /// The same shape `remove_memory_with_bridging` bridges across — one
+    /// in, one out, matching type — must produce no bridge here. A
+    /// namespace deletion erases the relationship, so inventing a new
+    /// edge between two survivors on the strength of it would resurrect
+    /// in summary form the thing that was just destroyed.
+    #[test]
+    fn w23_remove_memory_removes_the_node_and_its_edges_without_bridging() {
+        /// A pass-through shape: predecessor -> middle -> successor, one
+        /// in, one out, same edge type.
+        fn pass_through() -> (RelationshipGraph, MemoryId, MemoryId, MemoryId) {
+            let (mut graph, ids) = graph_with_nodes(3);
+            graph
+                .add_edge(ids[0], ids[1], EdgeType::Associative, 1.0, false)
+                .expect("in edge");
+            graph
+                .add_edge(ids[1], ids[2], EdgeType::Associative, 1.0, false)
+                .expect("out edge");
+            (graph, ids[0], ids[1], ids[2])
+        }
+
+        // Establish that this shape really is one bridging would bridge,
+        // so the assertion below is about the new path and not about an
+        // input that would never have bridged anyway.
+        let (mut bridging, _, middle, _) = pass_through();
+        assert!(
+            bridging
+                .remove_memory_with_bridging(middle)
+                .bridge_created
+                .is_some(),
+            "the shape under test is not one that bridging would bridge"
+        );
+
+        let (mut graph, predecessor, middle, successor) = pass_through();
+        let removed = graph.remove_memory(middle);
+
+        assert_eq!(removed.len(), 2);
+        assert!(!graph.contains(&middle));
+        assert_eq!(graph.edge_count(), 0, "a bridge edge was manufactured");
+        assert_eq!(graph.degree(&predecessor), 0);
+        assert_eq!(graph.degree(&successor), 0);
+        assert!(graph.contains(&predecessor) && graph.contains(&successor));
+    }
+
+    #[test]
+    fn w23b_remove_memory_of_an_unknown_id_is_empty() {
+        let (mut graph, _) = graph_with_nodes(1);
+        assert!(graph.remove_memory(MemoryId::new()).is_empty());
     }
 }

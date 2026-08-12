@@ -213,6 +213,78 @@ impl FtsIndex {
         Ok(out)
     }
 
+    /// Remove every document belonging to a namespace. Returns how many
+    /// were removed.
+    ///
+    /// # Not an optimization — the only way to reach some of these rows
+    ///
+    /// Calling [`remove`](Self::remove) per id would only be correct for
+    /// ids that meta.db still knows about. The decay sweep hard-deletes
+    /// a Ghost record without touching this index, so a namespace can
+    /// hold FTS rows whose meta.db record is already gone — ids no
+    /// caller can enumerate. Filtering on `namespace_id` is the only
+    /// handle on them.
+    ///
+    /// # `fts_content` rows have to go first
+    ///
+    /// `fts_content` is declared `contentless_delete=1`, so its rows are
+    /// reachable ONLY by rowid, and the rowid lives in `id_map`. A bare
+    /// `DELETE FROM id_map` therefore orphans every content row
+    /// permanently: nothing can ever name them again.
+    ///
+    /// What that costs is not a later collision — `id_map.rowid` is
+    /// `AUTOINCREMENT` and [`add`](Self::add) removes the old `id_map`
+    /// row first, so re-indexing the same memory takes a fresh rowid and
+    /// the `memory_id` UNIQUE constraint is never in play. It costs:
+    ///
+    /// - the space, for the life of the database, with no way to reclaim
+    ///   it short of rebuilding the index;
+    /// - **corpus-wide ranking drift.** `bm25()` scores against the
+    ///   whole `fts_content` table, so orphaned rows go on contributing
+    ///   to the document count and to per-term document frequencies. The
+    ///   rows can never be *returned* — [`search`](Self::search) inner
+    ///   joins `id_map` — but every query in every namespace is scored
+    ///   against an IDF that counts them.
+    ///
+    /// So: collect the rowids, delete the content rows, and only then
+    /// delete the id_map rows, all in one transaction.
+    ///
+    /// `id_map.namespace_id` is not indexed, so this is a table scan.
+    /// Acceptable for a rare administrative operation.
+    pub fn remove_namespace(&self, namespace_id: NamespaceId) -> Result<usize, FtsError> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let rowids: Vec<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT rowid FROM id_map WHERE namespace_id = ?1")?;
+            let rows = stmt.query_map(rusqlite::params![namespace_id.get()], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<i64>, _>>()?
+        };
+
+        if rowids.is_empty() {
+            tx.commit()?;
+            return Ok(0);
+        }
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare("DELETE FROM fts_content WHERE rowid = ?1")?;
+            for rowid in &rowids {
+                stmt.execute(rusqlite::params![rowid])?;
+            }
+        }
+
+        self.conn.execute(
+            "DELETE FROM id_map WHERE namespace_id = ?1",
+            rusqlite::params![namespace_id.get()],
+        )?;
+
+        tx.commit()?;
+        Ok(rowids.len())
+    }
+
     /// Whether the index contains no documents.
     pub fn is_empty(&self) -> Result<bool, FtsError> {
         let count: i64 = self
@@ -401,6 +473,110 @@ mod tests {
         let _ = index.search(test_ns_id(), "\"quoted phrase\"", 10).unwrap();
         let _ = index.search(test_ns_id(), "", 10).unwrap();
         let _ = index.search(test_ns_id(), "   ", 10).unwrap();
+    }
+
+    /// `fts_content` is contentless_delete, so its rows are reachable
+    /// only by rowid — which lives in `id_map`. Deleting the id_map rows
+    /// first orphans every content row permanently.
+    ///
+    /// This asserts on `fts_content` DIRECTLY, because nothing else can:
+    /// an orphaned content row is invisible to `search` (which inner
+    /// joins `id_map`), does not collide with anything on re-index
+    /// (`id_map.rowid` is AUTOINCREMENT), and does not show up in
+    /// `is_empty` (which counts `id_map`). Every observable this test
+    /// used to check passed with the guard removed. The row count is the
+    /// one that does not.
+    #[test]
+    fn w20_remove_namespace_deletes_id_map_and_fts_content_together() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index = FtsIndex::new(dir.path()).unwrap();
+
+        let id = MemoryId::new();
+        index
+            .add(test_ns_id(), id, "obsolete content here", None, &[])
+            .unwrap();
+        assert_eq!(fts_content_rows(&index), 1, "the setup did not index");
+
+        assert_eq!(index.remove_namespace(test_ns_id()).unwrap(), 1);
+        assert!(index.is_empty().unwrap());
+        assert_eq!(
+            fts_content_rows(&index),
+            0,
+            "an orphaned fts_content row survived: unreachable, unreclaimable, and \
+             still counted by bm25's corpus statistics"
+        );
+
+        // The rest of the original guard: the memory re-indexes cleanly
+        // and the stale text does not come back.
+        index
+            .add(test_ns_id(), id, "replacement content", None, &[])
+            .unwrap();
+        let results = index.search(test_ns_id(), "replacement", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, id);
+        assert_eq!(fts_content_rows(&index), 1);
+    }
+
+    /// The same assertion for the per-record path, which has the same
+    /// ordering requirement and the same invisible failure mode.
+    #[test]
+    fn w61_remove_deletes_the_content_row_too() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index = FtsIndex::new(dir.path()).unwrap();
+
+        let id = MemoryId::new();
+        index
+            .add(test_ns_id(), id, "obsolete content here", None, &[])
+            .unwrap();
+
+        assert!(index.remove(id).unwrap());
+        assert_eq!(
+            fts_content_rows(&index),
+            0,
+            "an orphaned fts_content row survived a per-record removal"
+        );
+    }
+
+    /// Rows actually present in the FTS5 virtual table, orphans included.
+    fn fts_content_rows(index: &FtsIndex) -> i64 {
+        index
+            .conn
+            .query_row("SELECT count(*) FROM fts_content", [], |row| row.get(0))
+            .expect("count fts_content rows")
+    }
+
+    #[test]
+    fn w21_remove_namespace_leaves_other_namespaces_searchable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index = FtsIndex::new(dir.path()).unwrap();
+
+        let doomed = MemoryId::new();
+        let kept = MemoryId::new();
+        index
+            .add(test_ns_id(), doomed, "shared keyword alpha", None, &[])
+            .unwrap();
+        index
+            .add(test_ns_id_2(), kept, "shared keyword alpha", None, &[])
+            .unwrap();
+
+        index.remove_namespace(test_ns_id()).unwrap();
+
+        assert!(index.search(test_ns_id(), "alpha", 10).unwrap().is_empty());
+        let survivors = index.search(test_ns_id_2(), "alpha", 10).unwrap();
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].0, kept);
+    }
+
+    #[test]
+    fn w22_remove_namespace_of_an_empty_namespace_is_zero() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index = FtsIndex::new(dir.path()).unwrap();
+        index
+            .add(test_ns_id_2(), MemoryId::new(), "kept", None, &[])
+            .unwrap();
+
+        assert_eq!(index.remove_namespace(test_ns_id()).unwrap(), 0);
+        assert!(!index.is_empty().unwrap());
     }
 
     #[test]

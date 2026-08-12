@@ -1,4 +1,4 @@
-//! Strict argument parsing for the MCP store tools.
+//! Strict argument parsing for the MCP tools.
 //!
 //! The store handlers used to pull their fields out of the raw
 //! `serde_json::Value` with `.get(k).and_then(|v| v.as_str())` and
@@ -15,7 +15,9 @@
 //! three things and delegates the fourth:
 //!
 //! 1. **Extraction** with explicit types ([`require_str`], [`opt_str`],
-//!    [`opt_string_array`], [`opt_uuid`], [`require_uuid`]).
+//!    [`opt_string_array`], [`opt_uuid`], [`require_uuid`],
+//!    [`opt_u64_in_range`], [`opt_usize_in_range`], [`opt_bool`],
+//!    [`namespace_or`]).
 //! 2. **Type strictness** — a wrong-typed argument is an error naming
 //!    the field and the type that arrived, never a default.
 //! 3. **Markup detection** ([`scan_client_markup`]) — text fields that
@@ -24,8 +26,14 @@
 //!    [`crate::model::validation::validate_memory_input`], which the
 //!    HTTP API shares.
 //!
+//! A *numeric* bound is treated the same way. An out-of-range `limit` is
+//! rejected rather than clamped: the tool schema already declares the
+//! maximum, so only a schema-violating client can hit it, and quietly
+//! returning 200 rows to a caller who asked for 1000 makes a paginating
+//! agent believe it has enumerated the namespace.
+//!
 //! Nothing here needs a bridge, a runtime, or storage: the composite
-//! parser takes the default namespace as a `&str`, which is what makes
+//! parsers take the default namespace as a `&str`, which is what makes
 //! the whole boundary unit-testable with no mocks.
 //!
 //! # Explicit JSON `null` means "absent"
@@ -38,8 +46,11 @@
 
 use serde_json::Value;
 
-use crate::mcp::bridge::StoreInput;
+use crate::mcp::bridge::{ListMemoriesInput, ListTagsInput, SearchInput, StoreInput};
 use crate::model::MemoryId;
+use crate::model::constants::{
+    DEFAULT_LIST_LIMIT, DEFAULT_TAG_LIMIT, MAX_LIST_LIMIT, MAX_TAG_LIMIT,
+};
 use crate::model::validation::{MemoryInputRef, truncate_on_char_boundary, validate_memory_input};
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -238,6 +249,128 @@ pub fn require_uuid(obj: &Value, key: &str) -> Result<MemoryId, ArgError> {
         None => Err(ArgError::new(
             key,
             format!("Missing required parameter: {key}"),
+        )),
+    }
+}
+
+/// Extract an optional integer parameter and check an inclusive range.
+///
+/// A numeric *string* is an error, not a coercion: `{"limit": "50"}` used
+/// to become 50 silently, the same class of bug as a comma-joined `tags`
+/// string storing zero tags.
+///
+/// Out-of-range is also an error rather than a clamp. The schema already
+/// declares the bound, so only a schema-violating client can hit it, and
+/// silently returning 200 rows to a caller who asked for 1000 makes a
+/// paginating agent believe it has seen the whole namespace.
+pub fn opt_u64_in_range(
+    obj: &Value,
+    key: &str,
+    min: u64,
+    max: u64,
+) -> Result<Option<u64>, ArgError> {
+    let Some(v) = field_opt(obj, key) else {
+        return Ok(None);
+    };
+    let Value::Number(n) = v else {
+        return Err(ArgError::new(
+            key,
+            format!(
+                "Parameter '{key}' must be an integer (got {})",
+                json_type_name(v)
+            ),
+        ));
+    };
+    let Some(value) = n.as_u64() else {
+        // Negative and fractional both land here. The literal is echoed
+        // through `elide` because JSON permits arbitrarily long numbers.
+        return Err(ArgError::new(
+            key,
+            format!(
+                "Parameter '{key}' must be a non-negative whole number (got {})",
+                elide(&n.to_string(), ECHO_MAX_BYTES)
+            ),
+        ));
+    };
+    if value < min || value > max {
+        return Err(ArgError::new(
+            key,
+            format!("Parameter '{key}' must be between {min} and {max} (got {value})"),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// [`opt_u64_in_range`] returning `usize`.
+///
+/// The cast lives here, done once against an already-checked bound,
+/// rather than at four call sites where a truncating `as usize` could
+/// hide. `max` is a `usize`, so on any target the range check runs before
+/// the narrowing and a value that would wrap is rejected, not wrapped.
+pub fn opt_usize_in_range(
+    obj: &Value,
+    key: &str,
+    min: usize,
+    max: usize,
+) -> Result<Option<usize>, ArgError> {
+    Ok(opt_u64_in_range(obj, key, min as u64, max as u64)?.map(|v| v as usize))
+}
+
+/// Extract an optional boolean parameter.
+///
+/// `"true"` and `1` are errors. A client sending either has a broken
+/// serializer, and guessing is how a `false` becomes a `true` — which for
+/// a scope switch such as `allNamespaces` silently widens what the caller
+/// reads.
+pub fn opt_bool(obj: &Value, key: &str) -> Result<Option<bool>, ArgError> {
+    match field_opt(obj, key) {
+        None => Ok(None),
+        Some(v) => match v.as_bool() {
+            Some(b) => Ok(Some(b)),
+            None => Err(ArgError::new(
+                key,
+                format!(
+                    "Parameter '{key}' must be a boolean (got {})",
+                    json_type_name(v)
+                ),
+            )),
+        },
+    }
+}
+
+/// Extract the shared `namespace` parameter, falling back to `default`
+/// only when it is absent or `null`.
+///
+/// A *wrong-typed* namespace is an error, never the default partition:
+/// reading or writing the wrong partition because an array arrived where
+/// a string was expected is precisely the silent-default failure this
+/// module exists to remove. One definition of the rule, so the handlers
+/// cannot drift.
+pub fn namespace_or(obj: &Value, default: &str) -> Result<String, ArgError> {
+    Ok(opt_str(obj, "namespace")?.unwrap_or_else(|| default.to_string()))
+}
+
+/// Extract an optional time bound, accepting epoch millis or ISO 8601.
+///
+/// [`crate::time::parse_time_value`] maps every non-number, non-string to
+/// `None`, which a handler cannot distinguish from "absent" — so
+/// `{"timeRangeStart": ["x"]}` was silently ignored and the query widened
+/// to the whole namespace. Here the wrong type is an error.
+fn opt_time_bound(obj: &Value, key: &str) -> Result<Option<i64>, ArgError> {
+    let Some(v) = field_opt(obj, key) else {
+        return Ok(None);
+    };
+    match crate::time::parse_time_value(v) {
+        Some(Ok(ms)) => Ok(Some(ms)),
+        // Preserves the wording the handler used before this moved here.
+        Some(Err(e)) => Err(ArgError::new(key, format!("Invalid {key}: {e}"))),
+        None => Err(ArgError::new(
+            key,
+            format!(
+                "Parameter '{key}' must be an integer (epoch millis) or an ISO 8601 string \
+                 (got {})",
+                json_type_name(v)
+            ),
         )),
     }
 }
@@ -509,8 +642,8 @@ pub fn reject_client_markup(field: &str, text: &str) -> Result<(), ArgError> {
 /// Checks run in a fixed order so that an argument object broken in
 /// several ways always reports the same failure: object-ness, then
 /// `summary` (presence, type, markup), `fullText` (type, markup), the
-/// four array fields, `namespace`, `parentId`, `supersedes`, and
-/// finally the shared content limits from
+/// four array fields, `namespace`, `parentId`, `supersedes`,
+/// `checkDuplicates`, and finally the shared content limits from
 /// [`validate_memory_input`](crate::model::validation::validate_memory_input).
 pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreInput, ArgError> {
     if !item.is_object() {
@@ -533,10 +666,11 @@ pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreI
     let topics = opt_string_array(item, "topics")?;
     let emotions = opt_string_array(item, "emotions")?;
 
-    let namespace = opt_str(item, "namespace")?.unwrap_or_else(|| default_namespace.to_string());
+    let namespace = namespace_or(item, default_namespace)?;
 
     let parent_id = opt_uuid(item, "parentId")?;
     let supersedes = opt_uuid(item, "supersedes")?;
+    let check_duplicates = opt_bool(item, "checkDuplicates")?;
 
     validate_memory_input(MemoryInputRef {
         summary: &summary,
@@ -560,6 +694,7 @@ pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreI
         initial_stability: None,
         parent_id,
         supersedes,
+        check_duplicates,
     })
 }
 
@@ -583,6 +718,255 @@ pub fn parse_store_item(
         ));
     }
     parse_store_input(item, default_namespace)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Search-tool parsers
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The maximum `limit` a search tool will accept, matching the schema.
+const MAX_SEARCH_LIMIT: usize = 100;
+/// The `limit` a search uses when the caller names none.
+const DEFAULT_SEARCH_LIMIT: usize = 10;
+/// The maximum graph `depth` a recall will traverse, matching the schema.
+const MAX_RECALL_DEPTH: u64 = 3;
+
+/// Extract an optional floating-point parameter and check an inclusive
+/// range.
+///
+/// A JSON integer is a legitimate float (`1` is `1.0`); a numeric
+/// *string* is not, for the same reason [`opt_u64_in_range`] refuses
+/// one. Out of range is an error, not a clamp: `minScore: 5` asks for
+/// something the caller will not get, and silently answering a different
+/// question is what this module exists to stop.
+pub fn opt_f32_in_range(
+    obj: &Value,
+    key: &str,
+    min: f64,
+    max: f64,
+) -> Result<Option<f32>, ArgError> {
+    let Some(v) = field_opt(obj, key) else {
+        return Ok(None);
+    };
+    let Some(n) = v.as_f64() else {
+        return Err(ArgError::new(
+            key,
+            format!(
+                "Parameter '{key}' must be a number (got {})",
+                json_type_name(v)
+            ),
+        ));
+    };
+    if n.is_nan() || n < min || n > max {
+        return Err(ArgError::new(
+            key,
+            format!("Parameter '{key}' must be between {min} and {max} (got {n})"),
+        ));
+    }
+    Ok(Some(n as f32))
+}
+
+/// Extract an optional string parameter constrained to a fixed set.
+///
+/// A wrong-typed or unknown value is an error naming the alternatives.
+/// `mode` used to be read with `.and_then(|v| v.as_str())`, so
+/// `{"mode": 2}` silently ran "single" — a different operation from the
+/// one asked for.
+pub fn opt_enum(obj: &Value, key: &str, allowed: &[&str]) -> Result<Option<String>, ArgError> {
+    let Some(value) = opt_str(obj, key)? else {
+        return Ok(None);
+    };
+    if !allowed.contains(&value.as_str()) {
+        return Err(ArgError::new(
+            key,
+            format!(
+                "Parameter '{key}' must be one of {} (got {:?})",
+                allowed
+                    .iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                elide(&value, ECHO_MAX_BYTES)
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// A parsed `recall_memories` call.
+pub struct RecallArgs {
+    /// What the search pipeline is given.
+    pub input: SearchInput,
+    /// Whether to render the token-efficient response shape.
+    pub compact: bool,
+}
+
+/// Parse the arguments of a `recall_memories` call.
+///
+/// Only `namespace` was ever checked here. Everything else went through
+/// the `.get(k).and_then(..)` chain this module exists to replace, so
+/// `{"tags": "topic/rust"}` became `[]` and ran UNFILTERED over the
+/// whole namespace, `limit: 1000` was clamped to 100 (telling a
+/// paginating caller it had seen everything), `compact: "false"` became
+/// `true`, and `depth: 5` sailed past a schema that says 3.
+pub fn parse_recall_input(obj: &Value, default_namespace: &str) -> Result<RecallArgs, ArgError> {
+    let query = require_str(obj, "query")?;
+    let namespace = namespace_or(obj, default_namespace)?;
+    let limit =
+        opt_usize_in_range(obj, "limit", 1, MAX_SEARCH_LIMIT)?.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let tags = opt_string_array(obj, "tags")?;
+    let entities = opt_string_array(obj, "entities")?;
+    let topics = opt_string_array(obj, "topics")?;
+    let emotions = opt_string_array(obj, "emotions")?;
+    let min_strength = opt_f32_in_range(obj, "minStrength", 0.0, 1.0)?;
+    let depth = opt_u64_in_range(obj, "depth", 0, MAX_RECALL_DEPTH)?.unwrap_or(0) as u32;
+    let time_range_start = opt_time_bound(obj, "timeRangeStart")?;
+    let time_range_end = opt_time_bound(obj, "timeRangeEnd")?;
+    let compact = opt_bool(obj, "compact")?.unwrap_or(true);
+
+    Ok(RecallArgs {
+        input: SearchInput {
+            query,
+            namespace,
+            limit,
+            tags,
+            entities,
+            topics,
+            emotions,
+            min_strength,
+            depth,
+            time_range_start,
+            time_range_end,
+        },
+        compact,
+    })
+}
+
+/// A parsed `find_similar_memories` call in `single` mode.
+pub struct FindSimilarArgs {
+    /// The memory to find neighbours of.
+    pub id: MemoryId,
+    /// Maximum neighbours to return.
+    pub limit: usize,
+    /// Minimum similarity, when the caller set one.
+    pub min_score: Option<f32>,
+    /// Whether to stay inside the source memory's namespace.
+    pub same_namespace: bool,
+}
+
+/// Parse the `single`-mode arguments of a `find_similar_memories` call.
+pub fn parse_find_similar_args(obj: &Value) -> Result<FindSimilarArgs, ArgError> {
+    let id = require_uuid(obj, "id")?;
+    let limit =
+        opt_usize_in_range(obj, "limit", 1, MAX_SEARCH_LIMIT)?.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let min_score = opt_f32_in_range(obj, "minScore", 0.0, 1.0)?;
+    let same_namespace = opt_bool(obj, "sameNamespace")?.unwrap_or(true);
+
+    Ok(FindSimilarArgs {
+        id,
+        limit,
+        min_score,
+        same_namespace,
+    })
+}
+
+/// A parsed `find_similar_memories` call in `scan` mode.
+pub struct DuplicateScanArgs {
+    /// The namespace to scan.
+    pub namespace: String,
+    /// Similarity at or above which two memories are a duplicate.
+    pub threshold: f32,
+}
+
+/// Parse the `scan`-mode arguments of a `find_similar_memories` call.
+pub fn parse_duplicate_scan_args(
+    obj: &Value,
+    default_namespace: &str,
+    default_threshold: f64,
+) -> Result<DuplicateScanArgs, ArgError> {
+    let namespace = namespace_or(obj, default_namespace)?;
+    let threshold =
+        opt_f32_in_range(obj, "threshold", 0.0, 1.0)?.unwrap_or(default_threshold as f32);
+
+    Ok(DuplicateScanArgs {
+        namespace,
+        threshold,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Listing-tool parsers
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Parse the arguments of a `list_memories` call.
+///
+/// Checks run in a fixed order — `namespace`, `limit`, `offset`, `tags`,
+/// `entities`, `timeRangeStart`, `timeRangeEnd` — so an argument object
+/// broken in several ways always reports the same failure.
+///
+/// Three things that used to pass silently now fail: a stringly-typed
+/// `limit`, a `limit` above the schema's maximum (previously clamped to
+/// [`MAX_LIST_LIMIT`], which told a paginating caller it had seen
+/// everything), and a wrong-typed time bound (previously dropped, which
+/// widened the query to the whole namespace).
+pub fn parse_list_memories_input(
+    obj: &Value,
+    default_namespace: &str,
+) -> Result<ListMemoriesInput, ArgError> {
+    let namespace = namespace_or(obj, default_namespace)?;
+    let limit = opt_usize_in_range(obj, "limit", 1, MAX_LIST_LIMIT)?.unwrap_or(DEFAULT_LIST_LIMIT);
+    let offset = opt_usize_in_range(obj, "offset", 0, usize::MAX)?.unwrap_or(0);
+    let tags = opt_string_array(obj, "tags")?;
+    let entities = opt_string_array(obj, "entities")?;
+    let time_range_start = opt_time_bound(obj, "timeRangeStart")?;
+    let time_range_end = opt_time_bound(obj, "timeRangeEnd")?;
+
+    Ok(ListMemoriesInput {
+        namespace,
+        limit,
+        offset,
+        tags,
+        entities,
+        time_range_start,
+        time_range_end,
+    })
+}
+
+/// Parse the arguments of a `list_tags` call.
+///
+/// `allNamespaces: true` and an explicit `namespace` are mutually
+/// exclusive. Letting one silently win would hand back a histogram over a
+/// scope the caller did not ask for, and the caller would have no way to
+/// tell which rule applied — so the combination is rejected, attributed
+/// to `allNamespaces`.
+///
+/// `allNamespaces: false` alongside an explicit `namespace` is legal: a
+/// client that always serializes the flag is not making a contradictory
+/// request.
+pub fn parse_list_tags_input(
+    obj: &Value,
+    default_namespace: &str,
+) -> Result<ListTagsInput, ArgError> {
+    let explicit_namespace = opt_str(obj, "namespace")?;
+    let all_namespaces = opt_bool(obj, "allNamespaces")?.unwrap_or(false);
+
+    if all_namespaces && explicit_namespace.is_some() {
+        return Err(ArgError::new(
+            "allNamespaces",
+            "Parameter 'allNamespaces' cannot be combined with an explicit 'namespace'; \
+             pass one or the other",
+        ));
+    }
+
+    let namespace = if all_namespaces {
+        None
+    } else {
+        Some(explicit_namespace.unwrap_or_else(|| default_namespace.to_string()))
+    };
+
+    let limit = opt_usize_in_range(obj, "limit", 1, MAX_TAG_LIMIT)?.unwrap_or(DEFAULT_TAG_LIMIT);
+
+    Ok(ListTagsInput { namespace, limit })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1288,6 +1672,51 @@ mod tests {
         assert_eq!(from_nulls.supersedes, from_absent.supersedes);
     }
 
+    /// The opt-out reaches `StoreInput`. One construction site, so this
+    /// covers the batch path too — `parse_store_item` delegates here.
+    #[test]
+    fn c19_parse_store_input_carries_check_duplicates() {
+        let item = json!({ "summary": "s", "checkDuplicates": false });
+        assert_eq!(
+            parse_store_input(&item, NS).unwrap().check_duplicates,
+            Some(false)
+        );
+
+        let item = json!({ "summary": "s", "checkDuplicates": true });
+        assert_eq!(
+            parse_store_input(&item, NS).unwrap().check_duplicates,
+            Some(true)
+        );
+    }
+
+    /// Absent means unset, not `false`. The adapter reads unset as
+    /// enabled; a `Some(false)` here would silently disable the check for
+    /// every caller that never heard of the parameter.
+    #[test]
+    fn c20_check_duplicates_is_none_when_absent_or_null() {
+        assert!(
+            parse_store_input(&json!({ "summary": "s" }), NS)
+                .unwrap()
+                .check_duplicates
+                .is_none()
+        );
+        assert!(
+            parse_store_input(&json!({ "summary": "s", "checkDuplicates": null }), NS)
+                .unwrap()
+                .check_duplicates
+                .is_none()
+        );
+    }
+
+    /// `"false"` is a client bug, and JavaScript-style truthiness would
+    /// read it as `true` — turning an opt-out into an opt-in.
+    #[test]
+    fn c18_check_duplicates_rejects_a_stringly_typed_boolean() {
+        let err = parse_store_input(&json!({ "summary": "s", "checkDuplicates": "false" }), NS)
+            .unwrap_err();
+        assert_eq!(err.field, "checkDuplicates");
+    }
+
     #[test]
     fn d3_wrong_typed_namespace_fails_instead_of_falling_back() {
         // Reproduces "namespace silently wrong": the old code took the
@@ -1526,5 +1955,326 @@ mod tests {
     fn d11_error_display_is_exactly_the_message() {
         let err = parse_store_input(&json!({}), NS).unwrap_err();
         assert_eq!(err.to_string(), err.message);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // E. Numeric, boolean and namespace extractors
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn e1_opt_u64_treats_absent_and_null_as_none() {
+        assert_eq!(opt_u64_in_range(&json!({}), "limit", 1, 200).unwrap(), None);
+        assert_eq!(
+            opt_u64_in_range(&json!({ "limit": null }), "limit", 1, 200).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn e2_opt_u64_accepts_both_inclusive_bounds() {
+        assert_eq!(
+            opt_u64_in_range(&json!({ "limit": 1 }), "limit", 1, 200).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            opt_u64_in_range(&json!({ "limit": 200 }), "limit", 1, 200).unwrap(),
+            Some(200)
+        );
+        assert_eq!(
+            opt_u64_in_range(&json!({ "offset": 0 }), "offset", 0, 10).unwrap(),
+            Some(0)
+        );
+    }
+
+    /// The named regression: `{"limit": "50"}` used to coerce to 50.
+    #[test]
+    fn e3_opt_u64_rejects_a_numeric_string() {
+        let err = opt_u64_in_range(&json!({ "limit": "50" }), "limit", 1, 200).unwrap_err();
+        assert_eq!(err.field, "limit");
+        assert_eq!(
+            err.message,
+            "Parameter 'limit' must be an integer (got string)"
+        );
+    }
+
+    #[test]
+    fn e4_opt_u64_rejects_bool_array_and_object() {
+        for (value, name) in [
+            (json!(true), "boolean"),
+            (json!([]), "array"),
+            (json!({}), "object"),
+        ] {
+            let err = opt_u64_in_range(&json!({ "limit": value }), "limit", 1, 200).unwrap_err();
+            assert_eq!(
+                err.message,
+                format!("Parameter 'limit' must be an integer (got {name})")
+            );
+        }
+    }
+
+    #[test]
+    fn e5_opt_u64_rejects_negative_and_fractional() {
+        let err = opt_u64_in_range(&json!({ "limit": -1 }), "limit", 1, 200).unwrap_err();
+        assert_eq!(err.field, "limit");
+        assert_eq!(
+            err.message,
+            "Parameter 'limit' must be a non-negative whole number (got -1)"
+        );
+
+        let err = opt_u64_in_range(&json!({ "limit": 1.5 }), "limit", 1, 200).unwrap_err();
+        assert_eq!(err.field, "limit");
+        assert_eq!(
+            err.message,
+            "Parameter 'limit' must be a non-negative whole number (got 1.5)"
+        );
+    }
+
+    #[test]
+    fn e6_opt_u64_rejects_out_of_range_at_both_ends() {
+        let err = opt_u64_in_range(&json!({ "limit": 0 }), "limit", 1, 200).unwrap_err();
+        assert_eq!(
+            err.message,
+            "Parameter 'limit' must be between 1 and 200 (got 0)"
+        );
+
+        let err = opt_u64_in_range(&json!({ "limit": 500 }), "limit", 1, 200).unwrap_err();
+        assert_eq!(
+            err.message,
+            "Parameter 'limit' must be between 1 and 200 (got 500)"
+        );
+    }
+
+    /// Mirrors `c_opt_uuid_elides_a_long_bad_value`: a hostile literal
+    /// must not become a hostile error message.
+    #[test]
+    fn e7_opt_u64_keeps_the_message_bounded_for_a_huge_literal() {
+        let huge: Value = serde_json::from_str(&format!(r#"{{"limit": {}}}"#, "9".repeat(300)))
+            .expect("parses as a JSON number");
+        let err = opt_u64_in_range(&huge, "limit", 1, 200).unwrap_err();
+        assert_eq!(err.field, "limit");
+        assert!(err.message.len() < 140, "{err}");
+    }
+
+    /// `u64::MAX` must be *rejected* by the range check, never narrowed
+    /// into a small `usize` by a truncating cast.
+    #[test]
+    fn e8_opt_usize_never_truncates() {
+        let err = opt_usize_in_range(&json!({ "limit": u64::MAX }), "limit", 1, 200).unwrap_err();
+        assert_eq!(
+            err.message,
+            format!(
+                "Parameter 'limit' must be between 1 and 200 (got {})",
+                u64::MAX
+            )
+        );
+        assert_eq!(
+            opt_usize_in_range(&json!({ "limit": 7 }), "limit", 1, 200).unwrap(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn e9_opt_bool_treats_absent_and_null_as_none() {
+        assert_eq!(opt_bool(&json!({}), "allNamespaces").unwrap(), None);
+        assert_eq!(
+            opt_bool(&json!({ "allNamespaces": null }), "allNamespaces").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn e10_opt_bool_accepts_true_and_false() {
+        assert_eq!(
+            opt_bool(&json!({ "allNamespaces": true }), "allNamespaces").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            opt_bool(&json!({ "allNamespaces": false }), "allNamespaces").unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn e11_opt_bool_rejects_stringly_and_numeric_booleans() {
+        let err = opt_bool(&json!({ "allNamespaces": "true" }), "allNamespaces").unwrap_err();
+        assert_eq!(err.field, "allNamespaces");
+        assert_eq!(
+            err.message,
+            "Parameter 'allNamespaces' must be a boolean (got string)"
+        );
+
+        let err = opt_bool(&json!({ "allNamespaces": 1 }), "allNamespaces").unwrap_err();
+        assert_eq!(
+            err.message,
+            "Parameter 'allNamespaces' must be a boolean (got number)"
+        );
+    }
+
+    #[test]
+    fn e12_namespace_or_falls_back_only_when_absent_or_null() {
+        assert_eq!(namespace_or(&json!({}), NS).unwrap(), NS);
+        assert_eq!(namespace_or(&json!({ "namespace": null }), NS).unwrap(), NS);
+        assert_eq!(
+            namespace_or(&json!({ "namespace": "personal" }), NS).unwrap(),
+            "personal"
+        );
+    }
+
+    /// The silent-default failure this module exists to remove: a
+    /// wrong-typed namespace must not read or write the default
+    /// partition.
+    #[test]
+    fn e13_namespace_or_rejects_a_wrong_typed_namespace() {
+        let err = namespace_or(&json!({ "namespace": ["work"] }), NS).unwrap_err();
+        assert_eq!(err.field, "namespace");
+        assert_eq!(
+            err.message,
+            "Parameter 'namespace' must be a string (got array)"
+        );
+    }
+
+    /// Documents the choice: an empty namespace is passed through rather
+    /// than silently defaulted, so it fails downstream as "not found"
+    /// naming what the caller actually sent.
+    #[test]
+    fn e14_namespace_or_passes_an_empty_string_through() {
+        assert_eq!(namespace_or(&json!({ "namespace": "" }), NS).unwrap(), "");
+    }
+
+    // ── parse_list_memories_input ────────────────────────────────────
+
+    #[test]
+    fn e15_list_memories_defaults_when_everything_is_absent() {
+        let input = parse_list_memories_input(&json!({}), NS).unwrap();
+        assert_eq!(input.namespace, NS);
+        assert_eq!(input.limit, DEFAULT_LIST_LIMIT);
+        assert_eq!(input.offset, 0);
+        assert!(input.tags.is_empty());
+        assert!(input.entities.is_empty());
+        assert_eq!(input.time_range_start, None);
+        assert_eq!(input.time_range_end, None);
+    }
+
+    #[test]
+    fn e16_list_memories_rejects_a_stringly_typed_limit() {
+        let err = parse_list_memories_input(&json!({ "limit": "50" }), NS).unwrap_err();
+        assert_eq!(err.field, "limit");
+        assert_eq!(
+            err.message,
+            "Parameter 'limit' must be an integer (got string)"
+        );
+    }
+
+    /// Pins the intentional behaviour change: an over-maximum `limit` is
+    /// an error, NOT a silent clamp to `MAX_LIST_LIMIT`.
+    #[test]
+    fn e17_list_memories_rejects_a_limit_above_the_maximum_rather_than_clamping() {
+        let err = parse_list_memories_input(&json!({ "limit": 1000 }), NS).unwrap_err();
+        assert_eq!(err.field, "limit");
+        assert_eq!(
+            err.message,
+            format!("Parameter 'limit' must be between 1 and {MAX_LIST_LIMIT} (got 1000)")
+        );
+
+        // The boundary itself is still accepted.
+        assert_eq!(
+            parse_list_memories_input(&json!({ "limit": MAX_LIST_LIMIT }), NS)
+                .unwrap()
+                .limit,
+            MAX_LIST_LIMIT
+        );
+    }
+
+    #[test]
+    fn e18_list_memories_rejects_bare_string_tags() {
+        let err = parse_list_memories_input(&json!({ "tags": "a,b" }), NS).unwrap_err();
+        assert_eq!(err.field, "tags");
+        assert!(err.message.contains("array of strings"), "{err}");
+    }
+
+    #[test]
+    fn e19_list_memories_accepts_epoch_millis_and_iso_8601_bounds() {
+        let input =
+            parse_list_memories_input(&json!({ "timeRangeStart": 1_700_000_000_000i64 }), NS)
+                .unwrap();
+        assert_eq!(input.time_range_start, Some(1_700_000_000_000));
+
+        let input =
+            parse_list_memories_input(&json!({ "timeRangeEnd": "2026-01-01T00:00:00Z" }), NS)
+                .unwrap();
+        assert!(input.time_range_end.is_some());
+    }
+
+    /// At HEAD this was silently ignored, widening the query to the whole
+    /// namespace.
+    #[test]
+    fn e20_list_memories_rejects_a_wrong_typed_time_bound() {
+        let err = parse_list_memories_input(&json!({ "timeRangeStart": ["x"] }), NS).unwrap_err();
+        assert_eq!(err.field, "timeRangeStart");
+        assert_eq!(
+            err.message,
+            "Parameter 'timeRangeStart' must be an integer (epoch millis) or an ISO 8601 \
+             string (got array)"
+        );
+
+        let err = parse_list_memories_input(&json!({ "timeRangeEnd": true }), NS).unwrap_err();
+        assert_eq!(err.field, "timeRangeEnd");
+        assert!(err.message.ends_with("(got boolean)"), "{err}");
+    }
+
+    #[test]
+    fn e21_list_memories_keeps_the_invalid_time_prefix_for_an_unparseable_string() {
+        let err =
+            parse_list_memories_input(&json!({ "timeRangeStart": "not a date" }), NS).unwrap_err();
+        assert_eq!(err.field, "timeRangeStart");
+        assert!(err.message.starts_with("Invalid timeRangeStart: "), "{err}");
+    }
+
+    // ── parse_list_tags_input ────────────────────────────────────────
+
+    #[test]
+    fn e22_list_tags_defaults_when_everything_is_absent() {
+        let input = parse_list_tags_input(&json!({}), NS).unwrap();
+        assert_eq!(input.namespace.as_deref(), Some(NS));
+        assert_eq!(input.limit, DEFAULT_TAG_LIMIT);
+    }
+
+    #[test]
+    fn e23_list_tags_all_namespaces_clears_the_namespace() {
+        let input = parse_list_tags_input(&json!({ "allNamespaces": true }), NS).unwrap();
+        assert_eq!(input.namespace, None);
+    }
+
+    /// Neither scope silently wins: the contradiction is reported, and it
+    /// is attributed to the flag that caused it.
+    #[test]
+    fn e24_list_tags_rejects_all_namespaces_with_an_explicit_namespace() {
+        let err = parse_list_tags_input(&json!({ "allNamespaces": true, "namespace": "work" }), NS)
+            .unwrap_err();
+        assert_eq!(err.field, "allNamespaces");
+        assert!(err.message.contains("cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn e25_list_tags_rejects_a_limit_above_the_maximum() {
+        let err = parse_list_tags_input(&json!({ "limit": MAX_TAG_LIMIT + 1 }), NS).unwrap_err();
+        assert_eq!(err.field, "limit");
+        assert_eq!(
+            err.message,
+            format!(
+                "Parameter 'limit' must be between 1 and {MAX_TAG_LIMIT} (got {})",
+                MAX_TAG_LIMIT + 1
+            )
+        );
+    }
+
+    /// A client that always serializes the flag is not contradicting
+    /// itself, so `false` plus an explicit namespace is legal.
+    #[test]
+    fn e26_list_tags_allows_all_namespaces_false_beside_an_explicit_namespace() {
+        let input =
+            parse_list_tags_input(&json!({ "allNamespaces": false, "namespace": "work" }), NS)
+                .unwrap();
+        assert_eq!(input.namespace.as_deref(), Some("work"));
     }
 }

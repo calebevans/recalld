@@ -38,6 +38,11 @@ pub enum SearchError {
     #[error("empty query: at least one of text, tags, or memory_id must be provided")]
     EmptyQuery,
 
+    /// A filter names a label that no memory can carry, so applying it
+    /// is impossible and DROPPING it would widen the query.
+    #[error("{0}")]
+    InvalidFilter(String),
+
     /// An unexpected internal error occurred.
     #[error("internal error: {0}")]
     Internal(String),

@@ -104,15 +104,25 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             state::QueryInput::Vector(_) => None,
         };
 
-        // Build proper filter from query tags/entities (Issue 2)
+        // A label that cannot become a tag is an error, not a dropped
+        // filter: dropping one from `includeTags` or `entities` WIDENS
+        // the query, and a caller cannot tell "every memory in the
+        // namespace" from a genuine match.
         let mut require_tags: Vec<Tag> =
-            crate::model::parse_tags_lossy("search.includeTags", &query.include_tags);
-        // Convert entities to entity/ tags (Issue 4)
-        for e in &query.entities {
-            if let Ok(tag) = Tag::new(&format!("entity/{}", e.to_lowercase())) {
-                require_tags.push(tag);
-            }
-        }
+            crate::model::parse_filter_tags("includeTags", "", &query.include_tags)
+                .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?;
+        require_tags.extend(
+            crate::model::parse_filter_tags(
+                "entities",
+                crate::model::constants::ENTITY_TAG_PREFIX,
+                &query.entities,
+            )
+            .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?,
+        );
+        // `excludeTags` is the safe direction — dropping one can only
+        // ever return MORE than asked for in the same sense a missing
+        // exclusion does, and it never masquerades as a match — so it
+        // keeps the lossy parse.
         let exclude_tags: Vec<Tag> =
             crate::model::parse_tags_lossy("search.excludeTags", &query.exclude_tags);
         let phases: Vec<DecayPhase> = query
@@ -179,6 +189,17 @@ impl state::SearchPipeline for SearchPipelineAdapter {
                 }
             })
             .collect())
+    }
+
+    async fn near_duplicates(
+        &self,
+        embedding: &[f32],
+        namespace_id: NamespaceId,
+        threshold: f32,
+        limit: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        let index = self.vector_index.read().await;
+        crate::search::find_near_duplicates(&index, embedding, namespace_id, threshold, limit)
     }
 
     async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId) {
@@ -290,15 +311,37 @@ impl state::SearchPipeline for SearchPipelineAdapter {
 pub struct StorageEngineAdapter {
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: Arc<CacheManager>,
+    /// Held so `delete_memory` can clean the indexes storage cannot
+    /// reach. Without them this adapter could tombstone a record and
+    /// leave it indexed everywhere else.
+    vector_index: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
+    /// See [`vector_index`](Self::vector_index).
+    fts_index: Arc<tokio::sync::Mutex<FtsIndex>>,
+    /// See [`vector_index`](Self::vector_index).
+    entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
+    /// See [`vector_index`](Self::vector_index).
+    graph: crate::graph::SharedGraph,
 }
 
 impl StorageEngineAdapter {
-    /// Creates a new adapter wrapping the storage engine and cache.
+    /// Creates a new adapter wrapping the storage engine, the cache, and
+    /// the four indexes a delete has to clean.
     pub fn new(
         storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
         cache: Arc<CacheManager>,
+        vector_index: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
+        fts_index: Arc<tokio::sync::Mutex<FtsIndex>>,
+        entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
+        graph: crate::graph::SharedGraph,
     ) -> Self {
-        Self { storage, cache }
+        Self {
+            storage,
+            cache,
+            vector_index,
+            fts_index,
+            entity_index,
+            graph,
+        }
     }
 }
 
@@ -401,6 +444,10 @@ impl state::StorageEngine for StorageEngineAdapter {
         // as non-tombstoned, both tombstone it, and both free the same
         // vector slot -- corrupting the free list into a self-referential
         // cycle.
+        // Returns the PRE-tombstone record, not a bool: `tombstone`
+        // erases the tag list, and the tag list is where the entity
+        // names live. A bool here would leave the entity index with no
+        // way to know what to unlink.
         let deleted = tokio::task::spawn_blocking(move || {
             let mut storage_w = storage.write().map_err(|e| {
                 crate::storage::StorageError::Io(std::io::Error::new(
@@ -412,11 +459,15 @@ impl state::StorageEngine for StorageEngineAdapter {
             // Check if the record exists and is not already tombstoned.
             let existing_record = match storage_w.get_record(id)? {
                 Some(r) => r,
-                None => return Ok::<bool, crate::storage::StorageError>(false),
+                None => {
+                    return Ok::<Option<crate::model::DiskRecord>, crate::storage::StorageError>(
+                        None,
+                    );
+                }
             };
 
             if existing_record.phase == DecayPhase::Tombstone {
-                return Ok(false);
+                return Ok(None);
             }
 
             // Tombstone the record.
@@ -433,7 +484,7 @@ impl state::StorageEngine for StorageEngineAdapter {
                 );
             }
 
-            Ok(true)
+            Ok(Some(existing_record))
         })
         .await
         .map_err(|e| {
@@ -443,10 +494,33 @@ impl state::StorageEngine for StorageEngineAdapter {
             ))
         })??;
 
-        if deleted {
-            self.cache.invalidate(id).await;
-        }
-        Ok(deleted)
+        let Some(record) = deleted else {
+            return Ok(false);
+        };
+
+        // This used to stop at `cache.invalidate`, so an HTTP-deleted
+        // memory kept its vector-index entry (burning a top-k slot in
+        // every search and reading as a live autolink target), kept its
+        // FTS row — which survives restart, because the FTS index is
+        // only rebuilt when it is empty — and kept a graph node
+        // reporting Full phase at strength 1.0, still propping up its
+        // neighbours' decay resistance. Same helper as the MCP path now,
+        // so the two cannot drift apart again.
+        crate::index_cleanup::purge_from_indexes(
+            &crate::index_cleanup::IndexHandles {
+                cache: &self.cache,
+                vector_index: &self.vector_index,
+                fts_index: &self.fts_index,
+                entity_index: &self.entity_index,
+                graph: &self.graph,
+            },
+            std::slice::from_ref(&(id, record)),
+            crate::index_cleanup::FtsAction::PerRecord,
+            crate::index_cleanup::GraphAction::MarkTombstoned,
+        )
+        .await;
+
+        Ok(true)
     }
 
     async fn namespace_stats(
@@ -466,6 +540,7 @@ impl state::StorageEngine for StorageEngineAdapter {
             let all_records = storage_r.scan_all()?;
 
             let mut memory_count: u64 = 0;
+            let mut tombstone_count: u64 = 0;
             let mut phase_1_count: u64 = 0;
             let mut phase_2_count: u64 = 0;
             let mut phase_3_count: u64 = 0;
@@ -477,12 +552,23 @@ impl state::StorageEngine for StorageEngineAdapter {
                 if NamespaceId::new(record.namespace_id) != namespace_id {
                     continue;
                 }
+
+                // Mirrors the MCP path exactly: a tombstoned record is not
+                // a memory, and counting it dragged avg_strength toward
+                // zero while still contributing its (unzeroed) permastore
+                // flag and edge count.
+                if record.phase == DecayPhase::Tombstone {
+                    tombstone_count += 1;
+                    continue;
+                }
                 memory_count += 1;
 
                 match record.phase {
                     DecayPhase::Full => phase_1_count += 1,
                     DecayPhase::Summary => phase_2_count += 1,
                     DecayPhase::Ghost => phase_3_count += 1,
+                    // Unreachable: skipped above. An arm, not an
+                    // `unreachable!()` -- this is a read path.
                     DecayPhase::Tombstone => {}
                 }
 
@@ -502,6 +588,7 @@ impl state::StorageEngine for StorageEngineAdapter {
 
             Ok(state::NamespaceStats {
                 memory_count,
+                tombstone_count,
                 phase_1_count,
                 phase_2_count,
                 phase_3_count,
@@ -1237,9 +1324,15 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
                 Err(_) => return Vec::new(),
             };
 
+            // Live memories only. Counting tombstones here made every
+            // namespace listing disagree with what a caller could actually
+            // fetch from it.
             let mut counts = std::collections::HashMap::<u32, u64>::new();
             if let Ok(all_records) = storage_r.scan_all() {
                 for (_id, record) in &all_records {
+                    if record.phase == DecayPhase::Tombstone {
+                        continue;
+                    }
                     *counts.entry(record.namespace_id).or_default() += 1;
                 }
             }
@@ -1332,5 +1425,138 @@ pub struct NoopMetricsCollector;
 impl state::MetricsCollector for NoopMetricsCollector {
     async fn render_prometheus(&self) -> String {
         String::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::state::StorageEngine as _;
+    use crate::search::{VectorIndex as _, VectorMetadata};
+    use crate::test_support::{DIM, Fixture, MemorySpec};
+
+    /// A vector of the fixture's width, so it matches the index.
+    fn unit_vector() -> Vec<f32> {
+        let mut v = vec![0.0; DIM];
+        v[0] = 1.0;
+        v
+    }
+
+    fn adapter(fx: &Fixture) -> StorageEngineAdapter {
+        StorageEngineAdapter::new(
+            fx.storage.clone(),
+            fx.cache.clone(),
+            fx.vector_index.clone(),
+            fx.fts_index.clone(),
+            fx.entity_index.clone(),
+            fx.graph.clone(),
+        )
+    }
+
+    /// Put a memory into every index, which is the state the running
+    /// system leaves after a successful store.
+    async fn indexed_memory(fx: &Fixture) -> MemoryId {
+        let ns = NamespaceId::new(1);
+        let id = fx
+            .insert_memory_with(MemorySpec {
+                tags: &["entity/sarah"],
+                ..MemorySpec::new(ns)
+            })
+            .await;
+
+        fx.fts_index
+            .lock()
+            .await
+            .add(ns, id, "a fact about Sarah", None, &[])
+            .expect("fts add");
+        fx.vector_index
+            .write()
+            .await
+            .add(
+                id,
+                &unit_vector(),
+                VectorMetadata {
+                    namespace_id: ns,
+                    decay_phase: 1,
+                    tags: Vec::new(),
+                },
+            )
+            .expect("vector add");
+        fx.entity_index
+            .write()
+            .await
+            .add(id, &["Sarah".to_string()]);
+
+        id
+    }
+
+    /// THE HTTP-delete regression. This path used to stop after
+    /// `cache.invalidate`, leaving the memory in all four indexes: a
+    /// vector entry burning a top-k slot in every search and reading as
+    /// a live autolink target, an FTS row that survives restart forever,
+    /// an entity entry, and a graph node still reporting Full phase at
+    /// strength 1.0 and so still propping up its neighbours' decay
+    /// resistance.
+    #[tokio::test]
+    async fn w35_http_delete_clears_every_index_and_marks_the_graph_node() {
+        let fx = Fixture::new();
+        let id = indexed_memory(&fx).await;
+
+        assert!(adapter(&fx).delete_memory(id).await.expect("delete"));
+
+        assert!(
+            fx.fts_index.lock().await.is_empty().expect("fts"),
+            "FTS row survived an HTTP delete"
+        );
+        assert_eq!(
+            fx.vector_index.read().await.len(),
+            0,
+            "vector index entry survived an HTTP delete"
+        );
+        assert_eq!(
+            fx.entity_index.read().await.len(),
+            0,
+            "entity index entry survived an HTTP delete"
+        );
+        assert_eq!(
+            fx.graph
+                .read()
+                .await
+                .get_node(&id)
+                .expect("the node is kept, only re-phased")
+                .decay_phase,
+            DecayPhase::Tombstone
+        );
+    }
+
+    /// A second delete is a no-op, not a second round of index churn.
+    #[tokio::test]
+    async fn w36_http_delete_of_an_already_tombstoned_memory_reports_false() {
+        let fx = Fixture::new();
+        let id = indexed_memory(&fx).await;
+        let adapter = adapter(&fx);
+
+        assert!(adapter.delete_memory(id).await.expect("first delete"));
+
+        // Re-index it, so a second pass through the cleanup would be
+        // visible rather than idempotent by accident.
+        fx.fts_index
+            .lock()
+            .await
+            .add(NamespaceId::new(1), id, "re-indexed", None, &[])
+            .expect("fts add");
+
+        assert!(
+            !adapter.delete_memory(id).await.expect("second delete"),
+            "an already-tombstoned memory must report false"
+        );
+        assert!(
+            !fx.fts_index.lock().await.is_empty().expect("fts"),
+            "the second delete ran the index cleanup anyway"
+        );
     }
 }

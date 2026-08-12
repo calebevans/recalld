@@ -322,10 +322,17 @@ pub async fn compute_metadata_stats(
     storage: &dyn StorageEngine,
     _namespace_filter: Option<NamespaceId>,
 ) -> Result<MetadataStats, Box<dyn std::error::Error + Send + Sync>> {
-    // list_tags returns all tags sorted by count descending
-    let all_tags = storage.list_tags().await?;
+    let mut all_tags = storage.list_tags().await?;
 
     let unique_tags = all_tags.len() as u64;
+
+    // `list_tags` reads a redb B-tree keyed by tag, so it arrives in
+    // LEXICOGRAPHIC order -- the comment here used to claim it came back
+    // sorted by count, and the report published the first ten tags
+    // alphabetically under the heading "top tags". The "top" has to be
+    // selected here.
+    crate::model::sort_tag_counts(&mut all_tags);
+
     let top_tags: Vec<TagCount> = all_tags
         .into_iter()
         .take(10)

@@ -61,6 +61,15 @@ pub trait StorageEngine: Send + Sync {
     /// Delete a memory by ID. Returns `true` if the memory existed and was deleted.
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, BridgeError>;
 
+    /// Delete many memories in one pass.
+    ///
+    /// Returns one flag per input id, in input order. `false` means the
+    /// memory was missing **or** already tombstoned — the same
+    /// conflation [`delete_memory`](Self::delete_memory) already makes,
+    /// kept rather than replaced with a third state a caller would have
+    /// to learn for the batch alone.
+    async fn delete_memories(&self, ids: &[MemoryId]) -> Result<Vec<bool>, BridgeError>;
+
     /// Reinforce a memory with the given FSRS quality rating (1-4).
     async fn reinforce_memory(
         &self,
@@ -73,6 +82,13 @@ pub trait StorageEngine: Send + Sync {
         &self,
         input: ListMemoriesInput,
     ) -> Result<ListMemoriesResponse, BridgeError>;
+
+    /// Tag vocabulary with per-label memory counts.
+    ///
+    /// On `StorageEngine` rather than `NamespaceRegistry` because
+    /// `list_tags` already lives on the storage traits and the tag index
+    /// is storage.
+    async fn list_tags(&self, input: ListTagsInput) -> Result<ListTagsResponse, BridgeError>;
 }
 
 /// Namespace registry interface.
@@ -89,6 +105,17 @@ pub trait NamespaceRegistry: Send + Sync {
 
     /// Get detailed statistics for a namespace by name.
     async fn namespace_stats(&self, name: &str) -> Result<NamespaceStats, BridgeError>;
+
+    /// Destroy a namespace and every memory in it.
+    ///
+    /// **Destructive and irreversible.** There is no undo and no backup.
+    /// Implementations must refuse the default namespace outright and
+    /// must refuse a namespace still holding live memories unless
+    /// `force` is set.
+    async fn delete_namespace(
+        &self,
+        input: DeleteNamespaceInput,
+    ) -> Result<DeleteNamespaceResult, BridgeError>;
 }
 
 /// Health check interface.
@@ -265,6 +292,26 @@ pub struct StoreInput {
     pub parent_id: Option<MemoryId>,
     /// ID of an older memory this one replaces.
     pub supersedes: Option<MemoryId>,
+    /// Whether to check the new memory against existing ones and report
+    /// near-duplicates. Absent means enabled.
+    ///
+    /// `Option<bool>` rather than `bool` with a `default_true` function
+    /// is the load-bearing choice. This struct is deserialized straight
+    /// off the daemon socket, so an older client sends a payload with no
+    /// `checkDuplicates` key; serde already decodes a missing
+    /// `Option<T>` as `None` — as the un-attributed `embedding` and
+    /// `initial_stability` beside it demonstrate — so "unset" arrives
+    /// intact and means "on". A `bool` would need
+    /// `#[serde(default = "…")]` and a bare `#[serde(default)]` on one
+    /// would yield `false`, silently disabling the feature for every
+    /// pre-existing client.
+    ///
+    /// The `#[serde(default)]` below is therefore redundant, and kept
+    /// only so the attribute set matches [`DeleteNamespaceInput::force`],
+    /// where it IS required. Do not read it as evidence that a
+    /// non-`Option` field is safe without one.
+    #[serde(default)]
+    pub check_duplicates: Option<bool>,
 }
 
 /// Result of storing a memory.
@@ -286,12 +333,21 @@ pub struct StoredMemory {
     /// What became of the requested `supersedes` link, when one was asked
     /// for. Absent when the store named no target.
     ///
-    /// `#[serde(default)]` is load-bearing, not decoration: this struct
-    /// round-trips through the daemon protocol, so a new client talking to
-    /// an older daemon receives a payload without this key and must still
-    /// decode it.
+    /// `skip_serializing_if` is the load-bearing half: it keeps the key
+    /// OUT of the response when there is nothing to report, so existing
+    /// clients see the shape they saw before this field existed. The
+    /// `default` is redundant — serde decodes a missing `Option<T>` as
+    /// `None` on its own — and is kept only for symmetry with the pair
+    /// below it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<crate::model::SupersedesOutcome>,
+    /// Existing memories that closely resemble this one.
+    ///
+    /// Absent when nothing crossed the threshold, when the caller passed
+    /// `checkDuplicates: false`, or when the namespace's vectors are not
+    /// L2-normalized. Advisory only: the memory was stored regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_duplicates: Option<crate::model::NearDuplicateReport>,
 }
 
 /// A full memory record returned by get.
@@ -360,6 +416,68 @@ pub struct ListMemoriesInput {
     pub time_range_end: Option<i64>,
 }
 
+/// Input for a tag-vocabulary listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTagsInput {
+    /// Namespace to count within, or `None` for every namespace.
+    pub namespace: Option<String>,
+    /// Maximum labels returned *per bucket*. Each bucket also reports the
+    /// untruncated total, so a truncated answer still states its own size.
+    pub limit: usize,
+}
+
+/// One label and the number of live memories carrying it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagCount {
+    /// The label. In the `entities`, `topics` and `emotions` buckets the
+    /// derived prefix is **stripped**, so the value can be passed
+    /// straight back to `store_memory` or `list_memories` — which is not
+    /// true of the prefixed form, since those tools add the prefix
+    /// themselves.
+    pub name: String,
+    /// Live memories carrying this label.
+    pub count: u64,
+}
+
+/// One bucket of a tag listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagBucket {
+    /// Distinct labels in this bucket *before* truncation, so a truncated
+    /// answer still states its own size.
+    pub total: u64,
+    /// Whether `items` is shorter than `total`.
+    pub truncated: bool,
+    /// Count descending, ties broken on name ascending.
+    pub items: Vec<TagCount>,
+}
+
+/// Tag vocabulary split into plain and derived buckets.
+///
+/// Split rather than flat because in a real corpus every memory carries
+/// several `entity/` tags, so a single top-50 list is nearly all entities
+/// and useless for discovering the plain tags a caller would filter on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTagsResponse {
+    /// The namespace counted, or `null` when every namespace was counted.
+    pub namespace: Option<String>,
+    /// Live memories inspected. `null` in global scope, where the tag
+    /// index is read directly and no memory records are touched.
+    pub memories_counted: Option<u64>,
+    /// Labels that are not derived from `entities`, `topics` or
+    /// `emotions`.
+    pub tags: TagBucket,
+    /// Labels derived from `entities`, prefix stripped.
+    pub entities: TagBucket,
+    /// Labels derived from `topics`, prefix stripped.
+    pub topics: TagBucket,
+    /// Labels derived from `emotions`, prefix stripped.
+    pub emotions: TagBucket,
+}
+
 /// A single memory entry in a list response (lightweight, no full_text).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -410,6 +528,53 @@ pub struct CreateNamespaceInput {
     pub decay_rate_multiplier: Option<f32>,
 }
 
+/// Input for destroying a namespace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteNamespaceInput {
+    /// Name of the namespace to destroy.
+    pub name: String,
+    /// Destroy the namespace even if it still holds live memories.
+    ///
+    /// `#[serde(default)]` is required: this struct is deserialized
+    /// straight off the daemon socket, an older client sends a payload
+    /// with no `force` key, and `bool` has no "missing" representation —
+    /// so without the attribute such a call is a hard parse failure.
+    /// (`Option` fields elsewhere in this module get that for free from
+    /// serde and carry the attribute only for symmetry; this one does
+    /// not.) Defaulting to `false` is also the safe direction — a
+    /// missing key can only ever make the operation more cautious.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// What a namespace deletion destroyed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteNamespaceResult {
+    /// Name of the namespace that was destroyed.
+    pub name: String,
+    /// Its numeric id. Never reused.
+    pub id: u32,
+    /// Always true on success; present so the response shape matches
+    /// `forget_memory`.
+    pub deleted: bool,
+    /// Live memories destroyed.
+    pub memories_deleted: u64,
+    /// Tombstoned records reclaimed. These held no content — they had
+    /// already been forgotten — but nothing else in the system ever
+    /// removes them, so they are reported separately rather than folded
+    /// into `memoriesDeleted`.
+    pub tombstones_purged: u64,
+    /// Graph edges removed, including edges that pointed into the
+    /// namespace from outside it.
+    pub edges_removed: u64,
+    /// Full-text search rows removed.
+    pub fts_rows_removed: u64,
+    /// Whether the namespace's vector file was removed from disk.
+    pub vector_file_removed: bool,
+}
+
 /// Namespace information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -432,17 +597,34 @@ pub struct NamespaceInfo {
 pub struct NamespaceStats {
     /// Namespace name.
     pub name: String,
-    /// Total number of memories.
+    /// Number of live memories. Excludes tombstoned records, and always
+    /// equals `phase_counts.full + .summary + .ghost`.
     pub memory_count: u64,
+    /// Number of tombstoned records still occupying a metadata row.
+    ///
+    /// Reported rather than silently dropped: a namespace showing one
+    /// live memory where eleven were stored has ten tombstones, and an
+    /// agent auditing it needs to see that rather than guess whether
+    /// something was lost to a bug.
+    ///
+    /// `#[serde(default)]` is required here, unlike the `Option` fields
+    /// elsewhere in this module: `u64` has no "missing" representation,
+    /// so without the attribute a new client decoding an old daemon's
+    /// response — which has no `tombstoneCount` — fails outright, which
+    /// is strictly worse than the zero it reports instead.
+    #[serde(default)]
+    pub tombstone_count: u64,
     /// Memory counts broken down by decay phase.
     pub phase_counts: PhaseCounts,
-    /// Number of memories in permastore.
+    /// Number of live memories in permastore.
     pub permastore_count: u64,
-    /// Average memory strength across all memories.
+    /// Average memory strength across the live memories.
     pub avg_strength: f32,
-    /// Total number of graph edges.
+    /// Total number of graph edges on the live memories.
     pub edge_count: u64,
-    /// Total bytes used by vector storage.
+    /// Logical bytes of live vector data
+    /// (`memory_count` x `embeddingDim` x 4). NOT the size of
+    /// `vectors.dat`, which retains freed slots until compaction.
     pub vector_bytes: u64,
 }
 
@@ -508,6 +690,18 @@ pub enum BridgeError {
     /// The request or response exceeded the daemon's frame size limit.
     #[error("Too large: {0}")]
     TooLarge(String),
+
+    /// The operation failed after it had already changed something, and
+    /// the change is not undoable.
+    ///
+    /// Distinct from [`Storage`](Self::Storage) because the two demand
+    /// opposite reactions from the agent reading the message: a storage
+    /// failure means "nothing happened, try again or give up", and this
+    /// means "something was destroyed, re-run to finish the job". A
+    /// caller that renders both as a bare failure tells its user the
+    /// destroyed records are still there.
+    #[error("Partially applied: {0}")]
+    PartiallyApplied(String),
 }
 
 impl BridgeError {
@@ -641,8 +835,10 @@ mod tests {
 
     /// Back-compat guard for the daemon protocol. `StoredMemory` is
     /// round-tripped through serde between client and daemon, so a new
-    /// client must still decode a response from a daemon that predates the
-    /// `supersedes` field. This is what `#[serde(default)]` buys.
+    /// client must still decode a response from a daemon that predates
+    /// the `supersedes` field. (Serde gives an `Option` field that for
+    /// free; the test is here because the guarantee matters, not because
+    /// an attribute is doing the work.)
     #[test]
     fn stored_memory_decodes_a_payload_without_the_supersedes_field() {
         let decoded: StoredMemory =
@@ -702,5 +898,286 @@ mod tests {
         assert_eq!(outcome.target, target);
         assert_eq!(outcome.status, SupersedesStatus::AppliedNotDurable);
         assert_eq!(outcome.detail.as_deref(), Some("disk write failed"));
+    }
+
+    // ── near-duplicate wire format ───────────────────────────────────
+
+    fn store_input_json() -> serde_json::Value {
+        json!({
+            "summary": "a fact",
+            "fullText": null,
+            "tags": [],
+            "namespace": "default",
+            "embedding": null,
+            "initialStability": null,
+            "parentId": null,
+            "supersedes": null,
+        })
+    }
+
+    /// Response-side back-compat, matching the `supersedes` guard above: a
+    /// new client must decode a response from a daemon that predates the
+    /// field.
+    #[test]
+    fn b11_stored_memory_decodes_a_payload_without_near_duplicates() {
+        let decoded: StoredMemory =
+            serde_json::from_value(stored_memory_json()).expect("old daemon payload decodes");
+
+        assert!(decoded.near_duplicates.is_none());
+    }
+
+    /// A store with nothing to report serialises exactly as before, so an
+    /// existing client sees an unchanged response shape rather than a new
+    /// `"nearDuplicates": null`.
+    #[test]
+    fn b12_an_absent_report_is_omitted_from_the_output() {
+        let stored: StoredMemory =
+            serde_json::from_value(stored_memory_json()).expect("payload decodes");
+
+        let encoded = serde_json::to_value(&stored).expect("encodes");
+        assert!(encoded.get("nearDuplicates").is_none());
+    }
+
+    /// The key names are the wire contract; camelCase on every level.
+    #[test]
+    fn b13_a_report_round_trips_with_camel_case_keys() {
+        let target = MemoryId::new();
+        let mut stored: StoredMemory =
+            serde_json::from_value(stored_memory_json()).expect("payload decodes");
+        stored.near_duplicates = crate::model::NearDuplicateReport::from_matches(
+            0.85,
+            vec![crate::model::NearDuplicateMatch {
+                id: target,
+                score: 0.93,
+                summary: "an older phrasing of the same fact".to_string(),
+            }],
+        );
+
+        let encoded = serde_json::to_value(&stored).expect("encodes");
+        let report = &encoded["nearDuplicates"];
+        // `threshold` is `f64`, so the round number stays round. `score`
+        // is a genuine `f32` similarity and widens on the way out, which
+        // is why only this one is compared approximately.
+        assert_eq!(report["threshold"], json!(0.85));
+        assert_eq!(report["matches"][0]["id"], json!(target.to_string()));
+        let score = report["matches"][0]["score"]
+            .as_f64()
+            .expect("score is a number");
+        assert!((score - 0.93).abs() < 1e-6, "{score}");
+        assert_eq!(
+            report["matches"][0]["summary"],
+            json!("an older phrasing of the same fact")
+        );
+
+        let decoded: StoredMemory = serde_json::from_value(encoded).expect("decodes");
+        let report = decoded.near_duplicates.expect("report preserved");
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(report.matches[0].id, target);
+    }
+
+    /// The REQUEST-side guard. `StoreInput` is deserialized straight off
+    /// the daemon socket, so an older client sends a payload without
+    /// `checkDuplicates`, and it must decode as "unset" — which means
+    /// enabled. The `Option` is what carries that: a `bool` with a bare
+    /// `#[serde(default)]` would decode as `false` and silently disable
+    /// the feature for every pre-existing client.
+    #[test]
+    fn b14_store_input_decodes_a_payload_without_check_duplicates() {
+        let decoded: StoreInput =
+            serde_json::from_value(store_input_json()).expect("old client payload decodes");
+
+        assert!(decoded.check_duplicates.is_none());
+        assert_eq!(decoded.summary, "a fact");
+    }
+
+    /// The executable form of the note on `check_duplicates`: serde
+    /// decodes a MISSING `Option<T>` as `None` with no attribute at all.
+    /// `embedding`, `initialStability`, `parentId` and `supersedes` carry
+    /// no `#[serde(default)]` and are absent here.
+    ///
+    /// Written down because the comments used to claim the attribute was
+    /// what made these decode, which would tell the next author that a
+    /// non-`Option` field is equally safe without one. It is not — see
+    /// `DeleteNamespaceInput::force` and `NamespaceStats::tombstone_count`,
+    /// where the attribute is the only thing standing between an old
+    /// payload and a hard parse failure.
+    #[test]
+    fn w68_a_missing_option_field_needs_no_serde_default() {
+        let decoded: StoreInput = serde_json::from_value(json!({
+            "summary": "a fact",
+            "tags": [],
+            "namespace": "default",
+        }))
+        .expect("a payload with every optional key absent decodes");
+
+        assert!(decoded.embedding.is_none());
+        assert!(decoded.initial_stability.is_none());
+        assert!(decoded.parent_id.is_none());
+        assert!(decoded.supersedes.is_none());
+        assert!(decoded.full_text.is_none());
+        assert!(decoded.check_duplicates.is_none());
+    }
+
+    /// The case where `#[serde(default)]` is genuinely load-bearing:
+    /// `force` is a `bool`, not an `Option<bool>`, so a missing key has
+    /// no representation and the decode fails outright without it. An
+    /// older client sends no `force` key, and with the attribute that
+    /// missing key can only ever make the operation more cautious.
+    #[test]
+    fn w44_delete_namespace_input_decodes_a_payload_without_force() {
+        let decoded: DeleteNamespaceInput = serde_json::from_value(json!({ "name": "scratch" }))
+            .expect("old client payload decodes");
+
+        assert_eq!(decoded.name, "scratch");
+        assert!(
+            !decoded.force,
+            "a missing force key must mean the safe path"
+        );
+
+        let decoded: DeleteNamespaceInput =
+            serde_json::from_value(json!({ "name": "scratch", "force": true })).expect("decodes");
+        assert!(decoded.force);
+    }
+
+    #[test]
+    fn b15_check_duplicates_round_trips_on_a_store_input() {
+        let mut payload = store_input_json();
+        payload["checkDuplicates"] = json!(false);
+
+        let decoded: StoreInput = serde_json::from_value(payload).expect("decodes");
+        assert_eq!(decoded.check_duplicates, Some(false));
+
+        let encoded = serde_json::to_value(&decoded).expect("encodes");
+        assert_eq!(encoded["checkDuplicates"], json!(false));
+    }
+
+    // ── namespace_stats wire format ──────────────────────────────────
+
+    /// Back-compat guard for the daemon protocol. `NamespaceStats` is
+    /// round-tripped through serde in BOTH directions, so a new client
+    /// must still decode a response from a daemon that predates
+    /// `tombstoneCount`. `#[serde(default)]` really is doing the work
+    /// here — `tombstone_count` is a `u64`, which has no "missing"
+    /// representation — so without it the call fails outright.
+    #[test]
+    fn namespace_stats_decodes_a_payload_without_the_tombstone_count() {
+        let decoded: NamespaceStats = serde_json::from_value(json!({
+            "name": "default",
+            "memoryCount": 3,
+            "phaseCounts": { "full": 3, "summary": 0, "ghost": 0 },
+            "permastoreCount": 0,
+            "avgStrength": 1.0,
+            "edgeCount": 0,
+            "vectorBytes": 128,
+        }))
+        .expect("old daemon payload decodes");
+
+        assert_eq!(decoded.tombstone_count, 0);
+        assert_eq!(decoded.memory_count, 3);
+    }
+
+    #[test]
+    fn namespace_stats_round_trips_the_tombstone_count() {
+        let stats = NamespaceStats {
+            name: "default".into(),
+            memory_count: 1,
+            tombstone_count: 10,
+            phase_counts: PhaseCounts {
+                full: 1,
+                summary: 0,
+                ghost: 0,
+            },
+            permastore_count: 0,
+            avg_strength: 0.8,
+            edge_count: 0,
+            vector_bytes: 16,
+        };
+
+        let encoded = serde_json::to_value(&stats).expect("encodes");
+        assert_eq!(encoded["tombstoneCount"], json!(10));
+
+        let decoded: NamespaceStats = serde_json::from_value(encoded).expect("decodes");
+        assert_eq!(decoded.tombstone_count, 10);
+        assert_eq!(decoded.memory_count, 1);
+    }
+
+    // ── list_tags wire format ────────────────────────────────────────
+
+    fn bucket(items: &[(&str, u64)], total: u64, truncated: bool) -> TagBucket {
+        TagBucket {
+            total,
+            truncated,
+            items: items
+                .iter()
+                .map(|(n, c)| TagCount {
+                    name: (*n).to_string(),
+                    count: *c,
+                })
+                .collect(),
+        }
+    }
+
+    fn empty_bucket() -> TagBucket {
+        bucket(&[], 0, false)
+    }
+
+    #[test]
+    fn list_tags_response_round_trips_in_camel_case() {
+        let response = ListTagsResponse {
+            namespace: Some("work".into()),
+            memories_counted: Some(128),
+            tags: bucket(&[("type/decision", 12)], 41, false),
+            entities: bucket(&[("recalld", 30)], 120, true),
+            topics: empty_bucket(),
+            emotions: empty_bucket(),
+        };
+
+        let encoded = serde_json::to_value(&response).expect("encodes");
+        assert_eq!(encoded["namespace"], json!("work"));
+        assert_eq!(encoded["memoriesCounted"], json!(128));
+        assert_eq!(encoded["entities"]["truncated"], json!(true));
+        assert_eq!(encoded["entities"]["total"], json!(120));
+        assert_eq!(encoded["entities"]["items"][0]["name"], json!("recalld"));
+        assert_eq!(encoded["entities"]["items"][0]["count"], json!(30));
+
+        let decoded: ListTagsResponse = serde_json::from_value(encoded).expect("decodes");
+        assert_eq!(decoded.tags.items[0].name, "type/decision");
+        assert_eq!(decoded.memories_counted, Some(128));
+    }
+
+    /// Global scope emits EXPLICIT nulls rather than omitting the keys,
+    /// so the response always states its own scope instead of leaving the
+    /// caller to infer it from an absence.
+    #[test]
+    fn list_tags_response_states_global_scope_with_explicit_nulls() {
+        let response = ListTagsResponse {
+            namespace: None,
+            memories_counted: None,
+            tags: empty_bucket(),
+            entities: empty_bucket(),
+            topics: empty_bucket(),
+            emotions: empty_bucket(),
+        };
+
+        let encoded = serde_json::to_value(&response).expect("encodes");
+        assert_eq!(encoded["namespace"], json!(null));
+        assert_eq!(encoded["memoriesCounted"], json!(null));
+        let obj = encoded.as_object().expect("object");
+        assert!(obj.contains_key("namespace"));
+        assert!(obj.contains_key("memoriesCounted"));
+    }
+
+    #[test]
+    fn list_tags_input_round_trips_a_global_scope() {
+        let input = ListTagsInput {
+            namespace: None,
+            limit: 50,
+        };
+        let encoded = serde_json::to_value(&input).expect("encodes");
+        assert_eq!(encoded["namespace"], json!(null));
+
+        let decoded: ListTagsInput = serde_json::from_value(encoded).expect("decodes");
+        assert_eq!(decoded.namespace, None);
+        assert_eq!(decoded.limit, 50);
     }
 }

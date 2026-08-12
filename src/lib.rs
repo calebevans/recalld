@@ -34,6 +34,7 @@ pub mod embedding;
 pub mod error;
 pub mod graph;
 pub mod health;
+pub(crate) mod index_cleanup;
 pub mod mcp;
 pub mod model;
 pub mod rif;
@@ -41,6 +42,8 @@ pub mod search;
 pub mod serialization;
 pub mod storage;
 pub mod system;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod time;
 
 // ── Top-level re-exports ─────────────────────────────────────────────

@@ -68,6 +68,11 @@ claude mcp add --scope user --transport http recalld http://localhost:7680/mcp
 
 Then allow the MCP tools so Claude can use them without prompting each time. Add to your `~/.claude/settings.local.json` (global) or project `.claude/settings.local.json`:
 
+`delete_namespace` is deliberately left out of the allowlist below. It
+destroys every memory in a namespace and removes its vector file from
+disk, with no undo and no backup — the one tool worth a confirmation
+prompt each time. Add it only if you want that prompt gone.
+
 ```json
 {
   "permissions": {
@@ -78,10 +83,13 @@ Then allow the MCP tools so Claude can use them without prompting each time. Add
       "mcp__recalld__get_memory",
       "mcp__recalld__reinforce_memory",
       "mcp__recalld__forget_memory",
+      "mcp__recalld__forget_memories",
       "mcp__recalld__find_similar_memories",
       "mcp__recalld__create_namespace",
       "mcp__recalld__namespace_stats",
-      "mcp__recalld__list_memories"
+      "mcp__recalld__list_memories",
+      "mcp__recalld__list_namespaces",
+      "mcp__recalld__list_tags"
     ]
   }
 }
@@ -173,7 +181,7 @@ See [docs/benchmark.md](docs/benchmark.md) for full methodology, per-category br
 
 ## Usage modes
 
-**MCP server (stdio)** -- Runs as a Model Context Protocol server for AI tools like Claude Code. Exposes 10 tools: `store_memory`, `store_memories`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `find_similar_memories`, `create_namespace`, `namespace_stats`, `list_memories`.
+**MCP server (stdio)** -- Runs as a Model Context Protocol server for AI tools like Claude Code. Exposes 14 tools: `store_memory`, `store_memories`, `recall_memories`, `get_memory`, `reinforce_memory`, `forget_memory`, `forget_memories`, `find_similar_memories`, `create_namespace`, `delete_namespace`, `namespace_stats`, `list_memories`, `list_namespaces`, `list_tags`.
 
 ```sh
 recalld mcp

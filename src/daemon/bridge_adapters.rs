@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use super::client::DaemonClient;
 use super::protocol;
 use crate::mcp::bridge::{
-    self, BridgeError, CreateNamespaceInput, DuplicateCluster, HealthStatus, MemoryRecord,
-    NamespaceInfo, NamespaceStats, ReinforceResult, SearchHit, SearchInput, SearchPipeline,
-    SearchResponse, StoreInput, StoredMemory, SubsystemHealth,
+    self, BridgeError, CreateNamespaceInput, DuplicateCluster, HealthStatus, ListTagsInput,
+    ListTagsResponse, MemoryRecord, NamespaceInfo, NamespaceStats, ReinforceResult, SearchHit,
+    SearchInput, SearchPipeline, SearchResponse, StoreInput, StoredMemory, SubsystemHealth,
 };
 use crate::model::MemoryId;
 
@@ -116,6 +116,16 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
 
+    async fn delete_memories(&self, ids: &[MemoryId]) -> Result<Vec<bool>, BridgeError> {
+        let params = serde_json::to_value(protocol::DeleteMemoriesParams {
+            ids: ids.iter().map(|id| id.to_string()).collect(),
+        })
+        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let result = self.client.call("delete_memories", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
+    }
+
     async fn reinforce_memory(
         &self,
         id: MemoryId,
@@ -138,6 +148,14 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
         let params =
             serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("list_memories", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
+    }
+
+    async fn list_tags(&self, input: ListTagsInput) -> Result<ListTagsResponse, BridgeError> {
+        let params =
+            serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let result = self.client.call("list_tags", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
@@ -177,6 +195,17 @@ impl bridge::NamespaceRegistry for RemoteNamespaceAdapter {
         let params =
             serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
         let result = self.client.call("create_namespace", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
+    }
+
+    async fn delete_namespace(
+        &self,
+        input: bridge::DeleteNamespaceInput,
+    ) -> Result<bridge::DeleteNamespaceResult, BridgeError> {
+        let params =
+            serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let result = self.client.call("delete_namespace", params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }

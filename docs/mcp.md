@@ -44,10 +44,13 @@ By default, Claude Code will prompt you for approval each time an MCP tool is ca
       "mcp__recalld__get_memory",
       "mcp__recalld__reinforce_memory",
       "mcp__recalld__forget_memory",
+      "mcp__recalld__forget_memories",
       "mcp__recalld__find_similar_memories",
       "mcp__recalld__create_namespace",
       "mcp__recalld__namespace_stats",
-      "mcp__recalld__list_memories"
+      "mcp__recalld__list_memories",
+      "mcp__recalld__list_namespaces",
+      "mcp__recalld__list_tags"
     ]
   }
 }
@@ -123,6 +126,10 @@ Configure per-project namespace defaults in a `.recalld.toml` file (see above), 
 
 ## Available tools
 
+### A note on deletion
+
+`forget_memory` and `forget_memories` move a memory to the Tombstone phase: content erased, but the record and its graph edges kept so relationship chains stay intact, and the UUID never reused. **Tombstones are never reclaimed by the decay sweep** — they persist for the life of the database. `delete_namespace` is the only operation that reclaims them.
+
 ### A note on limits
 
 Every length limit below is measured in **UTF-8 bytes, not characters**. For plain ASCII the two are the same, so a 2000-byte `summary` holds 2000 characters. Non-ASCII characters cost more: accented letters and curly quotes are 2-3 bytes, em dashes (`—`) are 3 bytes, and emoji are 4 bytes. A summary of 1900 em dashes is 5700 bytes and will be rejected. Rejection messages report both numbers, e.g. `summary is 5700 bytes (1900 characters), which exceeds the 2000-byte limit.`
@@ -135,7 +142,9 @@ Before this limit existed there was no per-element bound at all: an over-long en
 
 ### Argument validation
 
-`store_memory` and `store_memories` validate their arguments strictly. A wrong-typed or unparseable argument is an error naming the field; it is never coerced, defaulted, or dropped. Earlier versions guessed silently — a `tags` array sent as a comma-joined string stored zero tags, a wrong-typed `namespace` fell back to the default partition, and an unparseable `supersedes` stored the memory with no link — so a client with a broken serializer could write a long run of quietly wrong memories without a single error reaching the agent.
+`store_memory`, `store_memories`, `list_memories`, `list_tags`, `namespace_stats`, `recall_memories` and `find_similar_memories` validate their arguments strictly. A wrong-typed or unparseable argument is an error naming the field; it is never coerced, defaulted, or dropped. Earlier versions guessed silently — a `tags` array sent as a comma-joined string stored zero tags, a wrong-typed `namespace` fell back to the default partition, an unparseable `supersedes` stored the memory with no link, and a wrong-typed `timeRangeStart` was dropped, silently widening a range query to the whole namespace — so a client with a broken serializer could write a long run of quietly wrong memories, or read a long run of quietly wrong results, without a single error reaching the agent.
+
+**An out-of-range `limit` is rejected, not clamped.** `list_memories` used to clamp a `limit` above 200 down to 200, which told a paginating caller it had seen the whole namespace when it had seen the first page. The schema already declares the maximum, so only a schema-violating client is affected, and it now gets one clean error instead of a quietly short page.
 
 **Explicit `null` still means "absent."** `{"fullText": null}` is treated exactly like omitting `fullText`, for every optional field. SDKs that serialize optional fields as `null` need no changes.
 
@@ -148,6 +157,13 @@ Example messages:
 | `"tags": "a,b"` | `Parameter 'tags' must be an array of strings (got string)` |
 | `"tags": ["a", 3]` | `Parameter 'tags' must be an array of strings (element at index 2 is a number)` |
 | `"supersedes": 123` | `Parameter 'supersedes' must be a string containing a UUID (got number)` |
+| `"limit": "50"` | `Parameter 'limit' must be an integer (got string)` |
+| `"limit": 1000` | `Parameter 'limit' must be between 1 and 200 (got 1000)` |
+| `"limit": -1` | `Parameter 'limit' must be a non-negative whole number (got -1)` |
+| `"namespace": ["work"]` | `Parameter 'namespace' must be a string (got array)` |
+| `"allNamespaces": "true"` | `Parameter 'allNamespaces' must be a boolean (got string)` |
+| `"allNamespaces": true` with `"namespace"` | `Parameter 'allNamespaces' cannot be combined with an explicit 'namespace'; pass one or the other` |
+| `"timeRangeStart": ["x"]` | `Parameter 'timeRangeStart' must be an integer (epoch millis) or an ISO 8601 string (got array)` |
 | `"supersedes": "mem-1234"` | `Invalid UUID in parameter 'supersedes': "mem-1234"` |
 | a `memories` entry that is not an object | `Item at index 3 must be an object (got string)` |
 
@@ -188,6 +204,7 @@ Store a new observation, fact, or piece of context. The system automatically gen
 | `namespace` | string | no | `"default"` | Memory partition |
 | `parentId` | string | no | -- | UUID of parent memory for hierarchical linking |
 | `supersedes` | string | no | -- | UUID of an existing memory in the same namespace that this one replaces. Recall returns this memory **in place of** the old one. The store fails if the target does not exist or is in a different namespace. See [supersedes semantics](#supersedes-semantics). |
+| `checkDuplicates` | boolean | no | `true` | Report existing memories that closely resemble this one. Never blocks the store; it only adds a `nearDuplicates` object to the result. See [near-duplicate warnings](#near-duplicate-warnings). |
 
 #### Example
 
@@ -211,6 +228,29 @@ Response:
   "strength": 1.0,
   "stability": 3.7145,
   "createdAt": "2025-06-24 00:00:00 UTC"
+}
+```
+
+Response when an existing memory closely resembles the new one:
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "namespace": "default",
+  "phase": "Full",
+  "strength": 1.0,
+  "stability": 3.7145,
+  "createdAt": "2025-06-24 00:00:00 UTC",
+  "nearDuplicates": {
+    "threshold": 0.85,
+    "matches": [
+      {
+        "id": "9f8e7d6c-5b4a-7392-8180-1a2b3c4d5e6f",
+        "score": 0.94,
+        "summary": "User writes Rust in snake_case and TypeScript in camelCase"
+      }
+    ]
+  }
 }
 ```
 
@@ -250,6 +290,72 @@ replacement passes the query's own filters** -- namespace above all. If it does
 not, the original is returned instead, so a result is never dropped with nothing
 in its place.
 
+---
+
+#### Near-duplicate warnings
+
+Every store compares the new memory against what is already there and, when
+something crosses the line, attaches a `nearDuplicates` object to the result:
+
+```json
+"nearDuplicates": {
+  "threshold": 0.85,
+  "matches": [
+    { "id": "…", "score": 0.94, "summary": "the existing memory's summary, truncated to 240 bytes" }
+  ]
+}
+```
+
+**Advisory, never a block.** The memory is stored either way. The field is
+absent -- not `null`, not an empty object -- when nothing crossed the threshold,
+when the caller passed `checkDuplicates: false`, or when the namespace's vectors
+are not L2-normalized (see below). At most three matches, closest first.
+
+**0.85 is the same number `find_similar_memories` scan mode uses.** One
+definition of "duplicate" for the whole system, so scan mode and a store cannot
+disagree about the same pair of memories. It is not configurable: the right
+value is a property of the embedding model, not of the deployment, and a
+per-call knob would hand the caller a lever to silence the warning.
+
+**Scope.** Full- and summary-phase memories in the *same namespace* only --
+the same set auto-linking considers. Ghost-phase memories have no summary left
+to show and tombstoned ones are deleted. The phase is re-checked against the
+stored record when the report is built, so a memory that has decayed or been
+deleted since it was indexed is dropped rather than reported with an empty
+summary.
+
+**The recovery.** The warning arrives after the write, so acting on it means
+undoing:
+
+1. `forget_memory` on the id you just created.
+2. Then either `reinforce_memory` on the existing memory (you had nothing new to
+   say) or `store_memory` again with `supersedes` set to the existing id (the
+   fact changed).
+
+Leave both only when they are genuinely distinct facts that happen to read
+alike.
+
+**Cost, and when to turn it off.** The scan is a linear pass over every vector
+in the index -- all namespaces, not just the target one, because the index is
+one flat array with a namespace filter applied per entry. It is proportional to
+the *total* number of memories and their dimensionality, not to the size of the
+namespace being written to. At ten thousand memories that is well under the
+fsync a store already pays; at a hundred thousand it is comparable. Pass
+`checkDuplicates: false` during bulk ingestion, where you are importing known-
+distinct records and paying one scan per memory buys nothing.
+
+**Batches catch themselves.** `store_memories` stores its items in order and
+indexes each one before checking the next, so a batch containing the same fact
+twice reports the second against the first.
+
+**Normalization caveat.** Scores are dot products, which are cosine
+similarities only for L2-normalized vectors. In a namespace whose embeddings are
+supplied by the caller (a `passthrough` provider) nothing validates that, so the
+check verifies the query vector first and *skips* rather than reporting a number
+that is not a similarity. A skip is logged at `debug` every time and at `warn`
+once per process, so an operator gets one visible signal that the feature is
+inert rather than silence.
+
 ### store_memories
 
 Store multiple memories in a single call. Each item has the same schema as `store_memory`. Returns an array of results, one per input memory.
@@ -273,6 +379,7 @@ Each object in the `memories` array accepts:
 | `namespace` | string | no | `"default"` | Memory partition |
 | `parentId` | string | no | -- | UUID of parent memory |
 | `supersedes` | string | no | -- | UUID of an older memory this one replaces |
+| `checkDuplicates` | boolean | no | `true` | Report existing memories that closely resemble this item. Per item, not per batch. |
 
 #### Example
 
@@ -327,6 +434,8 @@ Response:
 ```
 
 If individual memories fail validation (e.g., missing summary), their entry in the `results` array contains an `error` field instead of an `id`. Other memories in the batch are still stored.
+
+A result entry carries `nearDuplicates` on the same terms as `store_memory` -- `checkDuplicates` is set per item, and the report appears per result entry. Because items are stored in order and each is indexed before the next is checked, a duplicate *within* the batch is reported too.
 
 ---
 
@@ -504,13 +613,17 @@ Response:
 
 ### forget_memory
 
-Permanently delete a memory. Use for incorrect or outdated information that should be removed immediately rather than allowed to decay. The memory transitions to Tombstone phase (graph edges are preserved).
+Delete a memory's content. The memory moves to the Tombstone phase: its summary, full text and tags are erased and it stops appearing in recall, but its record and its graph edges are kept so relationship chains stay intact, and its UUID is never reused.
+
+Tombstoned memories are never reclaimed by the decay sweep, so they persist for the life of the database.
+
+Use for incorrect, outdated or harmful information that must stop being recalled immediately. To correct a memory, prefer storing the correction with `supersedes`.
 
 #### Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `id` | string | yes | -- | Memory UUID to delete |
+| `id` | string | yes | -- | Memory UUID to forget. The memory moves to the Tombstone phase; its graph edges are kept and its UUID is never reused. |
 
 #### Example
 
@@ -528,6 +641,108 @@ Response:
 {
   "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "deleted": true
+}
+```
+
+---
+
+### forget_memories
+
+Delete several memories in a single call. Each moves to the Tombstone phase exactly as `forget_memory` describes: content erased, record and graph edges kept, UUID never reused, never reclaimed by the decay sweep.
+
+Returns one result per input id, in the order given. A `deleted: false` result means the id was unknown or the memory had already been forgotten. A malformed UUID becomes a per-item error and does not fail the rest of the batch.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `ids` | string[] | yes | -- | Memory UUIDs to forget. 1-100 items. Each moves to the Tombstone phase; its graph edges are kept and its UUID is never reused. |
+
+#### Example
+
+Request:
+
+```json
+{
+  "ids": [
+    "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "not-a-uuid"
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "results": [
+    { "index": 0, "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "deleted": true },
+    { "index": 1, "error": "Invalid UUID: not-a-uuid", "field": "ids[1]" }
+  ],
+  "total": 2,
+  "deleted": 1,
+  "errors": 1
+}
+```
+
+---
+
+### delete_namespace
+
+**Destructive and irreversible. There is no undo and no backup.**
+
+Destroys a namespace and everything in it: every memory, every graph edge touching one (including edges that point into the namespace from outside), its full-text and vector index entries, and its vector file on disk.
+
+A namespace that still holds live memories is refused unless you pass `force: true`. The refusal names the count and touches nothing.
+
+A namespace holding only tombstones counts as empty and deletes without `force`. Those records hold no content — they have already been forgotten — and they report as `memoryCount: 0` everywhere else. The purge still reclaims them, and the response reports how many as `tombstonesPurged`.
+
+This is the **only** operation that reclaims tombstones. A memory deleted with `forget_memory` keeps its record and its graph edges for the life of the database; the decay sweep never removes them.
+
+The `default` namespace cannot be deleted, with or without `force`, and whether or not it is empty. It is recreated on every startup under the same directory name but with a new namespace id, so deleting it would leave a stale `vectors.dat` that the recreated namespace could silently reuse.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | string | yes | -- | Namespace to delete (1-64 chars). The `default` namespace cannot be deleted. |
+| `force` | boolean | no | `false` | Delete the namespace even if it still holds memories. Without this, a non-empty namespace is refused. Forced deletion permanently destroys every memory in the namespace and removes its vector file from disk. |
+
+#### Example
+
+Request:
+
+```json
+{
+  "name": "scratch",
+  "force": true
+}
+```
+
+Response:
+
+```json
+{
+  "name": "scratch",
+  "id": 4,
+  "deleted": true,
+  "memoriesDeleted": 128,
+  "tombstonesPurged": 12,
+  "edgesRemoved": 341,
+  "ftsRowsRemoved": 128,
+  "vectorFileRemoved": true
+}
+```
+
+Refusal (a non-empty namespace without `force`):
+
+```json
+{
+  "isError": true,
+  "content": [{
+    "type": "text",
+    "text": "Namespace 'scratch' still holds 12 memories. Deleting it permanently destroys them and removes its vector file from disk; there is no undo and no backup. Re-run with force: true to proceed."
+  }]
 }
 ```
 
@@ -667,7 +882,9 @@ Response:
 
 ### namespace_stats
 
-Get statistics for a memory namespace including total memory count, phase breakdown (full/summary/ghost), permastore count, average strength, edge count, and vector storage size. Use this to check how many memories exist or monitor namespace health.
+Get statistics for a memory namespace including the live memory count, tombstone count, phase breakdown (full/summary/ghost), permastore count, average strength, edge count, and vector storage size. Use this to check how many memories exist or monitor namespace health.
+
+`memoryCount` counts **live** memories only and always equals `full + summary + ghost`, so it agrees with `list_memories.total` and `list_namespaces[].memoryCount`. Deleted memories appear separately as `tombstoneCount`: a namespace showing one memory where you stored eleven has ten tombstones, and nothing was lost.
 
 #### Parameters
 
@@ -689,19 +906,22 @@ Response:
 
 ```json
 {
-  "namespace": "default",
-  "totalMemories": 42,
-  "phases": {
+  "name": "default",
+  "memoryCount": 42,
+  "tombstoneCount": 7,
+  "phaseCounts": {
     "full": 30,
     "summary": 8,
     "ghost": 4
   },
   "permastoreCount": 3,
-  "averageStrength": 0.72,
+  "avgStrength": 0.72,
   "edgeCount": 156,
-  "vectorStorageBytes": 1048576
+  "vectorBytes": 258048
 }
 ```
+
+`vectorBytes` is the logical size of the live vector data (`memoryCount` x embedding dimensions x 4). It is not the size of `vectors.dat`, which retains freed slots until compaction.
 
 ---
 
@@ -714,7 +934,7 @@ List memories in a namespace with pagination and optional filters. Unlike `recal
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `namespace` | string | no | `"default"` | Which namespace to list from |
-| `limit` | integer | no | `50` | Maximum results per page (1-200) |
+| `limit` | integer | no | `50` | Maximum results per page (1-200). A larger value is **rejected**, not clamped. |
 | `offset` | integer | no | `0` | Number of results to skip for pagination |
 | `tags` | string[] | no | `[]` | Only return memories with ALL of these tags |
 | `entities` | string[] | no | `[]` | Only return memories mentioning ALL of these entities |
@@ -751,6 +971,101 @@ Response:
   "offset": 0
 }
 ```
+
+---
+
+### list_namespaces
+
+List every memory namespace with its ID, embedding dimensions, live memory count, and creation date. Call this first when you do not know which namespaces exist, before targeting one with `list_memories`, `list_tags`, or `namespace_stats`.
+
+Counts exclude deleted (tombstoned) memories, so they agree with `list_memories.total` and `namespace_stats.memoryCount` for the same namespace.
+
+#### Parameters
+
+None. The tool takes no arguments.
+
+#### Example
+
+Request:
+
+```json
+{}
+```
+
+Response:
+
+```json
+[
+  {
+    "id": 1,
+    "name": "default",
+    "embeddingDim": 1536,
+    "memoryCount": 128,
+    "createdAt": "2026-08-11 12:00:00 UTC"
+  }
+]
+```
+
+The response is a bare array, deliberately: it is the same payload the `recalld://namespaces` resource returns, and the total is the array length.
+
+---
+
+### list_tags
+
+List the tag vocabulary with per-label memory counts, most common first. Use this to discover what labels already exist before filtering `list_memories` or `recall_memories`, and before storing — so you reuse an existing tag instead of inventing a near-duplicate.
+
+Results come in four buckets: plain `tags`, plus the `entities`, `topics`, and `emotions` labels derived from those fields. **The derived buckets have their prefix stripped**, so a name from `entities` can be passed straight back to `store_memory` or `list_memories`; the prefixed form (`entity/recalld`) cannot, because those tools add the prefix themselves.
+
+A tag that merely contains a slash, such as `project/recalld`, stays in `tags`. Counts cover live memories only.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `namespace` | string | no | `"default"` | Which namespace to count within. Reads that namespace's memory records, costing about one `list_memories` call. |
+| `allNamespaces` | boolean | no | `false` | Count across every namespace instead of one. Cannot be combined with an explicit `namespace`. |
+| `limit` | integer | no | `50` | Maximum labels returned **per bucket** (1-500). Each bucket also reports its untruncated total. |
+
+Passing `allNamespaces: true` together with an explicit `namespace` is an error, not a precedence rule — neither scope silently wins.
+
+#### Example
+
+Request:
+
+```json
+{
+  "namespace": "default",
+  "limit": 20
+}
+```
+
+Response:
+
+```json
+{
+  "namespace": "default",
+  "memoriesCounted": 128,
+  "tags": {
+    "total": 41,
+    "truncated": true,
+    "items": [
+      { "name": "type/decision", "count": 12 },
+      { "name": "project/recalld", "count": 9 }
+    ]
+  },
+  "entities": {
+    "total": 120,
+    "truncated": true,
+    "items": [
+      { "name": "recalld", "count": 30 }
+    ]
+  },
+  "topics": { "total": 18, "truncated": false, "items": [] },
+  "emotions": { "total": 3, "truncated": false, "items": [] }
+}
+```
+
+In global scope (`allNamespaces: true`) both `namespace` and `memoriesCounted` are explicitly `null` rather than omitted, so the response always states its own scope. `memoriesCounted` is `null` there because the global path reads the tag index directly and touches no memory records.
 
 ## Best practices
 

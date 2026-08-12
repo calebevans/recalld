@@ -132,6 +132,18 @@ impl PhaseIndex {
         }
     }
 
+    /// Drop every bitmap belonging to a namespace, in all four phases.
+    ///
+    /// For namespace deletion, which removes records without going
+    /// through [`remove`](Self::remove) per record. Without this the
+    /// bitmaps outlive the namespace, and
+    /// [`all_slots_in_phase`](Self::all_slots_in_phase) would keep
+    /// handing the decay sweep `(namespace_id, vector_slot)` pairs whose
+    /// records no longer exist.
+    pub fn remove_namespace(&mut self, namespace_id: u32) {
+        self.namespaces.remove(&namespace_id);
+    }
+
     /// Return all `(namespace_id, vector_slot)` pairs in the given
     /// phase across all namespaces.
     pub fn all_slots_in_phase(&self, phase: DecayPhase) -> Vec<(u32, u32)> {
@@ -311,5 +323,51 @@ impl PhaseIndex {
                 .insert(slot);
         }
         index
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Namespace deletion removes records without going through
+    /// `remove` per record, so without a wholesale drop the bitmaps
+    /// outlive the namespace and `all_slots_in_phase` keeps offering the
+    /// decay sweep slots whose records are gone.
+    #[test]
+    fn w10_remove_namespace_clears_every_phase_for_that_namespace_only() {
+        let mut index = PhaseIndex::new();
+
+        index.insert(1, 0);
+        index.insert(1, 1);
+        index.transition(1, 1, DecayPhase::Full, DecayPhase::Ghost);
+        index.insert(1, 2);
+        index.transition(1, 2, DecayPhase::Full, DecayPhase::Summary);
+        index.insert(2, 0);
+
+        index.remove_namespace(1);
+
+        for phase in [
+            DecayPhase::Full,
+            DecayPhase::Summary,
+            DecayPhase::Ghost,
+            DecayPhase::Tombstone,
+        ] {
+            let survivors: Vec<(u32, u32)> = index
+                .all_slots_in_phase(phase)
+                .into_iter()
+                .filter(|(ns, _)| *ns == 1)
+                .collect();
+            assert!(
+                survivors.is_empty(),
+                "{phase:?} still holds ns 1: {survivors:?}"
+            );
+        }
+
+        assert_eq!(index.all_slots_in_phase(DecayPhase::Full), vec![(2, 0)]);
     }
 }

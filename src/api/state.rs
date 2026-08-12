@@ -43,6 +43,24 @@ pub trait SearchPipeline: Send + Sync {
     /// Execute a search query, returning scored results.
     async fn search(&self, query: SearchQuery) -> Result<Vec<ResolvedSearchResult>, SearchError>;
 
+    /// Find existing memories at or above `threshold` similarity to a
+    /// pre-computed embedding, closest first, at most `limit` of them.
+    ///
+    /// Distinct from [`search`](Self::search) in the one way that matters
+    /// at store time: it records no accesses on what it returns, so
+    /// checking a new memory for duplicates does not age every
+    /// neighbour's decay schedule.
+    ///
+    /// Never errors — the caller is an advisory field that must not fail a
+    /// create.
+    async fn near_duplicates(
+        &self,
+        embedding: &[f32],
+        namespace_id: NamespaceId,
+        threshold: f32,
+        limit: usize,
+    ) -> Vec<(MemoryId, f32)>;
+
     /// Index a memory's embedding in the vector index.
     async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId);
 
@@ -391,8 +409,10 @@ pub struct ReinforceResult {
 /// Statistics for a single namespace, returned by storage.
 #[derive(Debug, Clone)]
 pub struct NamespaceStats {
-    /// Total memory count.
+    /// Number of live memories. Excludes tombstoned records.
     pub memory_count: u64,
+    /// Number of tombstoned records still occupying a metadata row.
+    pub tombstone_count: u64,
     /// Memories in Full phase (phase 1).
     pub phase_1_count: u64,
     /// Memories in Summary phase (phase 2).

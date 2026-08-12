@@ -18,6 +18,7 @@
 
 pub mod constants;
 pub mod decay;
+pub mod duplicates;
 pub mod edge;
 pub mod error;
 pub mod id;
@@ -29,6 +30,7 @@ pub mod validation;
 
 // Re-export primary types at module level for convenience.
 pub use self::decay::DecayPhase;
+pub use self::duplicates::{NearDuplicateMatch, NearDuplicateReport, truncate_summary};
 pub use self::edge::{EdgeType, SupersedesOutcome, SupersedesStatus};
 pub use self::error::{DecodeError, TagError, ValidationError};
 pub use self::id::{MemoryId, NamespaceId};
@@ -36,6 +38,7 @@ pub use self::memory::{AccessEvent, AccessKind, Memory};
 pub use self::namespace::{NamespaceConfig, PhaseThresholds};
 pub use self::record::{CachedRecord, DiskRecord};
 pub use self::tag::{
-    StructuredMetadata, Tag, entity_overlap, parse_structured_tags, parse_tags_lossy,
+    StructuredMetadata, Tag, TagFilterError, entity_overlap, parse_filter_tags,
+    parse_structured_tags, parse_tags_lossy, sort_tag_counts,
 };
 pub use self::validation::{MemoryInputRef, validate_memory_input};
