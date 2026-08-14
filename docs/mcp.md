@@ -1263,10 +1263,9 @@ storing, store it. Memories decay over time if they are not reinforced.
 
 Prompt instructions tell the model *how* to use memory, but models don't always follow instructions consistently -- especially long ones competing with other system prompt content. Hooks provide a per-turn nudge that's harder to ignore.
 
-Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) are shell commands that run in response to lifecycle events. Their stdout is injected into the conversation context. Two hooks work well for memory:
+Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) are shell commands that run in response to lifecycle events. Their stdout is injected into the conversation context. One hook works well for memory:
 
 - **`UserPromptSubmit`** -- runs before the model responds to each user message. A good place to remind the model that memory tools are available.
-- **`Stop`** -- runs after the model finishes a turn. A good place to prompt for storing new memories.
 
 Add to your `~/.claude/settings.json` (or project `.claude/settings.json`):
 
@@ -1282,22 +1281,12 @@ Add to your `~/.claude/settings.json` (or project `.claude/settings.json`):
           }
         ]
       }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo 'Anything from this exchange worth remembering for next time? (store_memory)'"
-          }
-        ]
-      }
     ]
   }
 }
 ```
 
-These hooks are deliberately suggestive rather than commanding -- the model decides whether memories are relevant on each turn. This avoids unnecessary memory operations on simple tasks while ensuring the model doesn't forget that memory tools exist.
+This hook is deliberately suggestive rather than commanding -- the model decides whether memories are relevant on each turn. This avoids unnecessary memory operations on simple tasks while ensuring the model doesn't forget that memory tools exist.
 
 **Tuning the wording:** If you find the model using memory too aggressively, soften the hooks (e.g., just list available tools). If it's still too sparse, make them more directive (e.g., "You MUST check recall_memories before responding").
 

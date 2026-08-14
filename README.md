@@ -141,22 +141,12 @@ Add to your `~/.claude/settings.json`:
           }
         ]
       }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo 'Anything from this exchange worth remembering for next time? (store_memory)'"
-          }
-        ]
-      }
     ]
   }
 }
 ```
 
-These hooks are suggestive, not mandatory -- the model decides whether memories are relevant on each turn. The `UserPromptSubmit` hook nudges recall before responding, and the `Stop` hook nudges storage after finishing a task.
+This hook is suggestive, not mandatory -- the model decides whether memories are relevant on each turn. It nudges recall before responding without adding another model pass after the task is finished.
 
 ## Features
 
