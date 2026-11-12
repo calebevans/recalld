@@ -218,6 +218,18 @@ impl MetadataStore {
     /// `strength` is the raw FSRS retrievability R(t,S).
     /// `decay_strength` is the effective retrievability including
     /// connection bonus.
+    ///
+    /// # Errors
+    /// `StorageError::NotFound` if the record does not exist, or if it
+    /// has been tombstoned. Tombstone is terminal, and it is enforced
+    /// here rather than left to callers because every caller decides
+    /// from a record it read earlier: the decay sweep works from a
+    /// per-phase snapshot of ids, and `reinforce_memory` reads, computes
+    /// and then writes. A `forget_memory` landing in between used to
+    /// have its tombstone overwritten with the caller's stale phase,
+    /// which brought the record back in a live phase with its content
+    /// stripped, its `NAMESPACE_INDEX` entry gone, and a `vector_slot`
+    /// that had already been freed and could belong to another memory.
     pub fn update_decay_state(
         &self,
         id: MemoryId,
@@ -231,6 +243,9 @@ impl MetadataStore {
 
         let record = self.update_record(&id, |record| {
             old_phase = Some(record.phase);
+            if record.phase == DecayPhase::Tombstone {
+                return;
+            }
             record.phase = phase;
             record.strength = strength;
             record.decay_strength = decay_strength;
@@ -239,6 +254,13 @@ impl MetadataStore {
         })?;
 
         let old_phase = old_phase.expect("update_record closure always runs");
+
+        // Reported the way a hard-deleted record already is, so callers
+        // treat "forgotten since I read it" the same in both cases. The
+        // phase bitmap is left alone: a tombstone is not tracked in it.
+        if old_phase == DecayPhase::Tombstone {
+            return Err(StorageError::NotFound(id.into_inner()));
+        }
 
         // Update phase bitmap if phase changed.
         if old_phase != phase {
@@ -1733,6 +1755,43 @@ mod tests {
             store.get(id).expect("get").expect("record").phase,
             DecayPhase::Full,
             "an empty batch must not open a transaction that changes anything"
+        );
+    }
+
+    // ── update_decay_state ───────────────────────────────────────────
+
+    /// Tombstone is terminal, and this is the write that has to enforce
+    /// it. The decay sweep and `reinforce_memory` both read a record,
+    /// decide, and write back later with the phase they read. A
+    /// `forget_memory` landing in between used to have its tombstone
+    /// overwritten: the record came back in a live phase with no
+    /// summary, no tags, no text and no `NAMESPACE_INDEX` entry, still
+    /// pointing at a vector slot it had already given up.
+    #[test]
+    fn update_decay_state_does_not_bring_a_tombstone_back() {
+        let (_dir, store) = open_store();
+        let id = insert(&store, 1, 7, &["type/fact"]);
+        store
+            .update_decay_state(id, DecayPhase::Summary, 0.9, 0.9, 3.7, false)
+            .expect("decay a live record");
+        store.tombstone(id).expect("tombstone");
+
+        let stale = store.update_decay_state(id, DecayPhase::Summary, 0.8, 0.8, 3.7, false);
+
+        assert!(
+            matches!(stale, Err(StorageError::NotFound(_))),
+            "a write against a tombstone must be refused, got {stale:?}"
+        );
+        let record = store.get(id).expect("get").expect("the row is kept");
+        assert_eq!(record.phase, DecayPhase::Tombstone);
+        assert_eq!(record.strength, 0.0);
+        assert_eq!(record.decay_strength, 0.0);
+        assert!(
+            store
+                .ids_in_phase(DecayPhase::Summary)
+                .expect("ids in phase")
+                .is_empty(),
+            "the phase bitmap claims a tombstone's freed vector slot is live"
         );
     }
 }

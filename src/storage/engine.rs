@@ -99,6 +99,9 @@ pub trait StorageEngine: Send + Sync {
     /// `strength` is the raw FSRS retrievability R(t,S).
     /// `decay_strength` is the effective retrievability including
     /// connection bonus.
+    ///
+    /// Returns `Err(NotFound)` if the memory does not exist or has been
+    /// tombstoned; a tombstone is never rewritten.
     fn update_decay_state(
         &self,
         id: MemoryId,
