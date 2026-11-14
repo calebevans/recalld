@@ -1,12 +1,13 @@
 # Accepted work and metadata capture
 
-Status: implementation in progress on `impl/accepted-work`, based on the frozen
-purge runtime `f6e4d9263fe2d96fca16282eed47b1251ad5398b`. The A5 exclusive measurement
+Status: validated foundation slice on `impl/accepted-work`. Measured runtime is
+`50e0c5e0d42bcdafa24acb9a9c267c5d3318fe85`, based on frozen purge runtime
+`f6e4d9263fe2d96fca16282eed47b1251ad5398b`. The A5 exclusive measurement
 hold was respected; isolated validation began only after explicit release.
 Previous public/evidence branches remain
 unchanged, including PR64 tail `0dd9954d0b454726c333f7635300e5547790dd45`.
 
-## Implemented boundary, pending validation
+## Implemented boundary
 
 `MetadataStore` owns one `WorkTracker`. Clones refer to that same owned core;
 matching store UUIDs do not authorize a ticket from another core. Tickets are
@@ -50,9 +51,9 @@ before and after validation: late success is rejected, but validation scans and
 blocking OS I/O are **not bounded** by those checks. No hard 30-second completion
 claim is made.
 
-## Source review and test plan
+## Validation
 
-Draft tests cover accepted children/grandchildren during closing; a parent dropped
+Passing regressions cover accepted children/grandchildren during closing; a parent dropped
 while its child runs; a consumed parent rejected as a new child's authority;
 same-UUID foreign cores; timeout followed by concurrent reclose; spurious wakes,
 expired deadlines and sequence overflow; actual mutation/recovery/purge gates;
@@ -60,22 +61,37 @@ panic/unknown completion; durable pending state despite stale volatile flags;
 and metadata publication contention.
 
 Actual coordinator regressions hold the derived publication or graph lock, queue
-insertion/purge completion, close admission, then release the lock. The expected
-result is completion through child tickets, durable acknowledgements, zero
-pending work and successful metadata capture. A cancelled queued forget must
-leave unresolved work without a canonical mutation.
+insertion/purge completion, close admission, then release the lock. They complete
+through child tickets with durable acknowledgements, zero pending work and
+successful metadata capture. A cancelled queued forget leaves unresolved work
+without a canonical mutation.
 
 Initial measured source `9b6c7eca79625766ac5bf118ebf5856922431e83` compiled and
 passed 13/14 tracker/metadata tests. The failed test incorrectly tried to purge
 the protected default namespace; it now uses a distinct namespace without
 changing production validation. Raw failure is retained at
 `/tmp/recalld-accepted-test-g8o6ohxe/output`. That run stopped before coordinator,
-full-suite and Clippy checks. Revised validation remains pending.
+full-suite and Clippy checks. Corrected `b627cd5` passed all checks; final `50e0c5e`
+then removed one new needless-borrow warning and passed the same checks again.
 
-After release: isolated Rust 1.94.1 formatting, focused tracker/coordinator tests,
-then the full library/CLI suite and Clippy using a fresh explicit source snapshot
-and a private copied cache. Use network-none Docker, two CPUs, 4 GiB RAM, and no
-home/credential/socket mounts. Preserve failures and exact revised-source hashes.
+Exact final results: **14 tracker/metadata + 9 coordinator focused checks,
+715 library tests, 1 CLI test, formatting and Clippy pass**. Library tests ran
+normally parallel in 71.59s, not a performance benchmark. Clippy reports 427
+library and 447 library-test warnings (427 duplicates), plus one binary warning.
+
+Image `sha256:daefdc9cbe9b0f39b1fc29d975148b3b10adc1bd4309f9ca1be8abd36ed811ef`,
+Rust 1.94.1, network-none Docker, two CPUs, 4 GiB RAM, private copied caches,
+read-only allowlisted source, temporary HOME and no home/credential/socket mounts.
+Final raw output: `/tmp/recalld-accepted-test-wjgq37hv/output`. All 167 source
+hashes and 9 output hashes were reverified, including archived contents.
+
+Evidence is on separate branch `study/accepted-work` (base frozen PR64 tail) at
+`benchmarks/accepted-work/REPORT.md`. It includes all three immutable runs,
+source/command manifests, runtime patch and changed-file list; no runtime ancestry
+or build caches were added. Final archive SHA-256:
+`f1f59723dcb51127d9a6376d1b76d3e611ee7c501f2fc175793e1255c81d0456`.
+No new public nine-episode suite was run on this core-only base; prior public
+evidence remains pinned to its own measured source.
 
 ## Required joins and remaining A6 work
 
