@@ -1,0 +1,64 @@
+   Compiling recalld v1.0.0 (/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.68s
+     Running unittests src/lib.rs (/target/debug/build/recalld/ec3fd4d8d6ce26e9/out/recalld-ec3fd4d8d6ce26e9)
+
+running 6 tests
+NAMESPACE input=-1 expected_reject=true stored_dimension=Some(4) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 4,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+NAMESPACE input=0 expected_reject=true stored_dimension=Some(0) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 0,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+QUALITY input=None expected_reject=false unchanged=false matched=true response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e381-7ab2-8bdc-663bffc0a447\",\n  \"strength\": 1.0,\n  \"stability\": 57.219933,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+NAMESPACE input=1 expected_reject=false stored_dimension=Some(1) matched=true response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 1,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+QUALITY input=Some(Number(0)) expected_reject=true unchanged=true matched=true response={"content":[{"type":"text","text":"Quality must be 1-4"}],"isError":true}
+QUALITY input=Some(Number(-1)) expected_reject=true unchanged=false matched=false response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e386-7041-a8d0-c1299d7edb84\",\n  \"strength\": 1.0,\n  \"stability\": 57.219933,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+NAMESPACE input=1.5 expected_reject=true stored_dimension=Some(4) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 4,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+NAMESPACE input=8192 expected_reject=false stored_dimension=Some(8192) matched=true response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 8192,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+NAMESPACE input=8193 expected_reject=true stored_dimension=Some(8193) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 8193,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+QUALITY input=Some(Number(1)) expected_reject=false unchanged=false matched=true response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e469-7562-b6e5-2a860eea178c\",\n  \"strength\": 1.0,\n  \"stability\": 0.3043439,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+QUALITY input=Some(Number(1.5)) expected_reject=true unchanged=false matched=false response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e46e-7763-92bf-ff81795e72d7\",\n  \"strength\": 1.0,\n  \"stability\": 57.219933,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+QUALITY input=Some(Number(5)) expected_reject=true unchanged=true matched=true response={"content":[{"type":"text","text":"Quality must be 1-4"}],"isError":true}
+test mcp::tools::tests::research_namespace_dimension_boundary_controls ... ok
+NAMESPACE input="4" expected_reject=true stored_dimension=Some(4) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 4,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+NAMESPACE input=65535 expected_reject=true stored_dimension=Some(65535) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 65535,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+QUALITY input=Some(Number(2)) expected_reject=false unchanged=false matched=true response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e54e-7330-a58b-f8a18b0096b6\",\n  \"strength\": 1.0,\n  \"stability\": 40.35395,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+QUALITY input=Some(Number(256)) expected_reject=true unchanged=true matched=true response={"content":[{"type":"text","text":"Quality must be 1-4"}],"isError":true}
+QUALITY input=Some(String("3")) expected_reject=true unchanged=false matched=false response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e553-7663-9ac5-254dac05961f\",\n  \"strength\": 1.0,\n  \"stability\": 57.219933,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+NAMESPACE input=true expected_reject=true stored_dimension=Some(4) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 4,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+NAMESPACE input=65536 expected_reject=true stored_dimension=Some(0) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 0,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+QUALITY input=Some(Number(3)) expected_reject=false unchanged=false matched=true response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e627-72e0-a3ef-cf2e3ae270f0\",\n  \"strength\": 1.0,\n  \"stability\": 57.219933,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+QUALITY input=Some(Number(259)) expected_reject=true unchanged=true matched=true response={"content":[{"type":"text","text":"Quality must be 1-4"}],"isError":true}
+QUALITY input=Some(Bool(true)) expected_reject=true unchanged=false matched=false response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e637-76b1-8fcc-f7686ef4492d\",\n  \"strength\": 1.0,\n  \"stability\": 57.219933,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+NAMESPACE input=null expected_reject=true stored_dimension=Some(4) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 4,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+NAMESPACE input=65537 expected_reject=true stored_dimension=Some(1) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 1,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:50 UTC\"\n}"}]}
+QUALITY input=Some(Number(18446744073709551615)) expected_reject=true unchanged=true matched=true response={"content":[{"type":"text","text":"Quality must be 1-4"}],"isError":true}
+QUALITY input=Some(Number(4)) expected_reject=false unchanged=false matched=true response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e70f-7360-9c34-bf70ab3484f5\",\n  \"strength\": 1.0,\n  \"stability\": 74.08591,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+QUALITY input=Some(Null) expected_reject=true unchanged=false matched=false response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e716-7c62-bc18-6a012f4361b1\",\n  \"strength\": 1.0,\n  \"stability\": 57.219933,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+test mcp::tools::tests::research_quality_valid_and_omitted_controls ... ok
+test mcp::tools::tests::research_quality_integer_range_is_rejected_without_mutation ... ok
+NAMESPACE input=[] expected_reject=true stored_dimension=Some(4) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 4,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:51 UTC\"\n}"}]}
+NAMESPACE input=18446744073709551615 expected_reject=true stored_dimension=Some(65535) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 65535,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:51 UTC\"\n}"}]}
+QUALITY input=Some(Array []) expected_reject=true unchanged=false matched=false response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e7fc-72d1-b823-a383cf4baa13\",\n  \"strength\": 1.0,\n  \"stability\": 57.219933,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+
+thread 'mcp::tools::tests::research_namespace_dimension_range_is_rejected_without_creation' (573) panicked at src/mcp/tools.rs:2588:9:
+invalid dimensions accepted or created namespaces: [0, 8193, 65535, 65536, 65537, 18446744073709551615]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test mcp::tools::tests::research_namespace_dimension_range_is_rejected_without_creation ... FAILED
+NAMESPACE input={} expected_reject=true stored_dimension=Some(4) matched=false response={"content":[{"type":"text","text":"{\n  \"id\": 2,\n  \"name\": \"synthetic-probe\",\n  \"embeddingDim\": 4,\n  \"memoryCount\": 0,\n  \"createdAt\": \"2026-11-14 05:25:51 UTC\"\n}"}]}
+QUALITY input=Some(Object {}) expected_reject=true unchanged=false matched=false response={"content":[{"type":"text","text":"{\n  \"id\": \"01a1d884-e8ca-77a0-82ce-fdda6eb4b204\",\n  \"strength\": 1.0,\n  \"stability\": 57.219933,\n  \"phase\": \"Full\",\n  \"isPermastore\": false\n}"}]}
+
+thread 'mcp::tools::tests::research_namespace_wrong_json_types_are_rejected_without_creation' (574) panicked at src/mcp/tools.rs:2599:9:
+invalid dimension types accepted: [Number(-1), Number(1.5), String("4"), Bool(true), Null, Array [], Object {}]
+test mcp::tools::tests::research_namespace_wrong_json_types_are_rejected_without_creation ... FAILED
+
+thread 'mcp::tools::tests::research_quality_wrong_json_types_are_rejected_without_mutation' (577) panicked at src/mcp/tools.rs:2535:9:
+wrong quality values accepted or mutated storage: [Number(-1), Number(1.5), String("3"), Bool(true), Null, Array [], Object {}]
+test mcp::tools::tests::research_quality_wrong_json_types_are_rejected_without_mutation ... FAILED
+
+failures:
+
+failures:
+    mcp::tools::tests::research_namespace_dimension_range_is_rejected_without_creation
+    mcp::tools::tests::research_namespace_wrong_json_types_are_rejected_without_creation
+    mcp::tools::tests::research_quality_wrong_json_types_are_rejected_without_mutation
+
+test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 487 filtered out; finished in 1.59s
+
+error: test failed, to rerun pass `--lib`

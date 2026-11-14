@@ -1,0 +1,21 @@
+   Compiling recalld v1.0.0 (/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.38s
+     Running unittests src/lib.rs (/target/debug/build/recalld/ec3fd4d8d6ce26e9/out/recalld-ec3fd4d8d6ce26e9)
+
+running 1 test
+SUPERSESSION already_present=false replacement_score=0.9 replacement_rank=1 top10_contains=true
+SUPERSESSION already_present=true replacement_score=0.1 replacement_rank=11 top10_contains=false
+
+thread 'search::pipeline::tests::research_supersedes_inherits_score_when_replacement_already_present' (572) panicked at src/search/pipeline.rs:1692:9:
+already-present replacement must inherit the old score too: [(0.9, 1), (0.1, 11)]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test search::pipeline::tests::research_supersedes_inherits_score_when_replacement_already_present ... FAILED
+
+failures:
+
+failures:
+    search::pipeline::tests::research_supersedes_inherits_score_when_replacement_already_present
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 493 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

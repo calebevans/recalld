@@ -1,0 +1,13 @@
+   Compiling recalld v1.0.0 (/tmp/review)
+    Finished `test` profile [unoptimized] target(s) in 9.72s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-95c53b6a0cf39984)
+
+running 5 tests
+test decay::sweep::independent_review_regressions::review_access_must_not_move_feedback_anchor_backward ... ok
+test decay::sweep::independent_review_regressions::purge_releases_storage_before_graph_publication_and_stale_sweep_skips ... ok
+test decay::sweep::independent_review_regressions::review_stale_sweep_must_not_overwrite_committed_feedback ... ok
+test decay::sweep::independent_review_regressions::review_successful_sweep_must_publish_final_graph_phase ... ok
+test decay::sweep::independent_review_regressions::stale_transition_checks_each_expected_field_before_storage_or_graph_mutation ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 507 filtered out; finished in 2.30s
+

@@ -1,0 +1,28 @@
+# Executed with Docker sandbox escalation. No original repository or personal-data mounts.
+# Scratch source was copied from git ls-files, skipping .git, target, non-files and symlinks.
+# Original file hashes are in source-sha256.json; original commit in source-commit.txt.
+# Directory: /tmp/recalld-unit-tests-l__ja1yo
+
+docker image inspect rust:1-bookworm --format '{{json .RepoDigests}} {{.Id}} {{.Architecture}}'
+docker run --rm --network none rust:1-bookworm sh -c 'rustc --version --verbose; cargo --version; uname -a'
+docker run --rm --network none rust:1-bookworm rustup toolchain list
+
+# Fetch before testing; network allowed for registry/toolchain downloads only.
+docker run --rm --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/source,dst=/work --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/cargo,dst=/cargo --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/target,dst=/target -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target -w /work rust:1-bookworm cargo fetch --locked > logs/fetch.log 2>&1
+
+# baseline-test; source modifications were applied in the order documented in REPORT.md.
+docker run --rm --network none --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/source,dst=/work --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/cargo,dst=/cargo --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/target,dst=/target -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target -e RUSTUP_TOOLCHAIN=1.100.0 -w /work rust:1-bookworm cargo test --locked --offline > logs/baseline-test.log 2>&1
+
+# validation-probes; source modifications were applied in the order documented in REPORT.md.
+docker run --rm --network none --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/source,dst=/work --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/cargo,dst=/cargo --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/target,dst=/target -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target -e RUSTUP_TOOLCHAIN=1.100.0 -w /work rust:1-bookworm cargo test --locked --offline research_ -- --nocapture > logs/validation-probes.log 2>&1
+
+# supersession-probe; source modifications were applied in the order documented in REPORT.md.
+docker run --rm --network none --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/source,dst=/work --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/cargo,dst=/cargo --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/target,dst=/target -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target -e RUSTUP_TOOLCHAIN=1.100.0 -w /work rust:1-bookworm cargo test --locked --offline research_supersedes -- --nocapture > logs/supersession-probe.log 2>&1
+
+# vector-benchmark; source modifications were applied in the order documented in REPORT.md.
+docker run --rm --network none --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/source,dst=/work --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/cargo,dst=/cargo --mount type=bind,src=/tmp/recalld-unit-tests-l__ja1yo/target,dst=/target -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target -e RUSTUP_TOOLCHAIN=1.100.0 -w /work rust:1-bookworm cargo run --release --locked --offline --example research_flat_vector > logs/vector-benchmark.log 2>&1
+
+# Actual log paths above were /tmp/recalld-unit-tests-l__ja1yo/logs/<name>.
+
+# Container CPU metadata captured after benchmark.
+docker run --rm --network none rust:1-bookworm sh -c 'lscpu; getconf _NPROCESSORS_ONLN' > logs/cpu.log 2>&1

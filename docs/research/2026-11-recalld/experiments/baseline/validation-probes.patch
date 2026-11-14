@@ -1,0 +1,155 @@
+--- a/src/mcp/tools.rs
++++ b/src/mcp/tools.rs
+@@ -2496,4 +2496,114 @@
+             .collect::<Vec<_>>()
+             .join("\n")
+     }
+-}
++    // Scratch-only research probes: real temporary storage, no daemon or provider.
++    async fn research_quality_probe(value: Option<serde_json::Value>, reject: bool) -> bool {
++        let fixture = crate::test_support::Fixture::new();
++        let id = fixture.insert_memory().await;
++        let mut bridge = crate::test_support::StubBridge::default().into_bridge();
++        bridge.storage = std::sync::Arc::new(fixture.storage_adapter());
++        let before = fixture.record(id).expect("synthetic memory exists");
++        let mut args = json!({"id": id.to_string()});
++        if let Some(value) = &value {
++            args["quality"] = value.clone();
++        }
++        let result = dispatch_tool(&bridge, "reinforce_memory", args).await;
++        let after = fixture.record(id).expect("synthetic memory still exists");
++        let unchanged = before.last_accessed_at == after.last_accessed_at
++            && before.access_history.len() == after.access_history.len()
++            && before.stability == after.stability;
++        let rendered = serde_json::to_string(&result).unwrap();
++        let ok = if reject {
++            result.is_error == Some(true)
++                && rendered.to_lowercase().contains("quality")
++                && unchanged
++        } else {
++            result.is_error != Some(true) && !unchanged
++        };
++        println!("QUALITY input={value:?} expected_reject={reject} unchanged={unchanged} matched={ok} response={rendered}");
++        ok
++    }
++
++    #[tokio::test]
++    async fn research_quality_wrong_json_types_are_rejected_without_mutation() {
++        let mut failures = Vec::new();
++        for value in [json!(-1), json!(1.5), json!("3"), json!(true), json!(null), json!([]), json!({})] {
++            if !research_quality_probe(Some(value.clone()), true).await {
++                failures.push(value);
++            }
++        }
++        assert!(failures.is_empty(), "wrong quality values accepted or mutated storage: {failures:?}");
++    }
++
++    #[tokio::test]
++    async fn research_quality_integer_range_is_rejected_without_mutation() {
++        let mut failures = Vec::new();
++        for value in [0_u64, 5, 256, 259, u64::MAX] {
++            if !research_quality_probe(Some(json!(value)), true).await {
++                failures.push(value);
++            }
++        }
++        assert!(failures.is_empty(), "out-of-range quality values: {failures:?}");
++    }
++
++    #[tokio::test]
++    async fn research_quality_valid_and_omitted_controls() {
++        for value in [None, Some(json!(1)), Some(json!(2)), Some(json!(3)), Some(json!(4))] {
++            assert!(research_quality_probe(value, false).await);
++        }
++    }
++
++    async fn research_namespace_probe(value: serde_json::Value, reject: bool) -> bool {
++        use crate::storage::StorageEngine as _;
++        let fixture = crate::test_support::Fixture::new();
++        let mut bridge = crate::test_support::StubBridge::default().into_bridge();
++        bridge.namespaces = std::sync::Arc::new(fixture.namespace_adapter());
++        let result = dispatch_tool(&bridge, "create_namespace", json!({
++            "name": "synthetic-probe", "embeddingDim": value,
++        })).await;
++        let persisted = fixture.storage.read().unwrap()
++            .get_namespace_by_name("synthetic-probe").unwrap();
++        let actual_dim = persisted.as_ref().map(|ns| ns.embedding_dim);
++        let rendered = serde_json::to_string(&result).unwrap();
++        let lower = rendered.to_lowercase();
++        let ok = if reject {
++            result.is_error == Some(true) && persisted.is_none()
++                && (lower.contains("dimension") || lower.contains("embedding"))
++        } else {
++            result.is_error != Some(true)
++                && actual_dim.map(u64::from) == value.as_u64()
++        };
++        println!("NAMESPACE input={value} expected_reject={reject} stored_dimension={actual_dim:?} matched={ok} response={rendered}");
++        ok
++    }
++
++    #[tokio::test]
++    async fn research_namespace_dimension_range_is_rejected_without_creation() {
++        let mut failures = Vec::new();
++        for value in [0_u64, 8193, 65535, 65536, 65537, u64::MAX] {
++            if !research_namespace_probe(json!(value), true).await {
++                failures.push(value);
++            }
++        }
++        assert!(failures.is_empty(), "invalid dimensions accepted or created namespaces: {failures:?}");
++    }
++
++    #[tokio::test]
++    async fn research_namespace_wrong_json_types_are_rejected_without_creation() {
++        let mut failures = Vec::new();
++        for value in [json!(-1), json!(1.5), json!("4"), json!(true), json!(null), json!([]), json!({})] {
++            if !research_namespace_probe(value.clone(), true).await {
++                failures.push(value);
++            }
++        }
++        assert!(failures.is_empty(), "invalid dimension types accepted: {failures:?}");
++    }
++
++    #[tokio::test]
++    async fn research_namespace_dimension_boundary_controls() {
++        for value in [1, 8192] {
++            assert!(research_namespace_probe(json!(value), false).await);
++        }
++    }
++
++}
+--- a/src/search/pipeline.rs
++++ b/src/search/pipeline.rs
+@@ -1664,4 +1664,33 @@
+         assert_eq!(ids(&candidates), vec![new]);
+         assert!(candidates[0].composite_score >= 0.85);
+     }
+-}
++    #[tokio::test]
++    async fn research_supersedes_inherits_score_when_replacement_already_present() {
++        let (old, new) = (MemoryId::new(), MemoryId::new());
++        let distractors: Vec<_> = (0..10).map(|_| MemoryId::new()).collect();
++        let mut outcomes = Vec::new();
++        for already_present in [false, true] {
++            let (graph, meta) = superseded_setup(old, rec(new));
++            let engine = engine(graph, meta);
++            let mut candidates = vec![candidate(rec(old), 0.9)];
++            candidates.extend(distractors.iter().map(|id| candidate(rec(*id), 0.5)));
++            if already_present {
++                candidates.push(candidate(rec(new), 0.1));
++            }
++            engine.resolve_supersedes(
++                &mut candidates, &query(json!({"text": "q"})), &[], ns(),
++            ).await;
++            assert!(!ids(&candidates).contains(&old));
++            assert_eq!(ids(&candidates).iter().filter(|id| **id == new).count(), 1);
++            candidates.sort_by(|a, b| b.composite_score.total_cmp(&a.composite_score));
++            let rank = candidates.iter().position(|c| c.record.id == new).unwrap() + 1;
++            let score = candidates.iter().find(|c| c.record.id == new).unwrap().composite_score;
++            println!("SUPERSESSION already_present={already_present} replacement_score={score} replacement_rank={rank} top10_contains={}", rank <= 10);
++            outcomes.push((score, rank));
++        }
++        assert!(outcomes[0].0 >= 0.9 && outcomes[0].1 == 1, "injected control: {outcomes:?}");
++        assert!(outcomes[1].0 >= 0.9 && outcomes[1].1 == 1,
++            "already-present replacement must inherit the old score too: {outcomes:?}");
++    }
++
++}

@@ -1,0 +1,30 @@
+{
+  "baselineCommit": "211b1bd409570d4cb7fc594ecc90d4fad56a3293",
+  "fixedCommit": "8cbb7344b1c45cc444b32781fa6c52d0c6f88ceb",
+  "toolchain": "1.94.1",
+  "image": "recalld-ci:1.94",
+  "command": "cargo test --offline --locked --lib independent_review_regressions -- --nocapture",
+  "results": {
+    "baseline": {
+      "passed": 0,
+      "failed": 3,
+      "filtered": 505
+    },
+    "fixed": {
+      "passed": 5,
+      "failed": 0,
+      "filtered": 507
+    }
+  },
+  "sha256": {
+    "probes.rs": "31a63e63f5f79366598213a9662bdc21f26a3f25d30a7ffb2c96287b38dd945e",
+    "baseline.log": "c0d44e6d8391aed28c7d1b09cbad1fd3b65d3dfc63eed9bb7aeeb3e4641d5fc4",
+    "fixed.log": "9a8d6062b26af4226dcc175876906b76bcb1b047e6abb2f0f2db609e69424f70",
+    "baseline/src/decay/sweep.rs": "d4b237acd39b76166d0ab7fc08558274c05d2122a91b5da8a7926bbaaaa996ad",
+    "baseline/src/api/adapters.rs": "62a560b16183dfabcce1be2b935930af28a2641c5fab1e0f11dcbe1ee6016395",
+    "baseline/Cargo.lock": "65a8b8c3356e85444c9d90e631c6c06928278e3a70645fb23a424f33d887498f",
+    "fixed/src/decay/sweep.rs": "6224cc312da89f4c2a6ddf9ff3664f9cad0996b221b2b1fdc0bbc110415d9104",
+    "fixed/src/api/adapters.rs": "1fc1c3230cf2c38041e66a05ca54dabcc91daa32585608b12eb3d1fada842de8",
+    "fixed/Cargo.lock": "65a8b8c3356e85444c9d90e631c6c06928278e3a70645fb23a424f33d887498f"
+  }
+}
