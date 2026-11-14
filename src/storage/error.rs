@@ -8,6 +8,14 @@ use crate::model::error::DecodeError;
 /// Errors from storage operations (metadata, vectors, text, edges).
 #[derive(Debug, Error)]
 pub enum StorageError {
+    /// Canonical insertion exists; retry publication, never retry as a new write.
+    #[error("INDEX_NOT_READY commitState=committed ready=false receipt={} cause={source}", serde_json::to_string(receipt).unwrap_or_default())]
+    CommittedInsertion {
+        receipt: Box<crate::storage::control::WriteReceipt>,
+        #[source]
+        source: Box<StorageError>,
+    },
+
     /// Invalid lineage, key, version, or generation encoding.
     #[error("invalid mutation context: {0}")]
     InvalidMutationContext(String),
@@ -70,6 +78,9 @@ pub enum StorageError {
     /// A redb commit error.
     #[error("redb commit error: {0}")]
     RedbCommit(#[from] redb::CommitError),
+
+    #[error("EDGE_CONFLICT: {0}")]
+    EdgeConflict(String),
 
     #[error("invalid storage mutation: {0}")]
     InvalidMutation(String),

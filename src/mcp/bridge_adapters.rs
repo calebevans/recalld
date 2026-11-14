@@ -20,6 +20,25 @@ use crate::time::format_timestamp;
 use super::bridge;
 use crate::storage::StorageEngine as StorageEngineTrait;
 
+/// Preserve committed/uncertain insertion outcomes across legacy transport errors.
+fn map_insertion_error(error: crate::storage::StorageError) -> bridge::BridgeError {
+    match error {
+        crate::storage::StorageError::CommittedInsertion { .. }
+        | crate::storage::StorageError::CommitOutcomeUnknown { .. } => {
+            bridge::BridgeError::PartiallyApplied(error.to_string())
+        }
+        crate::storage::StorageError::InvalidMutation(_)
+        | crate::storage::StorageError::EdgeConflict(_)
+        | crate::storage::StorageError::MutationNamespaceMismatch => {
+            bridge::BridgeError::InvalidInput(error.to_string())
+        }
+        crate::storage::StorageError::NotFound(_) => {
+            bridge::BridgeError::NotFound(error.to_string())
+        }
+        _ => bridge::BridgeError::Storage(error.to_string()),
+    }
+}
+
 /// Map an explicit-link validation failure onto the bridge error the tool
 /// layer already knows how to render.
 ///
@@ -767,16 +786,10 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         input: bridge::StoreInput,
     ) -> Result<bridge::StoredMemory, bridge::BridgeError> {
-        let _publication = crate::derived_completion::publication_gate(&self.storage)
-            .await
-            .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
-            .read_owned()
-            .await;
         effects_stamp(&self.storage).await?;
 
         use crate::model::Tag;
         use crate::model::constants::{DUPLICATE_SIMILARITY_THRESHOLD, MAX_NEAR_DUPLICATE_MATCHES};
-        use crate::model::record::DiskRecord;
 
         // Resolve namespace.
         let ns_config = {
@@ -799,11 +812,6 @@ impl bridge::StorageEngine for McpStorageAdapter {
             })??
         };
 
-        // The ID is minted here rather than just before the insert so the
-        // link pre-validation below can reject a self-reference. Minting is
-        // pure (UUIDv7 from the clock), so an early mint costs nothing.
-        let memory_id = MemoryId::new();
-
         // Validate caller-specified links BEFORE anything is written.
         //
         // The record is committed to meta.db, fulltext.dat, vectors.dat, FTS
@@ -814,7 +822,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
         if let Some(parent_id) = input.parent_id {
             crate::graph::check_link_target(
                 "parentId",
-                Some(memory_id),
+                None,
                 parent_id,
                 ns_config.id,
                 &self.graph,
@@ -827,7 +835,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
         if let Some(old_id) = input.supersedes {
             crate::graph::check_link_target(
                 "supersedes",
-                Some(memory_id),
+                None,
                 old_id,
                 ns_config.id,
                 &self.graph,
@@ -863,8 +871,8 @@ impl bridge::StorageEngine for McpStorageAdapter {
         }
 
         // Generate full embedding (summary + full_text + tags for max surface).
-        let embedding = match input.embedding {
-            Some(emb) => emb,
+        let embedding = match &input.embedding {
+            Some(emb) => emb.clone(),
             None => {
                 let mut embed_text = match &input.full_text {
                     Some(ft) => format!(
@@ -926,132 +934,46 @@ impl bridge::StorageEngine for McpStorageAdapter {
         let parsed_tags: Vec<Tag> =
             crate::model::parse_tags_lossy("store_memory.tags", &merged_tags);
 
-        let mut record = DiskRecord {
-            schema: None,
-            version: DiskRecord::CURRENT_VERSION,
-            id: *memory_id.as_bytes(),
-            namespace_id: ns_config.id.get(),
-            created_at: now,
-            last_accessed_at: now,
-            phase: DecayPhase::Full,
-            strength: 1.0,
-            decay_strength: 1.0,
-            stability: input
-                .initial_stability
-                .unwrap_or(ns_config.initial_stability),
-            difficulty: 5.0,
-            is_permastore: 0,
-            vector_slot: 0,
-            edge_count: 0,
-            summary: input.summary.clone(),
-            tags: parsed_tags,
-            access_history: Vec::new(),
-            text_offset: 0,
-            text_length: 0,
+        let completion = crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
         };
-
-        // Insert into storage (on blocking thread to avoid starving the async runtime).
-        let record = {
-            let storage = self.storage.clone();
-            let embedding_clone = embedding.clone();
-            let full_text_clone = input.full_text.clone();
-            let ns_id = ns_config.id;
-            tokio::task::spawn_blocking(move || {
-                let mut storage_w = storage.write().map_err(|e| {
-                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-                })?;
-                storage_w
-                    .insert_memory(
-                        memory_id,
-                        ns_id,
-                        &mut record,
-                        &embedding_clone,
-                        full_text_clone.as_deref(),
-                    )
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
-                Ok::<_, bridge::BridgeError>(record)
-            })
-            .await
-            .map_err(|e| {
-                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
-            })??
-        };
-
-        // Insert into cache.
-        let cached = crate::model::CachedRecord::from(&record);
-        self.cache.insert(memory_id, cached).await;
-
-        // Index the embedding in the vector index.
-        {
-            use crate::search::{VectorIndex, VectorMetadata};
-            let mut index = self.vector_index.write().await;
-            let metadata = VectorMetadata {
-                namespace_id: ns_config.id,
-                decay_phase: DecayPhase::Full.as_u8(),
-                tags: merged_tags.clone(),
-            };
-            let _ = index.add(memory_id, &embedding, metadata);
-        }
-
-        // Index in FTS5 — summary, full_text, and tags as separate columns.
-        {
-            let fts = self.fts_index.lock().await;
-            if let Err(e) = fts.add(
-                ns_config.id,
-                memory_id,
-                &input.summary,
-                input.full_text.as_deref(),
-                &merged_tags,
-            ) {
-                tracing::warn!(
-                    memory_id = %memory_id,
-                    %e,
-                    "FTS5 indexing failed (non-fatal)"
-                );
-            }
-        }
-
-        // Add node to the relationship graph (must happen BEFORE autolink,
-        // and before either explicit edge — both endpoints must exist).
-        {
-            let mut graph_w = self.graph.write().await;
-            // Silently ignore DuplicateNode (should not happen for a new memory).
-            let _ = graph_w.add_node(
-                memory_id,
-                ns_config.id,
-                DecayPhase::Full,
-                1.0,
-                record.vector_slot,
-            );
-        } // graph write lock released
-
-        // Explicit links. Both targets were validated before the record was
-        // written, so anything that goes wrong here is a durability or
-        // idempotency detail, not a reason to fail a store that succeeded.
-        if let Some(parent_id) = input.parent_id {
-            crate::graph::apply_parent_edge(
-                parent_id,
-                memory_id,
-                &self.graph,
-                &self.storage,
-                &self.cache,
+        let inserted = completion
+            .insert(
+                crate::storage::control::MutationContext::unkeyed(ns_config.id),
+                crate::storage::insertion::InsertMemory {
+                    id: None,
+                    summary: input.summary.clone(),
+                    full_text: input.full_text.clone(),
+                    tags: parsed_tags,
+                    embedding: input.embedding.clone(),
+                    initial_stability: input.initial_stability,
+                    created_at: None,
+                    parent_id: input.parent_id,
+                    supersedes: input.supersedes,
+                },
+                embedding.clone(),
+                now,
             )
-            .await;
-        }
-
-        let supersedes_outcome = match input.supersedes {
-            Some(old_id) => Some(
-                crate::graph::apply_supersedes_edge(
-                    memory_id,
-                    old_id,
-                    &self.graph,
-                    &self.storage,
-                    &self.cache,
-                )
-                .await,
-            ),
-            None => None,
-        };
+            .await
+            .map_err(map_insertion_error)?;
+        let receipt = inserted.receipt;
+        let record = inserted.record.ok_or_else(|| {
+            map_insertion_error(crate::storage::StorageError::CommittedInsertion {
+                receipt: Box::new(receipt.clone()),
+                source: Box::new(crate::storage::StorageError::RecoveryRequired(
+                    "inserted record unavailable".into(),
+                )),
+            })
+        })?;
+        let memory_id = record.id;
+        let supersedes_outcome = input.supersedes.map(|id| {
+            crate::model::SupersedesOutcome::new(id, crate::model::SupersedesStatus::Applied)
+        });
 
         // Auto-link: discover and create edges to similar existing memories.
         if self.config.graph.autolink_enabled {
@@ -1147,6 +1069,13 @@ impl bridge::StorageEngine for McpStorageAdapter {
             }
         }
 
+        completion.complete().await.map_err(|source| {
+            map_insertion_error(crate::storage::StorageError::CommittedInsertion {
+                receipt: Box::new(receipt),
+                source: Box::new(source),
+            })
+        })?;
+        self.cache.insert(memory_id, record.clone()).await;
         Ok(bridge::StoredMemory {
             id: memory_id.to_string(),
             namespace: input.namespace,
