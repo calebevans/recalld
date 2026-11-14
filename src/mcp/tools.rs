@@ -245,7 +245,8 @@ fn store_memories_def() -> ToolInfo {
         name: "store_memories".to_string(),
         title: Some("Store Memories (Batch)".to_string()),
         description: "Store multiple memories in a single call. Each item has the \
-            same schema as store_memory. Returns an array of results, one per \
+            store_memory fields, plus optional embedding and initialStability \
+            in the batch schema. Returns an array of results, one per \
             input memory. Saves round trips for bulk ingestion. \
             Items are stored in order and each is indexed before the next is \
             checked, so a result entry may carry a `nearDuplicates` object naming \

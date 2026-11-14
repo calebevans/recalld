@@ -78,7 +78,7 @@ impl McpStorageAdapter {
             return Ok(outcome);
         }
         for (index, prepared) in prepared.iter().enumerate() {
-            if !matches!(progress.items[index].state, BatchItemState::NotAttempted) {
+            if !matches!(progress.items[index].state, BatchItemState::NotAttempted {}) {
                 continue;
             }
             let child = progress.child(index).ok_or_else(|| {
@@ -249,8 +249,10 @@ impl McpStorageAdapter {
                         if matches!(
                             outcome.items[index].status,
                             BatchStatus::Unknown | BatchStatus::NotAttempted
-                        ) && !matches!(current.items[index].state, BatchItemState::NotAttempted)
-                        {
+                        ) && !matches!(
+                            current.items[index].state,
+                            BatchItemState::NotAttempted {}
+                        ) {
                             outcome.items[index] =
                                 item_outcome(&current, index, prepared, self.timezone)?;
                         }
@@ -330,7 +332,7 @@ fn item_outcome(
         result: None,
     };
     match &item.state {
-        BatchItemState::NotAttempted => {}
+        BatchItemState::NotAttempted {} => {}
         BatchItemState::Error { error } => {
             outcome.status = BatchStatus::Error;
             outcome.error = Some(error.clone());
@@ -677,7 +679,7 @@ mod tests {
                     progress
                         .items
                         .iter()
-                        .all(|i| matches!(i.state, BatchItemState::NotAttempted))
+                        .all(|i| matches!(i.state, BatchItemState::NotAttempted {}))
                 );
             }
         }

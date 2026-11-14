@@ -53,6 +53,8 @@ pub(crate) fn validate_existing(
     let names: Vec<_> = tx.list_tables()?.map(|t| t.name().to_owned()).collect();
     let present = reserved.map(|n| names.iter().any(|s| s == n));
     let mut receipts = std::collections::HashMap::new();
+    let mut operation_keys: std::collections::HashMap<Uuid, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
     let mut batch_receipts = std::collections::HashSet::new();
     if names.iter().any(|n| n == control::RECEIPTS.name()) {
         for row in tx.open_table(control::RECEIPTS)?.iter()? {
@@ -64,6 +66,10 @@ pub(crate) fn validate_existing(
             ) {
                 batch_receipts.insert(r.receipt.operation_id);
             }
+            operation_keys
+                .entry(r.receipt.operation_id)
+                .or_default()
+                .push(key.value().to_vec());
             receipts.insert(key.value().to_vec(), r);
         }
     }
@@ -181,9 +187,10 @@ pub(crate) fn validate_existing(
                 )
             });
             let child = child_key.as_ref().and_then(|k| receipts.get(k));
-            if receipts.iter().any(|(key, r)| {
-                r.receipt.operation_id == item.operation_id && Some(key) != child_key.as_ref()
-            }) {
+            if operation_keys
+                .get(&item.operation_id)
+                .is_some_and(|keys| keys.iter().any(|key| Some(key) != child_key.as_ref()))
+            {
                 return Err(invalid(
                     "reserved child identity already used in another scope",
                 ));
@@ -238,7 +245,7 @@ pub(crate) fn validate_existing(
                     }
                     validate_error(error)?;
                 }
-                BatchItemState::NotAttempted => {
+                BatchItemState::NotAttempted {} => {
                     pending_prefix = true;
                     if child.is_some()
                         || item.resolution_error.is_some()
@@ -376,7 +383,7 @@ impl MetadataStore {
                 defaults: None,
                 canonical_hash: None,
                 resolution_error: None,
-                state: BatchItemState::NotAttempted,
+                state: BatchItemState::NotAttempted {},
             };
             match self.resolve_batch_item(&tx, kind, plan)? {
                 Ok((defaults, hash)) => {
@@ -566,7 +573,7 @@ impl MetadataStore {
         let mut p = load_child(&tx, child)?;
         require_turn(&p, child.index)?;
         let item = &mut p.items[child.index as usize];
-        if !matches!(item.state, BatchItemState::NotAttempted) {
+        if !matches!(item.state, BatchItemState::NotAttempted {}) {
             return Ok(p);
         }
         let ctx = catalog_context();
@@ -638,7 +645,7 @@ pub(super) fn replay_child(
         BatchItemState::Error { .. } => Err(StorageError::InvalidMutation(
             "batch item has a finalized error; use a new key".into(),
         )),
-        BatchItemState::NotAttempted => {
+        BatchItemState::NotAttempted {} => {
             require_turn(&p, child.index)?;
             Ok(None)
         }
@@ -648,7 +655,7 @@ pub(super) fn replay_child(
 fn require_turn(p: &BatchProgress, index: u32) -> Result<(), StorageError> {
     if p.items[..index as usize]
         .iter()
-        .any(|item| matches!(item.state, BatchItemState::NotAttempted))
+        .any(|item| matches!(item.state, BatchItemState::NotAttempted {}))
     {
         return Err(StorageError::InvalidMutation(
             "earlier batch items must finish before this child".into(),

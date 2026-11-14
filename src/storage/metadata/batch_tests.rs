@@ -362,7 +362,7 @@ fn pending_child_policy_is_rechecked_and_final_error_has_separate_durable_receip
 
 #[test]
 fn corrupt_batch_manifest_is_rejected_before_writable_startup_without_source_changes() {
-    for corruption in 0..4 {
+    for corruption in 0..5 {
         let f = Fixture::new();
         let (ctx, plans) = request(&f, "corrupt", vec![item()]);
         {
@@ -383,11 +383,22 @@ fn corrupt_batch_manifest_is_rejected_before_writable_startup_without_source_cha
                     p.items[0].operation_id = p.reservation_receipt.operation_id;
                     save(&tx, &p).unwrap();
                 }
-                _ => {
+                3 => {
                     p.items[0].state = BatchItemState::Error {
                         error: BatchError::new("INVALID_INPUT"),
                     };
                     save(&tx, &p).unwrap();
+                }
+                _ => {
+                    let mut row = serde_json::to_value(&p).unwrap();
+                    row["items"][0]["state"]["futureStep"] = serde_json::json!(true);
+                    tx.open_table(BATCHES)
+                        .unwrap()
+                        .insert(
+                            p.reservation_receipt.operation_id.as_bytes().as_slice(),
+                            serde_json::to_vec(&row).unwrap().as_slice(),
+                        )
+                        .unwrap();
                 }
             }
             tx.commit().unwrap();

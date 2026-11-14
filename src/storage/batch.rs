@@ -39,9 +39,9 @@ pub struct BatchDefaults {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "camelCase")]
+#[serde(tag = "status", rename_all = "camelCase", deny_unknown_fields)]
 pub enum BatchItemState {
-    NotAttempted,
+    NotAttempted {},
     Ok { receipt: WriteReceipt },
     Error { error: BatchError },
 }
@@ -143,7 +143,7 @@ impl BatchProgress {
     pub fn unresolved(&self) -> usize {
         self.items
             .iter()
-            .filter(|i| matches!(i.state, BatchItemState::NotAttempted))
+            .filter(|i| matches!(i.state, BatchItemState::NotAttempted {}))
             .count()
     }
 }
