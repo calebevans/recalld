@@ -130,3 +130,6 @@ four ignored doctests. `cargo fmt --all -- --check` passed. Offline
 Logs: `.validation/consumer-tests.log` and `.validation/consumer-clippy.log`.
 Standalone timestamp follow-up evidence remains in `.validation/timestamp-*.log`.
 The tested source commit is pinned in the documentation-only handoff below.
+
+Validated source: `357c780907e7b2302b969feabf86d053849266a2`.
+The following handoff commit changes this document only; source/tests are unchanged.
