@@ -10,6 +10,20 @@ struct OfflineHttpStorage(Arc<OfflineSnapshot>);
 #[async_trait::async_trait]
 #[allow(unused_variables)]
 impl crate::api::StorageEngine for OfflineHttpStorage {
+    async fn insert_memory(
+        &self,
+        _: NamespaceId,
+        _: crate::storage::insertion::InsertMemory,
+        _: crate::embedding::runtime::GeneratedEmbedding,
+    ) -> std::result::Result<crate::storage::insertion::InsertResult, StorageError> {
+        panic!("unexpected offline HTTP insertion")
+    }
+    async fn complete_insertion(
+        &self,
+        _: &crate::storage::control::WriteReceipt,
+    ) -> std::result::Result<(), StorageError> {
+        panic!("unexpected offline HTTP insertion completion")
+    }
     async fn create_memory(
         &self,
         namespace_id: NamespaceId,

@@ -119,7 +119,10 @@ impl Harness {
                 .await
                 .add(NamespaceId::new(1), id, summary, None, &[])
                 .unwrap();
-            f.entity_index.write().await.add(id, &["fixture".into()]);
+            f.entity_index
+                .write()
+                .await
+                .add(NamespaceId::new(1), id, &["fixture".into()]);
             ids.push(id);
         }
         Self {

@@ -306,7 +306,12 @@ mod tests {
             panic!()
         };
         assert_eq!(receipt.committed_generation, before.next().unwrap());
-        assert!(fx.storage_adapter().get_memory(memory_id).await.is_err());
+        assert!(
+            fx.storage_adapter()
+                .get_memory(memory_id, false, None)
+                .await
+                .is_err()
+        );
         assert_eq!(
             fx.storage
                 .read()

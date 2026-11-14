@@ -2581,7 +2581,7 @@ mod tests {
         }
         let mut entities = EntityIndex::new();
         for record in &records {
-            entities.add(record.id, &record.entities);
+            entities.add(record.namespace_id, record.id, &record.entities);
         }
         let fixture = Arc::new(SearchFixture(records));
         QueryEngine::new(

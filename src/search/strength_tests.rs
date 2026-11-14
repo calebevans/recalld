@@ -231,7 +231,7 @@ fn engine(
                 fts.add(r.namespace_id, r.id, &r.summary, None, &[])
                     .unwrap();
             }
-            entities.add(r.id, &r.entities);
+            entities.add(r.namespace_id, r.id, &r.entities);
             // Deliberately stale phase and strength; explicit policy must ignore it.
             graph
                 .add_node(r.id, r.namespace_id, DecayPhase::Full, 0.99, r.vector_slot)

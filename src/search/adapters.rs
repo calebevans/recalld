@@ -681,8 +681,9 @@ impl EntityIndexReader for SharedEntityIndexReader {
         let index = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.entity_index.read())
         });
-        let results =
-            index.find_by_entities_filtered(namespace_id, entities, exclude_id, |id| eligible_ids.contains(&id));
+        let results = index.find_by_entities_filtered(namespace_id, entities, exclude_id, |id| {
+            eligible_ids.contains(&id)
+        });
         Ok(results
             .into_iter()
             .take(k)

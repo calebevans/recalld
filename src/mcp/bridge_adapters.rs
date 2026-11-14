@@ -3923,7 +3923,7 @@ mod tests {
                 vec![(ids[1], 4)]
             );
         }
-        assert!(adapter.delete_memory(ids[0]).await.unwrap());
+        assert!(adapter.delete_memory(ids[0], None).await.unwrap());
         let index = fx.entity_index.read().await;
         assert_eq!(index.len(), 1);
         assert!(
