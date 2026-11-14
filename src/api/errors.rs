@@ -218,6 +218,10 @@ impl From<SearchError> for AppError {
                 message: "query text is required".to_string(),
                 field: Some("query".to_string()),
             },
+            SearchError::InvalidEmbedding(message) => AppError::UnprocessableEntity {
+                message: message.clone(),
+                field: Some("embedding".into()),
+            },
             SearchError::MemoryNotFound(id) => AppError::NotFound {
                 resource: "memory",
                 id: format!("{id}"),

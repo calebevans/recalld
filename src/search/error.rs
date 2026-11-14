@@ -43,6 +43,10 @@ pub enum SearchError {
     #[error("{0}")]
     InvalidFilter(String),
 
+    /// A supplied query vector cannot be searched safely.
+    #[error("invalid query embedding: {0}")]
+    InvalidEmbedding(String),
+
     /// An unexpected internal error occurred.
     #[error("internal error: {0}")]
     Internal(String),
