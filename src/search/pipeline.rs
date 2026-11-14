@@ -17,6 +17,10 @@ use super::response::{MemoryResponse, SearchResponse, SearchResult, StageTimings
 use super::{EligibleFtsResults, FtsCoverage};
 use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConfig, NamespaceId};
 
+#[path = "rif_experiment.rs"]
+mod rif_experiment;
+pub use rif_experiment::{MAX_RIF_PAIRS, MAX_RIF_TARGETS_PER_ANCHOR, RifDiagnostics, RifMode};
+
 #[path = "diagnostics.rs"]
 mod diagnostics;
 #[path = "strength.rs"]
@@ -31,6 +35,9 @@ mod strength_tests;
 pub use diagnostics::{
     ChannelDiagnostics, ChannelParticipation, ResultProvenance, RetrievalChannel,
 };
+#[cfg(test)]
+#[path = "rif_experiment_tests.rs"]
+mod rif_experiment_tests;
 #[cfg(test)]
 #[path = "semantics_tests.rs"]
 mod semantics_tests;
@@ -238,6 +245,18 @@ pub trait GraphReader: Send + Sync {
             "semantics2 graph expansion unavailable".into(),
         ))
     }
+    /// Complete one-hop typed adjacency for the opt-in RIF experiment.
+    /// Unsupported/corrupt reads fail; absence is not silently successful.
+    fn rif_edges(
+        &self,
+        _anchor: MemoryId,
+        _namespace: NamespaceId,
+    ) -> Result<Vec<crate::graph::query::RifEdge>> {
+        Err(SearchError::Unavailable(
+            "RIF graph reads unavailable".into(),
+        ))
+    }
+
     /// Get the neighbor IDs for a given memory.
     /// Used by RIF computation (line 601) to find competitors.
     fn neighbors(&self, id: &MemoryId) -> Vec<MemoryId>;
@@ -383,6 +402,7 @@ const FTS_ONLY_RATE: f32 = 0.3;
 /// Holds `Arc` references to all subsystems. Cheap to clone, safe to
 /// share across request handlers.
 pub struct QueryEngine {
+    rif_mode: RifMode,
     clock: Arc<dyn crate::time::Clock>,
     decay_policy: crate::decay::DecayConfig,
     decay_multiplier: f64,
@@ -423,6 +443,7 @@ impl QueryEngine {
         access_recorder: Arc<dyn AccessRecorder>,
     ) -> Self {
         Self {
+            rif_mode: RifMode::Off,
             clock: Arc::new(crate::time::SystemClock),
             decay_policy: crate::decay::DecayConfig::default(),
             decay_multiplier: 1.0,
@@ -537,6 +558,11 @@ impl QueryEngine {
         let stage_start = Instant::now();
         if semantics != RetrievalSemantics::V1 {
             semantics::validate_query(&query)?;
+            if self.rif_mode != RifMode::Off && query.record_access {
+                return Err(SearchError::InvalidFilter(
+                    "operator RIF experiments require explicit recordAccess=false".into(),
+                ));
+            }
         }
         query.validate()?;
         let ns_config = self.namespace_resolver.resolve(&query.namespace).await?;
@@ -1073,7 +1099,7 @@ impl QueryEngine {
     }
 
     /// Stage 8: Compute composite scores and apply temporal boost.
-    fn apply_boosts(&self, candidates: &mut Vec<Candidate>, query: &SearchQuery) {
+    fn apply_boosts(&self, candidates: &mut [Candidate], query: &SearchQuery) {
         for candidate in candidates.iter_mut() {
             candidate.composite_score = Self::compute_composite_score(candidate);
         }
