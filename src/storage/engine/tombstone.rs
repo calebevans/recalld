@@ -9,10 +9,22 @@ impl RedbStorageEngine {
         ctx: &MutationContext,
         id: MemoryId,
     ) -> Result<WriteReceipt, StorageError> {
+        self.tombstone_memory_reserved(ctx, id, None)
+    }
+
+    pub(crate) fn tombstone_memory_reserved(
+        &mut self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        child: Option<&crate::storage::batch::BatchChild>,
+    ) -> Result<WriteReceipt, StorageError> {
         self.ensure_available()?;
-        let receipt =
-            self.meta_store
-                .tombstone_with_effects(ctx, id, &self.edge_store.load_all_edges()?)?;
+        let receipt = self.meta_store.tombstone_reserved_with_effects(
+            ctx,
+            id,
+            &self.edge_store.load_all_edges()?,
+            child,
+        )?;
         if !receipt.replayed {
             effects::apply_pending(
                 &self.meta_store,
