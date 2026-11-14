@@ -1188,3 +1188,6 @@ async fn by_id_legacy_strength_and_cosine_values_ignore_clock_advancement() {
     }
     assert_eq!(clock.calls.load(Ordering::SeqCst), 5);
 }
+
+#[path = "label_tests.rs"]
+mod label_tests;

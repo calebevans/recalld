@@ -23,7 +23,7 @@ pub use crate::model::CachedRecord as CacheRecord;
 ///
 /// Typical return: ~650-800 bytes per entry.
 pub fn weigh_cached_record(record: &CachedRecord) -> u32 {
-    let base = std::mem::size_of::<CachedRecord>(); // ~80 bytes stack fields
+    let base = std::mem::size_of::<CachedRecord>();
     let summary_heap = record.summary.len() // heap String content
         + std::mem::size_of::<String>(); // 24 bytes (ptr+len+cap)
     let tags_heap = record
@@ -32,10 +32,19 @@ pub fn weigh_cached_record(record: &CachedRecord) -> u32 {
         .map(|t| t.as_str().len() + std::mem::size_of::<Tag>())
         .sum::<usize>()
         + std::mem::size_of::<Vec<Tag>>(); // 24 bytes (ptr+len+cap)
+    let labels_heap = record.labels.as_ref().map_or(0, |labels| {
+        labels
+            .entities
+            .iter()
+            .chain(&labels.topics)
+            .chain(&labels.emotions)
+            .map(|value| value.len() + std::mem::size_of::<String>())
+            .sum::<usize>()
+    });
     let arc_overhead = std::mem::size_of::<usize>() * 2; // strong + weak refcount
     let moka_overhead = 64_usize; // internal bookkeeping estimate
 
-    let total = base + summary_heap + tags_heap + arc_overhead + moka_overhead;
+    let total = base + summary_heap + tags_heap + labels_heap + arc_overhead + moka_overhead;
     total.try_into().unwrap_or(u32::MAX)
 }
 

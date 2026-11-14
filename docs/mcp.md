@@ -146,6 +146,10 @@ Array fields (`tags`, `entities`, `topics`, `emotions`) carry two limits: a plai
 
 Before this limit existed there was no per-element bound at all: an over-long entity was accepted, merged into an over-long tag, and then dropped by the storage layer while the call still reported success.
 
+Legacy writes require nonempty structured labels that the prefixed tag codec can retain: ASCII letters/digits and `/ _ . : -`, within the limits above. Unrepresentable labels and invalid raw tags are rejected with field/index errors before embedding or allocation; they are not silently dropped. Native UTF-8 write admission remains a separate, gated feature.
+
+Canonical reader results preserve already-persisted structured metadata. Existing `entities`, `topics`, and `emotions` arrays retain their types. An optional `labels` object carries exact canonical arrays and their persisted `provenance` (`native_v2` or `legacy_retained_only`); it is omitted for legacy physical records. Empty canonical arrays are authoritative and do not fall back to retained tags. This additive read representation does not advertise native serving readiness or recover labels already lost by legacy writes. See [consumer scope and fixture provenance](implementation/canonical-label-consumers.md).
+
 > **Known limitation:** `entities`, `topics`, and `emotions` are converted into `entity/…`, `topic/…`, and `emotion/…` tags *after* validation runs, and the `tags` limit of 64 is checked against the tags you supplied. A memory that supplies 64 tags plus 32 entities, 32 topics, and 32 emotions can therefore end up with up to 160 tags stored. This is accepted today and is not treated as an error.
 
 ### Argument validation

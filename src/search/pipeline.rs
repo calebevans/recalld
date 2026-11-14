@@ -546,6 +546,12 @@ impl QueryEngine {
         }
         query.validate()?;
         let ns_config = self.namespace_resolver.resolve(&query.namespace).await?;
+        query
+            .filter
+            .labels
+            .validate(ns_config.schema.is_some())
+            .map_err(SearchError::InvalidFilter)?;
+        query.filter.compiled_labels = Some(query.filter.labels.compile());
         let mut strength_context = StrengthContext::pin(self, &ns_config, query.record_access)?;
         diagnostics.strength = Some(strength_context.diagnostics);
         if let Some(embedding) = query.query_embedding.as_mut() {
@@ -1308,6 +1314,7 @@ impl QueryEngine {
         Ok(Observed {
             receipts,
             value: Some(MemoryResponse {
+                labels: record.labels.clone(),
                 id: record.id,
                 namespace: namespace.name,
                 created_at: record.created_at,
@@ -1461,6 +1468,7 @@ impl QueryEngine {
                 }
                 let score = Some(scored.score);
                 Some(SearchResult {
+                    labels: rec.labels.clone(),
                     memory_id: rec.id,
                     created_at: rec.created_at,
                     last_accessed_at: rec.last_accessed_at,
@@ -1590,6 +1598,19 @@ impl QueryEngine {
             return false;
         }
 
+        // Admitted queries reuse a compiled predicate. Direct internal callers
+        // still apply the full filter if they have not gone through admission.
+        let labels_match = match &filter.compiled_labels {
+            Some(labels) => labels.matches(&record.tags, record.labels.as_ref()),
+            None => filter
+                .labels
+                .compile()
+                .matches(&record.tags, record.labels.as_ref()),
+        };
+        if !labels_match {
+            return false;
+        }
+
         // Require tags (ALL must be present)
         if !filter.require_tags.is_empty() {
             for required in &filter.require_tags {
@@ -1701,6 +1722,7 @@ impl QueryEngine {
             .map(|c| {
                 let record = &c.record;
                 SearchResult {
+                    labels: record.labels.clone(),
                     memory_id: record.id,
                     created_at: record.created_at,
                     last_accessed_at: record.last_accessed_at,
@@ -1941,6 +1963,7 @@ mod tests {
     /// A Full-phase, strong, untagged record in namespace 1.
     pub(super) fn rec(id: MemoryId) -> CachedRecord {
         CachedRecord {
+            labels: None,
             lifecycle: None,
             id,
             namespace_id: ns(),

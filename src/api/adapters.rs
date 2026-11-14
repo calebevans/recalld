@@ -16,7 +16,7 @@ use crate::embedding::EmbeddingProvider;
 use crate::graph::SharedGraph;
 use crate::model::{
     AccessKind, CachedRecord, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId, Tag,
-    parse_structured_tags,
+    structured_metadata,
 };
 use crate::search::{EntityIndex, FlatVectorIndex, FtsIndex};
 use crate::storage::RedbStorageEngine;
@@ -1762,21 +1762,11 @@ impl SearchPipelineAdapter {
             state::QueryInput::TextAndVector { text, embedding } => (Some(text), Some(embedding)),
         };
 
-        // A label that cannot become a tag is an error, not a dropped
-        // filter: dropping one from `includeTags` or `entities` WIDENS
-        // the query, and a caller cannot tell "every memory in the
-        // namespace" from a genuine match.
-        let mut require_tags: Vec<Tag> =
+        // Raw tags remain strict. The pipeline validates structured filters
+        // against the resolved namespace before provider/channel work.
+        let require_tags: Vec<Tag> =
             crate::model::parse_filter_tags("includeTags", "", &query.include_tags)
                 .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?;
-        require_tags.extend(
-            crate::model::parse_filter_tags(
-                "entities",
-                crate::model::constants::ENTITY_TAG_PREFIX,
-                &query.entities,
-            )
-            .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?,
-        );
         // `excludeTags` is the safe direction — dropping one can only
         // ever return MORE than asked for in the same sense a missing
         // exclusion does, and it never masquerades as a match — so it
@@ -1805,6 +1795,10 @@ impl SearchPipelineAdapter {
             fts_query: None,
             namespace: query.namespace_name.clone(), // Issue 1: pass actual namespace name
             filter: crate::search::PipelineSearchFilter {
+                labels: crate::model::tag::StructuredLabelFilter {
+                    entities: query.entities.clone(),
+                    ..Default::default()
+                },
                 require_tags,
                 exclude_tags,
                 phases,
@@ -1829,8 +1823,8 @@ impl SearchPipelineAdapter {
             .results
             .into_iter()
             .map(|r| {
-                // Issue 5: Parse entities from tags
-                let metadata = parse_structured_tags(&r.tags);
+                // Preserve canonical metadata; only legacy records parse retained tags.
+                let metadata = structured_metadata(&r.tags, r.labels.as_ref());
                 state::ResolvedSearchResult {
                     access_kind: if r.activation_score.is_some() {
                         AccessKind::AssociativeRetrieval
@@ -1838,6 +1832,7 @@ impl SearchPipelineAdapter {
                         AccessKind::DirectRetrieval
                     },
                     memory: CachedRecord {
+                        labels: r.labels,
                         lifecycle: None,
                         id: r.memory_id,
                         namespace_id: query.namespace_id, // Issue 6: use actual namespace_id
