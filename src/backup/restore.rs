@@ -459,9 +459,18 @@ mod tests {
         root: &Path,
         embedding: &[f32],
     ) -> (PathBuf, BackupManifest) {
+        fixture_with_namespace(root, embedding, "default")
+    }
+
+    fn fixture_with_namespace(
+        root: &Path,
+        embedding: &[f32],
+        name: &str,
+    ) -> (PathBuf, BackupManifest) {
         let source = root.join("source");
         let mut engine = RedbStorageEngine::open(&source).unwrap();
         let mut ns = NamespaceConfig::default_namespace(0);
+        ns.name = name.into();
         ns.embedding_dim = 4;
         let ns = engine.create_namespace(&ns).unwrap();
         let id = MemoryId::new();
@@ -1255,7 +1264,11 @@ mod tests {
     async fn retained_restore_terminal_ledger_survives_tombstone_and_namespace_purge() {
         for purge in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let (target, manifest) = fixture(root.path());
+            let (target, manifest) = fixture_with_namespace(
+                root.path(),
+                &[1., 2., 3., 4.],
+                if purge { "retired" } else { "default" },
+            );
             let backup = archive(root.path(), &target, &manifest);
             let mut engine = RedbStorageEngine::open(&target).unwrap();
             let (id, original) = engine.scan_all().unwrap().remove(0);
@@ -1278,13 +1291,19 @@ mod tests {
                 assert!(record.summary.is_empty() && record.tags.is_empty());
                 assert_eq!((record.text_offset, record.text_length), (0, 0));
             }
-            assert!(
-                engine
-                    .vector_manager()
-                    .get(ns)
-                    .unwrap()
-                    .is_free(original.vector_slot)
-            );
+            if purge {
+                assert!(engine.vector_manager().get(ns).is_none());
+                assert!(engine.get_namespace(ns).unwrap().is_none());
+                assert!(!target.join("retired").exists());
+            } else {
+                assert!(
+                    engine
+                        .vector_manager()
+                        .get(ns)
+                        .unwrap()
+                        .is_free(original.vector_slot)
+                );
+            }
             let fts = crate::search::FtsIndex::new(&target).unwrap();
             assert!(fts.search(ns, "backup fixture", 10).unwrap().is_empty());
             let mut reused = original;
@@ -1430,3 +1449,7 @@ mod tests {
 #[cfg(test)]
 #[path = "schema_restore_tests.rs"]
 mod schema_tests;
+
+#[cfg(test)]
+#[path = "purge_offline_tests.rs"]
+mod purge_offline_tests;

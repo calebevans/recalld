@@ -384,7 +384,6 @@ pub(crate) fn validate_existing(
             })
         };
         if !permitted_origin
-
             || stored.receipt.store_id != lineage
             || operation != stored.receipt.operation_id.as_bytes()
         {

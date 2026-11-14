@@ -104,10 +104,14 @@ fn table_kind(name: &str) -> Option<TableKind> {
         | "removal_ledger_state"
         | "restore_lineage_v1"
         | CATALOG => Some(TableKind::StrBytes),
-        "mutation_receipts" | "mutation_keys" | "mutation_effects" | "removal_ledger" => {
-            Some(TableKind::BytesBytes)
+        "mutation_receipts"
+        | "mutation_keys"
+        | "mutation_effects"
+        | "removal_ledger"
+        | "namespace_purge_progress" => Some(TableKind::BytesBytes),
+        "namespace_counter" | "effects_schema" | "namespace_purge_schema" => {
+            Some(TableKind::StrU32)
         }
-        "namespace_counter" | "effects_schema" => Some(TableKind::StrU32),
         _ => None,
     }
 }
