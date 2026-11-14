@@ -38,6 +38,7 @@ pub mod health;
 pub(crate) mod index_cleanup;
 pub mod mcp;
 pub mod model;
+pub(crate) mod performance;
 pub mod rif;
 pub mod search;
 pub mod serialization;

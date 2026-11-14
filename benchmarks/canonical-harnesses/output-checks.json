@@ -1,0 +1,29 @@
+{
+  "claim": "deterministic fixture/result projections only; not deterministic canonical-state/reset/replay",
+  "processes": 3,
+  "identicalArtifacts": [
+    "fixture.json",
+    "state-before.json",
+    "state-after.json",
+    "replay.json"
+  ],
+  "ledgerChecks": "full retained receipts; identity/reference/count/contiguous generations; all semantic fields compared except explicitly checked generated store/operation IDs",
+  "perProcessRecords": 100,
+  "perProcessInsertReceipts": 100,
+  "perProcessFinalGeneration": "104",
+  "falseRecordAndControlChecks": true,
+  "probeRecords": 1000,
+  "probeDimensions": 384,
+  "probeEnabledEvents": 228,
+  "probeDisabledEvents": 0,
+  "probeResultsAndCanonicalLogicalHashesEqual": true,
+  "probePhysicalHashesAcrossRestart": [
+    "7d7395d89100ad82204d1134e3484eb23bda13afda3d3cc0ce6652b2fca26189",
+    "621b83e84d5ad4beeb29787226650dbd1195e4f223991c16e6a9ed92c1200f9e"
+  ],
+  "probePhysicalHashesAcrossRestartExpectedEqual": false,
+  "probePerProcessFalseQueryBytesUnchanged": true,
+  "historicalDriverRejectedBeforeEffects": true,
+  "performanceGate": false,
+  "wholeCoreFreezeOrReset": false
+}
