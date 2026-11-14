@@ -45,6 +45,7 @@ pub(crate) fn capture(path: &Path) -> Result<CapturedSnapshot, StorageError> {
         "canonical_schema",
         "effects_schema",
         "mutation_effects",
+        "logical_import_progress",
     ];
     if read.list_tables()?.any(|t| !known.contains(&t.name()))
         || read
@@ -355,6 +356,12 @@ pub(crate) fn reconcile(
     let descriptor = text.seal(new_store_id, text_id, 2)?;
     crate::storage::text::generation::write_rejection_gate(stage, &descriptor)?;
     let tx = db.begin_write()?;
+    // A completed import checkpoint is derived retry state for the old copy.
+    // Full canonical validation precedes this private fork; never carry its
+    // destination/export identity into the newly restored lineage.
+    tx.delete_table(TableDefinition::<&str, &[u8]>::new(
+        "logical_import_progress",
+    ))?;
     let mut control = snapshot.control.clone();
     control.store_id = new_store_id;
     control.committed_generation = Generation::default().next()?;

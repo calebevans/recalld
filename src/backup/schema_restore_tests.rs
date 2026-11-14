@@ -480,7 +480,7 @@ async fn backup_and_restore_reject_unapplied_effects_without_rewriting_evidence(
         .iter()
         .map(|e| f.migrated.join(&e.name))
         .collect();
-    let forged = crate::backup::manifest::generate_manifest(&f.migrated, &files).unwrap();
+    let forged = super::tests::checksum_valid_manifest(&f.migrated, manifest);
     crate::backup::archive::create_archive(&f.migrated, &files, &forged, &bad).unwrap();
     let retained_before = fs::read(f.target.join("meta.db")).unwrap();
     assert!(

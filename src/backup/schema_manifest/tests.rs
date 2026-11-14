@@ -11,6 +11,56 @@ use crate::storage::{
 };
 use crate::test_support::Fixture;
 
+#[tokio::test]
+async fn imported_backup_restores_with_derived_checkpoint_discarded_only_in_private_fork() {
+    use crate::storage::logical_export::{export_store, import_store};
+    let root = fixture().await;
+    let source = root.path().join("store");
+    let export = root.path().join("source.jsonl");
+    let summary = export_store(&source, &export).unwrap();
+    let imported = root.path().join("imported");
+    import_store(&export, &imported).unwrap();
+    let before = bytes(&imported);
+    let archive = root.path().join("imported.zip");
+    run_backup(&RecalldConfig::default(), &archive, Some(&imported), false)
+        .await
+        .unwrap();
+    let restored = root.path().join("restored-import");
+    restore_from_backup(RestoreOptions {
+        backup_path: archive,
+        data_dir: restored.clone(),
+        force: true,
+        no_stop_daemon: true,
+        historical: true,
+    })
+    .await
+    .unwrap();
+    let imported_state = inspect_schema(&imported).unwrap();
+    let restored_state = inspect_schema(&restored).unwrap();
+    assert_ne!(
+        restored_state.control.store_id,
+        imported_state.control.store_id
+    );
+    assert_eq!(restored_state.schema, imported_state.schema);
+    assert_eq!(restored_state.record_count, imported_state.record_count);
+    assert_eq!(bytes(&imported), before);
+    let (_copy, database) = validation::inspect_database(&restored.join("meta.db")).unwrap();
+    let read = database.begin_read().unwrap();
+    assert!(
+        !read
+            .list_tables()
+            .unwrap()
+            .any(|t| t.name() == "logical_import_progress")
+    );
+    // Original completed import keeps its retry identity and remains immutable.
+    assert_eq!(import_store(&export, &imported).unwrap(), summary);
+    assert_eq!(bytes(&imported), before);
+    assert!(crate::storage::RedbStorageEngine::open(&restored).is_err());
+    // The private fork still produces an ordinary validated offline snapshot.
+    let snapshot = crate::storage::offline_snapshot::OfflineSnapshot::open(&restored).unwrap();
+    assert_eq!(snapshot.record_count().unwrap(), 2);
+}
+
 async fn fixture() -> tempfile::TempDir {
     let fixture = Fixture::new();
     let a = fixture.insert_memory().await;
@@ -99,7 +149,7 @@ async fn actual_v2_backup_captures_canonical_identity_configuration_counts_and_h
         data_dir: target.clone(),
         force: true,
         no_stop_daemon: true,
-            historical: true,
+        historical: true,
     })
     .await
     .unwrap();
@@ -146,7 +196,7 @@ async fn self_consistent_manifest_lies_fail_before_target_publication_and_source
                 data_dir: target.clone(),
                 force: true,
                 no_stop_daemon: true,
-            historical: true,
+                historical: true,
             })
             .await
             .is_err(),

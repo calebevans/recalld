@@ -498,7 +498,10 @@ mod tests {
 
     // Deliberately bypass production generation for semantically corrupt but
     // checksum-consistent archives. Production generation now rejects these.
-    fn checksum_valid_manifest(source: &Path, mut manifest: BackupManifest) -> BackupManifest {
+    pub(super) fn checksum_valid_manifest(
+        source: &Path,
+        mut manifest: BackupManifest,
+    ) -> BackupManifest {
         manifest.total_size_bytes = 0;
         for entry in &mut manifest.files {
             let bytes = fs::read(source.join(&entry.name)).unwrap();
