@@ -1,0 +1,645 @@
+use super::*;
+use crate::storage::{
+    catalog::{NamespacePolicy, boundary},
+    control::{MutationContext, WriteReceipt},
+    fsync::fsync_dir,
+};
+
+impl RedbStorageEngine {
+    /// Replay precedes CAS, directory inspection and vector preparation. The
+    /// receipt is canonical metadata evidence, never whole-store readiness.
+    pub fn create_namespace_with_receipt(
+        &mut self,
+        ctx: &MutationContext,
+        config: &NamespaceConfig,
+    ) -> Result<WriteReceipt, StorageError> {
+        self.ensure_available()?;
+        let mut prepared = None;
+        let mut payload_published = false;
+        let root = &self.db_path;
+        let result = self.meta_store.create_catalog(ctx, config, |id| {
+            boundary("before_stage")?;
+            let target = root.join(&config.name);
+            // Never adopt or clean an existing directory, including broken links.
+            match std::fs::symlink_metadata(&target) {
+                Ok(_) => {
+                    return Err(StorageError::InvalidMutation(
+                        "namespace directory already exists".into(),
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            let stage = tempfile::Builder::new()
+                .prefix(".recalld-catalog-")
+                .tempdir_in(root)?;
+            let mut vector =
+                crate::storage::VectorStore::open(stage.path(), config.embedding_dim as usize)?;
+            vector.sync()?;
+            fsync_dir(stage.path())?;
+            boundary("after_stage")?;
+            boundary("before_payload_publish")?;
+            rename_new_directory(stage.path(), &target)?;
+            payload_published = true;
+            // The final directory is deliberately never compensating-deleted:
+            // a failed/uncertain commit is reconciled by reopen; unreferenced
+            // final directories are quarantined by existing orphan recovery.
+            fsync_dir(root)?;
+            vector.relocate_path(&target);
+            boundary("after_payload_publish")?;
+            prepared = Some((id, vector));
+            Ok(())
+        });
+        let receipt = result.map_err(|error| {
+            if payload_published {
+                self.meta_store.mark_unavailable();
+            }
+            error
+        })?;
+        if let Some((id, vector)) = prepared {
+            let publish = (|| {
+                boundary("before_handle_publish")?;
+                self.vector_manager.install_prepared(id, vector);
+                boundary("after_handle_publish")
+            })();
+            publish.map_err(|source| {
+                self.meta_store.mark_unavailable();
+                StorageError::CommittedEffectsPending {
+                    operation_id: receipt.operation_id,
+                    source: Box::new(source),
+                }
+            })?;
+        }
+        Ok(receipt)
+    }
+
+    pub fn update_namespace_policy_with_receipt(
+        &self,
+        ctx: &MutationContext,
+        policy: &NamespacePolicy,
+    ) -> Result<WriteReceipt, StorageError> {
+        self.ensure_available()?;
+        self.meta_store
+            .update_namespace_policy_with_receipt(ctx, policy)
+    }
+}
+
+/// Publish a prepared directory without replacing even an empty existing one.
+/// The supported local platforms already provide an atomic no-replace rename.
+fn rename_new_directory(source: &Path, target: &Path) -> Result<(), StorageError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| StorageError::InvalidPath)?;
+        let target = std::ffi::CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| StorageError::InvalidPath)?;
+        // SAFETY: both C strings are NUL-terminated and live across the syscall.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (source, target);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace directory publication unavailable",
+        )
+        .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::catalog::FAILURE;
+    use crate::storage::control::MutationOutcome;
+    fn config(name: &str) -> NamespaceConfig {
+        let mut c = NamespaceConfig::default_namespace(123);
+        c.name = name.into();
+        c.embedding_dim = 4;
+        c
+    }
+    fn context(e: &RedbStorageEngine, key: &str, scope: MutationScope) -> MutationContext {
+        let state = e.control_state().unwrap();
+        MutationContext {
+            store_id: Some(state.store_id),
+            scope,
+            idempotency_key: Some(key.into()),
+            expected_generation: Some(state.committed_generation),
+            contract_version: 1,
+        }
+    }
+    fn created(r: &WriteReceipt) -> NamespaceId {
+        let MutationOutcome::NamespaceCreated { namespace_id, .. } = r.outcome else {
+            panic!("wrong outcome")
+        };
+        namespace_id
+    }
+    fn fault<T>(point: &'static str, f: impl FnOnce() -> T) -> T {
+        FAILURE.with(|v| v.set(Some(point)));
+        let result = f();
+        FAILURE.with(|v| v.set(None));
+        result
+    }
+
+    #[test]
+    fn catalog_namespace_legacy_retention_endpoints_persist_and_update() {
+        for retention in [0.0, 1.0] {
+            let root = tempfile::tempdir().unwrap();
+            let mut e = RedbStorageEngine::open(root.path()).unwrap();
+            let mut c = config("endpoints");
+            c.desired_retention = retention;
+            c.decay_rate_multiplier = Some(0.0);
+            let id = e
+                .create_namespace(&c)
+                .expect("legacy endpoint must remain valid");
+            drop(e);
+            let e = RedbStorageEngine::open(root.path()).unwrap();
+            let stored = e.get_namespace(id).unwrap().unwrap();
+            assert_eq!(stored.desired_retention, retention);
+            assert_eq!(stored.decay_rate_multiplier, Some(0.0));
+            let mut policy = NamespacePolicy::from(&stored);
+            policy.desired_retention = 1.0 - retention;
+            let ctx = context(&e, "endpoint-update", MutationScope::Namespace(id));
+            e.update_namespace_policy_with_receipt(&ctx, &policy)
+                .unwrap();
+            drop(e);
+            let e = RedbStorageEngine::open(root.path()).unwrap();
+            assert_eq!(
+                e.get_namespace(id).unwrap().unwrap().desired_retention,
+                1.0 - retention
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_receipt_scope_forgery_fails_startup_without_changing_source() {
+        use crate::storage::control::{KEYS, RECEIPTS, scoped_key};
+
+        fn files(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            let mut snapshot = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    snapshot.extend(files(&path));
+                } else {
+                    snapshot.insert(path.clone(), std::fs::read(path).unwrap());
+                }
+            }
+            snapshot
+        }
+
+        let mut accepted = Vec::new();
+        for keyed in [false, true] {
+            for mode in [
+                "create_namespace_scope",
+                "update_catalog_scope",
+                "update_wrong_id",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let mut e = RedbStorageEngine::open(root.path()).unwrap();
+                let mut ctx = context(&e, "receipt", MutationScope::Catalog);
+                if !keyed {
+                    ctx.idempotency_key = None;
+                }
+                let create = e
+                    .create_namespace_with_receipt(&ctx, &config("scope"))
+                    .unwrap();
+                let id = created(&create);
+                let (receipt, wrong_scope) = if mode == "create_namespace_scope" {
+                    (create, MutationScope::Namespace(id))
+                } else {
+                    ctx = context(&e, "policy", MutationScope::Namespace(id));
+                    if !keyed {
+                        ctx.idempotency_key = None;
+                    }
+                    let policy = NamespacePolicy::from(&e.get_namespace(id).unwrap().unwrap());
+                    let receipt = e
+                        .update_namespace_policy_with_receipt(&ctx, &policy)
+                        .unwrap();
+                    let scope = if mode == "update_catalog_scope" {
+                        MutationScope::Catalog
+                    } else {
+                        MutationScope::Namespace(NamespaceId::new(id.get() + 1))
+                    };
+                    (receipt, scope)
+                };
+                drop(e);
+
+                // Move the receipt AND its retry-key reference consistently: ordinary
+                // key-link validation must not mask the outcome/scope mismatch.
+                let db = redb::Database::open(root.path().join("meta.db")).unwrap();
+                let tx = db.begin_write().unwrap();
+                let old = scoped_key(receipt.store_id, ctx.scope, receipt.operation_id.as_bytes());
+                let new = scoped_key(
+                    receipt.store_id,
+                    wrong_scope,
+                    receipt.operation_id.as_bytes(),
+                );
+                {
+                    let mut receipts = tx.open_table(RECEIPTS).unwrap();
+                    let value = receipts
+                        .remove(old.as_slice())
+                        .unwrap()
+                        .unwrap()
+                        .value()
+                        .to_vec();
+                    receipts.insert(new.as_slice(), value.as_slice()).unwrap();
+                    if let Some(key) = &ctx.idempotency_key {
+                        let mut keys = tx.open_table(KEYS).unwrap();
+                        keys.remove(
+                            scoped_key(receipt.store_id, ctx.scope, key.as_bytes()).as_slice(),
+                        )
+                        .unwrap();
+                        keys.insert(
+                            scoped_key(receipt.store_id, wrong_scope, key.as_bytes()).as_slice(),
+                            new.as_slice(),
+                        )
+                        .unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+                drop(db);
+                let before = files(root.path());
+                match RedbStorageEngine::open(root.path()) {
+                    Err(StorageError::InvalidControl(message)) => {
+                        assert_eq!(message, "catalog receipt outcome disagrees with key scope");
+                        assert_eq!(files(root.path()), before, "{mode}, keyed={keyed}");
+                    }
+                    Err(error) => {
+                        panic!("unexpected rejection for {mode}, keyed={keyed}: {error:?}")
+                    }
+                    Ok(_) => accepted.push(format!("{mode}, keyed={keyed}")),
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "accepted forged catalog receipts: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_receipt_scopes_remain_valid_after_namespace_purge() {
+        for keyed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut e = RedbStorageEngine::open(root.path()).unwrap();
+            let mut create_ctx = context(&e, "create", MutationScope::Catalog);
+            if !keyed {
+                create_ctx.idempotency_key = None;
+            }
+            let create = e
+                .create_namespace_with_receipt(&create_ctx, &config("gone"))
+                .unwrap();
+            let id = created(&create);
+            let mut update_ctx = context(&e, "update", MutationScope::Namespace(id));
+            if !keyed {
+                update_ctx.idempotency_key = None;
+            }
+            let policy = NamespacePolicy::from(&e.get_namespace(id).unwrap().unwrap());
+            let update = e
+                .update_namespace_policy_with_receipt(&update_ctx, &policy)
+                .unwrap();
+            e.purge_namespace(id).unwrap();
+            drop(e);
+            let e = RedbStorageEngine::open(root.path()).unwrap();
+            assert!(e.get_namespace(id).unwrap().is_none());
+            for (receipt, scope) in [(create, create_ctx.scope), (update, update_ctx.scope)] {
+                assert_eq!(
+                    e.lookup_operation(receipt.store_id, scope, receipt.operation_id)
+                        .unwrap(),
+                    Some(receipt)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_create_replays_before_cas_and_filesystem_and_never_reuses_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let mut e = RedbStorageEngine::open(root.path()).unwrap();
+        let ctx = context(&e, "create", MutationScope::Catalog);
+        let c = config("notes");
+        let receipt = e.create_namespace_with_receipt(&ctx, &c).unwrap();
+        let id = created(&receipt);
+        assert_eq!(
+            receipt.committed_generation,
+            ctx.expected_generation.unwrap().next().unwrap()
+        );
+        assert!(root.path().join("notes/vectors.dat").is_file());
+        let mut retry = c.clone();
+        retry.created_at = 456;
+        retry.id = NamespaceId::new(999);
+        let replay = fault("before_stage", || {
+            e.create_namespace_with_receipt(&ctx, &retry)
+        })
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation_id, receipt.operation_id);
+        assert_eq!(replay.outcome, receipt.outcome);
+        let before = e.control_state().unwrap();
+        let mut other = c.clone();
+        other.embedding_dim = 5;
+        assert!(matches!(
+            e.create_namespace_with_receipt(&ctx, &other),
+            Err(StorageError::IdempotencyConflict)
+        ));
+        let stale = MutationContext {
+            idempotency_key: Some("new".into()),
+            ..ctx.clone()
+        };
+        assert!(matches!(
+            e.create_namespace_with_receipt(&stale, &config("stale")),
+            Err(StorageError::GenerationConflict { .. })
+        ));
+        assert!(!root.path().join("stale").exists());
+        assert_eq!(e.control_state().unwrap(), before);
+        e.purge_namespace(id).unwrap();
+        let replacement = e.create_namespace(&config("notes")).unwrap();
+        assert!(replacement.get() > id.get());
+        let state = e.control_state().unwrap();
+        assert_eq!(
+            created(
+                &fault("before_stage", || e
+                    .create_namespace_with_receipt(&ctx, &retry))
+                .unwrap()
+            ),
+            id
+        );
+        assert_eq!(e.control_state().unwrap(), state);
+        drop(e);
+        let e = RedbStorageEngine::open(root.path()).unwrap();
+        assert_eq!(
+            e.lookup_operation(
+                receipt.store_id,
+                MutationScope::Catalog,
+                receipt.operation_id
+            )
+            .unwrap(),
+            Some(receipt)
+        );
+    }
+
+    #[test]
+    fn catalog_policy_is_typed_atomic_replayable_and_identity_preserving() {
+        let root = tempfile::tempdir().unwrap();
+        let mut e = RedbStorageEngine::open(root.path()).unwrap();
+        let id = e.create_namespace(&config("policy")).unwrap();
+        let original = e.get_namespace(id).unwrap().unwrap();
+        let mut policy = NamespacePolicy::from(&original);
+        policy.initial_stability = 8.;
+        policy.decay_rate_multiplier = Some(0.);
+        let ctx = context(&e, "policy", MutationScope::Namespace(id));
+        let r = e
+            .update_namespace_policy_with_receipt(&ctx, &policy)
+            .unwrap();
+        assert_eq!(
+            r.committed_generation,
+            ctx.expected_generation.unwrap().next().unwrap()
+        );
+        let now = e.get_namespace(id).unwrap().unwrap();
+        assert_eq!(now.initial_stability, 8.);
+        assert_eq!(now.id, original.id);
+        assert_eq!(now.name, original.name);
+        assert_eq!(now.created_at, original.created_at);
+        assert_eq!(now.embedding_dim, original.embedding_dim);
+        assert!(now.schema.is_none());
+        assert!(
+            e.update_namespace_policy_with_receipt(&ctx, &policy)
+                .unwrap()
+                .replayed
+        );
+        let mut bad = policy.clone();
+        bad.initial_stability = f32::NAN;
+        assert!(e.update_namespace_policy_with_receipt(&ctx, &bad).is_err());
+        bad = policy.clone();
+        bad.initial_stability = 9.;
+        assert!(matches!(
+            e.update_namespace_policy_with_receipt(&ctx, &bad),
+            Err(StorageError::IdempotencyConflict)
+        ));
+        let next = context(&e, "failpolicy", MutationScope::Namespace(id));
+        let before = e.control_state().unwrap();
+        assert!(
+            fault("before_metadata_commit", || e
+                .update_namespace_policy_with_receipt(&next, &bad))
+            .is_err()
+        );
+        assert_eq!(e.control_state().unwrap(), before);
+        assert_eq!(e.get_namespace(id).unwrap().unwrap().initial_stability, 8.);
+        for field in ["name", "embeddingDim", "schema", "lifecycleVersion"] {
+            let mut json = serde_json::to_value(&policy).unwrap();
+            json[field] = serde_json::json!("forbidden");
+            assert!(serde_json::from_value::<NamespacePolicy>(json).is_err());
+        }
+        e.purge_namespace(id).unwrap();
+        assert!(
+            e.update_namespace_policy_with_receipt(&ctx, &policy)
+                .unwrap()
+                .replayed
+        );
+        drop(e);
+        let e = RedbStorageEngine::open(root.path()).unwrap();
+        assert_eq!(
+            e.lookup_operation(r.store_id, ctx.scope, r.operation_id)
+                .unwrap(),
+            Some(r)
+        );
+    }
+
+    #[test]
+    fn catalog_faults_preserve_preexisting_directories_and_reconcile_own_publication() {
+        for point in [
+            "before_stage",
+            "after_stage",
+            "before_payload_publish",
+            "after_payload_publish",
+            "before_metadata_commit",
+            "after_metadata_commit",
+            "before_handle_publish",
+            "after_handle_publish",
+            "commit_unknown",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut e = RedbStorageEngine::open(root.path()).unwrap();
+            let ctx = context(&e, "fault", MutationScope::Catalog);
+            let before = e.control_state().unwrap();
+            let result = fault(point, || {
+                e.create_namespace_with_receipt(&ctx, &config("fault"))
+            });
+            assert!(result.is_err(), "{point}");
+            let committed = matches!(
+                point,
+                "after_metadata_commit"
+                    | "before_handle_publish"
+                    | "after_handle_publish"
+                    | "commit_unknown"
+            );
+            if point == "commit_unknown" {
+                assert!(matches!(
+                    result,
+                    Err(StorageError::CommitOutcomeUnknown { .. })
+                ));
+            }
+            if !matches!(
+                point,
+                "before_stage" | "after_stage" | "before_payload_publish"
+            ) {
+                assert!(e.control_state().is_err(), "{point}");
+            }
+            drop(e);
+            let mut e = RedbStorageEngine::open(root.path()).unwrap();
+            let observed = e.control_state().unwrap();
+            assert_eq!(
+                observed.committed_generation.get(),
+                before.committed_generation.get() + u64::from(committed),
+                "{point}"
+            );
+            let replay = e
+                .create_namespace_with_receipt(&ctx, &config("fault"))
+                .unwrap();
+            assert_eq!(replay.replayed, committed, "{point}");
+            assert!(e.get_namespace(created(&replay)).unwrap().is_some());
+        }
+        for nonempty in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut e = RedbStorageEngine::open(root.path()).unwrap();
+            let dir = root.path().join("existing");
+            std::fs::create_dir(&dir).unwrap();
+            if nonempty {
+                std::fs::write(dir.join("sentinel"), b"keep").unwrap();
+            }
+            let before = e.control_state().unwrap();
+            assert!(e.create_namespace(&config("existing")).is_err());
+            assert!(dir.is_dir());
+            assert_eq!(e.control_state().unwrap(), before);
+            if nonempty {
+                assert_eq!(std::fs::read(dir.join("sentinel")).unwrap(), b"keep");
+            }
+            let stage = tempfile::tempdir_in(root.path()).unwrap();
+            assert!(rename_new_directory(stage.path(), &dir).is_err());
+            assert!(dir.is_dir());
+        }
+    }
+
+    #[test]
+    fn catalog_process_child() {
+        let Ok(path) = std::env::var("RECALLD_CATALOG_STORE") else {
+            return;
+        };
+        let mut e = RedbStorageEngine::open(path).unwrap();
+        let ctx = context(&e, "crash", MutationScope::Catalog);
+        e.create_namespace_with_receipt(&ctx, &config("crash"))
+            .unwrap();
+        panic!("crash boundary not reached");
+    }
+
+    #[test]
+    fn catalog_crash_boundaries_reopen_to_absent_or_receipted_namespace() {
+        for point in [
+            "before_stage",
+            "after_stage",
+            "after_payload_publish",
+            "before_metadata_commit",
+            "after_metadata_commit",
+            "before_handle_publish",
+            "after_handle_publish",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let e = RedbStorageEngine::open(root.path()).unwrap();
+            let ctx = context(&e, "crash", MutationScope::Catalog);
+            drop(e);
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::engine::catalog::tests::catalog_process_child",
+                    "--nocapture",
+                ])
+                .env("RECALLD_CATALOG_STORE", root.path())
+                .env("RECALLD_CATALOG_CRASH", point)
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.code(),
+                Some(89),
+                "{point}: {}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let mut e = RedbStorageEngine::open(root.path()).unwrap();
+            let committed = matches!(
+                point,
+                "after_metadata_commit" | "before_handle_publish" | "after_handle_publish"
+            );
+            assert_eq!(
+                e.get_namespace_by_name("crash").unwrap().is_some(),
+                committed,
+                "{point}"
+            );
+            let r = e
+                .create_namespace_with_receipt(&ctx, &config("crash"))
+                .unwrap();
+            assert_eq!(r.replayed, committed, "{point}");
+            let id = created(&r);
+            assert!(e.vector_manager.get(id).is_some());
+            assert!(e.meta_store.text_selection().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn catalog_invalid_inputs_and_lineage_never_allocate() {
+        let root = tempfile::tempdir().unwrap();
+        let mut e = RedbStorageEngine::open(root.path()).unwrap();
+        let before = e.control_state().unwrap();
+        for dim in [0, 8193, u32::MAX] {
+            let mut c = config("bad");
+            c.embedding_dim = dim;
+            assert!(e.create_namespace(&c).is_err());
+        }
+        for retention in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+            let mut c = config("bad");
+            c.desired_retention = retention;
+            assert!(e.create_namespace(&c).is_err());
+        }
+        // Inclusive legacy retention does not enable ordinary schema-v2 creation.
+        for retention in [0.0, 1.0] {
+            let mut c = config("bad");
+            c.desired_retention = retention;
+            c.schema = Some(crate::model::schema::NamespaceSchemaV2::from_legacy());
+            assert!(e.create_namespace(&c).is_err());
+        }
+        let mut c = config("bad");
+        c.phase_thresholds.full_to_summary = f32::NAN;
+        assert!(e.create_namespace(&c).is_err());
+        let mut ctx = context(&e, "lineage", MutationScope::Catalog);
+        ctx.store_id = Some(uuid::Uuid::new_v4());
+        assert!(matches!(
+            e.create_namespace_with_receipt(&ctx, &config("bad")),
+            Err(StorageError::StoreLineageMismatch)
+        ));
+        assert_eq!(e.control_state().unwrap(), before);
+        assert!(!root.path().join("bad").exists());
+    }
+}

@@ -90,13 +90,13 @@ impl MetadataStore {
         crate::storage::lineage::ensure_serving(read, &state)?;
         Ok(state)
     }
-    fn native_guard(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
+    fn native_guard(&self) -> Result<MutationGuard<'_>, StorageError> {
         if !self.native_lifecycle_only {
             return Err(StorageError::RecoveryRequired(
                 "explicit native lifecycle entry required".into(),
             ));
         }
-        let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        let guard = self.publication_guard(None)?;
         self.ensure_available()?;
         let read = self.db.begin_read()?;
         self.native_control_at(&read)?;
@@ -310,7 +310,7 @@ impl MetadataStore {
     // Tests can abandon the actual fully prepared transaction before commit.
     fn prepare_native(
         &self,
-        _publication: &std::sync::RwLockWriteGuard<'_, ()>,
+        publication: &MutationGuard<'_>,
         ctx: &MutationContext,
         scope: &LifecycleScope,
         capture: &CapturedLifecycle,
@@ -319,6 +319,7 @@ impl MetadataStore {
         policy: &NativePolicyInputs,
         clock: &dyn Clock,
     ) -> Result<(redb::WriteTransaction, Option<WriteReceipt>), StorageError> {
+        publication.check(self)?;
         ctx.validate()?;
         if ctx.contract_version != 2 {
             return Err(StorageError::InvalidMutationContext(

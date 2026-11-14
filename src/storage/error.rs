@@ -12,6 +12,9 @@ pub enum StorageError {
     LifecycleConflict(String),
     #[error("CONTENT_UNAVAILABLE")]
     LifecycleContentUnavailable,
+    #[error(transparent)]
+    Work(#[from] crate::storage::work::WorkError),
+
     /// Canonical mutation exists; retry publication, never retry as a new write.
     #[error("INDEX_NOT_READY commitState=committed ready=false receipt={} cause={source}", serde_json::to_string(receipt).unwrap_or_default())]
     CommittedMutation {
