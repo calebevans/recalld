@@ -827,9 +827,12 @@ pub async fn search_memories(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
-    let stamp = state.storage.effects_stamp().await?;
-    let observed = search_memories_admitted(State(state.clone()), Json(req), stamp).await;
-    observed?.finish(check_read_admission(&state, stamp).await)
+    crate::performance::measure("rest.search", req.record_access, async {
+        let stamp = state.storage.effects_stamp().await?;
+        let observed = search_memories_admitted(State(state.clone()), Json(req), stamp).await;
+        observed?.finish(check_read_admission(&state, stamp).await)
+    })
+    .await
 }
 
 async fn search_memories_admitted(
@@ -915,6 +918,7 @@ async fn search_memories_admitted(
 
     let results = state.search.prepare_search(search_query).await?;
 
+    let hydration = crate::performance::Timer::new("rest.hydration");
     // Batch-load embeddings with a single lock acquisition if requested.
     let embeddings = if req.include_embeddings {
         let ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id).collect();
@@ -965,6 +969,7 @@ async fn search_memories_admitted(
         });
     }
 
+    hydration.complete();
     check_read_admission(&state, admitted_stamp).await?;
     let receipts = if req.record_access {
         state
