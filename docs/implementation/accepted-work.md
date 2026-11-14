@@ -85,8 +85,8 @@ read-only allowlisted source, temporary HOME and no home/credential/socket mount
 Final raw output: `/tmp/recalld-accepted-test-wjgq37hv/output`. All 167 source
 hashes and 9 output hashes were reverified, including archived contents.
 
-Evidence is on separate branch `study/accepted-work` (base frozen PR64 tail) at
-`benchmarks/accepted-work/REPORT.md`. It includes all three immutable runs,
+Evidence was frozen on `study/accepted-work` (base PR64 tail) and is included
+in this same implementation PR at `benchmarks/accepted-work/REPORT.md`. It includes all three immutable runs,
 source/command manifests, runtime patch and changed-file list; no runtime ancestry
 or build caches were added. Final archive SHA-256:
 `f1f59723dcb51127d9a6376d1b76d3e611ee7c501f2fc175793e1255c81d0456`.
