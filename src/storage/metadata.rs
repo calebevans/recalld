@@ -16,6 +16,7 @@ pub(crate) mod purge;
 pub(crate) mod removal_ledger;
 pub(crate) mod text_generation;
 mod tombstone;
+mod work;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,6 +35,9 @@ use crate::storage::control::{
 };
 use crate::storage::error::StorageError;
 use crate::storage::indexes::PhaseIndex;
+use crate::storage::work::{WorkTicket, WorkTracker};
+pub use work::MetadataFreeze;
+pub(crate) use work::MutationGuard;
 
 // ═══════════════════════════════════════════════════════════════════════
 // redb Table Definitions
@@ -77,6 +81,7 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 /// concurrent read transactions and exclusive write transactions.
 pub struct MetadataStore {
     db: Database,
+    work_tracker: WorkTracker,
     unavailable: std::sync::atomic::AtomicBool,
     purge_pending: std::sync::atomic::AtomicBool,
     pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
@@ -142,7 +147,7 @@ impl MetadataStore {
         }
 
         // Force-create all tables by opening them in a write transaction.
-        {
+        let store_id = {
             let write_txn = db.begin_write()?;
             control::initialize(&write_txn)?;
             effects::initialize(&write_txn)?;
@@ -153,13 +158,15 @@ impl MetadataStore {
             let _ = write_txn.open_multimap_table(TAG_INDEX)?;
             let _ = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             removal_ledger::initialize(&write_txn, pristine)?;
+            let store_id = control::read_control(&write_txn)?.store_id;
             write_txn.commit()?;
-        }
-
+            store_id
+        };
         // Legacy checkpoints have no generation watermark. Always rebuild
         // from canonical records, even for direct MetadataStore callers.
         let store = Self {
             db,
+            work_tracker: WorkTracker::new(store_id),
             unavailable: std::sync::atomic::AtomicBool::new(false),
             purge_pending: std::sync::atomic::AtomicBool::new(false),
             canonical_pending: std::sync::atomic::AtomicBool::new(false),
@@ -230,15 +237,6 @@ impl MetadataStore {
             self.mark_unavailable();
             StorageError::RedbCommit(e)
         })
-    }
-
-    pub(crate) fn mutation_guard(
-        &self,
-    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
-        let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
-        // Recheck after waiting: the preceding writer may have failed.
-        self.ensure_available()?;
-        Ok(guard)
     }
 }
 
@@ -546,12 +544,13 @@ impl MetadataStore {
     // transaction at the last pre-commit boundary, without a fake backend.
     fn prepare_access(
         &self,
-        _publication: &std::sync::RwLockWriteGuard<'_, ()>,
+        _publication: &MutationGuard<'_>,
         ctx: &MutationContext,
         id: MemoryId,
         timestamp: i64,
         kind: AccessKind,
     ) -> Result<(redb::WriteTransaction, WriteReceipt), StorageError> {
+        _publication.check(self)?;
         let kind_bytes = control::encode(&kind)?;
         let hash = control::request_hash(ctx, "record_access", &[id.as_bytes(), &kind_bytes]);
         let tx = self.db.begin_write()?;
@@ -2184,7 +2183,7 @@ mod tests {
         let ctx = keyed_context(&store, 1, "abort");
         let before = store.control_state().unwrap();
         // All three writes have been staged in the real redb transaction.
-        let publication = store.publication.write().unwrap();
+        let publication = store.mutation_guard().unwrap();
         let (tx, abandoned) = store
             .prepare_access(&publication, &ctx, id, 123, AccessKind::DirectRetrieval)
             .unwrap();

@@ -20,6 +20,7 @@ impl MetadataStore {
     /// of that reserved slot before this transaction resolves.
     pub(crate) fn insert_with_effects(
         &self,
+        guard: &MutationGuard<'_>,
         ctx: &MutationContext,
         input: &InsertMemory,
         sampled_at: i64,
@@ -27,7 +28,7 @@ impl MetadataStore {
         existing_edges: &[PersistedEdge],
         stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord, &[f32]) -> Result<(), StorageError>,
     ) -> Result<WriteReceipt, StorageError> {
-        let guard = self.mutation_guard()?;
+        guard.check(self)?;
         ctx.validate()?;
         if ctx.contract_version != 1 {
             return Err(StorageError::InvalidMutationContext(
@@ -178,7 +179,7 @@ impl MetadataStore {
             });
         }
         self.finish_record_effects(
-            &guard,
+            guard,
             tx,
             ctx,
             hash,
@@ -249,6 +250,7 @@ mod schema_tests {
         };
         assert!(matches!(
             store.insert_with_effects(
+                &store.mutation_guard().unwrap(),
                 &MutationContext::unkeyed(config.id),
                 &input,
                 123,
