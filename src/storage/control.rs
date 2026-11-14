@@ -193,6 +193,12 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    LifecycleExposureRecorded {
+        transition: super::native_lifecycle::NativeLifecycleWrite,
+    },
+    LifecycleFeedbackApplied {
+        transition: super::native_lifecycle::NativeLifecycleWrite,
+    },
     LifecyclePolicyMigrated {
         transition: super::lifecycle_migration::PolicyTransition,
     },
@@ -313,6 +319,8 @@ pub(crate) fn validate_existing(
         if matches!(
             stored.receipt.outcome,
             MutationOutcome::LifecyclePolicyMigrated { .. }
+                | MutationOutcome::LifecycleExposureRecorded { .. }
+                | MutationOutcome::LifecycleFeedbackApplied { .. }
         ) && state.control_schema_version != 2
         {
             return Err(StorageError::InvalidControl(
@@ -465,6 +473,19 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
         return Err(StorageError::InvalidControl(
             "unsupported receipt/hash version or invalid persisted receipt".into(),
         ));
+    }
+    match &stored.receipt.outcome {
+        MutationOutcome::LifecycleExposureRecorded { transition } => {
+            transition.validate(&stored.receipt, false)?
+        }
+        MutationOutcome::LifecycleFeedbackApplied { transition } => {
+            transition.validate(&stored.receipt, true)?
+        }
+        MutationOutcome::LifecyclePolicyMigrated { .. }
+        | MutationOutcome::GraphChanged { .. }
+        | MutationOutcome::SchemaMigrated { .. }
+        | MutationOutcome::TextGenerationSelected { .. }
+        | MutationOutcome::AccessRecorded { .. } => {}
     }
     Ok(stored)
 }

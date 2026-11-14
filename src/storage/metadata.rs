@@ -9,6 +9,7 @@
 
 pub(crate) mod effects;
 mod lifecycle_updates;
+mod native_lifecycle;
 pub(crate) mod removal_ledger;
 pub(crate) mod restoration;
 pub(crate) mod text_generation;
@@ -73,6 +74,7 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 /// concurrent read transactions and exclusive write transactions.
 pub struct MetadataStore {
     db: Database,
+    native_lifecycle_only: bool,
     unavailable: std::sync::atomic::AtomicBool,
     pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
     derived_dirty: std::sync::atomic::AtomicBool,
@@ -97,14 +99,43 @@ impl MetadataStore {
     /// - Creates all tables on first open.
     /// - Loads or rebuilds the phase index from persisted bitmaps.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        Self::open_mode(path, false)
+    }
+
+    // Caller must already own the store and validate its complete inventory.
+    pub(crate) fn open_native_lifecycle(path: &Path) -> Result<Self, StorageError> {
+        Self::open_mode(path, true)
+    }
+
+    fn open_mode(path: &Path, native_lifecycle_only: bool) -> Result<Self, StorageError> {
+        if native_lifecycle_only && (!path.is_file() || path.metadata()?.len() == 0) {
+            return Err(StorageError::InvalidPath);
+        }
         // redb's writable open can change bookkeeping. Reject historical mode
         // on a disposable copy even for callers bypassing the engine.
         if path.try_exists()? && path.metadata()?.len() > 0 {
             let (_copy, db) = super::validation::inspect_database_copy(path, true)?;
             let read = db.begin_read()?;
-            if let Some(control) = control::validate_existing(&read)? {
+            let control = control::validate_existing(&read)?;
+            super::canonical_schema::validate_metadata_format(&read, control.as_ref())?;
+            if native_lifecycle_only && text_generation::read_selection(&read)?.is_none() {
+                return Err(StorageError::InvalidControl(
+                    "native lifecycle entry requires the selected-text old-reader fence".into(),
+                ));
+            }
+            if native_lifecycle_only && control.is_none() {
+                return Err(StorageError::InvalidMutation(
+                    "native lifecycle entry requires canonical schema 2".into(),
+                ));
+            }
+            if let Some(control) = control {
                 super::lineage::ensure_serving(&read, &control)?;
-                if control.control_schema_version == 2 {
+                if native_lifecycle_only && control.control_schema_version != 2 {
+                    return Err(StorageError::InvalidMutation(
+                        "native lifecycle entry requires canonical schema 2".into(),
+                    ));
+                }
+                if control.control_schema_version == 2 && !native_lifecycle_only {
                     return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
                 }
             }
@@ -124,7 +155,7 @@ impl MetadataStore {
             let control = control::validate_existing(&read)?;
             removal_ledger::read_export(&read, control.as_ref())?;
             if let Some(state) = control {
-                if state.control_schema_version == 2 {
+                if state.control_schema_version == 2 && !native_lifecycle_only {
                     return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
                 }
                 // An adopted store must retain its canonical tables. Do not
@@ -136,8 +167,8 @@ impl MetadataStore {
             effects::validate_existing(&read)?;
         }
 
-        // Force-create all tables by opening them in a write transaction.
-        {
+        // Native entry never adopts tables or rewrites derived checkpoints.
+        if !native_lifecycle_only {
             let write_txn = db.begin_write()?;
             control::initialize(&write_txn)?;
             effects::initialize(&write_txn)?;
@@ -155,6 +186,7 @@ impl MetadataStore {
         // from canonical records, even for direct MetadataStore callers.
         let store = Self {
             db,
+            native_lifecycle_only,
             unavailable: std::sync::atomic::AtomicBool::new(false),
             canonical_pending: std::sync::atomic::AtomicBool::new(false),
             derived_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -165,7 +197,17 @@ impl MetadataStore {
             publication: std::sync::RwLock::new(()),
             phase_index: std::sync::RwLock::new(PhaseIndex::new()),
         };
-        store.rebuild_phase_index()?;
+        if native_lifecycle_only {
+            let rows = store.scan_all_for_recovery()?;
+            let phases = rows
+                .iter()
+                .map(|(_, r)| (r.namespace_id, r.vector_slot, r.phase))
+                .collect::<Vec<_>>();
+            *store.phase_index.write().unwrap_or_else(|e| e.into_inner()) =
+                PhaseIndex::rebuild_from_records(&phases);
+        } else {
+            store.rebuild_phase_index()?;
+        }
         let pending = store.pending_effects()?;
         store.canonical_pending.store(
             pending.iter().any(|e| !e.canonical_applied),
@@ -200,15 +242,26 @@ impl MetadataStore {
     }
 
     fn commit(&self, tx: redb::WriteTransaction) -> Result<(), StorageError> {
+        self.ensure_legacy_operation()?;
         tx.commit().map_err(|e| {
             self.mark_unavailable();
             StorageError::RedbCommit(e)
         })
     }
 
+    fn ensure_legacy_operation(&self) -> Result<(), StorageError> {
+        if self.native_lifecycle_only {
+            return Err(StorageError::RecoveryRequired(
+                "operation does not participate in native lifecycle proof".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn mutation_guard(
         &self,
     ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
+        self.ensure_legacy_operation()?;
         let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
         // Recheck after waiting: the preceding writer may have failed.
         self.ensure_available()?;

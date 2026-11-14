@@ -1,0 +1,7 @@
+{
+  "mixed-format/src/storage/canonical_schema.rs": "c0a93da40ed09819f99720e73d69731f4ad767064d53a5658c6acf5e207d9ec6",
+  "mixed-format/src/storage/metadata.rs": "fb588687c3465ae6fcd17ed85ac115f70864cc48aabfa9fa995d651984c1b974",
+  "mixed-format/src/storage/metadata/native_lifecycle/tests.rs": "84e5a54dfd5e4c5220822111e2a76277de611a8cc87759fd43568239aadde87c",
+  "native-admission/src/storage/metadata/native_lifecycle.rs": "ac7d53973ac46f170f2517f760c0a2d9fc76eb029ae3f7d645b110e7a44c6a3f",
+  "native-admission/src/storage/metadata/native_lifecycle/tests.rs": "c9b304945cc80f9f3b2b3eceeeab1651989bf8528908c77b09c4dac56567b83e"
+}

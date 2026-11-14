@@ -140,8 +140,52 @@ pub struct FeedbackPlan {
     pub is_permastore: bool,
 }
 
+pub(crate) struct FeedbackState {
+    pub stability: f32,
+    pub difficulty: f32,
+    pub phase: DecayPhase,
+    pub is_permastore: bool,
+    pub has_summary: bool,
+    pub anchor: i64,
+    pub updated_at: i64,
+}
+
 pub fn plan_feedback(
     record: &DiskRecord,
+    policy: &EffectiveLifecyclePolicy,
+    now_millis: i64,
+    quality: u8,
+) -> Result<FeedbackPlan, LifecycleError> {
+    let (anchor, updated_at) = record.schema.as_ref().map_or(
+        (
+            record.last_accessed_at,
+            record.last_accessed_at.max(record.created_at),
+        ),
+        |schema| {
+            (
+                schema.lifecycle.decay_anchor_at,
+                schema.lifecycle.lifecycle_updated_at,
+            )
+        },
+    );
+    plan_feedback_state(
+        &FeedbackState {
+            stability: record.stability,
+            difficulty: record.difficulty,
+            phase: record.phase,
+            is_permastore: record.is_permastore != 0,
+            has_summary: !record.summary.is_empty(),
+            anchor,
+            updated_at,
+        },
+        policy,
+        now_millis,
+        quality,
+    )
+}
+
+pub(crate) fn plan_feedback_state(
+    record: &FeedbackState,
     policy: &EffectiveLifecyclePolicy,
     now_millis: i64,
     quality: u8,
@@ -150,7 +194,7 @@ pub fn plan_feedback(
         return Err(LifecycleError::InvalidInput("quality must be in 1..=4"));
     }
     if matches!(record.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
-        || (record.phase == DecayPhase::Summary && record.summary.is_empty())
+        || (record.phase == DecayPhase::Summary && !record.has_summary)
     {
         return Err(LifecycleError::ContentUnavailable);
     }
@@ -164,26 +208,14 @@ pub fn plan_feedback(
             "invalid record stability or difficulty",
         ));
     }
-    let (anchor, updated_at) = record.schema.as_ref().map_or(
-        (
-            record.last_accessed_at,
-            record.last_accessed_at.max(record.created_at),
-        ),
-        |schema| {
-            (
-                schema.lifecycle.decay_anchor_at,
-                schema.lifecycle.lifecycle_updated_at,
-            )
-        },
-    );
-    let timestamp = now_millis.max(updated_at);
+    let timestamp = now_millis.max(record.updated_at);
     let config = DecayConfig {
         difficulty: record.difficulty,
         ..policy.config.clone()
     };
     let stability = FsrsEngine::new(&config).review_stability(
         record.stability,
-        crate::time::elapsed_days(timestamp, anchor),
+        crate::time::elapsed_days(timestamp, record.anchor),
         quality,
         policy.decay_rate_multiplier,
     );
@@ -192,7 +224,7 @@ pub fn plan_feedback(
         stability,
         strength: 1.0,
         phase: record.phase,
-        is_permastore: record.is_permastore != 0 || stability >= config.permastore_threshold,
+        is_permastore: record.is_permastore || stability >= config.permastore_threshold,
     })
 }
 

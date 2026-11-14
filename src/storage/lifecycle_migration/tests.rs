@@ -349,7 +349,7 @@ async fn failures_abandon_whole_transaction_and_postpublish_retry_reconciles_exa
 }
 
 #[tokio::test]
-async fn expected_state_ownership_and_token_exhaustion_leave_source_untouched() {
+async fn expected_state_ownership_and_forged_tokens_leave_source_untouched() {
     let root = tempfile::tempdir().unwrap();
     let source = fixture(root.path()).await;
     let before = files(&source);
@@ -383,13 +383,26 @@ async fn expected_state_ownership_and_token_exhaustion_leave_source_untouched() 
             .insert(r.id.as_slice(), r.encode().unwrap().as_slice())
             .unwrap();
     });
-    let before = files(&source);
+    // Read the already-known inventory directly: canonical inventory validation
+    // intentionally rejects this corrupted fixture before returning its files.
+    let corrupted = before
+        .keys()
+        .map(|p| (p.clone(), std::fs::read(source.join(p)).unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    // This raw MAX token has no typed operation history. Native suffix proof
+    // now rejects that corruption before attempting the migration increment.
     assert!(matches!(
         migrate_lifecycle(&source, &target, &opts),
+        Err(StorageError::InvalidControl(_))
+    ));
+    assert!(matches!(
+        Generation::MAX.next(),
         Err(StorageError::GenerationExhausted)
     ));
     assert!(!target.exists());
-    assert_eq!(files(&source), before);
+    for (path, bytes) in corrupted {
+        assert_eq!(std::fs::read(source.join(path)).unwrap(), bytes);
+    }
 }
 
 #[tokio::test]

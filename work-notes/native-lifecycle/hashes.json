@@ -1,0 +1,30 @@
+{
+  "parent": "129b701",
+  "runtime_parent": "65edaa36a446789e7918e756c624025b1a91b6a7",
+  "source": {
+    "src/decay/lifecycle.rs": "4df3d6ae60c01542e615f710770cdfe2e5692fb492516e6cec891a3005336506",
+    "src/storage/canonical_schema.rs": "65ef16f0c0eaa3a78e2112ae45e27d963e44abc7eda3b5646e64809b0f62c0fb",
+    "src/storage/control.rs": "09af0a5b13943626afa96636289aa62e6a19c83c3699b06f9608cb3b0475ffd2",
+    "src/storage/error.rs": "11024d189a2cd931c47bb0f6bcfc14ad8de94b5f8d699d942a6f45e6442afbc1",
+    "src/storage/lifecycle_migration.rs": "b7c5814b716b100473b1c5e7cb7a68e7c89c5a3be5b17322ee04b57ee947abd3",
+    "src/storage/lifecycle_migration/tests.rs": "c98a9f0e0b181bb5ade26e13cd7fb925a3b5d82c730fde6f355104bb78b99933",
+    "src/storage/metadata.rs": "335a46e3b3ae02e4bbdb7a56c43132d8534fb379a9ac217e205042a1d7e3e7a5",
+    "src/storage/mod.rs": "ae20ee93959c3ff70569b59d023592b4c2be31a400674fd2583a9abc9230dfbe",
+    "src/storage/native_lifecycle.rs": "47209008b21283dfe64d0cb55a0d5a53c4a94118457e7a825927f38ace54dcfa",
+    "src/storage/metadata/native_lifecycle.rs": "b17ee724cc81783cef8c746815010c87fa8343f9efb7bbb2d3c0aaa1e6520871",
+    "src/storage/metadata/native_lifecycle/tests.rs": "84c65ea6f0f00eecce86ee18cf7e09b4fb5da49d815f44ab879f9e1c9f920294"
+  },
+  "evidence": {
+    "before-source-hashes.json": "cfafeea900069470faa00aae3b5e33aa924e7c2cf5105ae958aa3dda8232e4e7",
+    "before-source.tar.gz": "dbf5f489f4bbd5727ae0e47fe7ce4f27e95c014a497c0694c6d48d1f37b621d9",
+    "capture-before.log": "856281050d47ffb041dc61e5736eeb15e97a99dff946760d64cd48c3a84ba222",
+    "clippy.log.gz": "b08f8cafcb549b7fca0a38c1e64d9d84de0322c7921a8648047b7019a64bd19c",
+    "contract-before.log": "5206cc90a8030436e074c2a3c53dda774da368beb6eb8d8402e9defa7b4e2d94",
+    "fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "focused.log": "6e9667bbd72e3b297e076fa53fef3e010e4f8af705136b350bb8c45c77778709",
+    "full-suite.log": "47f5c0154eeac953554f93331102ccc3e50f49390a5c4f073f17272b0eaf9dc8",
+    "initial-full.log": "65c5c13072cb8716119c14e79002e522c204a4a91f573ef10ef3e5f4af895583",
+    "mixed-format-before.log": "194832b39525b86ff392ee4c205e112955cc42d0a6bfb85dc37d92a4353a3124"
+  },
+  "clippy_uncompressed_sha256": "ffa0a783a05e3f6b6d3f3c1d113768572890a9c234fdb916cf932fefc954ef89"
+}
