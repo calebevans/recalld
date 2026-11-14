@@ -115,6 +115,26 @@ pub trait StorageEngine: Send + Sync {
         is_permastore: bool,
     ) -> Result<(), StorageError>;
 
+    /// Atomic v1 feedback state/history patch; false rejects a stale snapshot.
+    fn apply_legacy_feedback(
+        &self,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        plan: &crate::decay::lifecycle::FeedbackPlan,
+    ) -> Result<bool, StorageError>;
+
+    /// Atomic v1 strength/phase/content patch (same phase or one phase loss).
+    fn apply_legacy_decay(
+        &self,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        phase: DecayPhase,
+        strength: f32,
+        decay_strength: f32,
+    ) -> Result<bool, StorageError>;
+
     /// Zero the full_text pointer on a memory record.
     ///
     /// Called during Full -> Summary phase transitions to mark the
@@ -1225,6 +1245,7 @@ impl StorageEngine for RedbStorageEngine {
         self.meta_store
             .get_namespace(namespace_id)?
             .ok_or(StorageError::NamespaceNotFound(namespace_id.get()))?;
+        self.meta_store.ensure_uuid_not_terminal(id)?;
         // 1. Allocate vector slot and write embedding.
         let vector_store = self
             .vector_manager
@@ -1320,6 +1341,32 @@ impl StorageEngine for RedbStorageEngine {
             stability,
             is_permastore,
         )
+    }
+
+    fn apply_legacy_feedback(
+        &self,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        plan: &crate::decay::lifecycle::FeedbackPlan,
+    ) -> Result<bool, StorageError> {
+        self.ensure_available()?;
+        self.meta_store
+            .apply_legacy_feedback(id, expected, namespace, plan)
+    }
+
+    fn apply_legacy_decay(
+        &self,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        phase: DecayPhase,
+        strength: f32,
+        decay_strength: f32,
+    ) -> Result<bool, StorageError> {
+        self.ensure_available()?;
+        self.meta_store
+            .apply_legacy_decay(id, expected, namespace, phase, strength, decay_strength)
     }
 
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
@@ -2940,5 +2987,174 @@ mod tests {
         db_path.join("meta.db").exists()
             && db_path.join("edges.db").exists()
             && db_path.join("fulltext.dat").exists()
+    }
+    fn independent_join_corrupt_peer_plan(path: &Path, applied: bool) {
+        use crate::storage::metadata::effects::{EFFECTS, PendingEffects};
+        use redb::ReadableTable;
+        let db = redb::Database::open(path.join("meta.db")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(EFFECTS).unwrap();
+            let (key, mut effect) = {
+                let row = table.iter().unwrap().next().unwrap().unwrap();
+                (
+                    row.0.value().to_vec(),
+                    crate::storage::control::decode::<PendingEffects>(row.1.value()).unwrap(),
+                )
+            };
+            assert!(!effect.peer_counts.is_empty());
+            effect.peer_counts[0].1 += 1;
+            effect.canonical_applied = applied;
+            table
+                .insert(
+                    key.as_slice(),
+                    crate::storage::control::encode(&effect).unwrap().as_slice(),
+                )
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn independent_join_recovery_plan_preflight_preserves_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "review");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .meta_store
+            .fail_effect_application
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            engine.add_edge(a, b, EdgeType::Associative, 0.5, false, 10),
+            Err(StorageError::CommittedEffectsPending { .. })
+        ));
+        drop(engine);
+        independent_join_corrupt_peer_plan(dir.path(), false);
+        let before = std::fs::read(dir.path().join("meta.db")).unwrap();
+        let result = RedbStorageEngine::open(dir.path());
+        assert!(result.is_err());
+        eprintln!("corrupt-plan open rejected: {:?}", result.err());
+        let after = std::fs::read(dir.path().join("meta.db")).unwrap();
+        assert!(
+            before == after,
+            "malformed pending plan changed original metadata before rejection"
+        );
+    }
+
+    #[test]
+    fn independent_join_ledger_receipt_snapshot_and_pending_barrier() {
+        use crate::storage::offline_snapshot::OfflineSnapshot;
+        use crate::storage::schema_migration::{MigrationOptions, inspect_schema, migrate_schema};
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "review");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .add_edge(a, b, EdgeType::Associative, 0.5, false, 10)
+            .unwrap();
+        engine.meta_store.acknowledge_rebuilt_effects().unwrap();
+        let before = engine.control_state().unwrap();
+        let effect = engine.delete_memory_with_edges(a, &[]).unwrap().unwrap();
+        let ledger = engine.meta_store.removal_ledger_export().unwrap();
+        let entry = ledger
+            .entries
+            .iter()
+            .find(|e| e.memory_uuid == a.into_inner())
+            .unwrap();
+        assert_eq!(entry.operation_id, effect.receipt.operation_id);
+        assert_eq!(entry.origin_lineage, effect.receipt.store_id);
+        assert_eq!(entry.generation, effect.receipt.committed_generation);
+        assert_eq!(
+            entry.generation,
+            before.committed_generation.next().unwrap()
+        );
+        let expected = engine.control_state().unwrap().generation_ref();
+        drop(engine);
+        let files = crate::storage::validation::canonical_files(dir.path()).unwrap();
+        let bytes: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let target_root = tempfile::tempdir().unwrap();
+        let target = target_root.path().join("schema");
+        let opts = MigrationOptions {
+            migration_now: 1234,
+            expected_source: expected,
+            attestations: vec![],
+        };
+        migrate_schema(dir.path(), &target, &opts).unwrap();
+        let view = OfflineSnapshot::open(&target).unwrap();
+        assert_eq!(view.control().generation_ref(), expected);
+        assert!(view.record(a).unwrap().is_none());
+        assert!(view.record(b).unwrap().is_some());
+        let read = view.metadata.begin_read().unwrap();
+        let copied =
+            crate::storage::metadata::removal_ledger::read_export(&read, Some(view.control()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(copied, ledger);
+        let pending = crate::storage::metadata::effects::validate_existing(&read).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].receipt, effect.receipt);
+        assert!(pending[0].canonical_applied);
+        drop(read);
+        drop(view);
+        assert!(inspect_schema(&target).is_ok());
+        assert_eq!(
+            files
+                .iter()
+                .map(|p| std::fs::read(p).unwrap())
+                .collect::<Vec<_>>(),
+            bytes
+        );
+        // Flip only the pending status in a separate synthetic fixture: offline consumers must refuse replay.
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "review");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .meta_store
+            .fail_effect_application
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            engine
+                .add_edge(a, b, EdgeType::Associative, 0.5, false, 10)
+                .is_err()
+        );
+        drop(engine);
+        let before = std::fs::read(dir.path().join("meta.db")).unwrap();
+        assert!(inspect_schema(dir.path()).is_err());
+        assert!(OfflineSnapshot::open(dir.path()).is_err());
+        assert!(migrate_schema(dir.path(), &target_root.path().join("blocked"), &opts).is_err());
+        assert!(!target_root.path().join("blocked").exists());
+        assert_eq!(std::fs::read(dir.path().join("meta.db")).unwrap(), before);
+    }
+
+    #[test]
+    fn preflight_preserves_valid_historical_applied_peer_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "history");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        let c = add_memory(&mut engine, ns);
+        engine
+            .add_edge(a, b, EdgeType::Associative, 0.5, false, 10)
+            .unwrap();
+        engine
+            .add_edge(a, c, EdgeType::Associative, 0.5, false, 11)
+            .unwrap();
+        let effects = engine.meta_store.pending_effects().unwrap();
+        assert_eq!(effects.len(), 2);
+        assert!(effects.iter().all(|effect| effect.canonical_applied));
+        assert_eq!(effects[0].peer_counts[0].1, 1);
+        assert_eq!(engine.get_record(a).unwrap().unwrap().edge_count, 2);
+        let control = engine.control_state().unwrap();
+        drop(engine);
+        let reopened = open_engine(dir.path());
+        assert_eq!(reopened.control_state().unwrap(), control);
+        assert_eq!(reopened.get_record(a).unwrap().unwrap().edge_count, 2);
+        assert_eq!(reopened.meta_store.pending_effects().unwrap().len(), 2);
     }
 }

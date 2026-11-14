@@ -93,6 +93,8 @@ pub struct ControlState {
     pub control_schema_version: u32,
     pub store_id: Uuid,
     pub committed_generation: Generation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_ledger_version: Option<u32>,
 }
 
 impl ControlState {
@@ -191,6 +193,11 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    GraphChanged {
+        edges_put: usize,
+        edges_removed: usize,
+        memories_removed: usize,
+    },
     SchemaMigrated {
         #[serde(rename = "migrationId")]
         migration_id: Uuid,
@@ -206,11 +213,6 @@ pub enum MutationOutcome {
         format_version: u16,
         #[serde(rename = "entriesKept")]
         entries_kept: u64,
-    },
-    GraphChanged {
-        edges_put: usize,
-        edges_removed: usize,
-        memories_removed: usize,
     },
     AccessRecorded {
         #[serde(rename = "memoryId")]
@@ -366,6 +368,7 @@ pub(crate) fn initialize(tx: &WriteTransaction) -> Result<(), StorageError> {
             control_schema_version: 1,
             store_id: Uuid::new_v4(),
             committed_generation: Generation::default(),
+            removal_ledger_version: None,
         };
         tx.open_table(CONTROL)?
             .insert("state", encode(&state)?.as_slice())?;

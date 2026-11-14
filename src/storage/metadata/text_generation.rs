@@ -106,8 +106,7 @@ impl MetadataStore {
         self.text_selection_for_recovery()
     }
 
-    /// Constructor-only read: validate selected text before replaying pending
-    /// effects while ordinary handle admission is still closed.
+    /// Constructor-only read before canonical effects replay; the engine has not escaped.
     pub(crate) fn text_selection_for_recovery(
         &self,
     ) -> Result<Option<TextGeneration>, StorageError> {
