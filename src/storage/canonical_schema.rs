@@ -1,7 +1,7 @@
 //! Offline schema-v2 metadata. Consumers must opt in only after all writers participate.
 use super::{
     StorageError,
-    control::{ControlState, GenerationRef},
+    control::{ControlState, Generation, GenerationRef},
 };
 use redb::{
     MultimapTableHandle, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
@@ -23,6 +23,8 @@ pub struct CanonicalSchemaState {
     pub receipt_operation_id: Option<Uuid>,
     pub migration_now: i64,
     pub source: GenerationRef,
+    /// Generation of this publication in source.store_id, retained across forks.
+    pub publication_generation: Generation,
     pub serving_mode: ServingMode,
 }
 
@@ -61,6 +63,16 @@ pub(crate) fn read_state(
         || state.canonical_schema_version != 2
         || state.migration_id.is_nil()
         || !super::control::permits_generation_origin(read, control, state.source)?
+        || !super::control::permits_generation_origin(
+            read,
+            control,
+            GenerationRef {
+                store_id: state.source.store_id,
+                generation: state.publication_generation,
+            },
+        )?
+        || (state.source.store_id == control.store_id
+            && state.publication_generation != control.committed_generation)
         || chrono::DateTime::from_timestamp_millis(state.migration_now).is_none()
     {
         return Err(StorageError::InvalidControl(
@@ -81,6 +93,7 @@ pub(crate) fn read_state(
         if receipt.operation_id != operation_id
             || receipt.store_id != state.source.store_id
             || receipt.committed_generation != state.source.generation.next()?
+            || receipt.committed_generation != state.publication_generation
             || !super::control::permits_generation_origin(
                 read,
                 control,
@@ -97,11 +110,10 @@ pub(crate) fn read_state(
                 "schema migration receipt mismatch".into(),
             ));
         }
-    } else if state.source.store_id == control.store_id
-        && state.source.generation != control.committed_generation
-    {
+    } else if state.source.generation != state.publication_generation {
         // There are no ordinary offline-v2 writers. A format-only migration
-        // cannot explain an increment; an attestation must retain its evidence.
+        // cannot explain an increment; an attestation must retain its evidence,
+        // including after a restore fork changes the active store ID/counter.
         return Err(StorageError::InvalidControl(
             "format-only migration changed generation without an attestation receipt".into(),
         ));

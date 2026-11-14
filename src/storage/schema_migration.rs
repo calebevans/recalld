@@ -351,6 +351,11 @@ fn convert_staging(
         receipt_operation_id: receipt.as_ref().map(|r| r.operation_id),
         migration_now: options.migration_now,
         source: options.expected_source,
+        publication_generation: receipt
+            .as_ref()
+            .map_or(options.expected_source.generation, |r| {
+                r.committed_generation
+            }),
         serving_mode: ServingMode::Offline,
     };
     tx.open_table(super::canonical_schema::SCHEMA)?
@@ -561,6 +566,8 @@ mod tests {
             "source_gap",
             "zero_attestations",
             "unverified_origin",
+            "missing_publication",
+            "publication_gap",
         ] {
             let source = fixture().await;
             let root = tempfile::tempdir().unwrap();
@@ -622,6 +629,15 @@ mod tests {
                             state.as_object_mut().unwrap().remove("receiptOperationId");
                         }
                         "source_gap" => state["source"]["generation"] = serde_json::json!("0"),
+                        "missing_publication" => {
+                            state
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("publicationGeneration");
+                        }
+                        "publication_gap" => {
+                            state["publicationGeneration"] = state["source"]["generation"].clone();
+                        }
                         _ => state["source"]["storeId"] = serde_json::json!(uuid::Uuid::new_v4()),
                     }
                     table
