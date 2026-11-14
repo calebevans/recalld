@@ -193,6 +193,16 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    NamespaceCreated {
+        #[serde(rename = "namespaceId")]
+        namespace_id: NamespaceId,
+        #[serde(rename = "createdAt")]
+        created_at: i64,
+    },
+    NamespacePolicyUpdated {
+        #[serde(rename = "namespaceId")]
+        namespace_id: NamespaceId,
+    },
     GraphChanged {
         edges_put: usize,
         edges_removed: usize,
@@ -302,8 +312,20 @@ pub(crate) fn validate_existing(
     super::canonical_schema::read_state(tx, &state)?;
     for entry in receipts.iter()? {
         let (key, value) = entry?;
-        let (lineage, _, operation) = decode_scope(key.value())?;
+        let (lineage, scope, operation) = decode_scope(key.value())?;
         let stored = validate_receipt(value.value())?;
+        let scope_matches = match &stored.receipt.outcome {
+            MutationOutcome::NamespaceCreated { .. } => scope == MutationScope::Catalog,
+            MutationOutcome::NamespacePolicyUpdated { namespace_id } => {
+                scope == MutationScope::Namespace(*namespace_id)
+            }
+            _ => true,
+        };
+        if !scope_matches {
+            return Err(StorageError::InvalidControl(
+                "catalog receipt outcome disagrees with key scope".into(),
+            ));
+        }
         if lineage != state.store_id
             || stored.receipt.store_id != lineage
             || operation != stored.receipt.operation_id.as_bytes()
@@ -437,6 +459,24 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
         return Err(StorageError::InvalidControl(
             "unsupported receipt/hash version or invalid persisted receipt".into(),
         ));
+    }
+    match &stored.receipt.outcome {
+        MutationOutcome::NamespaceCreated {
+            namespace_id,
+            created_at,
+        } if namespace_id.is_unset()
+            || chrono::DateTime::from_timestamp_millis(*created_at).is_none() =>
+        {
+            return Err(StorageError::InvalidControl(
+                "invalid catalog receipt".into(),
+            ));
+        }
+        MutationOutcome::NamespacePolicyUpdated { namespace_id } if namespace_id.is_unset() => {
+            return Err(StorageError::InvalidControl(
+                "invalid catalog receipt".into(),
+            ));
+        }
+        _ => {}
     }
     Ok(stored)
 }
