@@ -631,6 +631,34 @@ impl MetadataStore {
         Ok(ids)
     }
 
+    /// Load namespace members and canonical records from one redb read snapshot.
+    /// This is metadata-only coherence, not a snapshot of graph/vector/FTS views.
+    pub fn records_in_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<DiskRecord>, StorageError> {
+        let read = self.db.begin_read()?;
+        let namespaces = read.open_multimap_table(NAMESPACE_INDEX)?;
+        let records = read.open_table(META_TABLE)?;
+        let mut result = Vec::new();
+        for entry in namespaces.get(namespace_id.get())? {
+            let key = entry?;
+            let bytes: [u8; 16] = key.value().try_into().map_err(|_| {
+                StorageError::CorruptIndex("invalid UUID length in namespace index".into())
+            })?;
+            if let Some(value) = records.get(bytes.as_slice())? {
+                let record = DiskRecord::from_bytes(value.value())?;
+                if record.id != bytes || record.namespace_id != namespace_id.get() {
+                    return Err(StorageError::CorruptIndex(
+                        "namespace index disagrees with record identity".into(),
+                    ));
+                }
+                result.push(record);
+            }
+        }
+        Ok(result)
+    }
+
     /// Number of live (non-tombstoned) memories in `namespace_id`.
     ///
     /// Applies the same predicate as [`list_memories_filtered`] with no
