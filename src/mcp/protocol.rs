@@ -368,6 +368,10 @@ pub struct ToolCallParams {
 pub struct ToolCallResult {
     /// Content blocks in the result.
     pub content: Vec<ContentBlock>,
+    /// Object-shaped JSON for machine-readable clients. Legacy transports
+    /// omit this field while retaining the identical JSON text block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Map<String, serde_json::Value>>,
     /// Set to `true` if the tool call failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
@@ -386,14 +390,22 @@ impl ToolCallResult {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![ContentBlock::Text { text: text.into() }],
+            structured_content: None,
             is_error: None,
         }
     }
 
-    /// Build a JSON result (serialized to text).
+    /// Build JSON text and, for object payloads, matching structured content.
     pub fn json(value: &impl Serialize) -> Result<Self, serde_json::Error> {
         let text = serde_json::to_string_pretty(value)?;
-        Ok(Self::text(text))
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        let mut result = Self::text(text);
+        // MCP structured content must be an object. Preserve legacy array
+        // and scalar payloads instead of silently changing their shape.
+        if let serde_json::Value::Object(object) = value {
+            result.structured_content = Some(object);
+        }
+        Ok(result)
     }
 
     /// Build an error result.
@@ -402,6 +414,7 @@ impl ToolCallResult {
             content: vec![ContentBlock::Text {
                 text: message.into(),
             }],
+            structured_content: None,
             is_error: Some(true),
         }
     }
@@ -920,6 +933,45 @@ mod tests {
                 META_CLIENT_CAPABILITIES: {},
             }
         })
+    }
+
+    #[test]
+    fn structured_json_matches_text_and_preserves_non_object_shapes() {
+        let value = serde_json::json!({"id": "memory", "count": 2});
+        let result = ToolCallResult::json(&value).unwrap();
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["structuredContent"], value);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(wire["content"][0]["text"].as_str().unwrap())
+                .unwrap(),
+            value
+        );
+        for value in [
+            serde_json::json!([1, 2]),
+            serde_json::json!(null),
+            serde_json::json!(3),
+        ] {
+            let wire = serde_json::to_value(ToolCallResult::json(&value).unwrap()).unwrap();
+            assert!(wire.get("structuredContent").is_none());
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    wire["content"][0]["text"].as_str().unwrap()
+                )
+                .unwrap(),
+                value
+            );
+        }
+        let legacy: ToolCallResult = serde_json::from_value(
+            serde_json::json!({"content":[{"type":"text","text":"legacy"}]}),
+        )
+        .unwrap();
+        assert!(legacy.structured_content.is_none());
+        assert!(
+            serde_json::to_value(ToolCallResult::error("failure"))
+                .unwrap()
+                .get("structuredContent")
+                .is_none()
+        );
     }
 
     /// Every MCP revision names this field `resourceTemplates`. Without
