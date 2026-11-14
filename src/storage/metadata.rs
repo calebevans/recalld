@@ -29,12 +29,12 @@ use crate::storage::indexes::PhaseIndex;
 /// Primary metadata table.
 /// Key: UUID v7 bytes ([u8; 16], big-endian -- chronological sort).
 /// Value: DiskRecord::to_bytes() output (variable-length, version-prefixed).
-const META_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("memories");
+pub(crate) const META_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("memories");
 
 /// Namespace configuration table.
 /// Key: NamespaceId as u32.
 /// Value: serde_json::to_vec(&NamespaceConfig) bytes.
-const NAMESPACE_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("namespaces");
+pub(crate) const NAMESPACE_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("namespaces");
 
 /// Monotonic counter for namespace ID assignment.
 /// Single row: key = "max_id", value = highest assigned u32.
@@ -63,8 +63,11 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 /// concurrent read transactions and exclusive write transactions.
 pub struct MetadataStore {
     db: Database,
-    /// In-memory phase bitmap index. Authoritative copy; persisted
-    /// periodically to INDEX_TABLE under key "phase_bitmaps".
+    // Lock order: engine gate -> publication -> redb -> phase_index.
+    // Hold across commit and bitmap publication, including direct callers.
+    publication: std::sync::RwLock<()>,
+    /// Derived phase bitmap, published with canonical record commits.
+    /// Legacy persisted copies are never trusted at startup.
     phase_index: std::sync::RwLock<PhaseIndex>,
 }
 
@@ -93,24 +96,15 @@ impl MetadataStore {
             write_txn.commit()?;
         }
 
-        // Load persisted phase index, or create empty.
-        let phase_index = Self::load_phase_index(&db)?;
-
-        Ok(Self {
+        // Legacy checkpoints have no generation watermark. Always rebuild
+        // from canonical records, even for direct MetadataStore callers.
+        let store = Self {
             db,
-            phase_index: std::sync::RwLock::new(phase_index),
-        })
-    }
-
-    /// Load phase bitmaps from INDEX_TABLE. Returns empty PhaseIndex
-    /// if the key does not exist (first run or after corruption).
-    fn load_phase_index(db: &Database) -> Result<PhaseIndex, StorageError> {
-        let read_txn = db.begin_read()?;
-        let table = read_txn.open_table(INDEX_TABLE)?;
-        match table.get("phase_bitmaps")? {
-            Some(value) => PhaseIndex::from_bytes(value.value()),
-            None => Ok(PhaseIndex::new()),
-        }
+            publication: std::sync::RwLock::new(()),
+            phase_index: std::sync::RwLock::new(PhaseIndex::new()),
+        };
+        store.rebuild_phase_index()?;
+        Ok(store)
     }
 }
 
@@ -121,8 +115,8 @@ impl MetadataStore {
     ///
     /// Opens a write transaction, loads the record for `id`, passes it
     /// to the closure `f` for mutation, re-serializes, writes back,
-    /// and commits. Returns the mutated record so callers can perform
-    /// post-commit side effects (e.g., updating the phase bitmap).
+    /// commits and publishes phase changes under the publication gate.
+    /// Returns the committed record.
     ///
     /// # Errors
     /// - `StorageError::NotFound` if no record exists for this ID.
@@ -130,6 +124,8 @@ impl MetadataStore {
     where
         F: FnOnce(&mut DiskRecord),
     {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        let old_phase;
         let key = id.as_bytes().as_slice();
 
         let write_txn = self.db.begin_write()?;
@@ -142,6 +138,7 @@ impl MetadataStore {
                 DiskRecord::from_bytes(existing.value())?
             };
 
+            old_phase = record.phase;
             f(&mut record);
 
             table.insert(key, record.to_bytes().as_slice())?;
@@ -149,6 +146,17 @@ impl MetadataStore {
         };
         write_txn.commit()?;
 
+        if old_phase != record.phase {
+            self.phase_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .transition(
+                    record.namespace_id,
+                    record.vector_slot,
+                    old_phase,
+                    record.phase,
+                );
+        }
         Ok(record)
     }
 
@@ -159,6 +167,12 @@ impl MetadataStore {
     /// # Errors
     /// - `StorageError::DuplicateId` if a record with this ID already exists.
     pub fn insert(&self, id: MemoryId, record: &DiskRecord) -> Result<(), StorageError> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        if record.id != *id.as_bytes() {
+            return Err(StorageError::InvalidMutation(
+                "record ID disagrees with key".into(),
+            ));
+        }
         let key = id.as_bytes().as_slice();
         let value = record.to_bytes();
 
@@ -173,21 +187,25 @@ impl MetadataStore {
 
             // 2. Update tag index.
             let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
-            for tag in &record.tags {
-                tags.insert(tag.as_str(), key)?;
+            if record.phase != DecayPhase::Tombstone {
+                for tag in &record.tags {
+                    tags.insert(tag.as_str(), key)?;
+                }
+                let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+                ns_idx.insert(record.namespace_id, key)?;
             }
-
-            // 3. Update namespace index.
-            let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
-            ns_idx.insert(record.namespace_id, key)?;
         }
         write_txn.commit()?;
 
-        // 4. Update in-memory phase bitmap (always Phase::Full for new
-        //    records).
-        {
+        // 4. Publish the actual committed phase; tombstones own no slot.
+        if record.phase != DecayPhase::Tombstone {
             let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
-            pi.insert(record.namespace_id, record.vector_slot);
+            pi.transition(
+                record.namespace_id,
+                record.vector_slot,
+                DecayPhase::Full,
+                record.phase,
+            );
         }
 
         Ok(())
@@ -241,7 +259,7 @@ impl MetadataStore {
     ) -> Result<(), StorageError> {
         let mut old_phase = None;
 
-        let record = self.update_record(&id, |record| {
+        self.update_record(&id, |record| {
             old_phase = Some(record.phase);
             if record.phase == DecayPhase::Tombstone {
                 return;
@@ -260,12 +278,6 @@ impl MetadataStore {
         // phase bitmap is left alone: a tombstone is not tracked in it.
         if old_phase == DecayPhase::Tombstone {
             return Err(StorageError::NotFound(id.into_inner()));
-        }
-
-        // Update phase bitmap if phase changed.
-        if old_phase != phase {
-            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
-            pi.transition(record.namespace_id, record.vector_slot, old_phase, phase);
         }
 
         Ok(())
@@ -327,6 +339,7 @@ impl MetadataStore {
     /// The deleted `DiskRecord` (for the caller to know which vector
     /// slot to free, etc.), or `None` if the ID did not exist.
     pub fn delete(&self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         let key = id.as_bytes().as_slice();
 
         let write_txn = self.db.begin_write()?;
@@ -380,6 +393,7 @@ impl MetadataStore {
     /// tombstoned records don't have valid vector slots for bitmap
     /// tracking).
     pub fn tombstone(&self, id: MemoryId) -> Result<(), StorageError> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         let key = id.as_bytes().as_slice();
 
         let write_txn = self.db.begin_write()?;
@@ -440,6 +454,15 @@ impl MetadataStore {
     /// Uses the in-memory roaring bitmap index. Requires a META_TABLE
     /// lookup per matching slot to resolve vector_slot -> MemoryId.
     pub fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError> {
+        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
+        if phase == DecayPhase::Tombstone {
+            return Ok(self
+                .scan_all()?
+                .into_iter()
+                .filter(|(_, r)| r.phase == phase)
+                .map(|(id, _)| id)
+                .collect());
+        }
         let ns_slots: Vec<(u32, u32)> = {
             let pi = self.phase_index.read().unwrap_or_else(|e| e.into_inner());
             pi.all_slots_in_phase(phase)
@@ -459,7 +482,9 @@ impl MetadataStore {
         for result in table.iter()? {
             let (key_bytes, value) = result?;
             let record = DiskRecord::from_bytes(value.value())?;
-            if slot_set.contains(&(record.namespace_id, record.vector_slot)) {
+            if record.phase == phase
+                && slot_set.contains(&(record.namespace_id, record.vector_slot))
+            {
                 let uuid = uuid::Uuid::from_slice(key_bytes.value())
                     .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
                 ids.push(MemoryId::from_uuid(uuid));
@@ -478,6 +503,14 @@ impl MetadataStore {
         &self,
         phase: DecayPhase,
     ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
+        if phase == DecayPhase::Tombstone {
+            return Ok(self
+                .scan_all()?
+                .into_iter()
+                .filter(|(_, r)| r.phase == phase)
+                .collect());
+        }
         // Use (namespace_id, vector_slot) pairs for lookup to avoid
         // cross-namespace collisions.
         let ns_slots: std::collections::HashSet<(u32, u32)> = {
@@ -496,7 +529,9 @@ impl MetadataStore {
         for result in table.iter()? {
             let (key_bytes, value) = result?;
             let record = DiskRecord::from_bytes(value.value())?;
-            if ns_slots.contains(&(record.namespace_id, record.vector_slot)) {
+            if record.phase == phase
+                && ns_slots.contains(&(record.namespace_id, record.vector_slot))
+            {
                 let uuid = uuid::Uuid::from_slice(key_bytes.value())
                     .map_err(|_| StorageError::CorruptIndex("invalid UUID in meta table".into()))?;
                 results.push((MemoryId::from_uuid(uuid), record));
@@ -767,7 +802,7 @@ impl MetadataStore {
     /// 3. Collects records where the function returns Some.
     /// 4. Applies all updates in a single write transaction.
     /// 5. Updates the phase bitmap index.
-    /// 6. Persists the updated phase bitmaps to INDEX_TABLE.
+    /// Checkpoints are persisted separately; startup rebuilds from records.
     ///
     /// # Returns
     /// The number of records that were transitioned.
@@ -775,86 +810,91 @@ impl MetadataStore {
         &self,
         compute_new_state: impl Fn(&DiskRecord) -> Option<DiskRecord>,
     ) -> Result<usize, StorageError> {
-        // Phase 1: Read snapshot.
-        let updates: Vec<(MemoryId, DiskRecord, DecayPhase)> = {
-            let read_txn = self.db.begin_read()?;
-            let table = read_txn.open_table(META_TABLE)?;
-            let mut updates = Vec::new();
-
-            for result in table.iter()? {
-                let (key_bytes, value) = result?;
-                let record = DiskRecord::from_bytes(value.value())?;
-                let old_phase = record.phase;
-
-                if let Some(new_record) = compute_new_state(&record) {
-                    let uuid = uuid::Uuid::from_slice(key_bytes.value()).map_err(|_| {
-                        StorageError::CorruptIndex("invalid UUID in meta table".into())
-                    })?;
-                    updates.push((MemoryId::from_uuid(uuid), new_record, old_phase));
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        let mut updates = Vec::new();
+        for (id, record) in self.scan_all()? {
+            if record.phase != DecayPhase::Tombstone {
+                if let Some(updated) = compute_new_state(&record) {
+                    updates.push((id, updated));
                 }
             }
-            updates
-        };
-
-        if updates.is_empty() {
-            return Ok(0);
         }
-
-        let count = updates.len();
-
-        // Phase 2: Batch write all updated records + persist bitmaps.
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(META_TABLE)?;
-            for (id, record, _) in &updates {
-                table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
-            }
-        }
-
-        // Phase 3: Update in-memory phase bitmap.
-        {
-            let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
-            for (_, record, old_phase) in &updates {
-                if *old_phase != record.phase {
-                    pi.transition(
-                        record.namespace_id,
-                        record.vector_slot,
-                        *old_phase,
-                        record.phase,
-                    );
-                }
-            }
-
-            // Persist bitmaps inside the same write transaction.
-            let mut idx_table = write_txn.open_table(INDEX_TABLE)?;
-            idx_table.insert("phase_bitmaps", pi.to_bytes().as_slice())?;
-        }
-        write_txn.commit()?;
-
-        Ok(count)
+        self.batch_update_records_locked(&updates)?;
+        Ok(updates.len())
     }
 
-    /// Batch update multiple records in a single transaction.
-    /// Does NOT update secondary indexes -- caller must manage
-    /// index consistency.
+    /// Batch replacement with immutable identity/slot and coherent indexes.
     pub fn batch_update_records(
         &self,
         records: &[(MemoryId, DiskRecord)],
     ) -> Result<(), StorageError> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.batch_update_records_locked(records)
+    }
+
+    // Caller holds the publication write gate.
+    fn batch_update_records_locked(
+        &self,
+        records: &[(MemoryId, DiskRecord)],
+    ) -> Result<(), StorageError> {
+        if records.is_empty() {
+            return Ok(());
+        }
         let write_txn = self.db.begin_write()?;
+        let mut transitions = Vec::new();
         {
             let mut table = write_txn.open_table(META_TABLE)?;
+            let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
+            let mut namespaces = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             for (id, record) in records {
-                table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
+                let key = id.as_bytes().as_slice();
+                let old = DiskRecord::from_bytes(
+                    table
+                        .get(key)?
+                        .ok_or(StorageError::NotFound(id.into_inner()))?
+                        .value(),
+                )?;
+                if old.phase == DecayPhase::Tombstone {
+                    return Err(StorageError::NotFound(id.into_inner()));
+                }
+                if record.id != *id.as_bytes()
+                    || record.namespace_id != old.namespace_id
+                    || record.vector_slot != old.vector_slot
+                {
+                    return Err(StorageError::InvalidMutation(
+                        "batch replacement changes identity or vector ownership".into(),
+                    ));
+                }
+                for tag in &old.tags {
+                    tags.remove(tag.as_str(), key)?;
+                }
+                for tag in &record.tags {
+                    tags.insert(tag.as_str(), key)?;
+                }
+                if record.phase == DecayPhase::Tombstone {
+                    namespaces.remove(record.namespace_id, key)?;
+                }
+                table.insert(key, record.to_bytes().as_slice())?;
+                transitions.push((
+                    record.namespace_id,
+                    record.vector_slot,
+                    old.phase,
+                    record.phase,
+                ));
             }
         }
         write_txn.commit()?;
+        let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+        for (ns, slot, from, to) in transitions {
+            pi.transition(ns, slot, from, to);
+        }
         Ok(())
     }
 
     /// Persist the current in-memory phase bitmaps to INDEX_TABLE.
     /// Called periodically (end of decay sweep, graceful shutdown).
     pub fn persist_phase_index(&self) -> Result<(), StorageError> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         let bytes = {
             let pi = self.phase_index.read().unwrap_or_else(|e| e.into_inner());
             pi.to_bytes()
@@ -873,6 +913,7 @@ impl MetadataStore {
     /// missing, corrupt, or when the record count does not match the
     /// bitmap cardinality.
     pub fn rebuild_phase_index(&self) -> Result<(), StorageError> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         let mut slot_phases = Vec::new();
@@ -912,6 +953,7 @@ impl MetadataStore {
     /// - `StorageError::DuplicateName` if a namespace with this name
     ///   already exists.
     pub fn create_namespace(&self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         let write_txn = self.db.begin_write()?;
         let new_id;
         {
@@ -1040,6 +1082,7 @@ impl MetadataStore {
     /// Only removes the config entry. Memory cleanup is the caller's
     /// responsibility. The namespace ID is never recycled.
     pub fn delete_namespace(&self, id: NamespaceId) -> Result<NamespaceConfig, StorageError> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         let write_txn = self.db.begin_write()?;
         let config;
         {
@@ -1077,8 +1120,8 @@ impl MetadataStore {
     /// # Chunking, and what the caller owes it
     ///
     /// Removal is committed in chunks of `batch_size` rather than one
-    /// transaction, so a large namespace does not hold the write lock
-    /// for the whole purge. That makes the operation *resumable but not
+    /// transaction. The publication gate spans the purge so phase readers
+    /// cannot observe partially published chunks. This is *resumable but not
     /// atomic*: an interrupted purge leaves a live namespace holding
     /// fewer memories. The caller must therefore delete the
     /// `NAMESPACE_TABLE` row **after** this returns, never before —
@@ -1089,6 +1132,7 @@ impl MetadataStore {
         namespace_id: NamespaceId,
         batch_size: usize,
     ) -> Result<Vec<(MemoryId, DiskRecord)>, PartialPurge> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         // chunks(0) panics, and a zero batch would never terminate
         // anyway.
         let batch_size = batch_size.max(1);
@@ -1296,6 +1340,7 @@ impl MetadataStore {
     /// which would build a cycle in the free list and underflow
     /// `live_count`.
     pub fn batch_tombstone(&self, ids: &[MemoryId]) -> Result<Vec<TombstoneOutcome>, StorageError> {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1421,6 +1466,86 @@ impl MetadataStore {
 mod tests {
     use super::*;
     use crate::model::Tag;
+
+    #[test]
+    fn containment_publication_blocks_second_writer_and_phase_reader_after_commit() {
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+        let (_dir, store) = open_store();
+        let id = insert(&store, 1, 0, &[]);
+        let store = Arc::new(store);
+        // Hold the last lock in the order to pause writer 1 after its redb commit.
+        let bitmap = store.phase_index.write().unwrap();
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            writer_store
+                .update_decay_state(id, DecayPhase::Summary, 0.8, 0.8, 1., false)
+                .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.get(id).unwrap().unwrap().phase != DecayPhase::Summary {
+            assert!(Instant::now() < deadline, "writer did not commit");
+            std::thread::yield_now();
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let second_store = store.clone();
+        let second = std::thread::spawn(move || {
+            second_store
+                .update_record(&id, |r| {
+                    entered_tx.send(()).unwrap();
+                    r.phase = DecayPhase::Ghost;
+                })
+                .unwrap()
+        });
+        let (read_tx, read_rx) = mpsc::channel();
+        let reader_store = store.clone();
+        let reader = std::thread::spawn(move || {
+            read_tx
+                .send(
+                    reader_store
+                        .scan_phase_records(DecayPhase::Summary)
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+        let writer_blocked = entered_rx.recv_timeout(Duration::from_millis(100)).is_err();
+        let reader_blocked = read_rx.recv_timeout(Duration::from_millis(100)).is_err();
+        drop(bitmap);
+        writer.join().unwrap();
+        second.join().unwrap();
+        reader.join().unwrap();
+        assert!(writer_blocked && reader_blocked);
+        assert_eq!(store.ids_in_phase(DecayPhase::Ghost).unwrap(), vec![id]);
+        assert!(store.ids_in_phase(DecayPhase::Summary).unwrap().is_empty());
+    }
+
+    #[test]
+    fn containment_reopen_rebuilds_corrupt_checkpoint_and_batch_publishes_phase() {
+        let (dir, store) = open_store();
+        let id = insert(&store, 1, 0, &["before"]);
+        let mut record = store.get(id).unwrap().unwrap();
+        record.phase = DecayPhase::Ghost;
+        record.tags.clear();
+        store.batch_update_records(&[(id, record.clone())]).unwrap();
+        assert_eq!(store.ids_in_phase(DecayPhase::Ghost).unwrap(), vec![id]);
+        assert!(store.memories_with_tag("before").unwrap().is_empty());
+        store.tombstone(id).unwrap();
+        assert!(store.batch_update_records(&[(id, record)]).is_err());
+        let other = insert(&store, 1, 0, &[]);
+        assert_eq!(store.ids_in_phase(DecayPhase::Full).unwrap(), vec![other]);
+        let tx = store.db.begin_write().unwrap();
+        {
+            tx.open_table(INDEX_TABLE)
+                .unwrap()
+                .insert("phase_bitmaps", b"bad".as_slice())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        drop(store);
+        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
+        assert_eq!(store.ids_in_phase(DecayPhase::Full).unwrap(), vec![other]);
+        assert_eq!(store.ids_in_phase(DecayPhase::Tombstone).unwrap(), vec![id]);
+    }
 
     fn open_store() -> (tempfile::TempDir, MetadataStore) {
         let dir = tempfile::tempdir().expect("tempdir");

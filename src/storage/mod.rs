@@ -20,7 +20,9 @@ pub mod error;
 pub mod fsync;
 pub mod indexes;
 pub mod metadata;
+pub(crate) mod ownership;
 pub mod text;
+pub(crate) mod validation;
 pub mod vectors;
 
 // ── Re-exports ──────────────────────────────────────────────────────

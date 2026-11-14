@@ -5,7 +5,6 @@
 //! - **Restore**: Restore data from a backup archive with safety checks
 
 mod archive;
-mod lock;
 pub mod manifest;
 pub mod restore;
 
@@ -62,7 +61,7 @@ pub async fn run_backup(
     config: &RecalldConfig,
     destination: &Path,
     source_data_dir: Option<&Path>,
-    force: bool,
+    _force: bool,
 ) -> Result<PathBuf, BackupError> {
     // 1. Resolve paths.
     let data_dir = source_data_dir
@@ -79,13 +78,13 @@ pub async fn run_backup(
     println!("  Source: {}", data_dir.display());
     println!("  Destination: {}", archive_path.display());
 
-    // 2. Collect files to back up.
-    let files = collect_backup_files(&data_dir)?;
-    println!("  Files: {}", files.len());
-
-    // 3. Acquire locks.
-    println!("Acquiring file locks...");
-    let _locks = lock::lock_all_files(&data_dir, force)?;
+    let ownership = crate::storage::ownership::StoreOwnership::acquire(&data_dir)
+        .map_err(|e| BackupError::ManifestFailed(e.to_string()))?;
+    let data_dir = ownership.path.clone();
+    let _lock = crate::storage::ownership::lock_directory(&data_dir)
+        .map_err(|e| BackupError::ManifestFailed(e.to_string()))?;
+    let files = crate::storage::validation::canonical_files(&data_dir)
+        .map_err(|e| BackupError::ManifestFailed(e.to_string()))?;
 
     // 4. Generate manifest.
     println!("Generating manifest...");
@@ -93,7 +92,17 @@ pub async fn run_backup(
 
     // 5. Create archive (locks still held during this).
     println!("Creating archive...");
-    archive::create_archive(&data_dir, &files, &manifest, &archive_path)?;
+    let parent = archive_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let staged = tempfile::NamedTempFile::new_in(parent)?;
+    archive::create_archive(&data_dir, &files, &manifest, staged.path())?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist(&archive_path)
+        .map_err(|e| BackupError::Io(e.error))?;
+    crate::storage::fsync::fsync_dir(parent)?;
 
     // 6. Locks dropped automatically here.
     let archive_size = std::fs::metadata(&archive_path)?.len();
@@ -149,41 +158,4 @@ fn resolve_archive_path(destination: &Path) -> Result<PathBuf, BackupError> {
             "destination must be a directory or end in .zip".to_string(),
         ))
     }
-}
-
-/// Collect all files in `data_dir` that should be included in a backup.
-///
-/// Returns paths for core database files and namespace vector files.
-fn collect_backup_files(data_dir: &Path) -> Result<Vec<PathBuf>, BackupError> {
-    let mut files = Vec::new();
-
-    // Core databases.
-    let core_files = ["meta.db", "fts.db", "edges.db", "fulltext.dat"];
-    for name in &core_files {
-        let path = data_dir.join(name);
-        if path.exists() {
-            files.push(path);
-        } else {
-            return Err(BackupError::DataDirNotFound(format!(
-                "missing required file: {}",
-                name
-            )));
-        }
-    }
-
-    // Namespace vector files (in subdirectories).
-    for entry in std::fs::read_dir(data_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            // Check if this subdirectory contains a vectors.dat file.
-            let vectors_file = path.join("vectors.dat");
-            if vectors_file.exists() {
-                files.push(vectors_file);
-            }
-        }
-    }
-
-    Ok(files)
 }

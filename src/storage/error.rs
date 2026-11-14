@@ -33,6 +33,15 @@ pub enum StorageError {
     #[error("redb commit error: {0}")]
     RedbCommit(#[from] redb::CommitError),
 
+    #[error("invalid storage mutation: {0}")]
+    InvalidMutation(String),
+
+    #[error("storage recovery required: {0}")]
+    RecoveryRequired(String),
+
+    #[error("vector ownership mismatch: {0}")]
+    OwnershipMismatch(String),
+
     // ── Metadata errors ──────────────────────────────────────────────
     /// A record with this ID already exists.
     #[error("duplicate memory ID: {0}")]
