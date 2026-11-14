@@ -393,7 +393,7 @@ pub async fn perform_autolink(
 /// Edge weight = Jaccard similarity (shared_count / union_count).
 pub async fn perform_entity_link(
     new_memory_id: MemoryId,
-    _namespace_id: NamespaceId,
+    namespace_id: NamespaceId,
     entities: &[String],
     max_entity_links: usize,
     entity_index: &tokio::sync::RwLock<EntityIndex>,
@@ -414,42 +414,62 @@ pub async fn perform_entity_link(
         return Ok(0);
     }
 
-    let new_entity_count = entities.len();
-
-    // Pre-fetch candidate entity counts from cache for Jaccard weight calculation.
-    let candidate_entity_counts: std::collections::HashMap<MemoryId, usize> = {
-        let mut counts = std::collections::HashMap::with_capacity(candidates.len());
-        for (cid, _) in &candidates {
-            if let Some(cached) = cache.get(*cid).await {
-                counts.insert(*cid, cached.entities.len());
+    // Index postings propose IDs only. Namespace, retained entities and weights
+    // come from canonical records, even when the cache is cold or stale.
+    let storage_for_read = storage.clone();
+    let candidates = tokio::task::spawn_blocking(move || {
+        let storage = storage_for_read
+            .read()
+            .map_err(|e| AutoLinkError::LockPoisoned(e.to_string()))?;
+        let entity_keys = |record: &crate::model::DiskRecord| {
+            crate::model::parse_structured_tags(&record.tags)
+                .entities
+                .iter()
+                .flat_map(|entity| crate::search::canonicalize_entity(entity))
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let source = storage
+            .get_record(new_memory_id)
+            .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
+        let Some(source) = source
+            .filter(|r| r.namespace_id == namespace_id.get() && r.phase != DecayPhase::Tombstone)
+        else {
+            return Ok::<_, AutoLinkError>(Vec::new());
+        };
+        let source_keys = entity_keys(&source);
+        let mut eligible = Vec::new();
+        for (id, _) in candidates {
+            let record = storage
+                .get_record(id)
+                .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
+            let Some(record) = record.filter(|r| {
+                r.namespace_id == namespace_id.get() && r.phase != DecayPhase::Tombstone
+            }) else {
+                continue;
+            };
+            let keys = entity_keys(&record);
+            let shared = source_keys.intersection(&keys).count();
+            if shared > 0 {
+                let union = source_keys.union(&keys).count();
+                eligible.push((id, shared, shared as f32 / union as f32));
             }
         }
-        counts
-    };
+        eligible.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(eligible)
+    })
+    .await
+    .map_err(|e| AutoLinkError::Storage(format!("blocking task join error: {e}")))??;
 
-    // Read-lock graph to filter out existing edges.
+    // Scope and stale postings are resolved before the per-memory cap.
     let edges_to_create: Vec<(MemoryId, f32)> = {
         let graph_r = graph.read().await;
         candidates
             .iter()
-            .filter(|(cid, _)| {
+            .filter(|(cid, _, _)| {
                 !graph_r.has_typed_edge_between_ids(&new_memory_id, cid, EdgeType::Entity)
             })
             .take(max_entity_links)
-            .map(|(cid, shared)| {
-                // Jaccard similarity: shared / union for order-independent weight.
-                // Look up candidate's entity count from cache; fall back to
-                // shared count (which gives weight=1.0, a safe overestimate).
-                let candidate_entity_count =
-                    candidate_entity_counts.get(cid).copied().unwrap_or(*shared);
-                let union = new_entity_count + candidate_entity_count - *shared;
-                let weight = if union > 0 {
-                    (*shared as f32 / union as f32).min(1.0)
-                } else {
-                    0.0
-                };
-                (*cid, weight)
-            })
+            .map(|(cid, _, weight)| (*cid, *weight))
             .collect()
     };
 
@@ -557,4 +577,134 @@ pub async fn perform_temporal_link(
         .collect();
 
     persist_edges(new_memory_id, &persisted_edges, graph, storage, cache).await
+}
+
+#[cfg(test)]
+mod entity_scope_tests {
+    use super::*;
+    use crate::test_support::Fixture;
+
+    #[tokio::test]
+    async fn entity_links_filter_foreign_and_stale_postings_before_cap_without_cache() {
+        let f = Fixture::new();
+        let ns = NamespaceId::new(1);
+        let foreign_ns = f.create_namespace("foreign");
+        let source = f
+            .insert_memory_in(ns, &["entity/alice", "entity/bob"])
+            .await;
+        let local = f
+            .insert_memory_in(ns, &["entity/alice", "entity/carol"])
+            .await;
+        let foreign = f
+            .insert_memory_in(foreign_ns, &["entity/alice", "entity/bob"])
+            .await;
+        let removed = f
+            .insert_memory_in(ns, &["entity/alice", "entity/bob"])
+            .await;
+        let stale = f.insert_memory_in(ns, &["entity/dana"]).await;
+        f.tombstone(removed);
+        {
+            let mut index = f.entity_index.write().await;
+            index.add(local, &["alice".into()]);
+            for id in [foreign, removed, stale, MemoryId::new()] {
+                index.add(id, &["alice".into(), "bob".into()]);
+            }
+        }
+        let count = perform_entity_link(
+            source,
+            ns,
+            &["alice".into(), "bob".into()],
+            1,
+            &f.entity_index,
+            &f.graph,
+            &f.storage,
+            &f.cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        let edges = f.storage.read().unwrap().load_all_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, local);
+        assert!((edges[0].weight - 1.0 / 3.0).abs() < 1e-6);
+        assert!(
+            f.graph
+                .read()
+                .await
+                .has_typed_edge_between_ids(&source, &local, EdgeType::Entity)
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_links_reject_wrong_source_scope_and_resolve_ties_by_uuid() {
+        let f = Fixture::new();
+        let ns = NamespaceId::new(1);
+        let other = f.create_namespace("other");
+        let source = f.insert_memory_in(ns, &["entity/alice"]).await;
+        let a = f.insert_memory_in(ns, &["entity/alice"]).await;
+        let b = f.insert_memory_in(ns, &["entity/alice"]).await;
+        {
+            let mut index = f.entity_index.write().await;
+            index.add(b, &["alice".into()]);
+            index.add(a, &["alice".into()]);
+        }
+        assert_eq!(
+            perform_entity_link(
+                source,
+                other,
+                &["alice".into()],
+                1,
+                &f.entity_index,
+                &f.graph,
+                &f.storage,
+                &f.cache
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(
+            f.storage
+                .read()
+                .unwrap()
+                .load_all_edges()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            perform_entity_link(
+                source,
+                ns,
+                &["alice".into(), "ALICE".into()],
+                1,
+                &f.entity_index,
+                &f.graph,
+                &f.storage,
+                &f.cache
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let edges = f.storage.read().unwrap().load_all_edges().unwrap();
+        assert_eq!(edges[0].target, a.min(b));
+        assert_eq!(edges[0].weight, 1.0);
+        f.tombstone(source);
+        assert_eq!(
+            perform_entity_link(
+                source,
+                ns,
+                &["alice".into()],
+                1,
+                &f.entity_index,
+                &f.graph,
+                &f.storage,
+                &f.cache
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(f.storage.read().unwrap().load_all_edges().unwrap().len(), 1);
+    }
 }
