@@ -47,10 +47,11 @@ const HEALTH_REPORT_CACHE_TTL_SECS: u64 = 60;
 /// this fix). The `RwLock` ensures concurrent readers don't block each
 /// other and only one writer recomputes at a time.
 fn health_report_cache()
--> &'static RwLock<std::collections::HashMap<String, (Instant, HealthReport)>> {
+-> &'static RwLock<std::collections::HashMap<String, (u64, Instant, HealthReport)>> {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<RwLock<std::collections::HashMap<String, (Instant, HealthReport)>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        RwLock<std::collections::HashMap<String, (u64, Instant, HealthReport)>>,
+    > = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
@@ -80,7 +81,8 @@ async fn near_duplicate_report(
     embedding: &[f32],
     namespace_id: NamespaceId,
     check_duplicates: Option<bool>,
-) -> Option<crate::model::NearDuplicateReport> {
+) -> Result<Option<crate::model::NearDuplicateReport>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
     use crate::model::constants::{
         DUPLICATE_SIMILARITY_THRESHOLD, MAX_NEAR_DUPLICATE_MATCHES,
         NEAR_DUPLICATE_SUMMARY_MAX_BYTES,
@@ -88,7 +90,7 @@ async fn near_duplicate_report(
     use crate::model::{DecayPhase, NearDuplicateMatch, NearDuplicateReport, truncate_summary};
 
     if !check_duplicates.unwrap_or(true) {
-        return None;
+        return Ok(None);
     }
 
     let candidates = state
@@ -99,7 +101,7 @@ async fn near_duplicate_report(
             DUPLICATE_SIMILARITY_THRESHOLD as f32,
             MAX_NEAR_DUPLICATE_MATCHES,
         )
-        .await;
+        .await?;
 
     let mut matches = Vec::with_capacity(candidates.len());
     for (id, score) in candidates {
@@ -123,7 +125,16 @@ async fn near_duplicate_report(
         });
     }
 
-    NearDuplicateReport::from_matches(DUPLICATE_SIMILARITY_THRESHOLD, matches)
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during advisory hydration".into(),
+        )
+        .into());
+    }
+    Ok(NearDuplicateReport::from_matches(
+        DUPLICATE_SIMILARITY_THRESHOLD,
+        matches,
+    ))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -148,6 +159,9 @@ pub async fn create_memory(
     State(state): State<AppState>,
     Json(req): Json<CreateMemoryApiRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<MemoryResponse>>), AppError> {
+    let _publication = state.storage.publication_lease().await?;
+    state.storage.effects_stamp().await?;
+
     let start = Instant::now();
 
     // --- Validation ---
@@ -243,7 +257,7 @@ pub async fn create_memory(
     // Before the write, so the new memory is not yet in the vector index
     // and cannot match itself. See `near_duplicate_report`.
     let near_duplicates =
-        near_duplicate_report(&state, &embedding, ns.id, req.check_duplicates).await;
+        near_duplicate_report(&state, &embedding, ns.id, req.check_duplicates).await?;
 
     // --- Persist ---
     // Resolve initial stability: use caller-provided value, or fall back
@@ -355,6 +369,21 @@ pub async fn create_memory(
 /// 3. Record an access event (`DirectRetrieval`).
 /// 4. Return 200 with memory, or 404 if not found.
 pub async fn get_memory(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(options): Query<GetMemoryQuery>,
+) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = get_memory_admitted(State(state.clone()), Path(id), Query(options)).await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    result
+}
+
+async fn get_memory_admitted(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(options): Query<GetMemoryQuery>,
@@ -558,6 +587,8 @@ pub async fn list_memories(
     State(state): State<AppState>,
     Query(params): Query<ListMemoriesQuery>,
 ) -> Result<Json<ApiResponse<ListMemoriesResponse>>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
     let start = Instant::now();
 
     // Validate limit (cap at 1000)
@@ -749,6 +780,14 @@ pub async fn list_memories(
         data: response,
         took_us: Some(took),
     }))
+    }.await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during read".into(),
+        )
+        .into());
+    }
+    result
 }
 
 /// Helper: parse a UUID string from a path segment.
@@ -776,6 +815,20 @@ fn parse_memory_id(s: &str) -> Result<MemoryId, AppError> {
 /// 5. Convert results to `SearchHit`s.
 /// 6. Return `SearchResponse` with scores and timing.
 pub async fn search_memories(
+    State(state): State<AppState>,
+    Json(req): Json<SearchRequest>,
+) -> Result<Json<SearchResponse>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = search_memories_admitted(State(state.clone()), Json(req)).await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    result
+}
+
+async fn search_memories_admitted(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
@@ -910,6 +963,21 @@ pub async fn find_similar(
     Path(id): Path<String>,
     Json(req): Json<FindSimilarRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = find_similar_admitted(State(state.clone()), Path(id), Json(req)).await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    result
+}
+
+async fn find_similar_admitted(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<FindSimilarRequest>,
+) -> Result<Json<SearchResponse>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
@@ -1021,27 +1089,38 @@ pub async fn find_similar(
 pub async fn list_namespaces(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<Vec<NamespaceListItem>>>, AppError> {
-    let start = Instant::now();
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
+        let start = Instant::now();
 
-    let namespaces = state.namespaces.list_all().await;
+        let namespaces = state.namespaces.list_all().await;
 
-    let items: Vec<NamespaceListItem> = namespaces
-        .into_iter()
-        .map(|ns| NamespaceListItem {
-            id: ns.id,
-            name: ns.name,
-            embedding_dim: ns.embedding_dim,
-            memory_count: ns.memory_count,
-            created_at: ns.created_at,
-        })
-        .collect();
+        let items: Vec<NamespaceListItem> = namespaces
+            .into_iter()
+            .map(|ns| NamespaceListItem {
+                id: ns.id,
+                name: ns.name,
+                embedding_dim: ns.embedding_dim,
+                memory_count: ns.memory_count,
+                created_at: ns.created_at,
+            })
+            .collect();
 
-    let took = start.elapsed().as_micros() as u64;
+        let took = start.elapsed().as_micros() as u64;
 
-    Ok(Json(ApiResponse {
-        data: items,
-        took_us: Some(took),
-    }))
+        Ok(Json(ApiResponse {
+            data: items,
+            took_us: Some(took),
+        }))
+    }
+    .await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during read".into(),
+        )
+        .into());
+    }
+    result
 }
 
 /// POST /namespaces -- create a new namespace.
@@ -1119,44 +1198,55 @@ pub async fn namespace_stats(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<NamespaceStatsResponse>>, AppError> {
-    let start = Instant::now();
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
+        let start = Instant::now();
 
-    // Try parsing as integer ID first, then fall back to name lookup
-    let ns = if let Ok(numeric_id) = id.parse::<u32>() {
-        state.namespaces.get_by_id(numeric_id)
-    } else {
-        state.namespaces.resolve(&id)
+        // Try parsing as integer ID first, then fall back to name lookup
+        let ns = if let Ok(numeric_id) = id.parse::<u32>() {
+            state.namespaces.get_by_id(numeric_id)
+        } else {
+            state.namespaces.resolve(&id)
+        }
+        .ok_or_else(|| AppError::NotFound {
+            resource: "namespace",
+            id: id.clone(),
+        })?;
+
+        let stats = state.storage.namespace_stats(ns.id).await?;
+
+        let response = NamespaceStatsResponse {
+            name: ns.name,
+            id: ns.id.get(),
+            memory_count: stats.memory_count,
+            tombstone_count: stats.tombstone_count,
+            phase_counts: PhaseCounts {
+                full: stats.phase_1_count,
+                summary: stats.phase_2_count,
+                ghost: stats.phase_3_count,
+            },
+            permastore_count: stats.permastore_count,
+            avg_strength: stats.avg_strength,
+            edge_count: stats.edge_count,
+            embedding_dim: ns.embedding_dim,
+            vector_bytes: stats.memory_count * ns.embedding_dim as u64 * 4,
+        };
+
+        let took = start.elapsed().as_micros() as u64;
+
+        Ok(Json(ApiResponse {
+            data: response,
+            took_us: Some(took),
+        }))
     }
-    .ok_or_else(|| AppError::NotFound {
-        resource: "namespace",
-        id: id.clone(),
-    })?;
-
-    let stats = state.storage.namespace_stats(ns.id).await?;
-
-    let response = NamespaceStatsResponse {
-        name: ns.name,
-        id: ns.id.get(),
-        memory_count: stats.memory_count,
-        tombstone_count: stats.tombstone_count,
-        phase_counts: PhaseCounts {
-            full: stats.phase_1_count,
-            summary: stats.phase_2_count,
-            ghost: stats.phase_3_count,
-        },
-        permastore_count: stats.permastore_count,
-        avg_strength: stats.avg_strength,
-        edge_count: stats.edge_count,
-        embedding_dim: ns.embedding_dim,
-        vector_bytes: stats.memory_count * ns.embedding_dim as u64 * 4,
-    };
-
-    let took = start.elapsed().as_micros() as u64;
-
-    Ok(Json(ApiResponse {
-        data: response,
-        took_us: Some(took),
-    }))
+    .await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during read".into(),
+        )
+        .into());
+    }
+    result
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1266,93 +1356,106 @@ pub async fn health_report(
     State(state): State<AppState>,
     Query(params): Query<HealthReportQuery>,
 ) -> Result<Json<ApiResponse<HealthReport>>, AppError> {
-    let start = Instant::now();
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
+        let start = Instant::now();
 
-    // Resolve optional namespace filter (validate before cache check)
-    let namespace_filter: Option<NamespaceId> = if let Some(ref ns_name) = params.namespace {
-        Some(
-            state
-                .namespaces
-                .resolve(ns_name)
-                .ok_or_else(|| AppError::NotFound {
-                    resource: "namespace",
-                    id: ns_name.clone(),
-                })?
-                .id,
-        )
-    } else {
-        None
-    };
+        // Resolve optional namespace filter (validate before cache check)
+        let namespace_filter: Option<NamespaceId> = if let Some(ref ns_name) = params.namespace {
+            Some(
+                state
+                    .namespaces
+                    .resolve(ns_name)
+                    .ok_or_else(|| AppError::NotFound {
+                        resource: "namespace",
+                        id: ns_name.clone(),
+                    })?
+                    .id,
+            )
+        } else {
+            None
+        };
 
-    let scope = params.namespace.unwrap_or_else(|| "all".to_string());
+        let scope = params.namespace.unwrap_or_else(|| "all".to_string());
 
-    // --- Check cache ---
-    {
-        let cache = health_report_cache().read().await;
-        if let Some((generated_at, cached_report)) = cache.get(&scope) {
-            if generated_at.elapsed().as_secs() < HEALTH_REPORT_CACHE_TTL_SECS {
-                let took = start.elapsed().as_micros() as u64;
-                return Ok(Json(ApiResponse {
-                    data: cached_report.clone(),
-                    took_us: Some(took),
-                }));
+        // --- Check cache ---
+        {
+            let cache = health_report_cache().read().await;
+            if let Some((cached_stamp, generated_at, cached_report)) = cache.get(&scope) {
+                if *cached_stamp == stamp
+                    && generated_at.elapsed().as_secs() < HEALTH_REPORT_CACHE_TTL_SECS
+                {
+                    let took = start.elapsed().as_micros() as u64;
+                    return Ok(Json(ApiResponse {
+                        data: cached_report.clone(),
+                        took_us: Some(took),
+                    }));
+                }
             }
         }
+
+        // --- Cache miss: compute the report ---
+        let all_records = state.storage.scan_all().await?;
+
+        // Filter records by namespace if applicable
+        let filtered: Vec<_> = all_records
+            .iter()
+            .filter(|(_, r)| {
+                if let Some(ns_id) = namespace_filter {
+                    r.namespace_id == ns_id.get()
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        let overview = health_report_compute::compute_overview(&filtered);
+        let decay_forecast =
+            health_report_compute::compute_decay_forecast(&filtered, state.namespaces.as_ref());
+        let at_risk = health_report_compute::compute_at_risk(&filtered, state.namespaces.as_ref());
+        let age_distribution = health_report_compute::compute_age_distribution(&filtered);
+        let storage = health_report_compute::compute_storage_breakdown(
+            state.storage.as_ref(),
+            state.namespaces.as_ref(),
+            namespace_filter,
+        )
+        .await;
+        let metadata =
+            health_report_compute::compute_metadata_stats(state.storage.as_ref(), namespace_filter)
+                .await
+                .map_err(|e| AppError::Internal { source: e })?;
+
+        let report = HealthReport {
+            scope: scope.clone(),
+            overview,
+            decay_forecast,
+            at_risk,
+            age_distribution,
+            storage,
+            metadata,
+        };
+
+        // --- Store in cache ---
+        {
+            let mut cache = health_report_cache().write().await;
+            cache.insert(scope, (stamp, Instant::now(), report.clone()));
+        }
+
+        let took = start.elapsed().as_micros() as u64;
+
+        Ok(Json(ApiResponse {
+            data: report,
+            took_us: Some(took),
+        }))
     }
-
-    // --- Cache miss: compute the report ---
-    let all_records = state.storage.scan_all().await?;
-
-    // Filter records by namespace if applicable
-    let filtered: Vec<_> = all_records
-        .iter()
-        .filter(|(_, r)| {
-            if let Some(ns_id) = namespace_filter {
-                r.namespace_id == ns_id.get()
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    let overview = health_report_compute::compute_overview(&filtered);
-    let decay_forecast =
-        health_report_compute::compute_decay_forecast(&filtered, state.namespaces.as_ref());
-    let at_risk = health_report_compute::compute_at_risk(&filtered, state.namespaces.as_ref());
-    let age_distribution = health_report_compute::compute_age_distribution(&filtered);
-    let storage = health_report_compute::compute_storage_breakdown(
-        state.storage.as_ref(),
-        state.namespaces.as_ref(),
-        namespace_filter,
-    )
     .await;
-    let metadata =
-        health_report_compute::compute_metadata_stats(state.storage.as_ref(), namespace_filter)
-            .await
-            .map_err(|e| AppError::Internal { source: e })?;
-
-    let report = HealthReport {
-        scope: scope.clone(),
-        overview,
-        decay_forecast,
-        at_risk,
-        age_distribution,
-        storage,
-        metadata,
-    };
-
-    // --- Store in cache ---
-    {
-        let mut cache = health_report_cache().write().await;
-        cache.insert(scope, (Instant::now(), report.clone()));
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during health report".into(),
+        )
+        .into());
     }
-
-    let took = start.elapsed().as_micros() as u64;
-
-    Ok(Json(ApiResponse {
-        data: report,
-        took_us: Some(took),
-    }))
+    result
 }
 
 /// POST /memories/batch -- batch create memories (Issue 16).
@@ -1363,6 +1466,9 @@ pub async fn batch_store(
     State(state): State<AppState>,
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<BatchStoreResponse>>), AppError> {
+    let _publication = state.storage.publication_lease().await?;
+    state.storage.effects_stamp().await?;
+
     let start = Instant::now();
 
     if req.memories.is_empty() {
@@ -1508,7 +1614,7 @@ pub async fn batch_store(
         // so an intra-batch duplicate is reported too — same property the
         // MCP batch tool has.
         let near_duplicates =
-            near_duplicate_report(&state, &embedding, ns.id, mem_req.check_duplicates).await;
+            near_duplicate_report(&state, &embedding, ns.id, mem_req.check_duplicates).await?;
 
         // Persist — resolve initial stability from namespace config (matching MCP)
         let resolved_stability = mem_req.initial_stability.unwrap_or(ns.initial_stability);
@@ -1635,6 +1741,8 @@ pub async fn scan_duplicates(
     Path(name): Path<String>,
     Json(req): Json<ScanDuplicatesRequest>,
 ) -> Result<Json<ApiResponse<ScanDuplicatesResponse>>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
     let start = Instant::now();
 
     let ns = state
@@ -1787,6 +1895,11 @@ pub async fn scan_duplicates(
         },
         took_us: Some(took),
     }))
+    }.await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired("effects changed during read".into()).into());
+    }
+    result
 }
 
 /// GET /metrics -- Prometheus exposition format.

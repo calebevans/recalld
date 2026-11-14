@@ -6,6 +6,9 @@ use thiserror::Error;
 /// Errors that can occur during search operations.
 #[derive(Debug, Error)]
 pub enum SearchError {
+    /// Canonical effects or their derived publication are not ready.
+    #[error("search unavailable: {0}")]
+    Unavailable(String),
     /// The specified namespace does not exist.
     #[error("namespace not found: {0}")]
     NamespaceNotFound(String),

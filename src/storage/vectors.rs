@@ -4,7 +4,7 @@
 //! Vectors are read via zero-copy mmap and written via the file descriptor.
 //! See CS-06 for the full specification.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -298,6 +298,7 @@ pub struct VectorStore {
 
     /// Total allocated slots (live + free). Updated after extend/remap.
     slot_count: u32,
+    free_slots: HashSet<u32>,
 }
 
 impl VectorStore {
@@ -336,7 +337,7 @@ impl VectorStore {
         file.try_lock_exclusive()
             .map_err(|_| VectorError::FileLocked { path: path.clone() })?;
 
-        if !exists || file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+        if !exists {
             // New file -- write header.
             let header = VectorFileHeader::new(dim_u16);
             let header_bytes = zerocopy::IntoBytes::as_bytes(&header);
@@ -384,6 +385,39 @@ impl VectorStore {
         let stride = header.stride.get();
         let slot_count = header.slot_count.get();
 
+        let expected_size =
+            VectorFileHeader::SIZE as u64 + u64::from(slot_count) * u64::from(stride);
+        if mmap.len() as u64 != expected_size || dimensions == 0 {
+            return Err(VectorError::Corrupt {
+                path: path.clone(),
+                reason: "invalid vector extent or dimension".into(),
+            });
+        }
+        let mut free_slots = HashSet::new();
+        let mut slot = header.free_list_head.get();
+        while slot != VectorFileHeader::FREE_LIST_EMPTY {
+            if slot >= slot_count || !free_slots.insert(slot) {
+                return Err(VectorError::Corrupt {
+                    path: path.clone(),
+                    reason: "free-list cycle or out-of-bounds slot".into(),
+                });
+            }
+            let offset = VectorFileHeader::data_offset(slot, stride) as usize;
+            slot = u32::from_le_bytes(mmap[offset..offset + 4].try_into().unwrap());
+        }
+        if free_slots.len() as u32 != header.free_slot_count.get()
+            || header
+                .live_count
+                .get()
+                .checked_add(header.free_slot_count.get())
+                != Some(slot_count)
+        {
+            return Err(VectorError::Corrupt {
+                path: path.clone(),
+                reason: "free-list counts disagree".into(),
+            });
+        }
+
         Ok(Self {
             mmap,
             file,
@@ -391,6 +425,7 @@ impl VectorStore {
             dimensions,
             stride,
             slot_count,
+            free_slots,
         })
     }
 
@@ -519,6 +554,7 @@ impl VectorStore {
                 h.live_count = U32::new(h.live_count.get() + 1);
             })?;
 
+            self.free_slots.remove(&slot);
             Ok(slot)
         } else {
             // --- Extend the file by GROWTH_CHUNK slots ---
@@ -535,7 +571,12 @@ impl VectorStore {
         let grow_by = min_new_slots.max(GROWTH_CHUNK);
         let header = self.read_header()?;
         let old_count = header.slot_count.get();
-        let new_count = old_count + grow_by;
+        let new_count = old_count
+            .checked_add(grow_by)
+            .ok_or_else(|| VectorError::Corrupt {
+                path: self.path.clone(),
+                reason: "vector capacity exhausted".into(),
+            })?;
         let new_size = VectorFileHeader::SIZE as u64 + (new_count as u64) * (self.stride as u64);
 
         // Extend the file. The OS zero-fills the new region.
@@ -571,6 +612,7 @@ impl VectorStore {
             h.free_slot_count = U32::new(h.free_slot_count.get() + grow_by);
         })?;
 
+        self.free_slots.extend(old_count..new_count);
         self.remap()?;
         Ok(())
     }
@@ -585,6 +627,10 @@ impl VectorStore {
                 slot,
                 slot_count: self.slot_count,
             });
+        }
+
+        if self.free_slots.contains(&slot) {
+            return Ok(());
         }
 
         let offset = VectorFileHeader::data_offset(slot, self.stride);
@@ -625,8 +671,14 @@ impl VectorStore {
             h.live_count = U32::new(h.live_count.get() - 1);
         })?;
 
+        self.free_slots.insert(slot);
         self.remap()?;
         Ok(())
+    }
+
+    /// Allocation state only; canonical record ownership is checked by the engine.
+    pub(crate) fn is_free(&self, slot: u32) -> bool {
+        self.free_slots.contains(&slot)
     }
 
     // ── Header I/O and Remap ─────────────────────────────────────────
@@ -836,6 +888,41 @@ impl VectorManager {
 #[cfg(test)]
 mod manager_tests {
     use super::*;
+
+    #[test]
+    fn containment_double_free_is_idempotent_and_free_list_cycles_fail_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = VectorStore::open(dir.path(), 4).unwrap();
+        let a = store.insert_vector(&[1., 2., 3., 4.]).unwrap();
+        store.free_slot(a).unwrap();
+        let header = store.read_header().unwrap();
+        store.free_slot(a).unwrap();
+        assert_eq!(
+            store.read_header().unwrap().free_slot_count,
+            header.free_slot_count
+        );
+        assert_eq!(store.read_header().unwrap().live_count, header.live_count);
+        let offset = VectorFileHeader::data_offset(a, store.stride);
+        store.file.seek(SeekFrom::Start(offset)).unwrap();
+        store.file.write_all(&a.to_le_bytes()).unwrap();
+        store.sync().unwrap();
+        drop(store);
+        assert!(matches!(
+            VectorStore::open(dir.path(), 4),
+            Err(VectorError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn containment_zero_and_truncated_vector_files_are_never_initialized() {
+        for size in [0, 1, 63, 65] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("vectors.dat");
+            std::fs::write(&path, vec![0; size]).unwrap();
+            assert!(VectorStore::open(dir.path(), 4).is_err());
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), size as u64);
+        }
+    }
 
     const DIM: usize = 4;
 

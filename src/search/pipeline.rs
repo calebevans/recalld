@@ -87,6 +87,11 @@ pub trait RecordCache: Send + Sync {
 /// On-disk metadata storage fallback.
 #[async_trait::async_trait]
 pub trait MetadataStore: Send + Sync {
+    /// Internal effects admission stamp, not a canonical generation/read view.
+    async fn effects_stamp(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Get a single record by ID.
     async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>>;
     /// Batch load multiple records. Missing IDs are silently skipped.
@@ -348,7 +353,22 @@ impl QueryEngine {
     /// 8. **Rank**: Composite score, sort descending, truncate to limit.
     /// 9. **Return**: Assemble SearchResponse, record access events async.
     #[instrument(skip(self, query), fields(namespace = %query.namespace, mode = ?query.query_mode))]
-    pub async fn search(&self, mut query: SearchQuery) -> Result<SearchResponse> {
+    pub async fn search(&self, query: SearchQuery) -> Result<SearchResponse> {
+        let stamp = self.meta_store.effects_stamp().await?;
+        let result = self.search_admitted(query).await;
+        if self.meta_store.effects_stamp().await? != stamp {
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
+        }
+        result
+    }
+
+    pub(crate) async fn effects_stamp(&self) -> Result<u64> {
+        self.meta_store.effects_stamp().await
+    }
+
+    async fn search_admitted(&self, mut query: SearchQuery) -> Result<SearchResponse> {
         let pipeline_start = Instant::now();
         let mut timings = StageTimings::default();
 
@@ -890,6 +910,17 @@ impl QueryEngine {
         id: MemoryId,
         record_access: bool,
     ) -> Result<Option<MemoryResponse>> {
+        let stamp = self.meta_store.effects_stamp().await?;
+        let result = self.get_memory_with_access_admitted(id, record_access).await;
+        if self.meta_store.effects_stamp().await? != stamp {
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
+        }
+        result
+    }
+
+    async fn get_memory_with_access_admitted(&self, id: MemoryId, record_access: bool) -> Result<Option<MemoryResponse>> {
         let record = match record_access.then(|| self.cache.get(&id)).flatten() {
             Some(r) => r,
             None => match self.meta_store.get(&id).await? {
@@ -945,6 +976,17 @@ impl QueryEngine {
         k: usize,
         record_access: bool,
     ) -> Result<Vec<SearchResult>> {
+        let stamp = self.meta_store.effects_stamp().await?;
+        let result = self.similar_with_access_admitted(id, k, record_access).await;
+        if self.meta_store.effects_stamp().await? != stamp {
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
+        }
+        result
+    }
+
+    async fn similar_with_access_admitted(&self, id: MemoryId, k: usize, record_access: bool) -> Result<Vec<SearchResult>> {
         let k = k.clamp(1, SearchQuery::MAX_USER_LIMIT);
 
         // By-ID scope comes from the canonical record, even if its cache entry is stale.
@@ -1460,6 +1502,79 @@ mod tests {
             Arc::new(Unused),
             Arc::new(Unused),
         )
+    }
+
+    #[tokio::test]
+    async fn effects_completed_during_query_cannot_return_a_successful_miss() {
+        use crate::storage::StorageEngine as _;
+        let fx = crate::test_support::Fixture::new();
+        let a = fx.insert_memory().await;
+        let b = fx.insert_memory().await;
+        fx.storage
+            .read()
+            .unwrap()
+            .add_edge(a, b, crate::model::EdgeType::Associative, 0.5, false, 1)
+            .unwrap();
+        fx.storage
+            .read()
+            .unwrap()
+            .meta_store()
+            .acknowledge_rebuilt_effects()
+            .unwrap();
+        struct MutatingLookup {
+            storage: Arc<std::sync::RwLock<crate::storage::engine::RedbStorageEngine>>,
+            target: MemoryId,
+        }
+        #[async_trait::async_trait]
+        impl MetadataStore for MutatingLookup {
+            async fn effects_stamp(&self) -> Result<u64> {
+                self.storage
+                    .read()
+                    .unwrap()
+                    .meta_store()
+                    .effects_stamp()
+                    .map_err(|e| SearchError::MetadataError(e.to_string()))
+            }
+            async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
+                let storage = self.storage.write().unwrap();
+                let old = storage
+                    .get_record(*id)
+                    .unwrap()
+                    .map(|r| CachedRecord::from(&r));
+                storage.remove_all_edges(self.target).unwrap();
+                // Even complete publication must be noticed by the in-flight query.
+                storage.meta_store().acknowledge_rebuilt_effects().unwrap();
+                Ok(old)
+            }
+            async fn get_batch(&self, _: &[MemoryId]) -> Result<Vec<CachedRecord>> {
+                unreachable!()
+            }
+        }
+        let mut engine = engine(StubGraph::default(), StubMetaStore::default());
+        engine.meta_store = Arc::new(MutatingLookup {
+            storage: fx.storage.clone(),
+            target: b,
+        });
+        let result = engine.get_memory(MemoryId::new()).await;
+        assert!(matches!(result, Err(SearchError::Unavailable(_))));
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .effects_stamp()
+                .is_ok()
+        );
+        assert_eq!(
+            fx.storage
+                .read()
+                .unwrap()
+                .get_record(a)
+                .unwrap()
+                .unwrap()
+                .edge_count,
+            0
+        );
     }
 
     /// Wire up "B is superseded by A", where A's record is `replacement`.
