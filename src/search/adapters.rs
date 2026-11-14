@@ -3,6 +3,7 @@
 //! Each adapter struct wraps a concrete subsystem type and implements
 //! the corresponding DI trait from `pipeline.rs`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -115,6 +116,7 @@ impl VectorIndexRegistry for SharedVectorIndexRegistry {
         namespace_id: NamespaceId,
         query_vec: &[f32],
         k: usize,
+        eligible_ids: Option<&HashSet<MemoryId>>,
     ) -> Result<Vec<ScoredResult>> {
         let index = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.index.read())
@@ -124,7 +126,7 @@ impl VectorIndexRegistry for SharedVectorIndexRegistry {
             ..Default::default()
         };
         let results = index
-            .search(query_vec, k, &filter)
+            .search_eligible(query_vec, k, &filter, eligible_ids)
             .map_err(|e| SearchError::VectorIndexError(e.to_string()))?;
         Ok(results
             .into_iter()
@@ -485,12 +487,10 @@ impl GraphReader for SharedGraphReader {
 
 /// Adapts a shared `EntityIndex` to `EntityIndexReader`.
 ///
-/// The EntityIndex is shared across all namespaces. The adapter
-/// accepts a `namespace_id` parameter but does not filter by it
-/// because the entity index does not track which namespace a
-/// memory belongs to. Namespace filtering happens in the pipeline's
-/// `passes_filters` stage, which checks each candidate's
-/// `CachedRecord::namespace_id` against the query namespace.
+/// Canonical eligible IDs are scoped to the resolved namespace by the pipeline.
+/// Apply them before the result cap, so foreign or filtered postings cannot
+/// crowd out eligible records. Namespace-partitioned postings can later avoid
+/// scanning those foreign postings without changing this admission contract.
 pub struct SharedEntityIndexReader {
     entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
 }
@@ -508,6 +508,7 @@ impl EntityIndexReader for SharedEntityIndexReader {
         entities: &[String],
         exclude_id: MemoryId,
         k: usize,
+        eligible_ids: &HashSet<MemoryId>,
     ) -> Result<Vec<EntityRecallResult>> {
         if entities.is_empty() {
             return Ok(Vec::new());
@@ -515,7 +516,8 @@ impl EntityIndexReader for SharedEntityIndexReader {
         let index = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.entity_index.read())
         });
-        let results = index.find_by_entities(entities, exclude_id);
+        let results =
+            index.find_by_entities_filtered(entities, exclude_id, |id| eligible_ids.contains(&id));
         Ok(results
             .into_iter()
             .take(k)

@@ -1,0 +1,32 @@
+# A2 legacy retrieval correctness slice
+
+Implemented against `653c8d3` (including the upstream tombstone sweep and daemon socket fixes). This is a limited v1 correctness change, not completion of A2 or a v2 rollout. Research specifications remain read-only and are independently reviewed in PR #12.
+
+## Implemented
+
+- Existing and injected supersession terminals inherit the maximum admitted predecessor score. Stronger own evidence survives; inherited scores are not temporally boosted again or relabeled as terminal cosine. Injected terminals have no fabricated own metadata score. All terminals are revalidated from canonical metadata; unusable replacements retain the legacy predecessor fallback.
+- A canonical metadata scan computes namespace, tombstone/ghost, phase, required/excluded tag, strength and permastore eligibility. Exact vector search applies that membership before scoring/top-k, including EmbeddingOnly queries. `minScore` remains admission on fused relevance, after collection.
+- Entity recall applies the same namespace-scoped eligible membership before counting and the adapter cap. The existing global postings and writer signatures remain intact.
+- Metadata-only retrieval scans all eligible records, applies the existing ranking/temporal formulas, then limits results. The old scan-order `take(4L)` is gone. Equal scores use UUID ordering, including vector heap boundaries.
+
+`VectorIndexRegistry::search` now takes optional eligible-ID membership; `EntityIndexReader::find_by_entities` takes required namespace-scoped membership. `MetadataStore::scan_all` is required and errors propagate. Raw vector/similarity helpers keep their existing behavior with no supplied membership. No wire API, lifecycle policy, ranking weight, graph traversal or RIF default changed.
+
+## Validation
+
+Executed in `recalld-ci:1.94`, Rust 1.94.1, with `--network none --cpus 2 --memory 4g`, `CARGO_BUILD_JOBS=2`, and dedicated cargo/target scratch directories. No host home, credentials, daemon socket or personal data was mounted.
+
+- `cargo test --locked --offline --all-targets --features bench --quiet`: 505 passed, zero failed; both binary targets compiled (zero tests).
+- Rustfmt check of all four changed Rust files passed.
+- `cargo clippy --locked --offline --all-targets --features bench`: exited successfully with repository lint warnings (228 library warnings; no warnings-as-errors clean claim).
+- Regression sensitivity: restoring the four bugs in a disposable source copy caused five expected assertion failures (vector oracle, entity flood, metadata scan, stage inheritance, full-pipeline inheritance). The committed source was not modified by this experiment.
+
+The nine new tests cover those failures plus heap-boundary UUID ties, stronger own evidence, multiple predecessors and permutations, fused-score admission versus inheritance, temporal boosts, canonical tombstone revalidation, and canonical scan errors. Existing upstream tombstone and daemon tests passed. Fixtures use synthetic records and real vector/entity adapters; they do not claim concurrent-generation or transport-v2 conformance.
+
+## Next dependent PRs and release gates
+
+- **A1 integration:** pin canonical metadata, derived indexes and graph to one coherent read generation with readiness/error handling. This slice uses the existing read locking and does not establish a cross-index snapshot. Canonical scanning is O(all records); measure full-pipeline latency/RSS before promotion. No latency or quality gate has been established here.
+- **Entity publication:** partition postings by namespace, make add/remove counts idempotent, update all ingestion/rebuild/cleanup callers, and scope entity autolinking before its cap. Current query correctness uses canonical membership over global postings; it does not fix the legacy autolink path.
+- **Collection/diagnostics:** implement stable FTS refill and explicit degraded-channel handling, metadata top-B retention, coverage/provenance and resolved total-match accounting. Metadata currently retains all eligible candidates until final ranking, rather than claiming the complete bounded v2 budget profile.
+- **Graph/version PR:** typed current/history resolution, chain ambiguity and 64-edge/query-work ceilings, namespace validation of intermediate nodes, generation-pinned terminal checks, and strict-current omission behind v2 opt-in. Add synchronous `(UUID, depth)` traversal with actual hop bounds, 400 expanded-state/12,800 examined-edge budgets, deterministic contributions, and hard-eligible seeds/receivers/relays. Preserve legacy behavior until the v2 contract is available.
+- **RIF PR:** leave legacy query-local RIF unchanged here. Add v2 off/shadow/operator-experimental routing, actual target stability/similarity, deduplicated adjacent pairs, 100 targets per anchor/1,000 pairs per query, and one cumulative context capped at 25% suppression. Require A6 paired quality and A5 latency gates; no persistent RIF or lifecycle changes.
+- **A3/A4/A6 integration:** injected clock/strength policy, synchronous observation receipts and `recordAccess=false`, versioned transports, unavailable/readiness fixtures, and full frozen replay/oracle conformance.
