@@ -7,6 +7,8 @@
 //!
 //! See Spec 04 Section 7 for the design rationale.
 
+mod text_compaction;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
@@ -359,7 +361,20 @@ impl RedbStorageEngine {
 
         // Legacy compaction was checked before opening any canonical file.
         // Step 5: Open fulltext.dat.
-        let text_store = TextStore::open(&db_path.join("fulltext.dat"))?;
+        let selected_text = meta_store.text_selection()?;
+        let text_store = match &selected_text {
+            Some(selected) => TextStore::open_generation(&db_path, selected, true)?,
+            None => TextStore::open(&db_path.join("fulltext.dat"))?,
+        };
+        // Validate canonical text before effects replay or any cleanup.
+        for (_, record) in meta_store.scan_all()? {
+            if record.text_offset != 0 || record.text_length != 0 {
+                text_store.read(TextRef {
+                    file_offset: record.text_offset,
+                    length: record.text_length,
+                })?;
+            }
+        }
 
         // Step 6: Open vector files for each existing namespace.
         let mut vector_manager = VectorManager::new(db_path.clone());
@@ -390,6 +405,17 @@ impl RedbStorageEngine {
 
         // Step 7: Startup validation.
         engine.startup_validation()?;
+        if let Some(selected) = selected_text {
+            crate::storage::text::generation::install_legacy_gate(&engine.db_path, &selected)?;
+            if let Err(error) =
+                crate::storage::text::generation::cleanup_orphans(&engine.db_path, &selected)
+            {
+                tracing::warn!(%error, "text orphan cleanup pending");
+            }
+        }
+        if !existing {
+            engine.compact_text_log()?;
+        }
 
         Ok(engine)
     }
@@ -1454,11 +1480,7 @@ impl StorageEngine for RedbStorageEngine {
 
     fn compact_text_log(&mut self) -> Result<CompactionResult, StorageError> {
         self.ensure_available()?;
-        // ponytail: keep the append-only log until metadata can atomically
-        // select a durable text generation. Marker ordering cannot do this.
-        Err(StorageError::RecoveryRequired(
-            "text compaction is disabled until generation-selected recovery is implemented".into(),
-        ))
+        self.compact_text_at(|_| Ok(()))
     }
 
     // ── Tags ────────────────────────────────────────────────────────
@@ -1686,11 +1708,11 @@ mod tests {
     }
 
     #[test]
-    fn containment_disables_compaction_and_preserves_ambiguous_legacy_files() {
+    fn containment_preserves_ambiguous_legacy_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut engine = open_engine(dir.path());
         let text = std::fs::read(dir.path().join("fulltext.dat")).unwrap();
-        assert!(engine.compact_text_log().is_err());
+        engine.compact_text_log().unwrap();
         assert_eq!(
             std::fs::read(dir.path().join("fulltext.dat")).unwrap(),
             text
@@ -2010,7 +2032,17 @@ mod tests {
         // now fails closed instead (covered by the missing-payload regression).
         let older = tempfile::tempdir().unwrap();
         drop(open_engine(older.path()));
-        std::fs::copy(older.path().join("meta.db"), dir.path().join("meta.db")).unwrap();
+        // A selected text generation is part of the older catalog snapshot.
+        for entry in std::fs::read_dir(older.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == "meta.db"
+                || crate::storage::metadata::text_generation::is_generation_filename(
+                    &entry.file_name().to_string_lossy(),
+                )
+            {
+                std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+            }
+        }
 
         {
             let _engine = open_engine(dir.path());

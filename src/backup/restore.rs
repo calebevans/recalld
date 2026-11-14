@@ -233,6 +233,9 @@ fn valid_entry_name(name: &str) -> bool {
     if matches!(name, "meta.db" | "edges.db" | "fulltext.dat" | "fts.db") {
         return true;
     }
+    if crate::storage::metadata::text_generation::is_generation_filename(name) {
+        return true;
+    }
     let Some(namespace) = name.strip_suffix("/vectors.dat") else {
         return false;
     };
@@ -484,6 +487,29 @@ mod tests {
             assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"preserve");
             assert!(!target.join("meta.db").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn text_generation_restore_requires_selected_payload_even_if_manifest_omits_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, mut manifest) = fixture(root.path());
+        let selected = manifest
+            .files
+            .iter()
+            .find(|entry| {
+                crate::storage::metadata::text_generation::is_generation_filename(&entry.name)
+            })
+            .unwrap()
+            .name
+            .clone();
+        manifest.files.retain(|entry| entry.name != selected);
+        manifest.total_size_bytes = manifest.files.iter().map(|entry| entry.size_bytes).sum();
+        let path = archive(root.path(), &source, &manifest);
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("sentinel"), b"old").unwrap();
+        assert!(restore(path, &target).await.is_err());
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"old");
     }
 
     #[tokio::test]

@@ -7,6 +7,8 @@
 //!
 //! See CS-07 for the full specification.
 
+pub(crate) mod text_generation;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -93,6 +95,7 @@ impl MetadataStore {
         // Partial or future layouts must never be repaired into a new lineage.
         {
             let read = db.begin_read()?;
+            text_generation::read_selection(&read)?;
             if control::validate_existing(&read)?.is_some() {
                 // An adopted store must retain its canonical tables. Do not
                 // recreate records, namespaces or the never-reused ID counter.

@@ -91,7 +91,13 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
             VectorStore::open(&dir, config.embedding_dim as usize)?,
         );
     }
-    let text = TextStore::open_read_only(&path.join("fulltext.dat"))?;
+    let text = match super::metadata::text_generation::read_selection(&read)? {
+        Some(descriptor) => {
+            inventory.insert(descriptor.filename.clone());
+            TextStore::open_generation(path, &descriptor, false)?
+        }
+        None => TextStore::open_read_only(&path.join("fulltext.dat"))?,
+    };
     let records = read.open_table(META_TABLE)?;
     let mut ids = HashSet::new();
     let mut owners = HashSet::new();
