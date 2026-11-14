@@ -7,6 +7,8 @@
 //!
 //! See CS-07 for the full specification.
 
+pub(crate) mod effects;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -68,6 +70,11 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 pub struct MetadataStore {
     db: Database,
     unavailable: std::sync::atomic::AtomicBool,
+    pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
+    derived_dirty: std::sync::atomic::AtomicBool,
+    effects_epoch: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) fail_effect_application: std::sync::atomic::AtomicBool,
     // Lock order: engine gate -> publication -> redb -> phase_index.
     // Hold across commit and bitmap publication, including direct callers.
     publication: std::sync::RwLock<()>,
@@ -100,12 +107,14 @@ impl MetadataStore {
                 read.open_table(NAMESPACE_TABLE)?;
                 read.open_table(NAMESPACE_COUNTER)?;
             }
+            effects::validate_existing(&read)?;
         }
 
         // Force-create all tables by opening them in a write transaction.
         {
             let write_txn = db.begin_write()?;
             control::initialize(&write_txn)?;
+            effects::initialize(&write_txn)?;
             let _ = write_txn.open_table(META_TABLE)?;
             let _ = write_txn.open_table(NAMESPACE_TABLE)?;
             let _ = write_txn.open_table(NAMESPACE_COUNTER)?;
@@ -120,10 +129,23 @@ impl MetadataStore {
         let store = Self {
             db,
             unavailable: std::sync::atomic::AtomicBool::new(false),
+            canonical_pending: std::sync::atomic::AtomicBool::new(false),
+            derived_dirty: std::sync::atomic::AtomicBool::new(false),
+            effects_epoch: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            fail_effect_application: std::sync::atomic::AtomicBool::new(false),
             publication: std::sync::RwLock::new(()),
             phase_index: std::sync::RwLock::new(PhaseIndex::new()),
         };
         store.rebuild_phase_index()?;
+        let pending = store.pending_effects()?;
+        store.canonical_pending.store(
+            pending.iter().any(|e| !e.canonical_applied),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        store
+            .derived_dirty
+            .store(!pending.is_empty(), std::sync::atomic::Ordering::SeqCst);
         Ok(store)
     }
 }
@@ -137,7 +159,11 @@ impl MetadataStore {
     }
 
     pub(crate) fn ensure_available(&self) -> Result<(), StorageError> {
-        if self.unavailable.load(std::sync::atomic::Ordering::Acquire) {
+        if self.unavailable.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .canonical_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(StorageError::RecoveryRequired(
                 "store handle unavailable; reopen for recovery".into(),
             ));
@@ -152,7 +178,9 @@ impl MetadataStore {
         })
     }
 
-    fn mutation_guard(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
+    pub(crate) fn mutation_guard(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
         let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
         // Recheck after waiting: the preceding writer may have failed.
         self.ensure_available()?;
@@ -1199,6 +1227,12 @@ impl MetadataStore {
     /// List all namespace configurations.
     pub fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError> {
         self.ensure_available()?;
+        self.list_namespaces_for_recovery()
+    }
+
+    pub(crate) fn list_namespaces_for_recovery(
+        &self,
+    ) -> Result<Vec<NamespaceConfig>, StorageError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(NAMESPACE_TABLE)?;
         let mut configs = Vec::new();
@@ -1611,6 +1645,12 @@ impl MetadataStore {
     /// Iterate all records in creation order (UUID v7 byte order).
     pub fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
         self.ensure_available()?;
+        self.scan_all_for_recovery()
+    }
+
+    pub(crate) fn scan_all_for_recovery(
+        &self,
+    ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         let mut records = Vec::new();
@@ -1669,6 +1709,46 @@ impl MetadataStore {
 mod tests {
     use super::*;
     use crate::model::Tag;
+
+    #[test]
+    fn effects_schema_partial_future_or_malformed_layout_never_adopts() {
+        for mode in 0..4 {
+            let (dir, store) = open_store();
+            let path = dir.path().join("meta.db");
+            let tx = store.db.begin_write().unwrap();
+            match mode {
+                0 => {
+                    tx.delete_table(effects::SCHEMA).unwrap();
+                }
+                1 => {
+                    tx.delete_table(effects::EFFECTS).unwrap();
+                }
+                2 => {
+                    tx.open_table(effects::SCHEMA)
+                        .unwrap()
+                        .insert("version", 99)
+                        .unwrap();
+                }
+                _ => {
+                    tx.open_table(effects::EFFECTS)
+                        .unwrap()
+                        .insert(&[0u8; 16][..], &b"{}"[..])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            drop(store);
+            assert!(MetadataStore::open(&path).is_err(), "schema case {mode}");
+            let db = redb::Database::open(&path).unwrap();
+            let read = db.begin_read().unwrap();
+            if mode == 0 {
+                assert!(read.open_table(effects::SCHEMA).is_err());
+            }
+            if mode == 1 {
+                assert!(read.open_table(effects::EFFECTS).is_err());
+            }
+        }
+    }
 
     #[test]
     fn containment_publication_blocks_second_writer_and_phase_reader_after_commit() {

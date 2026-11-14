@@ -179,6 +179,11 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    GraphChanged {
+        edges_put: usize,
+        edges_removed: usize,
+        memories_removed: usize,
+    },
     AccessRecorded {
         #[serde(rename = "memoryId")]
         memory_id: MemoryId,

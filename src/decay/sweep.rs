@@ -1224,135 +1224,59 @@ impl DecaySweepRunner {
 
     /// Phase 3 -> Deleted: Ghost -> complete removal.
     ///
-    /// Removes the memory from all storage in a specific order:
-    /// 1. Zero out embedding slot in vectors.dat (add to free list).
-    /// 2. Remove edges via graph's bridging-aware deletion.
-    /// 3. Remove from all secondary indexes (tags, namespace, PhaseIndex).
-    /// 4. Remove metadata record from meta.db.
-    ///
-    /// The order matters: edges and indexes are cleaned up BEFORE the
-    /// metadata record is removed, so that any concurrent query that
-    /// finds the metadata can still resolve edges. If the metadata were
-    /// removed first, a concurrent edge scan could find dangling references.
+    /// Plans bridging privately, commits metadata plus durable edge/release
+    /// effects, then publishes the graph while retaining graph -> storage order.
+    /// Derived invalidations remain pending until complete index recovery.
     async fn transition_ghost_to_deleted(
         memory_id: MemoryId,
         effective_r: f32,
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
         graph: &SharedGraph,
     ) -> Result<PhaseTransition, SweepError> {
-        // 1. Remove all edges via the graph's bridging-aware deletion.
-        //    Acquires a WRITE lock on the graph. If a bridge edge is
-        //    created, resolve its NodeKey endpoints to MemoryIds while
-        //    the lock is held (NodeKeys are not valid after release).
-        let bridge_to_persist: Option<crate::storage::edges::PersistedEdge>;
-        {
-            let mut graph_w = graph.write().await;
-            let removal_result = graph_w.remove_memory_with_bridging(memory_id);
-            debug!(
-                id = %memory_id,
-                edges_removed = removal_result.removed_edges.len(),
-                bridge_created = removal_result.bridge_created.is_some(),
-                "removed edges with bridging"
-            );
-
-            // Resolve the bridge's NodeKey endpoints to MemoryIds
-            // while the graph lock is still held.
-            bridge_to_persist = removal_result.bridge_created.and_then(|bridge| {
-                let source_id = graph_w.get_node_by_key(bridge.source).map(|n| n.memory_id);
-                let target_id = graph_w.get_node_by_key(bridge.target).map(|n| n.memory_id);
-                match (source_id, target_id) {
-                    (Some(src), Some(tgt)) => Some(crate::storage::edges::PersistedEdge {
-                        source: src,
-                        target: tgt,
-                        edge_type: bridge.edge_type,
-                        weight: bridge.weight,
-                        auto_created: bridge.auto_created,
-                        created_at: bridge.created_at as u64,
-                    }),
-                    _ => {
-                        warn!(
-                            id = %memory_id,
-                            "bridge edge created but source/target nodes \
-                             not found in graph; skipping persistence"
-                        );
-                        None
-                    }
-                }
-            });
-        } // write lock released
-
-        // 2. Remove old edge records, persist bridge, and delete
-        //    metadata via spawn_blocking.
-        {
-            let storage_clone = Arc::clone(storage);
-            tokio::task::spawn_blocking(move || {
-                // Remove edges for the deleted memory.
-                {
-                    let storage_r = storage_clone
-                        .read()
-                        .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
-                    storage_r
-                        .remove_all_edges(memory_id)
-                        .map_err(|e| SweepError::Storage(e.to_string()))?;
-
-                    // Persist the bridge edge if one was created.
-                    if let Some(ref bridge) = bridge_to_persist {
-                        storage_r
-                            .batch_add_edges(&[bridge.clone()])
-                            .map_err(|e| SweepError::Storage(e.to_string()))?;
-                        tracing::debug!(
-                            source = %bridge.source,
-                            target = %bridge.target,
-                            edge_type = ?bridge.edge_type,
-                            weight = bridge.weight,
-                            "persisted bridge edge to edges.db"
-                        );
-                    }
-                }
-                // Delete metadata record (requires write lock).
-                //
-                // KNOWN LEAK — documented, not yet fixed.
-                //
-                // This is the system's only hard delete, and it cleans
-                // only what storage owns: the meta.db row, the vector
-                // slot and the edge rows. The four indexes that live
-                // outside storage are untouched, because
-                // `DecaySweepRunner` holds handles to none of them:
-                //
-                // - the FTS5 row survives, and survives *restart* —
-                //   system startup only rebuilds the FTS index when it
-                //   is empty, so the row is permanent;
-                // - the `FlatVectorIndex` entry survives until the
-                //   process exits;
-                // - the entity-index entry survives until restart.
-                //
-                // The damage is degraded recall, not wrong answers:
-                // search hydrates its candidates from meta.db, and an id
-                // with no record hydrates to nothing and is dropped. So
-                // an orphan row spends a top-k slot and returns no
-                // result.
-                //
-                // Fixing it means threading vector_index, fts_index and
-                // entity_index through `DecaySweepRunner::new`, the
-                // `start()` clone block, `execute_sweep` and into this
-                // path — a change to code that runs unattended on a
-                // background timer, which wants its own review rather
-                // than a ride along with a delete-path change.
-                // `FtsIndex::remove_namespace` is the manual remedy in
-                // the meantime.
-                {
-                    let mut storage_w = storage_clone
-                        .write()
-                        .map_err(|e| SweepError::Storage(format!("storage lock poisoned: {e}")))?;
-                    storage_w
-                        .delete_memory(memory_id)
-                        .map_err(|e| SweepError::Storage(e.to_string()))?;
-                }
-                Ok::<_, SweepError>(())
+        let mut live = graph.clone().write_owned().await;
+        // Plan on a private copy; a failed canonical commit leaves live graph intact.
+        let mut planned = (*live).clone();
+        let removal = planned.remove_memory_with_bridging(memory_id);
+        let bridges = removal
+            .bridge_created
+            .into_iter()
+            .map(|bridge| {
+                let source = planned
+                    .get_node_by_key(bridge.source)
+                    .ok_or_else(|| SweepError::Storage("bridge source missing".into()))?
+                    .memory_id;
+                let target = planned
+                    .get_node_by_key(bridge.target)
+                    .ok_or_else(|| SweepError::Storage("bridge target missing".into()))?
+                    .memory_id;
+                Ok(crate::storage::PersistedEdge {
+                    source,
+                    target,
+                    edge_type: bridge.edge_type,
+                    weight: bridge.weight,
+                    auto_created: bridge.auto_created,
+                    created_at: bridge.created_at as u64,
+                })
             })
-            .await
-            .map_err(|e| SweepError::Storage(format!("deletion task panicked: {e}")))??;
-        }
+            .collect::<Result<Vec<_>, SweepError>>()?;
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = storage
+                .write()
+                .map_err(|e| SweepError::Storage(e.to_string()))?;
+            store
+                .delete_memory_with_edges(memory_id, &bridges)
+                .map_err(|e| SweepError::Storage(e.to_string()))?
+                .ok_or_else(|| {
+                    SweepError::Storage("record disappeared before canonical deletion".into())
+                })?;
+            *live = planned;
+            // This runner has no vector/FTS/entity/cache handles. Leave durable
+            // invalidations pending: queries fail closed until startup rebuild.
+            Ok::<_, SweepError>(())
+        })
+        .await
+        .map_err(|e| SweepError::Storage(e.to_string()))??;
 
         Ok(PhaseTransition::Deleted {
             id: memory_id,

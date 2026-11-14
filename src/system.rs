@@ -278,6 +278,16 @@ impl Recalld {
             Arc::new(std::sync::RwLock::new(engine))
         };
 
+        let effects_rebuild = storage
+            .read()
+            .map_err(|e| RecalldError::Init {
+                step: "effects_rebuild",
+                message: e.to_string(),
+                source: None,
+            })?
+            .meta_store()
+            .needs_effects_rebuild();
+
         // -- Step 2: Scan all records once, reuse for graph / FTS / entity index
         let all_records = {
             let storage_r = storage.read().map_err(|e| RecalldError::Init {
@@ -324,9 +334,17 @@ impl Recalld {
 
             // After CS-23, graph::PersistedEdge == storage::PersistedEdge
             // (with created_at: u64). Pass them directly -- no field mapping needed.
+            let expected_edges = persisted_edges.len();
             let edge_count =
                 graph::rebuild_from_storage(&mut rel_graph, persisted_edges.into_iter());
 
+            if effects_rebuild && edge_count != expected_edges {
+                return Err(RecalldError::Init {
+                    step: "effects_graph_rebuild",
+                    message: "graph did not accept all canonical edges".into(),
+                    source: None,
+                });
+            }
             let stats = rel_graph.stats();
             tracing::info!(
                 nodes = stats.node_count,
@@ -434,6 +452,13 @@ impl Recalld {
                     VectorLoadStats::default()
                 }
             };
+            if effects_rebuild && (stats.dim_mismatch + stats.unreadable + stats.missing > 0) {
+                return Err(RecalldError::Init {
+                    step: "effects_vector_rebuild",
+                    message: "vector rebuild incomplete; effects remain pending".into(),
+                    source: None,
+                });
+            }
             let elapsed = started.elapsed();
 
             if stats.dim_mismatch > 0 {
@@ -494,7 +519,14 @@ impl Recalld {
             // fts.db file), populate it from all records in redb storage.
             // Also handles the case where fts.db exists but is empty
             // (e.g., previous crash during first migration).
-            if is_new || fts.is_empty().unwrap_or(true) {
+            if effects_rebuild {
+                fts.clear().map_err(|e| RecalldError::Init {
+                    step: "effects_fts_clear",
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
+                })?;
+            }
+            if effects_rebuild || is_new || fts.is_empty().unwrap_or(true) {
                 if !all_records.is_empty() {
                     let storage_r = storage.read().map_err(|e| RecalldError::Init {
                         step: "fts_migration",
@@ -506,6 +538,9 @@ impl Recalld {
                         "migrating records to FTS5 index"
                     );
                     for (memory_id, record) in &all_records {
+                        if record.phase == DecayPhase::Tombstone {
+                            continue;
+                        }
                         let namespace_id = crate::model::NamespaceId::new(record.namespace_id);
                         let tag_strings: Vec<String> =
                             record.tags.iter().map(|t| t.to_string()).collect();
@@ -515,23 +550,28 @@ impl Recalld {
                                 file_offset: record.text_offset,
                                 length: record.text_length,
                             };
-                            storage_r.get_text(text_ref).ok().flatten()
+                            storage_r
+                                .get_text(text_ref)
+                                .map_err(|e| RecalldError::Init {
+                                    step: "fts_text",
+                                    message: e.to_string(),
+                                    source: Some(Box::new(e)),
+                                })?
                         } else {
                             None
                         };
-                        if let Err(e) = fts.add(
+                        fts.add(
                             namespace_id,
                             *memory_id,
                             &record.summary,
                             full_text.as_deref(),
                             &tag_strings,
-                        ) {
-                            tracing::warn!(
-                                memory_id = %memory_id,
-                                %e,
-                                "failed to index record in FTS5 during migration"
-                            );
-                        }
+                        )
+                        .map_err(|e| RecalldError::Init {
+                            step: "fts_rebuild",
+                            message: e.to_string(),
+                            source: Some(Box::new(e)),
+                        })?;
                     }
                     drop(storage_r);
                     tracing::info!(indexed = all_records.len(), "FTS5 migration complete");
@@ -577,6 +617,21 @@ impl Recalld {
             tracing::info!(memories = idx.len(), "entity index built");
             Arc::new(RwLock::new(idx))
         };
+        // All startup graph/vector/FTS/entity/cache construction has completed.
+        storage
+            .read()
+            .map_err(|e| RecalldError::Init {
+                step: "effects_ack",
+                message: e.to_string(),
+                source: None,
+            })?
+            .meta_store()
+            .acknowledge_rebuilt_effects()
+            .map_err(|e| RecalldError::Init {
+                step: "effects_ack",
+                message: e.to_string(),
+                source: Some(Box::new(e)),
+            })?;
 
         // -- Step 7: Create QueryEngine -------------------------------
         let query_engine = {
@@ -976,6 +1031,126 @@ mod tests {
         config.embedding.dimensions = DIM;
         config.decay.disable_sweep = true;
         config
+    }
+
+    #[tokio::test]
+    async fn effects_block_cached_queries_and_reopen_rebuilds_deleted_fts_rows() {
+        let fx = Fixture::new();
+        let live = fx.insert_memory().await;
+        let dead = fx.insert_memory().await;
+        let dir = fx.close();
+        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+        let record = system
+            .storage
+            .read()
+            .unwrap()
+            .get_record(dead)
+            .unwrap()
+            .unwrap();
+        let ns = crate::model::NamespaceId::new(record.namespace_id);
+        system
+            .cache
+            .insert(dead, crate::model::CachedRecord::from(&record))
+            .await;
+        system.storage.write().unwrap().delete_memory(dead).unwrap();
+        assert!(
+            system.query_engine.get_memory(dead).await.is_err(),
+            "cached deleted record must not bypass admission"
+        );
+        assert!(system.query_engine.similar(dead, 5).await.is_err());
+        let query =
+            serde_json::from_value(serde_json::json!({"text":"fixture", "namespace":"default"}))
+                .unwrap();
+        assert!(system.query_engine.search(query).await.is_err());
+        assert!(
+            system
+                .storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .needs_effects_rebuild()
+        );
+        {
+            use crate::api::adapters::*;
+            let state = crate::api::AppState::new(
+                Arc::new(SearchPipelineAdapter::new(
+                    system.query_engine.clone(),
+                    system.embedding.clone(),
+                    system.vector_index.clone(),
+                    system.fts_index.clone(),
+                    system.entity_index.clone(),
+                )),
+                Arc::new(StorageEngineAdapter::new(
+                    system.storage.clone(),
+                    system.cache.clone(),
+                    system.vector_index.clone(),
+                    system.fts_index.clone(),
+                    system.entity_index.clone(),
+                    system.graph.clone(),
+                )),
+                Arc::new(RecordCacheAdapter::new(system.cache.clone())),
+                Arc::new(RelationshipGraphAdapter::new(
+                    system.graph.clone(),
+                    system.vector_index.clone(),
+                    system.entity_index.clone(),
+                    system.storage.clone(),
+                    system.cache.clone(),
+                    system.config.clone(),
+                )),
+                Arc::new(FsrsEngineAdapter::new(
+                    system.storage.clone(),
+                    system.cache.clone(),
+                    system.graph.clone(),
+                    system.config.clone(),
+                    false,
+                )),
+                Arc::new(NamespaceRegistryAdapter::new(system.storage.clone())),
+                Arc::new(NoopMetricsCollector),
+            );
+            use tower::ServiceExt;
+            let response = crate::api::router(state, &crate::api::ApiConfig::default())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/memories/{dead}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "HTTP cache must not return deleted content or a false 404"
+            );
+        }
+        drop(system);
+        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+        assert!(
+            !system
+                .storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .needs_effects_rebuild()
+        );
+        assert!(
+            system
+                .query_engine
+                .get_memory(dead)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(system.vector_index.read().await.get_vector(dead).is_none());
+        assert!(!system.graph.read().await.contains(&dead));
+        let hits = system
+            .fts_index
+            .lock()
+            .await
+            .search(ns, "fixture", 10)
+            .unwrap();
+        assert!(hits.iter().all(|hit| hit.0 != dead));
+        assert!(hits.iter().any(|hit| hit.0 == live));
     }
 
     // ── the regression ───────────────────────────────────────────────

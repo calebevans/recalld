@@ -217,6 +217,7 @@ pub struct RemovalResult {
 ///
 /// This struct is wrapped in `Arc<RwLock<RelationshipGraph>>` (the
 /// `SharedGraph` alias in mod.rs) for concurrent access.
+#[derive(Clone)]
 pub struct RelationshipGraph {
     /// Node storage. DenseSlotMap keeps elements contiguous for
     /// cache-friendly iteration during decay sweeps and batch

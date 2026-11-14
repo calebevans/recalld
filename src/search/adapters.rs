@@ -231,6 +231,20 @@ impl StorageMetadataAdapter {
 
 #[async_trait]
 impl MetadataStore for StorageMetadataAdapter {
+    async fn effects_stamp(&self) -> Result<u64> {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            storage
+                .read()
+                .map_err(|e| SearchError::MetadataError(e.to_string()))?
+                .meta_store()
+                .effects_stamp()
+                .map_err(|e| SearchError::MetadataError(e.to_string()))
+        })
+        .await
+        .map_err(|e| SearchError::Internal(e.to_string()))?
+    }
+
     async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
         let storage = self.storage.clone();
         let id = *id;

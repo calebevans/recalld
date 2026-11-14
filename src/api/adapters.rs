@@ -347,6 +347,19 @@ impl StorageEngineAdapter {
 
 #[async_trait]
 impl state::StorageEngine for StorageEngineAdapter {
+    async fn effects_stamp(&self) -> Result<u64, crate::storage::StorageError> {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            storage
+                .read()
+                .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
+                .meta_store()
+                .effects_stamp()
+        })
+        .await
+        .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
+    }
+
     async fn create_memory(
         &self,
         namespace_id: NamespaceId,
