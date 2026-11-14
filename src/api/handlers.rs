@@ -964,7 +964,7 @@ pub async fn find_similar(
     Json(req): Json<FindSimilarRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
     let stamp = state.storage.effects_stamp().await?;
-    let result = find_similar_admitted(State(state.clone()), Path(id), Json(req)).await;
+    let result = find_similar_admitted(State(state.clone()), Path(id), Json(req), stamp).await;
     if state.storage.effects_stamp().await? != stamp {
         return Err(AppError::ServiceUnavailable {
             message: "graph effects changed during query; retry".into(),
@@ -977,6 +977,7 @@ async fn find_similar_admitted(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<FindSimilarRequest>,
+    admitted_stamp: u64,
 ) -> Result<Json<SearchResponse>, AppError> {
     let start = Instant::now();
 
@@ -993,12 +994,7 @@ async fn find_similar_admitted(
     // similarity minScore before exposure. /search minStrength is independent.
     let results = state
         .search
-        .find_similar(
-            memory_id,
-            req.limit.min(100) as usize,
-            req.min_score,
-            req.record_access,
-        )
+        .find_similar(memory_id, req.limit.min(100) as usize, req.min_score, false)
         .await?;
     let embeddings = if req.include_embeddings {
         let ids: Vec<_> = results.iter().map(|r| r.memory_id).collect();
@@ -1008,38 +1004,44 @@ async fn find_similar_admitted(
     };
     let mut hits = Vec::with_capacity(results.len());
     for r in results {
-        let metadata = crate::model::parse_structured_tags(&r.tags);
-        let memory = MemoryResponse {
-            id: r.memory_id,
-            namespace: r.namespace,
-            created_at: r.created_at,
-            last_accessed_at: r.last_accessed_at,
-            summary: r.summary.unwrap_or_default(),
-            full_text: state
+        let record =
+            state
                 .storage
-                .get_full_text(r.memory_id)
+                .get_record(r.memory_id)
                 .await
-                .unwrap_or(None),
-            tags: r.tags,
-            entities: metadata.entities,
-            topics: metadata.topics,
-            emotions: metadata.emotions,
-            phase: r.phase,
-            strength: r.retrievability,
-            decay_strength: r.effective_r,
-            stability: r.stability,
-            difficulty: 5.0,
-            is_permastore: r.is_permastore,
-            edge_count: r.edge_count,
-            embedding: embeddings.get(&r.memory_id).cloned(),
-            access_history: None,
-            supersedes: None,
-            near_duplicates: None,
-        };
+                .ok_or_else(|| AppError::NotFound {
+                    resource: "memory",
+                    id: r.memory_id.to_string(),
+                })?;
+        if matches!(
+            record.phase,
+            crate::model::DecayPhase::Ghost | crate::model::DecayPhase::Tombstone
+        ) {
+            return Err(AppError::ServiceUnavailable {
+                message: "similarity result changed during hydration; retry".into(),
+            });
+        }
+        // Search projections omit fields such as difficulty and may carry an
+        // adjusted effective score. REST metadata is the canonical record.
+        let mut memory =
+            MemoryResponse::from_cached(&crate::model::CachedRecord::from(&record), r.namespace);
+        memory.full_text = state.storage.get_full_text(r.memory_id).await?;
+        memory.embedding = embeddings.get(&r.memory_id).cloned();
         hits.push(SearchHit {
             memory,
             score: r.score.unwrap_or(0.0),
         });
+    }
+
+    // Reject read-admission drift and hydration errors before any observation.
+    if state.storage.effects_stamp().await? != admitted_stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    if req.record_access {
+        let ids: Vec<_> = hits.iter().map(|hit| hit.memory.id).collect();
+        state.search.record_similar_accesses(&ids).await?;
     }
 
     let total = hits.len() as u64;
@@ -1714,161 +1716,165 @@ pub async fn scan_duplicates(
 ) -> Result<Json<ApiResponse<ScanDuplicatesResponse>>, AppError> {
     let stamp = state.storage.effects_stamp().await?;
     let result = async {
-    let start = Instant::now();
+        let start = Instant::now();
 
-    let ns = state
-        .namespaces
-        .resolve(&name)
-        .ok_or_else(|| AppError::NotFound {
-            resource: "namespace",
-            id: name.clone(),
-        })?;
+        let ns = state
+            .namespaces
+            .resolve(&name)
+            .ok_or_else(|| AppError::NotFound {
+                resource: "namespace",
+                id: name.clone(),
+            })?;
 
-    if !req.threshold.is_finite() || !(0.0..=1.0).contains(&req.threshold) {
-        return Err(AppError::BadRequest {
-            message: "threshold must be finite and between 0 and 1".into(),
-            field: Some("threshold".into()),
-        });
-    }
-    if !(1..=10_000).contains(&req.max_memories) {
-        return Err(AppError::BadRequest {
-            message: "maxMemories must be between 1 and 10000".into(),
-            field: Some("maxMemories".into()),
-        });
-    }
-    let threshold = req.threshold;
-    let max_memories = req.max_memories;
-
-    // Get memory IDs in this namespace
-    let filter = ListFilter {
-        namespace_id: Some(ns.id),
-        phase: None,
-        tags: vec![],
-        time_range_start: None,
-        time_range_end: None,
-    };
-    let records = state.storage.list_memories(&filter).await?;
-    let memory_ids: Vec<MemoryId> = records.iter().take(max_memories).map(|r| r.id).collect();
-
-    // Load embeddings
-    let embeddings = state.search.get_embeddings_batch(&memory_ids);
-    let sampled_count = memory_ids.len();
-    let id_embeddings: Vec<(MemoryId, Vec<f32>)> = memory_ids
-        .into_iter()
-        .filter_map(|mid| embeddings.get(&mid).map(|emb| (mid, emb.clone())))
-        .collect();
-
-    let coverage = DuplicateScanCoverage {
-        algorithm: "sampledPairs",
-        eligible_count: records.len(),
-        sampled_count,
-        skipped_vector_count: sampled_count - id_embeddings.len(),
-        sample_cap: max_memories,
-        neighbor_cap: None,
-        truncated: sampled_count < records.len(),
-        // This legacy scan has no generation-consistent read view.
-        complete: false,
-    };
-
-    // Union-Find based clustering
-    let n = id_embeddings.len();
-    let mut parent: Vec<usize> = (0..n).collect();
-
-    fn find(parent: &mut [usize], mut i: usize) -> usize {
-        while parent[i] != i {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
+        if !req.threshold.is_finite() || !(0.0..=1.0).contains(&req.threshold) {
+            return Err(AppError::BadRequest {
+                message: "threshold must be finite and between 0 and 1".into(),
+                field: Some("threshold".into()),
+            });
         }
-        i
-    }
-
-    fn union(parent: &mut [usize], a: usize, b: usize) {
-        let ra = find(parent, a);
-        let rb = find(parent, b);
-        if ra != rb {
-            parent[rb] = ra;
+        if !(1..=10_000).contains(&req.max_memories) {
+            return Err(AppError::BadRequest {
+                message: "maxMemories must be between 1 and 10000".into(),
+                field: Some("maxMemories".into()),
+            });
         }
-    }
+        let threshold = req.threshold;
+        let max_memories = req.max_memories;
 
-    let mut max_sim: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+        // Get memory IDs in this namespace
+        let filter = ListFilter {
+            namespace_id: Some(ns.id),
+            phase: None,
+            tags: vec![],
+            time_range_start: None,
+            time_range_end: None,
+        };
+        let records = state.storage.list_memories(&filter).await?;
+        let memory_ids: Vec<MemoryId> = records.iter().take(max_memories).map(|r| r.id).collect();
 
-    // Compare each memory's embedding against its nearest neighbors
-    for (i, (mid_i, _emb_i)) in id_embeddings.iter().enumerate() {
-        // Find similar via the search pipeline's get_embedding + manual cosine
-        if let Some(emb) = state.search.get_embedding(*mid_i) {
-            // Use pairwise comparison within the loaded set
-            for (j, (_mid_j, emb_j)) in id_embeddings.iter().enumerate() {
-                if i >= j {
-                    continue;
-                }
-                let score = crate::search::dot_product_simd(&emb, emb_j);
-                if score >= threshold {
-                    union(&mut parent, i, j);
-                    let root = find(&mut parent, i);
-                    let entry = max_sim.entry(root).or_insert(0.0);
-                    if score > *entry {
-                        *entry = score;
+        // Load embeddings
+        let embeddings = state.search.get_embeddings_batch(&memory_ids);
+        let sampled_count = memory_ids.len();
+        let id_embeddings: Vec<(MemoryId, Vec<f32>)> = memory_ids
+            .into_iter()
+            .filter_map(|mid| embeddings.get(&mid).map(|emb| (mid, emb.clone())))
+            .collect();
+
+        let coverage = DuplicateScanCoverage {
+            algorithm: "sampledPairs",
+            eligible_count: records.len(),
+            sampled_count,
+            skipped_vector_count: sampled_count - id_embeddings.len(),
+            sample_cap: max_memories,
+            neighbor_cap: None,
+            truncated: sampled_count < records.len(),
+            // This legacy scan has no generation-consistent read view.
+            complete: false,
+        };
+
+        // Union-Find based clustering
+        let n = id_embeddings.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[rb] = ra;
+            }
+        }
+
+        let mut max_sim: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+
+        // Compare each memory's embedding against its nearest neighbors
+        for (i, (mid_i, _emb_i)) in id_embeddings.iter().enumerate() {
+            // Find similar via the search pipeline's get_embedding + manual cosine
+            if let Some(emb) = state.search.get_embedding(*mid_i) {
+                // Use pairwise comparison within the loaded set
+                for (j, (_mid_j, emb_j)) in id_embeddings.iter().enumerate() {
+                    if i >= j {
+                        continue;
+                    }
+                    let score = crate::search::dot_product_simd(&emb, emb_j);
+                    if score >= threshold {
+                        union(&mut parent, i, j);
+                        let root = find(&mut parent, i);
+                        let entry = max_sim.entry(root).or_insert(0.0);
+                        if score > *entry {
+                            *entry = score;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Group into clusters
-    let mut clusters_map: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
-    for i in 0..n {
-        let root = find(&mut parent, i);
-        clusters_map.entry(root).or_default().push(i);
-    }
-
-    let mut clusters: Vec<DuplicateCluster> = Vec::new();
-    for (root, members) in &clusters_map {
-        if members.len() < 2 {
-            continue;
+        // Group into clusters
+        let mut clusters_map: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            clusters_map.entry(root).or_default().push(i);
         }
-        let entries: Vec<DuplicateEntry> = members
-            .iter()
-            .map(|&idx| {
-                let mid = id_embeddings[idx].0;
-                let summary = records
-                    .iter()
-                    .find(|r| r.id == mid)
-                    .map(|r| r.summary.clone())
-                    .unwrap_or_default();
-                DuplicateEntry {
-                    id: mid.to_string(),
-                    summary,
-                }
-            })
-            .collect();
-        let max_similarity = max_sim.get(root).copied().unwrap_or(0.0);
-        clusters.push(DuplicateCluster {
-            memories: entries,
-            max_similarity,
+
+        let mut clusters: Vec<DuplicateCluster> = Vec::new();
+        for (root, members) in &clusters_map {
+            if members.len() < 2 {
+                continue;
+            }
+            let entries: Vec<DuplicateEntry> = members
+                .iter()
+                .map(|&idx| {
+                    let mid = id_embeddings[idx].0;
+                    let summary = records
+                        .iter()
+                        .find(|r| r.id == mid)
+                        .map(|r| r.summary.clone())
+                        .unwrap_or_default();
+                    DuplicateEntry {
+                        id: mid.to_string(),
+                        summary,
+                    }
+                })
+                .collect();
+            let max_similarity = max_sim.get(root).copied().unwrap_or(0.0);
+            clusters.push(DuplicateCluster {
+                memories: entries,
+                max_similarity,
+            });
+        }
+
+        clusters.sort_by(|a, b| {
+            b.max_similarity
+                .partial_cmp(&a.max_similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        let total = clusters.len() as u64;
+        let took = start.elapsed().as_micros() as u64;
+
+        Ok(Json(ApiResponse {
+            data: ScanDuplicatesResponse {
+                clusters,
+                total,
+                coverage,
+            },
+            took_us: Some(took),
+        }))
     }
-
-    clusters.sort_by(|a, b| {
-        b.max_similarity
-            .partial_cmp(&a.max_similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let total = clusters.len() as u64;
-    let took = start.elapsed().as_micros() as u64;
-
-    Ok(Json(ApiResponse {
-        data: ScanDuplicatesResponse {
-            clusters,
-            total,
-            coverage,
-        },
-        took_us: Some(took),
-    }))
-    }.await;
+    .await;
     if state.storage.effects_stamp().await? != stamp {
-        return Err(crate::storage::StorageError::RecoveryRequired("effects changed during read".into()).into());
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during read".into(),
+        )
+        .into());
     }
     result
 }

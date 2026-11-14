@@ -167,10 +167,13 @@ mod tests {
             .pending_effects()
             .unwrap();
         assert_eq!(pending.len(), 1);
-        assert!(adapter.get_memory(dead).await.is_err());
-        assert!(adapter.get_memory(live).await.is_err());
+        assert!(adapter.get_memory(dead, false, None).await.is_err());
+        assert!(adapter.get_memory(live, false, None).await.is_err());
         assert!(
-            adapter.get_memory(MemoryId::new()).await.is_err(),
+            adapter
+                .get_memory(MemoryId::new(), false, None)
+                .await
+                .is_err(),
             "no false miss while blocked"
         );
 
@@ -179,7 +182,7 @@ mod tests {
         *fx.vector_index.write().await = FlatVectorIndex::new(DIM + 1);
         assert!(matches!(publisher(&fx).complete().await,
             Err(StorageError::CommittedEffectsPending {operation_id, ..}) if operation_id == pending[0].receipt.operation_id));
-        assert!(adapter.get_memory(live).await.is_err());
+        assert!(adapter.get_memory(live, false, None).await.is_err());
         assert_eq!(
             fx.storage
                 .read()
@@ -201,8 +204,20 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(adapter.get_memory(dead).await.unwrap().is_none());
-        assert!(adapter.get_memory(live).await.unwrap().is_some());
+        assert!(
+            adapter
+                .get_memory(dead, false, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            adapter
+                .get_memory(live, false, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(fx.vector_index.read().await.get_vector(dead).is_none());
         assert!(fx.vector_index.read().await.get_vector(live).is_some());
         assert!(!fx.graph.read().await.contains(&dead));
@@ -225,7 +240,13 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(adapter.get_memory(dead).await.unwrap().is_none());
+        assert!(
+            adapter
+                .get_memory(dead, false, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
         publisher(&fx).complete().await.unwrap();
     }
 
@@ -369,7 +390,7 @@ mod tests {
         );
         assert!(
             fx.storage_adapter()
-                .get_memory(dead)
+                .get_memory(dead, false, None)
                 .await
                 .unwrap()
                 .is_none()

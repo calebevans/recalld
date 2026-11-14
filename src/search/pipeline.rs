@@ -915,7 +915,9 @@ impl QueryEngine {
         record_access: bool,
     ) -> Result<Option<MemoryResponse>> {
         let stamp = self.meta_store.effects_stamp().await?;
-        let result = self.get_memory_with_access_admitted(id, record_access).await;
+        let result = self
+            .get_memory_with_access_admitted(id, record_access)
+            .await;
         if self.meta_store.effects_stamp().await? != stamp {
             return Err(SearchError::Unavailable(
                 "graph effects changed during query".into(),
@@ -924,7 +926,11 @@ impl QueryEngine {
         result
     }
 
-    async fn get_memory_with_access_admitted(&self, id: MemoryId, record_access: bool) -> Result<Option<MemoryResponse>> {
+    async fn get_memory_with_access_admitted(
+        &self,
+        id: MemoryId,
+        record_access: bool,
+    ) -> Result<Option<MemoryResponse>> {
         let record = match record_access.then(|| self.cache.get(&id)).flatten() {
             Some(r) => r,
             None => match self.meta_store.get(&id).await? {
@@ -1093,21 +1099,27 @@ impl QueryEngine {
             })
             .collect();
 
-        // Record associative access for returned results.
-        let accesses: Vec<(MemoryId, AccessKind)> = results
-            .iter()
-            .map(|r| (r.memory_id, AccessKind::AssociativeRetrieval))
-            .collect();
-        if record_access && !accesses.is_empty() {
-            let recorder = Arc::clone(&self.access_recorder);
-            tokio::spawn(async move {
-                if let Err(e) = recorder.record_access_batch(&accesses).await {
-                    warn!("failed to record associative access: {e}");
-                }
-            });
+        if record_access {
+            self.record_similar_accesses(&results.iter().map(|r| r.memory_id).collect::<Vec<_>>())
+                .await?;
         }
-
         Ok(results)
+    }
+
+    /// Shared final-result exposure hook. REST calls this only after fallible
+    /// response hydration. Legacy batches are awaited, not receipt-atomic.
+    pub async fn record_similar_accesses(&self, ids: &[MemoryId]) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        let accesses: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .map(|id| (id, AccessKind::AssociativeRetrieval))
+            .collect();
+        if !accesses.is_empty() {
+            self.access_recorder.record_access_batch(&accesses).await?;
+        }
+        Ok(())
     }
 
     // =====================================================================

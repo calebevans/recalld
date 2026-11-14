@@ -54,6 +54,13 @@ pub trait SearchPipeline: Send + Sync {
         Err(SearchError::Internal("similarity unavailable".into()))
     }
 
+    /// Record the final, fully hydrated similarity result IDs exactly once.
+    async fn record_similar_accesses(&self, _ids: &[MemoryId]) -> Result<(), SearchError> {
+        Err(SearchError::Internal(
+            "similarity exposure unavailable".into(),
+        ))
+    }
+
     /// Find existing memories at or above `threshold` similarity to a
     /// pre-computed embedding, closest first, at most `limit` of them.
     ///

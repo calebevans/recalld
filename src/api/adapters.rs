@@ -206,6 +206,13 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             .await
     }
 
+    async fn record_similar_accesses(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<(), crate::search::SearchError> {
+        self.query_engine.record_similar_accesses(ids).await
+    }
+
     async fn near_duplicates(
         &self,
         embedding: &[f32],

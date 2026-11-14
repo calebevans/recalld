@@ -1157,17 +1157,36 @@ impl DecaySweepRunner {
                     // only after the effects-backed canonical deletion commits.
                     let mut planned = (*graph).clone();
                     let removal = planned.remove_memory_with_bridging(t.memory_id);
-                    let bridges = removal.bridge_created.into_iter().map(|bridge| {
-                        let source = planned.get_node_by_key(bridge.source)
-                            .ok_or_else(|| SweepError::Storage("bridge source missing".into()))?.memory_id;
-                        let target = planned.get_node_by_key(bridge.target)
-                            .ok_or_else(|| SweepError::Storage("bridge target missing".into()))?.memory_id;
-                        Ok(crate::storage::PersistedEdge { source, target,
-                            edge_type: bridge.edge_type, weight: bridge.weight,
-                            auto_created: bridge.auto_created, created_at: bridge.created_at as u64 })
-                    }).collect::<Result<Vec<_>, SweepError>>()?;
-                    storage.delete_memory_with_edges(t.memory_id, &bridges).map_err(map_error)?
-                        .ok_or_else(|| SweepError::Storage("record disappeared before canonical deletion".into()))?;
+                    let bridges = removal
+                        .bridge_created
+                        .into_iter()
+                        .map(|bridge| {
+                            let source = planned
+                                .get_node_by_key(bridge.source)
+                                .ok_or_else(|| SweepError::Storage("bridge source missing".into()))?
+                                .memory_id;
+                            let target = planned
+                                .get_node_by_key(bridge.target)
+                                .ok_or_else(|| SweepError::Storage("bridge target missing".into()))?
+                                .memory_id;
+                            Ok(crate::storage::PersistedEdge {
+                                source,
+                                target,
+                                edge_type: bridge.edge_type,
+                                weight: bridge.weight,
+                                auto_created: bridge.auto_created,
+                                created_at: bridge.created_at as u64,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, SweepError>>()?;
+                    storage
+                        .delete_memory_with_edges(t.memory_id, &bridges)
+                        .map_err(map_error)?
+                        .ok_or_else(|| {
+                            SweepError::Storage(
+                                "record disappeared before canonical deletion".into(),
+                            )
+                        })?;
                     *graph = planned;
                     return Ok(Some(PhaseTransition::Deleted {
                         id: t.memory_id,

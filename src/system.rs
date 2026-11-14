@@ -1202,7 +1202,12 @@ mod tests {
         use crate::mcp::bridge::{SearchPipeline, StorageEngine as McpStorage};
         use crate::mcp::bridge_adapters::{McpSearchAdapter, McpStorageAdapter};
         let fx = Fixture::new();
-        let live = fx.insert_memory().await;
+        let live = fx
+            .insert_memory_with(crate::test_support::MemorySpec {
+                embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+                ..crate::test_support::MemorySpec::new(crate::model::NamespaceId::new(1))
+            })
+            .await;
         let dead = fx.insert_memory().await;
         let dir = fx.close();
         let system = Recalld::new(offline_config(dir.path())).await.unwrap();
@@ -1235,9 +1240,14 @@ mod tests {
         );
         system.cache.insert(dead, stale.clone()).await;
         system.storage.write().unwrap().delete_memory(dead).unwrap();
-        assert!(search.find_similar(live, 5, None, true).await.is_err());
-        assert!(adapter.get_memory(dead).await.is_err());
-        assert!(adapter.get_memory(live).await.is_err());
+        assert!(
+            search
+                .find_similar(live, 5, None, true, true, None)
+                .await
+                .is_err()
+        );
+        assert!(adapter.get_memory(dead, false, None).await.is_err());
+        assert!(adapter.get_memory(live, false, None).await.is_err());
         system.complete_pending_effects().await.unwrap();
         system.cache.insert(dead, stale).await;
         assert!(
@@ -1248,9 +1258,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(adapter.get_memory(dead).await.unwrap().is_none());
-        assert!(adapter.get_memory(live).await.unwrap().is_some());
-        assert!(search.find_similar(live, 5, None, true).await.is_ok());
+        assert!(
+            adapter
+                .get_memory(dead, false, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            adapter
+                .get_memory(live, false, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            search
+                .find_similar(live, 5, None, true, true, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

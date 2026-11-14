@@ -148,26 +148,26 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                 Err(e) => return Err(bridge::BridgeError::InvalidInput(e)),
             };
 
-        let pipeline_query = crate::search::SearchQuery {
-            record_access: query.record_access,
-            query_embedding: None,
-            text: Some(query.query),
-            fts_query: None,
-            namespace: query.namespace.clone(),
-            filter: crate::search::PipelineSearchFilter {
-                require_tags,
-                min_strength: query.min_strength,
-                ..Default::default()
-            },
-            limit: query.limit,
-            min_score: 0.0,
-            include_ghosts: false,
-            query_mode: crate::search::QueryMode::default(),
-            graph_depth: query.depth.min(3) as u8,
-            time_range_start: query.time_range_start,
-            time_range_end: query.time_range_end,
-            entities: query.entities.clone(),
-        };
+            let pipeline_query = crate::search::SearchQuery {
+                record_access: query.record_access,
+                query_embedding: None,
+                text: Some(query.query),
+                fts_query: None,
+                namespace: query.namespace.clone(),
+                filter: crate::search::PipelineSearchFilter {
+                    require_tags,
+                    min_strength: query.min_strength,
+                    ..Default::default()
+                },
+                limit: query.limit,
+                min_score: 0.0,
+                include_ghosts: false,
+                query_mode: crate::search::QueryMode::default(),
+                graph_depth: query.depth.min(3) as u8,
+                time_range_start: query.time_range_start,
+                time_range_end: query.time_range_end,
+                entities: query.entities.clone(),
+            };
 
             let response = self
                 .query_engine
@@ -380,30 +380,30 @@ impl bridge::SearchPipeline for McpSearchAdapter {
     ) -> Result<Vec<bridge::SearchHit>, bridge::BridgeError> {
         let stamp = effects_stamp(&self.storage).await?;
         let result = async {
-        let namespace = namespace.map(str::to_owned);
-        if let Some(namespace) = namespace {
-            let storage = self.storage.clone();
-            tokio::task::spawn_blocking(move || {
-                let storage = storage
-                    .read()
-                    .map_err(|e| bridge::BridgeError::Internal(e.to_string()))?;
-                storage
-                    .assert_memory_namespace(id, &namespace)
-                    .map_err(bridge::BridgeError::from)
-            })
-            .await
-            .map_err(|e| bridge::BridgeError::Internal(e.to_string()))??;
-        }
-        let results = self
-            .query_engine
-            .similar_filtered_with_access(id, limit, min_score, record_access)
-            .await
-            .map_err(|e| bridge::BridgeError::Search(e.to_string()))?;
+            let namespace = namespace.map(str::to_owned);
+            if let Some(namespace) = namespace {
+                let storage = self.storage.clone();
+                tokio::task::spawn_blocking(move || {
+                    let storage = storage
+                        .read()
+                        .map_err(|e| bridge::BridgeError::Internal(e.to_string()))?;
+                    storage
+                        .assert_memory_namespace(id, &namespace)
+                        .map_err(bridge::BridgeError::from)
+                })
+                .await
+                .map_err(|e| bridge::BridgeError::Internal(e.to_string()))??;
+            }
+            let results = self
+                .query_engine
+                .similar_filtered_with_access(id, limit, min_score, record_access)
+                .await
+                .map_err(|e| bridge::BridgeError::Search(e.to_string()))?;
 
-        Ok(results
-            .into_iter()
-            .map(|r| {
-                let metadata = crate::model::parse_structured_tags(&r.tags);
+            Ok(results
+                .into_iter()
+                .map(|r| {
+                    let metadata = crate::model::parse_structured_tags(&r.tags);
 
                     let tz = self.timezone;
                     bridge::SearchHit {
@@ -1183,18 +1183,18 @@ impl bridge::StorageEngine for McpStorageAdapter {
     ) -> Result<Option<bridge::MemoryRecord>, bridge::BridgeError> {
         let stamp = effects_stamp(&self.storage).await?;
         let result = async {
-        let namespace = namespace.map(str::to_owned);
-        let storage = self.storage.clone();
-        let tz = self.timezone;
-        tokio::task::spawn_blocking(move || {
-            let storage_r = storage.read().map_err(|e| {
-                bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-            })?;
-            if let Some(namespace) = namespace.as_deref() {
-                storage_r
-                    .assert_memory_namespace(id, namespace)
-                    .map_err(bridge::BridgeError::from)?;
-            }
+            let namespace = namespace.map(str::to_owned);
+            let storage = self.storage.clone();
+            let tz = self.timezone;
+            tokio::task::spawn_blocking(move || {
+                let storage_r = storage.read().map_err(|e| {
+                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
+                })?;
+                if let Some(namespace) = namespace.as_deref() {
+                    storage_r
+                        .assert_memory_namespace(id, namespace)
+                        .map_err(bridge::BridgeError::from)?;
+                }
 
                 let disk_record = storage_r
                     .get_record(id)

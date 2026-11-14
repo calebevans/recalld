@@ -396,7 +396,7 @@ async fn http_call(
     )
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_only_http_get_search_and_existing_similarity_error() {
+async fn read_only_http_get_search_and_similarity_success() {
     let h = Harness::new().await;
     let before = h.snapshot().await;
     let get = format!("/memories/{}", h.ids[0]);
@@ -418,8 +418,7 @@ async fn read_only_http_get_search_and_existing_similarity_error() {
     .await;
     assert!(status.is_success(), "{body}");
     assert_eq!(body["hits"].as_array().unwrap().len(), 3);
-    // Existing HTTP vector-only adapter rejects EmptyQuery. Verify false mode
-    // also bypasses the source cache before this failure; do not claim success.
+    // Joined vector support succeeds while false mode bypasses the source cache.
     let (status, _) = http_call(
         h.http(),
         "POST",
@@ -427,7 +426,7 @@ async fn read_only_http_get_search_and_existing_similarity_error() {
         json!({"recordAccess":false}),
     )
     .await;
-    assert!(status.is_client_error());
+    assert!(status.is_success());
     assert!(h.f.cache.get(h.ids[0]).await.is_none());
     h.assert_quiet(&before).await;
     for suffix in ["", "?recordAccess=true"] {
@@ -1055,5 +1054,107 @@ async fn similarity_call(h: &Harness, bridge: &McpBridge, rest: bool, args: Valu
         let body: Value =
             serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap();
         body["memories"].as_array().unwrap().clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn similarity_rest_preserves_canonical_metadata_and_full_text() {
+    let mut h = Harness::new().await;
+    let (status, created) = http_call(
+        h.http(),
+        "POST",
+        "/memories",
+        json!({
+            "summary":"canonical metadata", "fullText":"preserved full text",
+            "embedding":VECTOR, "checkDuplicates":false,
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{created}");
+    let id: MemoryId = MemoryId::from_uuid(
+        uuid::Uuid::parse_str(created["data"]["id"].as_str().unwrap()).unwrap(),
+    );
+    h.ids.push(id);
+    let mut disk = h.f.record(id).unwrap();
+    disk.difficulty = 7.25;
+    disk.strength = 0.23;
+    disk.decay_strength = 0.67;
+    disk.stability = 12.5;
+    h.f.storage
+        .read()
+        .unwrap()
+        .meta_store()
+        .batch_update_records(&[(id, disk.clone())])
+        .unwrap();
+    // A deliberately stale cache cannot replace the canonical response fields.
+    let mut stale = CachedRecord::from(&disk);
+    stale.difficulty = 1.0;
+    stale.strength = 0.99;
+    stale.decay_strength = 0.98;
+    h.f.cache.insert(id, stale).await;
+    let before = h.snapshot().await;
+    let (status, body) = http_call(
+        h.http(),
+        "POST",
+        &format!("/similar/{}", h.ids[0]),
+        json!({
+            "recordAccess":false, "includeEmbeddings":true, "limit":20, "minScore":0.1,
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let actual = &body["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["memory"]["id"] == id.to_string())
+        .unwrap()["memory"];
+    assert_eq!(actual["difficulty"], json!(7.25));
+    assert!((actual["strength"].as_f64().unwrap() - 0.23).abs() < 1e-6);
+    assert!((actual["decayStrength"].as_f64().unwrap() - 0.67).abs() < 1e-6);
+    let mut expected = crate::serialization::MemoryResponse::from_cached(
+        &CachedRecord::from(&disk),
+        "default".into(),
+    );
+    expected.full_text = Some("preserved full text".into());
+    expected.embedding = Some(VECTOR.to_vec());
+    // Match the actual HTTP JSON serialization, including f32's shortest
+    // round-tripping decimal representation (to_value instead promotes to f64).
+    let expected_wire: Value =
+        serde_json::from_str(&serde_json::to_string(&expected).unwrap()).unwrap();
+    assert_eq!(*actual, expected_wire);
+    h.assert_quiet(&before).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn similarity_rest_full_text_failure_rejects_without_exposure() {
+    let h = Harness::new().await;
+    let id = h.ids[1];
+    let mut disk = h.f.record(id).unwrap();
+    // Synthetic corrupt text reference: metadata and vector are readable, text is not.
+    disk.text_offset = 1_000_000;
+    disk.text_length = 16;
+    h.f.storage
+        .read()
+        .unwrap()
+        .meta_store()
+        .batch_update_records(&[(id, disk)])
+        .unwrap();
+    let before = h.snapshot().await;
+    for record_access in [false, true] {
+        let (status, body) = http_call(
+            h.http(),
+            "POST",
+            &format!("/similar/{}", h.ids[0]),
+            json!({
+                "recordAccess":record_access, "limit":20,
+            }),
+        )
+        .await;
+        assert!(
+            status.is_server_error(),
+            "full-text failure must not become successful missing text: {body}"
+        );
+        h.assert_quiet(&before).await;
     }
 }
