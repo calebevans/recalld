@@ -1,0 +1,121 @@
+{
+  "excluded": [
+    "Cargo caches",
+    "targets/executables",
+    "ephemeral lock files"
+  ],
+  "runs": [
+    {
+      "archive": "failed-0c8ab9e.tgz",
+      "archiveBytes": 866564,
+      "archiveSha256": "a1760d79881d18e0af09f4a69c262015fbd867f54b28ecd1d233a703565ee6c0",
+      "binarySha256": {
+        "/work/target/debug/examples/offline_eval-fa3d43944fc9fc5a": "20057b45a59ae2be723132b6627a00bd16c245d9bd2fa91df181bb08ebcb91dc"
+      },
+      "closedProbeFilesSha256": {},
+      "exitCode": 101,
+      "rawRoot": "/tmp/recalld-canonical-harness-test-a1hpl2g2",
+      "sourceCommit": "0c8ab9ef56dcb851bea034332f6540926cf2ebb3",
+      "status": "failed",
+      "verifiedOutputFiles": 8,
+      "verifiedSourceFiles": 201
+    },
+    {
+      "archive": "failed-e23e7f8.tgz",
+      "archiveBytes": 1386184,
+      "archiveSha256": "7ebbccc08cd8b925ac03e4b4f332e57743714f3fdd70beade8c26a715a7c2c4a",
+      "binarySha256": {
+        "/work/target/debug/examples/offline_eval": "dc292d1e819168cc0c458893a4c6da2603f8c26fb382c9495ea3873648919d47",
+        "/work/target/debug/examples/offline_eval-fa3d43944fc9fc5a": "d83cccee4a1f482af5bbfcf23586cd453d7a4609636112ffdd5c0704282bd0da",
+        "/work/target/debug/examples/performance_probe": "7d38e550f5e3b3821975b67a21e0de7a73eee4307e0fd1657ea71620cfbd71bd",
+        "/work/target/debug/examples/performance_probe-67378b0c65de5c17": "36f535e3aebc1520d48b53634bf5abc93e5f57f65c093d007a5c7e7b9824ac9d"
+      },
+      "closedProbeFilesSha256": {
+        "probe-store/default/vectors.dat": "ec61097850fd35feda90173bf1b47ce9f3977c87eca4bf0c32517821bee7d9f8",
+        "probe-store/edges.db": "585e39c60625a8b01cd06f1d933d55b6c532a2d1c28b651382013896747b5d14",
+        "probe-store/fixture-source.json": "4b44c401425f16008899c955675aa1ac2664c268d70469d4c3563c4fb7543df4",
+        "probe-store/fts.db": "64a64fae3446ddb4af8f99ecffee565aaaaa02daae7d37af320fc915d8132339",
+        "probe-store/fulltext.7729af1d-9838-4556-bb38-e2bb95c6bea0.dat": "a9202408cb9c22c23d6d1fce59bfddd2affcc3301b9cd3d5867a8bcd34ce0407",
+        "probe-store/fulltext.dat": "a9202408cb9c22c23d6d1fce59bfddd2affcc3301b9cd3d5867a8bcd34ce0407",
+        "probe-store/meta.db": "c15f796252c21b5722477a0572f079ab209f96e3267aa0a2575f1a8c93890b44",
+        "probe-store/n0/vectors.dat": "6008a4a0145a629c048b69371941ca0f3acf21c5157b0581c4a246832995f826",
+        "probe-store/n1/vectors.dat": "87d331c907bff285026140b6c10d07b95b011c2e51f14a378b0a88d5b40527c9",
+        "probe-store/n2/vectors.dat": "eca00e945c7eb6e120699e8fe7dad5f2ec7699324312ae5acd7853c9424a3465",
+        "probe-store/n3/vectors.dat": "2b3205399b7d791b5929c830fbffdcc65a999517c37ced3e2cf821c40ad5a89e",
+        "probe-store/n4/vectors.dat": "6579ef120dfc1d0e05e01020a7aa02fa5854fbe9712c6b1d6e9f3983e495e714",
+        "probe-store/n5/vectors.dat": "993283505311b3dadf1e8e8e094af51edfeca84c5bdb272087cc9d59240625e3",
+        "probe-store/n6/vectors.dat": "546f413ae57a425887a6b0dc06524234a930bdbdaecde1c8282e570862c20f95",
+        "probe-store/n7/vectors.dat": "13a68dfa9d9582c06000a3f1e3d54789517817616ce7f9660a8894e92ca80c77",
+        "probe-store/n8/vectors.dat": "eb798a2952b7d3d4c1c7820042fdf5c3f8225da4e95754bdbc232736732915f1",
+        "probe-store/n9/vectors.dat": "2f68f51da809318667f9929472375f5a4bc0188f1d63ae6c4f1b62e194d23065"
+      },
+      "exitCode": 1,
+      "rawRoot": "/tmp/recalld-canonical-harness-test-v9e6iav2",
+      "sourceCommit": "e23e7f80bbfcd058eb6705ea0d763e9063a91069",
+      "status": "failed",
+      "verifiedOutputFiles": 45,
+      "verifiedSourceFiles": 201
+    },
+    {
+      "archive": "failed-90574b9.tgz",
+      "archiveBytes": 2700182,
+      "archiveSha256": "c008f63a76a33d212084825cd1bc39d868fa7da7a9f3d2785c6c7577829a683d",
+      "binarySha256": {
+        "/work/target/debug/examples/offline_eval": "dc292d1e819168cc0c458893a4c6da2603f8c26fb382c9495ea3873648919d47",
+        "/work/target/debug/examples/offline_eval-fa3d43944fc9fc5a": "d83cccee4a1f482af5bbfcf23586cd453d7a4609636112ffdd5c0704282bd0da",
+        "/work/target/debug/examples/performance_probe": "7d38e550f5e3b3821975b67a21e0de7a73eee4307e0fd1657ea71620cfbd71bd",
+        "/work/target/debug/examples/performance_probe-67378b0c65de5c17": "36f535e3aebc1520d48b53634bf5abc93e5f57f65c093d007a5c7e7b9824ac9d"
+      },
+      "closedProbeFilesSha256": {
+        "probe-store/default/vectors.dat": "ec61097850fd35feda90173bf1b47ce9f3977c87eca4bf0c32517821bee7d9f8",
+        "probe-store/edges.db": "1bcbd409664551eaa7203b69341723a3a88bc3c5415dd1bce2a4813a9270513a",
+        "probe-store/fixture-source.json": "b8c1755dee0992316dd493b5b70d20eb9f3e257c589edebd9524ac553d304d54",
+        "probe-store/fts.db": "edfd8c87e94d40938dba18151eed1d6fda1332a656eedf9eaca9b2f828a503cd",
+        "probe-store/fulltext.dat": "5a0ccf59be70cbc698199284e4924dfe3f351fe354f593d8eb851cb64e93865b",
+        "probe-store/fulltext.ec477bec-c49a-491f-aa65-ca2f63751c3c.dat": "5a0ccf59be70cbc698199284e4924dfe3f351fe354f593d8eb851cb64e93865b",
+        "probe-store/meta.db": "a90e65f3d3046a517cfa66282c24d14cba2f21ad32a54ce169fc3c5899a42b52",
+        "probe-store/n0/vectors.dat": "a5a63895b54b7961f80405ef3caea77ba791c8c2899584f9963a77bce1a8e29c",
+        "probe-store/n1/vectors.dat": "7151f43b553b6eddb1e177a83426d11a48588483328ece3d10266792ee1bd31a",
+        "probe-store/n2/vectors.dat": "b38e9c7c5e3de5d00c58000a956d37f2a9aefa56891e479d754c074f4e2c2cbe",
+        "probe-store/n3/vectors.dat": "df9fcf2f354dcbbaf601c390ea74a63c523f8531a12e32aa9894c46e3faf823d",
+        "probe-store/n4/vectors.dat": "044284e07d23134a32358d7ce15f59233e2e65dcbc9ba0bc59a17e9b25733445",
+        "probe-store/n5/vectors.dat": "9e1d0063cf2cd392a5e97113733a9ed3f548d0f2ece837d22ce361133a89e582",
+        "probe-store/n6/vectors.dat": "1abacca8e3673cee89cf20295774b5c68d5ae50ac27e085ff8c27dbef7f299d4",
+        "probe-store/n7/vectors.dat": "d04133fa55d6a2b6dfcf37caa6bc810e79dcf28ce88c8bbb094e3f9fee0916fd",
+        "probe-store/n8/vectors.dat": "e4387d860341c76bcdb25f638c2f256ee9c4d65ee94355e085ef1f161d066467",
+        "probe-store/n9/vectors.dat": "80856141941d124e29ee473494db8be137537ca48c46daba579afe91c7cc3862"
+      },
+      "exitCode": 1,
+      "rawRoot": "/tmp/recalld-canonical-harness-test-2ek80er5",
+      "sourceCommit": "90574b9ac5ddd83e5fccb66bca290e2442841200",
+      "status": "failed",
+      "verifiedOutputFiles": 52,
+      "verifiedSourceFiles": 201
+    },
+    {
+      "archive": "passed-90574b9.tgz",
+      "archiveBytes": 1018622,
+      "archiveSha256": "6d3d27f4519376ff37690150d26e10d52282b006b0803e6a3fe85f28a73f6a59",
+      "binarySha256": {
+        "/work/target/debug/deps/lifecycle_cli-ef7aa35bda05dfab": "ef20333330324a0abc1ea468eb4a67ac1e6c69aabdff9b7d6e7ef9e56cc5302c",
+        "/work/target/debug/deps/recalld-27bbb81e23f12ff5": "5b03b0c94441a9bef3a5a14a118211a7f1812e981edb1f5f8904351eccf6d97c",
+        "/work/target/debug/deps/recalld-7025a4141187b374": "da6e36ab8737e9ce13463bcdc8aeee563a773506a201feba75898b14b05fcadf",
+        "/work/target/debug/deps/recalld_cli-16a6b9f5f1a3f682": "032967153e2426fb7c9da75e1ea1e2d1f334d25c94c67d954e4af2dc57ee4c0d",
+        "/work/target/debug/deps/recalld_text_migrate-b3ddbfaa472dba30": "914d80fb2c7ef46808f012b6fc1fc2a44c1834f27145278d415816439382317a",
+        "/work/target/debug/deps/text_migration_cli-c242142a48e76014": "f2465df65de971d64b78b41c4f6e157a952c5a9cde41f151cd6d1054da3fdf1d",
+        "/work/target/debug/examples/offline_eval": "dc292d1e819168cc0c458893a4c6da2603f8c26fb382c9495ea3873648919d47",
+        "/work/target/debug/examples/offline_eval-fa3d43944fc9fc5a": "d83cccee4a1f482af5bbfcf23586cd453d7a4609636112ffdd5c0704282bd0da",
+        "/work/target/debug/examples/performance_probe": "7d38e550f5e3b3821975b67a21e0de7a73eee4307e0fd1657ea71620cfbd71bd",
+        "/work/target/debug/examples/performance_probe-67378b0c65de5c17": "36f535e3aebc1520d48b53634bf5abc93e5f57f65c093d007a5c7e7b9824ac9d"
+      },
+      "closedProbeFilesSha256": {},
+      "exitCode": 0,
+      "rawRoot": "/tmp/recalld-canonical-harness-supplement-lpi73dbg",
+      "sourceCommit": "90574b9ac5ddd83e5fccb66bca290e2442841200",
+      "status": "passed",
+      "verifiedOutputFiles": 42,
+      "verifiedSourceFiles": 201
+    }
+  ],
+  "scope": "Immutable source/raw outputs, full receipts, command manifests and exact executable hashes; not a frozen snapshot"
+}

@@ -1,0 +1,824 @@
+diff --git a/examples/offline_eval.rs b/examples/offline_eval.rs
+index e3c756c..a973105 100644
+--- a/examples/offline_eval.rs
++++ b/examples/offline_eval.rs
+@@ -1,19 +1,19 @@
+ //! Internal production-engine diagnostic; NOT the A6 public-action harness.
++mod support;
++
+ use std::{
+     collections::{BTreeMap, BTreeSet},
+     fs::{self, File},
+     io::Write,
+     path::PathBuf,
+     sync::Arc,
+-    time::{Duration, Instant},
++    time::Instant,
+ };
+ 
+ use anyhow::{Context, Result, ensure};
+ use clap::Parser;
+ use recalld::{
+-    cache::{CacheConfig, CacheManager},
+-    graph::RelationshipGraph,
+-    model::{AccessKind, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId},
++    model::{DecayPhase, MemoryId, NamespaceConfig, NamespaceId},
+     rif::{RifConfig, RifEngine},
+     search::{adapters::*, *},
+     storage::{RedbStorageEngine, StorageEngine},
+@@ -147,23 +147,6 @@ impl EmbeddingProviderRegistry for ReplayEmbeddings {
+     }
+ }
+ 
+-// The current public API cannot disable access. Suppress ONLY in this diagnostic,
+-// and acknowledge every scheduled batch so post-query inspection is not racy.
+-struct DiagnosticAccessRecorder {
+-    completed: tokio::sync::Semaphore,
+-}
+-#[async_trait::async_trait]
+-impl AccessRecorder for DiagnosticAccessRecorder {
+-    async fn record_access(&self, _: MemoryId, _: AccessKind) -> Result<(), SearchError> {
+-        self.completed.add_permits(1);
+-        Ok(())
+-    }
+-    async fn record_access_batch(&self, _: &[(MemoryId, AccessKind)]) -> Result<(), SearchError> {
+-        self.completed.add_permits(1);
+-        Ok(())
+-    }
+-}
+-
+ fn write_json(path: impl AsRef<std::path::Path>, value: &Value) -> Result<()> {
+     fs::write(path, serde_json::to_vec_pretty(value)?)?;
+     Ok(())
+@@ -271,7 +254,7 @@ async fn main() -> Result<()> {
+         );
+     }
+ 
+-    // Fresh fixture-only storage. This deliberately bypasses public ingestion.
++    // Canonical internal insertion with receipts; not public transport ingestion.
+     let store_dir = tempfile::tempdir()?;
+     let build_start = Instant::now();
+     let mut storage = RedbStorageEngine::open(store_dir.path())?;
+@@ -285,8 +268,6 @@ async fn main() -> Result<()> {
+             "unexpected namespace identity"
+         );
+     }
+-    let fts = FtsIndex::new(store_dir.path())?;
+-    let mut graph = RelationshipGraph::new();
+     let mut ledger = File::create(args.out.join("turn-ledger.jsonl"))?;
+     for (i, v) in fixture.iter().enumerate() {
+         writeln!(
+@@ -294,49 +275,34 @@ async fn main() -> Result<()> {
+             "{}",
+             json!({"sourceId": i, "memoryId": id(i), "status": "attempted"})
+         )?;
+-        let mut record = DiskRecord {
+-            version: DiskRecord::CURRENT_VERSION,
+-            id: *id(i).as_bytes(),
+-            namespace_id: namespace(i).get(),
+-            created_at: TIME,
+-            last_accessed_at: TIME,
+-            phase: DecayPhase::Full,
+-            strength: 1.0,
+-            decay_strength: 1.0,
+-            stability: 1.0,
+-            difficulty: 5.0,
+-            is_permastore: 0,
+-            vector_slot: 0,
+-            edge_count: 0,
+-            summary: format!("fixture token{i}"),
+-            tags: vec![],
+-            access_history: vec![],
+-            text_offset: 0,
+-            text_length: 0,
+-        };
+-        storage.insert_memory(id(i), namespace(i), &mut record, v, None)?;
+-        fts.add(namespace(i), id(i), &record.summary, None, &[])?;
+-        graph.add_node(
++        let receipt = support::insert(
++            &mut storage,
+             id(i),
+             namespace(i),
+-            DecayPhase::Full,
+-            1.0,
+-            record.vector_slot,
++            format!("fixture token{i}"),
++            v,
++            TIME,
+         )?;
+         writeln!(
+             ledger,
+             "{}",
+-            json!({"sourceId": i, "memoryId": id(i), "status": "accepted"})
++            json!({"sourceId": i, "memoryId": id(i), "status": "accepted", "receipt": receipt,
++                "publication": "canonical committed; startup rebuild follows"})
+         )?;
+     }
++    storage.sync()?;
++    drop(storage);
++    let system = support::open_ready(store_dir.path(), args.dimensions, TIME).await?;
+     let build_us = build_start.elapsed().as_secs_f64() * 1e6;
+-    let before = record_state(&storage)?;
++    let storage = system.storage().clone();
++    let graph = system.graph().clone();
++    let before = record_state(&storage.read().unwrap())?;
++    let control_before = storage.read().unwrap().control_state()?;
+     write_json(args.out.join("state-before.json"), &before)?;
+-    let storage = Arc::new(std::sync::RwLock::new(storage));
+-    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+-    let recorder = Arc::new(DiagnosticAccessRecorder {
+-        completed: tokio::sync::Semaphore::new(0),
+-    });
++    write_json(
++        args.out.join("control-before.json"),
++        &serde_json::to_value(&control_before)?,
++    )?;
+     let embeddings = Arc::new(ReplayEmbeddings(
+         (0..args.records)
+             .step_by(10)
+@@ -353,22 +319,12 @@ async fn main() -> Result<()> {
+     let engine = QueryEngine::new(
+         Arc::new(StorageNamespaceResolver::new(storage.clone())),
+         embeddings,
+-        Arc::new(SharedVectorIndexRegistry::new(Arc::new(
+-            tokio::sync::RwLock::new(index),
+-        ))),
+-        Arc::new(SharedFtsIndexRegistry::new(Arc::new(
+-            tokio::sync::Mutex::new(fts),
+-        ))),
+-        Arc::new(SharedEntityIndexReader::new(Arc::new(
+-            tokio::sync::RwLock::new(EntityIndex::new()),
+-        ))),
+-        Arc::new(CacheManagerAdapter::new(Arc::new(CacheManager::new(
+-            CacheConfig {
+-                embedding_dim: args.dimensions,
+-                ..Default::default()
+-            },
+-            None,
+-        )))),
++        Arc::new(SharedVectorIndexRegistry::new(
++            system.vector_index().clone(),
++        )),
++        Arc::new(SharedFtsIndexRegistry::new(system.fts_index().clone())),
++        Arc::new(SharedEntityIndexReader::new(system.entity_index().clone())),
++        Arc::new(CacheManagerAdapter::new(system.cache().clone())),
+         Arc::new(StorageMetadataAdapter::new(storage.clone())),
+         Arc::new(SharedGraphReader::new(graph.clone())),
+         Arc::new(RifProcessorAdapter::new(
+@@ -378,8 +334,12 @@ async fn main() -> Result<()> {
+             })),
+             graph,
+         )),
+-        recorder.clone(),
+-    );
++        Arc::new(
++            StorageAccessRecorder::new(storage.clone(), system.cache().clone())
++                .with_clock(system.clock().clone()),
++        ),
++    )
++    .with_lifecycle_inputs(system.clock().clone(), Default::default(), 1.0);
+ 
+     let retained: Vec<_> = (0..args.records).collect();
+     for hybrid in [false, true] {
+@@ -393,15 +353,11 @@ async fn main() -> Result<()> {
+             let q = (step % (args.records / 10)) * 10;
+             let query: SearchQuery = serde_json::from_value(json!({"text": format!("query{q}"),
+                 "ftsQuery": if hybrid { format!("token{q}") } else { "unmatchedfixtureterm".into() },
+-                "namespace": "fixture", "limit": args.k, "graphDepth": 0}))?;
++                "namespace": "fixture", "limit": args.k, "graphDepth": 0, "recordAccess": false}))?;
+             let start = Instant::now();
+             let response = engine.search(query).await?;
+             let call_us = start.elapsed().as_secs_f64() * 1e6;
+             ensure!(!response.results.is_empty(), "empty fixture response");
+-            tokio::time::timeout(Duration::from_secs(30), recorder.completed.acquire())
+-                .await??
+-                .forget();
+-            let drained_us = start.elapsed().as_secs_f64() * 1e6;
+             let encode_start = Instant::now();
+             let encoded = serde_json::to_vec(&response)?;
+             let encode_us = encode_start.elapsed().as_secs_f64() * 1e6;
+@@ -454,7 +410,6 @@ async fn main() -> Result<()> {
+                     response.timings.as_ref().context("missing stage timings")?,
+                 )?;
+                 timing["engineCallUs"] = json!(call_us);
+-                timing["engineAndDiagnosticDrainUs"] = json!(drained_us);
+                 timing["jsonSerializationUs"] = json!(encode_us);
+                 for (name, value) in timing.as_object().unwrap() {
+                     stages
+@@ -479,14 +434,26 @@ async fn main() -> Result<()> {
+     let after = record_state(&storage.read().unwrap())?;
+     ensure!(before == after, "diagnostic queries mutated stored records");
+     write_json(args.out.join("state-after.json"), &after)?;
++    let control_after = storage.read().unwrap().control_state()?;
++    ensure!(
++        control_before == control_after,
++        "false queries changed canonical control"
++    );
++    write_json(
++        args.out.join("control-after.json"),
++        &serde_json::to_value(control_after)?,
++    )?;
+     write_json(args.out.join("replay.json"), &json!(replay))?;
+     write_json(
+         args.out.join("summary.json"),
+         &json!({"diagnosticManifestVersion": 1,
+-        "track": "legacy-internal-offline-foundation", "publicApiConformance": false,
++        "track": "canonical-internal-offline-v2", "publicApiConformance": false,
+         "syntheticSemanticQualityClaim": false, "records": args.records, "dimensions": args.dimensions,
+         "k": args.k, "seed": args.seed, "warmupPerCell": args.warmup, "samplesPerCell": args.samples,
+-        "fixtureIngestUs": build_us, "canonicalRecordsUnchanged": true,
++        "fixtureIngestUs": build_us, "canonicalRecordsUnchanged": true, "canonicalControlUnchanged": true,
++        "ingestion": "InsertMemory receipts; production startup/completion", "recordAccess": false,
++        "clock": "ManualClock for lifecycle only; operation/store UUIDs remain random",
++        "identity": "explicit caller-supplied canonical memory IDs; not whole-store deterministic replay",
+         "extraction": {"track": "raw-synthetic-unit", "sourceUnits": args.records,
+             "attempted": args.records, "accepted": args.records, "rejected": 0,
+             "sourceUnitCoverage": 1.0, "propositionPreservation": "not measured"},
+diff --git a/examples/performance_probe.rs b/examples/performance_probe.rs
+index 49f73a0..c5f79a4 100644
+--- a/examples/performance_probe.rs
++++ b/examples/performance_probe.rs
+@@ -1,4 +1,6 @@
+ //! Isolated actual-engine instrumentation probe. No provider/network or serving-v2.
++mod support;
++
+ use anyhow::{Result, ensure};
+ use clap::Parser;
+ use recalld::{
+@@ -31,6 +33,8 @@ struct Args {
+     samples: usize,
+     #[arg(long, default_value_t = 60)]
+     throughput_seconds: u64,
++    #[arg(long, default_value_t = 1000)]
++    throughput_minimum_requests: usize,
+     #[arg(long)]
+     initialize: bool,
+     #[arg(long)]
+@@ -140,6 +144,10 @@ fn canonical_state(storage: &RedbStorageEngine) -> Result<String> {
+ #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+ async fn main() -> Result<()> {
+     let args = Args::parse();
++    ensure!(
++        args.samples > 0 && args.throughput_minimum_requests > 0,
++        "positive sample/request count required"
++    );
+     ensure!(
+         args.records >= 200 && args.records % 10 == 0,
+         "invalid corpus"
+@@ -161,30 +169,22 @@ async fn main() -> Result<()> {
+         for (i, v) in fixture.iter().enumerate() {
+             let id = MemoryId::from_uuid(uuid::Uuid::from_u128((i + 1) as u128));
+             let ns = NamespaceId::new((i % 10 + 1) as u32);
+-            let mut r = DiskRecord {
+-                version: 1,
+-                schema: None,
+-                id: *id.as_bytes(),
+-                namespace_id: ns.get(),
+-                created_at: NOW,
+-                last_accessed_at: NOW,
+-                phase: DecayPhase::Full,
+-                strength: 1.0,
+-                decay_strength: 1.0,
+-                stability: 1.0,
+-                difficulty: 5.0,
+-                is_permastore: 0,
+-                vector_slot: 0,
+-                edge_count: 0,
+-                summary: "needle fixture".into(),
+-                tags: vec![],
+-                access_history: vec![],
+-                text_offset: 0,
+-                text_length: 0,
+-            };
+-            storage.insert_memory(id, ns, &mut r, v, None)?;
++            support::insert(&mut storage, id, ns, "needle fixture".into(), v, NOW)?;
+         }
+         storage.sync()?;
++        drop(storage);
++        let system = support::open_ready(&args.store, 384, NOW).await?;
++        system.storage().write().unwrap().sync()?;
++        fs::write(
++            args.store.join("fixture-source.json"),
++            serde_json::to_vec_pretty(&serde_json::json!({
++                "fixtureVersion": 2, "track": "canonical-writer-internal-probe", "seed": args.seed,
++                "records": args.records, "dimensions": 384,
++                "ingestion": "InsertMemory receipts; production startup/completion",
++                "identity": "caller-supplied canonical memory IDs; random store/operation UUIDs",
++                "wholeStoreDeterministicReplay": false
++            }))?,
++        )?;
+         return Ok(());
+     }
+     fs::create_dir(&args.out)?;
+@@ -205,54 +205,36 @@ async fn main() -> Result<()> {
+             "off"
+         })
+         .init();
+-    let mut storage = RedbStorageEngine::open(&args.store)?;
+-    let rows = storage.scan_all()?;
+-    ensure!(rows.len() == args.records, "corpus count");
+-    let mut index = FlatVectorIndex::new(384);
+-    let fts = FtsIndex::new(&args.out)?;
+-    let mut graph = recalld::graph::RelationshipGraph::new();
+-    for (id, r) in rows {
+-        let ns = NamespaceId::new(r.namespace_id);
+-        let v = storage.get_vector(ns, r.vector_slot)?.unwrap();
+-        index.add(
+-            id,
+-            &v,
+-            VectorMetadata {
+-                namespace_id: ns,
+-                decay_phase: 1,
+-                tags: vec![],
+-            },
+-        )?;
+-        fts.add(ns, id, &r.summary, None, &[])?;
+-        graph.add_node(id, ns, r.phase, r.strength, r.vector_slot)?;
+-    }
+-    storage.sync()?;
++    let source: serde_json::Value =
++        serde_json::from_slice(&fs::read(args.store.join("fixture-source.json"))?)?;
++    ensure!(
++        source["fixtureVersion"] == 2
++            && source["seed"] == args.seed
++            && source["records"] == args.records,
++        "canonical fixture manifest mismatch; initialize with this source"
++    );
++    let system = support::open_ready(&args.store, 384, NOW).await?;
++    let storage = system.storage().clone();
++    ensure!(
++        storage.read().unwrap().scan_all()?.len() == args.records,
++        "corpus count"
++    );
++    storage.write().unwrap().sync()?;
+     let before = digest_files(&args.store)?;
+-    let canonical_before = canonical_state(&storage)?;
+-    let storage = Arc::new(std::sync::RwLock::new(storage));
+-    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+-    let cache = Arc::new(recalld::cache::CacheManager::new(
+-        recalld::cache::CacheConfig {
+-            embedding_dim: 384,
+-            ..Default::default()
+-        },
+-        None,
+-    ));
++    let canonical_before = canonical_state(&storage.read().unwrap())?;
++    let graph = system.graph().clone();
++    let cache = system.cache().clone();
+     let clock = Arc::new(recalld::time::ManualClock::new(NOW));
+     let engine = QueryEngine::new(
+         Arc::new(StorageNamespaceResolver::new(storage.clone())),
+         Arc::new(SingleEmbeddingRegistry::new(Arc::new(
+             recalld::embedding::PassthroughProvider::new(384),
+         ))),
+-        Arc::new(SharedVectorIndexRegistry::new(Arc::new(
+-            tokio::sync::RwLock::new(index),
+-        ))),
+-        Arc::new(SharedFtsIndexRegistry::new(Arc::new(
+-            tokio::sync::Mutex::new(fts),
+-        ))),
+-        Arc::new(SharedEntityIndexReader::new(Arc::new(
+-            tokio::sync::RwLock::new(EntityIndex::new()),
+-        ))),
++        Arc::new(SharedVectorIndexRegistry::new(
++            system.vector_index().clone(),
++        )),
++        Arc::new(SharedFtsIndexRegistry::new(system.fts_index().clone())),
++        Arc::new(SharedEntityIndexReader::new(system.entity_index().clone())),
+         Arc::new(NoCache),
+         Arc::new(StorageMetadataAdapter::new(storage.clone())),
+         Arc::new(SharedGraphReader::new(graph.clone())),
+@@ -297,7 +279,9 @@ async fn main() -> Result<()> {
+     }
+     let start = Instant::now();
+     let mut completed = 0;
+-    while start.elapsed() < Duration::from_secs(args.throughput_seconds) || completed < 1000 {
++    while start.elapsed() < Duration::from_secs(args.throughput_seconds)
++        || completed < args.throughput_minimum_requests
++    {
+         engine
+             .search(queries[completed % queries.len()].clone())
+             .await?;
+@@ -323,6 +307,8 @@ async fn main() -> Result<()> {
+     fs::write(
+         args.out.join("summary.json"),
+         serde_json::to_vec_pretty(&serde_json::json!({
++            "track":"canonical-writer-internal-probe-v2", "fixture_source":source,
++            "historicalMeasurementComparable":false,
+             "seed":args.seed,"records":args.records,"trace":args.trace,"samples":args.samples,"p95_ns":p95,
+             "throughput_completed":completed,"throughput_seconds":seconds,"requests_per_second":completed as f64/seconds,
+             "result_sha256":result_hash.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>(),"canonical_file_sha256":before,"canonical_state_sha256":canonical_before,
+diff --git a/examples/support/mod.rs b/examples/support/mod.rs
+new file mode 100644
+index 0000000..909e33f
+--- /dev/null
++++ b/examples/support/mod.rs
+@@ -0,0 +1,119 @@
++//! Internal diagnostics use the real canonical writer and production startup.
++//! Caller-supplied fixture IDs are supported InsertMemory inputs, not raw records.
++use anyhow::{Result, ensure};
++use recalld::{
++    config::{EmbeddingProvider, RecalldConfig},
++    model::{MemoryId, NamespaceId},
++    storage::{
++        RedbStorageEngine,
++        control::{MutationContext, WriteReceipt},
++        insertion::{InsertMemory, inserted_id},
++    },
++    system::Recalld,
++    time::ManualClock,
++};
++use std::{path::Path, sync::Arc};
++
++pub fn insert(
++    storage: &mut RedbStorageEngine,
++    id: MemoryId,
++    namespace: NamespaceId,
++    summary: String,
++    vector: &[f32],
++    now: i64,
++) -> Result<WriteReceipt> {
++    let receipt = storage.insert_memory_with_receipt(
++        &MutationContext::unkeyed(namespace),
++        &InsertMemory {
++            id: Some(id),
++            summary,
++            full_text: None,
++            tags: vec![],
++            initial_stability: Some(1.0),
++            created_at: Some(now),
++            embedding: Some(vector.to_vec()),
++            parent_id: None,
++            supersedes: None,
++        },
++        &[],
++        now,
++    )?;
++    ensure!(
++        inserted_id(&receipt)? == id,
++        "canonical writer changed supplied fixture identity"
++    );
++    Ok(receipt)
++}
++
++pub async fn open_ready(path: &Path, dimensions: usize, now: i64) -> Result<Recalld> {
++    // Do not load ambient config, credentials, providers or daemon sockets.
++    let mut config = RecalldConfig::default();
++    config.storage.data_dir = path
++        .to_str()
++        .ok_or_else(|| anyhow::anyhow!("non-UTF8 fixture path"))?
++        .into();
++    config.embedding.provider = EmbeddingProvider::Passthrough;
++    config.embedding.dimensions = dimensions;
++    config.decay.disable_sweep = true;
++    config.rif.enabled = false;
++    let system = Recalld::with_clock(config, Arc::new(ManualClock::new(now))).await?;
++    system.complete_pending_effects().await?;
++    Ok(system)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use recalld::{model::NamespaceConfig, storage::StorageEngine};
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn canonical_seed_rejects_bad_input_and_startup_makes_it_queryable() {
++        let root = tempfile::tempdir().unwrap();
++        let mut storage = RedbStorageEngine::open(root.path()).unwrap();
++        let mut ns = NamespaceConfig::default_namespace(123);
++        ns.name = "fixture".into();
++        ns.embedding_dim = 4;
++        let ns = storage.create_namespace(&ns).unwrap();
++        let id = MemoryId::from_uuid(uuid::Uuid::from_u128(1));
++        let before = storage.control_state().unwrap();
++        assert!(insert(&mut storage, id, ns, "fixture".into(), &[f32::NAN; 4], 123).is_err());
++        assert_eq!(storage.control_state().unwrap(), before);
++        let receipt = insert(
++            &mut storage,
++            id,
++            ns,
++            "fixture".into(),
++            &[1., 0., 0., 0.],
++            123,
++        )
++        .unwrap();
++        assert_eq!(inserted_id(&receipt).unwrap(), id);
++        let committed = storage.control_state().unwrap();
++        assert!(
++            insert(
++                &mut storage,
++                id,
++                ns,
++                "duplicate".into(),
++                &[1., 0., 0., 0.],
++                123
++            )
++            .is_err()
++        );
++        assert_eq!(storage.control_state().unwrap(), committed);
++        drop(storage);
++        let system = open_ready(root.path(), 4, 123).await.unwrap();
++        let ready = system.storage().read().unwrap().control_state().unwrap();
++        let query = serde_json::from_value(serde_json::json!({
++            "namespace":"fixture", "text":"fixture", "queryEmbedding":[1.,0.,0.,0.],
++            "recordAccess":false, "graphDepth":0, "limit":1
++        }))
++        .unwrap();
++        let response = system.query_engine().search(query).await.unwrap();
++        assert_eq!(response.results[0].memory_id, id);
++        assert_eq!(
++            system.storage().read().unwrap().control_state().unwrap(),
++            ready
++        );
++    }
++}
+diff --git a/scripts/offline-evaluation.py b/scripts/offline-evaluation.py
+index 3895f6e..618d022 100644
+--- a/scripts/offline-evaluation.py
++++ b/scripts/offline-evaluation.py
+@@ -8,6 +8,8 @@ from pathlib import Path
+ import shutil
+ import subprocess
+ import tempfile
++import tomllib
++import uuid
+ 
+ IMAGE = "recalld-ci:1.94"
+ ROOT = Path(__file__).resolve().parents[1]
+@@ -31,15 +33,39 @@ def save(path, value):
+ 
+ 
+ def snapshot_source(root, destination):
+-    # Only tracked production Rust plus these exact harness/build inputs. Never
+-    # enumerate untracked files, checkout-local Cargo config, data or artifacts.
+-    tracked = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--", "src"], cwd=root)
++    # Tracked target inputs only; never copy scratch, ambient Cargo config or secrets.
++    tracked = {os.fsdecode(p) for p in subprocess.check_output(
++        ["git", "ls-files", "-z", "--cached"], cwd=root).split(b"\0") if p}
++    roots = ("src/", "tests/", "examples/", "benches/")
++    legacy_data = {f"src/bench/data/{name}.json" for name in
++                   ("locomo1", "locomo10", "locomo_conv30", "locomo_conv41", "locomo_first")}
+     names = set(FIXED_INPUTS)
+-    names.update(os.fsdecode(p) for p in tracked.split(b"\0") if p and p.endswith(b".rs"))
++    for name in tracked:
++        if name.startswith(roots):
++            if name.endswith(".rs"):
++                names.add(name)
++            elif name not in legacy_data:
++                raise RuntimeError(f"undeclared target asset requires explicit allowlist: {name}")
++    cargo = tomllib.loads((root / "Cargo.toml").read_text())
++    if "workspace" in cargo:
++        raise RuntimeError("workspace snapshot requires explicit policy")
++    for kind in ("lib", "bin", "test", "example", "bench"):
++        targets = [cargo[kind]] if kind == "lib" and kind in cargo else cargo.get(kind, [])
++        for target in targets:
++            if target.get("path") and target["path"] not in names:
++                raise RuntimeError(f"undeclared Cargo target: {target['path']}")
++    build = cargo.get("package", {}).get("build", "build.rs" if "build.rs" in tracked else False)
++    if build and build not in names:
++        raise RuntimeError(f"undeclared build script: {build}")
++    if not names <= tracked:
++        raise RuntimeError("required source inputs must be tracked")
+     hashes = {}
+     for name in sorted(names):
+         source = root / name
+-        if source.is_symlink() or not source.is_file() or not source.resolve().is_relative_to(root.resolve()):
++        relative = Path(name)
++        if (not source.is_file() or not source.resolve().is_relative_to(root.resolve())
++                or any((root / Path(*relative.parts[:i])).is_symlink()
++                       for i in range(1, len(relative.parts) + 1))):
+             raise RuntimeError(f"missing, nonregular or escaping source input: {name}")
+         target = destination / name
+         target.parent.mkdir(parents=True, exist_ok=True)
+@@ -53,6 +79,56 @@ def source_patch(root, names):
+     return subprocess.check_output(["git", "diff", "HEAD", "--binary", "--", *sorted(names)], cwd=root)
+ 
+ 
++def verify_replays(output, runs):
++    # Canonical receipts/store UUIDs stay in evidence but are not deterministic.
++    stable = ["fixture.json", "state-before.json", "state-after.json", "replay.json"]
++    for name in stable:
++        if len({sha(output / f"run-{run}" / name) for run in range(runs)}) != 1:
++            raise RuntimeError(f"replay mismatch: {name}")
++    receipt_semantics = []
++    controls = []
++    for run in range(runs):
++        root = output / f"run-{run}"
++        for kind in ("state", "control"):
++            if sha(root / f"{kind}-before.json") != sha(root / f"{kind}-after.json"):
++                raise RuntimeError(f"false query changed {kind}: run-{run}")
++        control = json.loads((root / "control-before.json").read_text())
++        store_id = control.pop("storeId")
++        if not uuid.UUID(store_id).int:
++            raise RuntimeError("nil store identity")
++        controls.append(control)
++        sources = json.loads((root / "fixture.json").read_text())["sources"]
++        state = json.loads((root / "state-before.json").read_text())
++        ledger = [json.loads(line) for line in (root / "turn-ledger.jsonl").read_text().splitlines()]
++        if len(ledger) != 2 * len(sources) or set(state) != {s["memoryId"] for s in sources}:
++            raise RuntimeError("fixture/ledger/record count mismatch")
++        operations, semantic = set(), []
++        for i, source in enumerate(sources):
++            attempted, accepted = ledger[2*i:2*i+2]
++            identity = {"sourceId": source["sourceId"], "memoryId": source["memoryId"]}
++            if attempted != {**identity, "status": "attempted"} or any(accepted[k] != v for k, v in identity.items()) or accepted["status"] != "accepted":
++                raise RuntimeError("ledger identity/reference mismatch")
++            receipt = accepted["receipt"].copy()
++            operation = receipt.pop("operationId")
++            if not uuid.UUID(operation).int or operation in operations or receipt.pop("storeId") != store_id:
++                raise RuntimeError("receipt identity mismatch")
++            operations.add(operation)
++            if (receipt["receiptVersion"] != 1 or receipt["replayed"] is not False
++                    or receipt["outcome"]["kind"] != "memoryInserted"
++                    or receipt["outcome"]["memoryId"] != source["memoryId"]
++                    or receipt["committedGeneration"] != str(i + 4)):
++                raise RuntimeError("receipt outcome/write count mismatch")
++            semantic.append({**accepted, "receipt": receipt})
++        # This source initializes control, creates two fixture namespaces, inserts
++        # N records, then production startup creates its default namespace.
++        if control["committedGeneration"] != str(len(sources) + 4):
++            raise RuntimeError("unexpected canonical write count")
++        receipt_semantics.append(semantic)
++    if any(value != receipt_semantics[0] for value in receipt_semantics[1:]) or any(value != controls[0] for value in controls[1:]):
++        raise RuntimeError("receipt/control semantics differ beyond declared generated identities")
++    return stable
++
++
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--cache", required=True, type=Path, help="Prior scratch Cargo home; only registry/ is copied")
+@@ -99,7 +175,7 @@ def main():
+         "sourceCommit": command(["git", "rev-parse", "HEAD"], cwd=ROOT),
+         "dirtyPatchSha256": hashlib.sha256(patch).hexdigest(),
+         "sourceFilesSha256": hashes,
+-        "sourceInputPolicy": "tracked src/**/*.rs plus FIXED_INPUTS; no other tracked or untracked paths",
++        "sourceInputPolicy": "tracked Rust under src/tests/examples/benches plus FIXED_INPUTS; unknown assets/targets rejected; legacy datasets excluded",
+         "dirtyPatchScope": "allowlisted source inputs only; per-file hashes are authoritative",
+         "sourceTreeSha256": hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(),
+         "lockfileSha256": hashes["Cargo.lock"],
+@@ -113,13 +189,13 @@ def main():
+                     "externalDataset": None, "license": "no third-party dataset", "sourceMappingVersion": 1},
+         "versions": {"publicContract": None, "retrievalSemantics": "legacy source-pinned internal path",
+                      "lifecycle": "legacy_access_v1 materialized strength; no sweeps", "rankingProfile": "baseline-v1",
+-                     "canonicalSchema": "source-pinned; no v2 claim", "receipts": None, "readiness": None},
++                     "canonicalSchema": "source-pinned; no v2 claim", "receipts": 1, "readiness": "production startup completion; not whole-store barrier"},
+         "embedding": {"profile": "splitmix64-f32-l2-v1", "model": None, "dimensions": args.dimensions,
+                       "input": "exact fixture namespace and query text; misses fail closed", "cache": "off"},
+-        "behavior": {"clock": "fixed stored timestamps; no injected A3 clock", "rif": "off", "graphDepth": 0,
++        "behavior": {"clock": "ManualClock for lifecycle; random store/operation IDs remain", "rif": "off", "graphDepth": 0,
+                      "storageFilesystem": "container /tmp tmpfs; CPU/logic control, not persistent-disk ingestion measurement",
+-                     "recordAccess": "harness-only acknowledged no-op adapter; public false-mode unavailable",
+-                     "ingestion": "direct real StorageEngine + index publication; bypasses public validation",
++                     "recordAccess": "false through production recorder/admission",
++                     "ingestion": "canonical InsertMemory receipts then production startup/completion; internal Rust, not public transport",
+                      "engine": "real QueryEngine and production storage/vector/FTS/entity/cache/graph/RIF adapters",
+                      "store": "fresh temporary root per process; no snapshot/restore claim"},
+         "performanceGate": {"established": False, "absoluteBudgets": None,
+@@ -139,11 +215,12 @@ df -T /tmp > /work/output/storage-filesystem.txt
+ cat /sys/fs/cgroup/memory.max > /work/output/cgroup-memory.txt
+ cat /sys/fs/cgroup/cpu.max > /work/output/cgroup-cpu.txt
+ python3 scripts/test_offline_evaluation.py > /work/output/runner-tests.log 2>&1
+-rustfmt --check --edition 2024 examples/offline_eval.rs > /work/output/format.log 2>&1
+-cargo test --locked --offline --lib > /work/output/library-tests.log 2>&1
++cargo fmt --all --check > /work/output/format.log 2>&1
++cargo clean -p recalld > /work/output/package-clean.log 2>&1
++cargo test --locked --offline --all-features --lib --bins --tests --examples -j1 > /work/output/library-tests.log 2>&1
+ cargo test --locked --offline --example offline_eval > /work/output/harness-tests.log 2>&1
+-cargo clippy --locked --offline --example offline_eval > /work/output/clippy.log 2>&1
+-cargo build --locked --offline --release --example offline_eval > /work/output/build.log 2>&1
++cargo clippy --locked --offline --all-features --all-targets > /work/output/clippy.log 2>&1
++cargo build --locked --offline --release --example offline_eval -j1 > /work/output/build.log 2>&1
+ '''
+     (scratch / "build.sh").write_text(inner)
+     docker = ["docker", "run", "--rm", "--network", "none", "--cpus", "2", "--memory", "4g",
+@@ -154,16 +231,14 @@ cargo build --locked --offline --release --example offline_eval > /work/output/b
+               "--env", f"RUSTUP_TOOLCHAIN={args.toolchain}", image["Id"]]
+     try:
+         subprocess.run(docker + ["bash", "/work/build.sh"], check=True)
++        manifest["executableSha256"] = sha(scratch / "target/release/examples/offline_eval")
+         for run in range(args.runs):
+             cmd = docker + ["/work/target/release/examples/offline_eval", "--out", f"/work/output/run-{run}"]
+             for key in ["records", "dimensions", "k", "warmup", "samples", "seed"]:
+                 cmd += [f"--{key}", str(getattr(args, key))]
+             with (output / f"run-{run}.log").open("w") as log:
+                 subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
+-        stable = ["fixture.json", "turn-ledger.jsonl", "state-before.json", "state-after.json", "replay.json"]
+-        for name in stable:
+-            if len({sha(output / f"run-{run}" / name) for run in range(args.runs)}) != 1:
+-                raise RuntimeError(f"replay mismatch: {name}")
++        stable = verify_replays(output, args.runs)
+         manifest["status"] = "passed"
+         manifest["replay"] = {"processes": args.runs, "identicalArtifacts": stable}
+     except BaseException as exc:
+diff --git a/scripts/pipeline-performance.py b/scripts/pipeline-performance.py
+index 6667938..c714d4e 100644
+--- a/scripts/pipeline-performance.py
++++ b/scripts/pipeline-performance.py
+@@ -72,6 +72,9 @@ def main():
+     p.add_argument("--mode", choices=["quiet", "characterization"], required=True,
+                    help="quiet requires an explicitly arranged exclusive interval")
+     args = p.parse_args()
++    historical_probe = "d7c1ca01f28ce3c91cd7411596f5085a83b9ca5e0b3dd75930e4994608503079"
++    if digest(Path(__file__).resolve().parent.parent / "examples/performance_probe.rs") != historical_probe:
++        raise SystemExit("This historical study driver requires the frozen 16c574b probe. Canonical fixture v2 requires a separately frozen study/protocol; no historical measurement claim transfers.")
+     root = args.root.resolve()
+     root.mkdir(parents=True, exist_ok=True)
+     anchor, candidate = args.anchor.resolve(), args.candidate.resolve()
+diff --git a/scripts/test_offline_evaluation.py b/scripts/test_offline_evaluation.py
+index 7c3b047..31f0134 100644
+--- a/scripts/test_offline_evaluation.py
++++ b/scripts/test_offline_evaluation.py
+@@ -1,5 +1,6 @@
+ """Runner boundary regression tests; execute in the isolated Rust container."""
+ from pathlib import Path
++import json
+ import runpy
+ import subprocess
+ import tempfile
+@@ -18,6 +19,7 @@ class SourceSnapshotTests(unittest.TestCase):
+         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+         for name in (*runner["FIXED_INPUTS"], "src/lib.rs", ".validation/tracked.txt", "notes.txt"):
+             self.write(name, "fixture\n")
++        self.write("Cargo.toml", '[package]\nname="fixture"\nversion="0.1.0"\nedition="2024"\n')
+         self.git("add", ".")
+         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                  "commit", "--no-gpg-sign", "-qm", "fixture")
+@@ -44,6 +46,25 @@ class SourceSnapshotTests(unittest.TestCase):
+         self.assertNotIn(b"DO_NOT_COPY_CANARY", patch)
+         self.assertEqual({str(p.relative_to(self.output)) for p in self.output.rglob("*") if p.is_file()}, set(hashes))
+ 
++    def test_actual_extra_example_modules_and_cli_targets_are_included(self):
++        for name in ("examples/performance_probe.rs", "examples/support/mod.rs", "tests/text_migration_cli.rs"):
++            self.write(name, "// tracked canonical consumer\n")
++        self.git("add", "examples", "tests")
++        hashes = runner["snapshot_source"](self.root, self.output)
++        self.assertIn("examples/support/mod.rs", hashes)
++        self.assertIn("examples/performance_probe.rs", hashes)
++        self.assertIn("tests/text_migration_cli.rs", hashes)
++
++    def test_unknown_target_asset_or_explicit_cargo_target_fails_closed(self):
++        self.write("tests/fixture.secret", "must not silently omit or copy\n")
++        self.git("add", "tests")
++        with self.assertRaises(RuntimeError):
++            runner["snapshot_source"](self.root, self.output)
++        self.git("rm", "-f", "tests/fixture.secret")
++        self.write("Cargo.toml", '[package]\nname="fixture"\nversion="0.1.0"\n[[test]]\nname="custom"\npath="other/check.rs"\n')
++        with self.assertRaises(RuntimeError):
++            runner["snapshot_source"](self.root, self.output)
++
+     def test_missing_required_input_fails_closed(self):
+         (self.root / "Cargo.lock").unlink()
+         with self.assertRaises(RuntimeError):
+@@ -56,6 +77,51 @@ class SourceSnapshotTests(unittest.TestCase):
+         with self.assertRaises(RuntimeError):
+             runner["snapshot_source"](self.root, self.output)
+ 
++    def test_symlink_parent_even_inside_checkout_fails_closed(self):
++        (self.root / "src").rename(self.root / "elsewhere")
++        (self.root / "src").symlink_to(self.root / "elsewhere", target_is_directory=True)
++        with self.assertRaises(RuntimeError):
++            runner["snapshot_source"](self.root, self.output)
++
++    def test_replay_checks_stable_results_and_each_control_not_random_receipts(self):
++        memory = "00000000-0000-0000-0000-000000000001"
++        for run in range(3):
++            root = self.output / f"run-{run}"
++            root.mkdir(parents=True)
++            store = f"00000000-0000-0000-0001-{run+1:012d}"
++            operation = f"00000000-0000-0000-0002-{run+1:012d}"
++            identity = {"sourceId": 0, "memoryId": memory}
++            runner["save"](root / "fixture.json", {"sources": [identity]})
++            runner["save"](root / "replay.json", [])
++            for name in ("state-before.json", "state-after.json"):
++                runner["save"](root / name, {memory: []})
++            for name in ("control-before.json", "control-after.json"):
++                runner["save"](root / name, {"storeId": store, "committedGeneration": "5"})
++            receipt = {"storeId": store, "operationId": operation, "committedGeneration": "4",
++                       "receiptVersion": 1, "replayed": False,
++                       "outcome": {"kind": "memoryInserted", "memoryId": memory}}
++            ledger = [{**identity, "status": "attempted"},
++                      {**identity, "status": "accepted", "receipt": receipt}]
++            (root / "turn-ledger.jsonl").write_text("\n".join(map(json.dumps, ledger)) + "\n")
++        stable = runner["verify_replays"](self.output, 3)
++        self.assertNotIn("turn-ledger.jsonl", stable)
++        (self.output / "run-1/replay.json").write_text('{}\n')
++        with self.assertRaisesRegex(RuntimeError, "replay mismatch"):
++            runner["verify_replays"](self.output, 3)
++        runner["save"](self.output / "run-1/replay.json", [])
++        ledger[-1]["receipt"]["outcome"]["memoryId"] = store
++        (root / "turn-ledger.jsonl").write_text("\n".join(map(json.dumps, ledger)) + "\n")
++        with self.assertRaisesRegex(RuntimeError, "receipt outcome/write count"):
++            runner["verify_replays"](self.output, 3)
++        ledger[-1]["receipt"]["outcome"]["memoryId"] = memory
++        ledger[-1]["receipt"]["outcome"]["extraSemanticChange"] = True
++        (root / "turn-ledger.jsonl").write_text("\n".join(map(json.dumps, ledger)) + "\n")
++        with self.assertRaisesRegex(RuntimeError, "semantics differ"):
++            runner["verify_replays"](self.output, 3)
++        (self.output / "run-2/control-after.json").write_text('{}\n')
++        with self.assertRaisesRegex(RuntimeError, "false query changed control"):
++            runner["verify_replays"](self.output, 3)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
