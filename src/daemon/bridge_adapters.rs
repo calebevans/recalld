@@ -92,6 +92,26 @@ impl RemoteStorageAdapter {
 
 #[async_trait]
 impl bridge::StorageEngine for RemoteStorageAdapter {
+    fn supports_durable_batches(&self) -> bool {
+        true
+    }
+
+    async fn mutate_batch(
+        &self,
+        input: crate::storage::batch::BatchInput,
+    ) -> Result<crate::storage::batch::BatchOutcome, BridgeError> {
+        let params =
+            serde_json::to_value(input).map_err(|e| BridgeError::Internal(e.to_string()))?;
+        // This new method is mutating and never enters the client's read-only
+        // retry allowlist. An old daemon rejects it before doing any work.
+        let result = self.client.call("mutate_batch", params).await?;
+        serde_json::from_value(result).map_err(|e| {
+            BridgeError::PartiallyApplied(format!(
+                "batch response decode failed; reconcile the same request and key: {e}"
+            ))
+        })
+    }
+
     async fn store_memory(&self, input: StoreInput) -> Result<StoredMemory, BridgeError> {
         let params =
             serde_json::to_value(&input).map_err(|e| BridgeError::Internal(e.to_string()))?;

@@ -1,0 +1,127 @@
+{
+  "runtime": "b7c1ddc261b1f00b7f28fa0147b8212b7d2596f9",
+  "parent": "c3ac21bd5a0b6e2495c312f44088add72afbc2ed",
+  "runtime_commits": [
+    "833b96144cb6e333ea62e40ceba05803b031c157",
+    "b7c1ddc261b1f00b7f28fa0147b8212b7d2596f9"
+  ],
+  "validation": {
+    "commands": [
+      "cargo test --offline --all-features batch -- --nocapture",
+      "cargo fmt --all -- --check",
+      "cargo test --offline --all-features",
+      "cargo clippy --offline --all-features --all-targets"
+    ],
+    "exit_codes": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "focused_passed": 34,
+    "library_passed": 717,
+    "cli_passed": 1,
+    "failed": 0,
+    "doctests_ignored": 4,
+    "clippy_library_warnings": 448,
+    "clippy_test_warnings_including_duplicates": 467,
+    "process_exit_boundaries": 7,
+    "clippy_test_duplicate_warnings": 446
+  },
+  "environment": {
+    "image": "recalld-ci:1.94",
+    "image_id": "sha256:daefdc9cbe9b0f39b1fc29d975148b3b10adc1bd4309f9ca1be8abd36ed811ef",
+    "RUSTUP_TOOLCHAIN": "1.94.1",
+    "CARGO_BUILD_JOBS": 2,
+    "network": "none",
+    "cpus": 2,
+    "memory": "4g",
+    "mounts": [
+      "canonical-batches worktree:/work",
+      "canonical-batches/.validation/cargo:/cargo",
+      "canonical-batches/.validation/target:/target"
+    ],
+    "target_preparation": "cargo clean --offline -p recalld after copying private cache; removed1889 files/5.3GiB before first build",
+    "source_switches": false
+  },
+  "provenance": "Tests ran against the exact source bytes committed as runtime; commit metadata was written after checks. No source-root switch. Developmental failed runs were evolving WIP, not a controlled paired binary comparison; their binary hashes were not captured. Final binary/source hashes below bind final proof.",
+  "source_files_sha256": {
+    "src/daemon/bridge_adapters.rs": "58cc34c022fb4191a6eddeb7f2eba8caf30ccb70ef6887fccfcd2aa872c6e241",
+    "src/daemon/server.rs": "0bc41ce79f8ec24c59c6ee743a4d86c99b8e202183aa9e458fa36d046b7327d7",
+    "src/derived_completion.rs": "b648bf89ba68015ca854688b198402ee89e57f3f9ada266ac0de066ed243f204",
+    "src/mcp/batch_adapters.rs": "342ec750b4f26d62f451b254c90db4be4ce18c3dc6b040f31f918156938cb9b1",
+    "src/mcp/batches.rs": "167be4b00aea40ce1e19a36037d9164a081b30aa5ffb944cf32d2909743757a9",
+    "src/mcp/bridge.rs": "db3216a55c50ced7fee56c3fb241c913592842681348a58648a906453a678e91",
+    "src/mcp/bridge_adapters.rs": "1b5fdd123b818d716b506a2184f0e88e69835f2db4c292bdd735cf68e2b9de77",
+    "src/mcp/mod.rs": "7d6c0319034ff2cb270dc0f0ecf0ea55e8dcbfcb1223b69210a7ed2bf0e62b4f",
+    "src/mcp/tools.rs": "36648092a4f506352c9eb0dd998b620712a90af992e872b0d42186692ed3cdf0",
+    "src/storage/batch.rs": "56bc0a4abc40f8c2d5e4d1b4a93f2df6b39e7e0f19cb31b5ecf15500d75d35a8",
+    "src/storage/control.rs": "3aeabe15158517e31b75380a07fe353029be6b40fecad1ade3814f0738fb72ed",
+    "src/storage/engine/insertion.rs": "35d3e122b30115587649ca8e58cbccaeaa9704ce80c63f2325e1d45d81d34272",
+    "src/storage/engine/tombstone.rs": "4e21ad1293651778f766330da813f30e6af1d78ccf7d09878672e9b131ca0ebb",
+    "src/storage/metadata.rs": "2a07caf690b840ae57154e4fa0ea2366512fc2d0480bf922d17d33418b7da290",
+    "src/storage/metadata/batch.rs": "9a9a9e489cc8d02fdc13cdc204ae2422b8063d5f79a097c5b1573777de9a5e97",
+    "src/storage/metadata/batch_tests.rs": "fdb9d274938f4dddfc91a208e2b3cd428a4f0a8a4b15fd9f27f85e686fe96d16",
+    "src/storage/metadata/effects.rs": "a7c576c21f9792aac4806dbf6b04fc172110d03cfb23db0ccd9fe36b02936de0",
+    "src/storage/metadata/insertion.rs": "2d09cb5cf1a9be49af3de807eeaf1a2e1e1e38fc20e8bb6cb23856205a7f321a",
+    "src/storage/metadata/purge.rs": "24bf93fcce261811e5f1a9d937f0168a3fde48606e55dc40768a31560802c457",
+    "src/storage/metadata/tombstone.rs": "6a788eb51a604619a8682d2c285249e6fbe04ae084e23cb46ee0505bd70be448",
+    "src/storage/mod.rs": "7486b65c03ce4556d987d17a51c52c185e43229ee6c40ce6635a19baa25871ee",
+    "src/storage/tombstone_tests.rs": "218419b1191ae01dc7294d4a03899a558800d311d28428f5d01574bf86cbbe6c",
+    "src/storage/validation.rs": "2bb8709ba8ab72ce5f25cf274c16f140b33fbd404df166920f2533e9be5f508c",
+    "Cargo.toml": "cc4ea0e359616e35116ff82c2dd09f8db681c05e64b9815ebf8fb3f72e5b5b30",
+    "Cargo.lock": "2027c0623c819d8aa903a2e0189b4f99be8aae118daac04de48207c5862ca440"
+  },
+  "test_binaries": {
+    "/target/debug/deps/recalld-7025a4141187b374": {
+      "sha256": "b414eaa5f348ca3433387f481f22ee636a51d15018ec4fa49e24227b3b3cc4cf",
+      "bytes": 330357456
+    },
+    "/target/debug/deps/recalld-27bbb81e23f12ff5": {
+      "sha256": "48bd9173503d4d424a64fc661d78df515639ed1574cf0ecfc3f57a8daa1fe6d6",
+      "bytes": 6908664
+    },
+    "/target/debug/deps/recalld_cli-16a6b9f5f1a3f682": {
+      "sha256": "cd54291dbc43bf0933db0f91e2778f6d761f59b19001aaa1e7f370636c833176",
+      "bytes": 6357936
+    },
+    "/target/debug/deps/recalld_text_migrate-b3ddbfaa472dba30": {
+      "sha256": "cc3a30679a3bccdf954e467e46ad603341622e14941d3d6a5fc329fad62061ac",
+      "bytes": 6358016
+    },
+    "/target/debug/deps/text_migration_cli-c242142a48e76014": {
+      "sha256": "b97083a506ead1fd22a8cd9d6d27791c9fb062ac327c9a1d86b3025ae7cf6d44",
+      "bytes": 246035344
+    }
+  },
+  "full_validation_logs_sha256": {
+    "batch-focused.log": "5c30c0e619584509c3ab672626205a7deda65874945e5406cb16fe8185e99a7e",
+    "batch-focused-2.log": "7f1b5a68fd445c1d3d7ca14852d7dd6bc68766d829a48fbc24541abc26affce5",
+    "batch-focused-3.log": "ce9e65fe28fc898fc8f616b7947bac893513fbee80824a6b113d0a624103b98f",
+    "batch-focused-4.log": "a379ea9860d664bb5590dfa46a9bbc0c8a545aaf1dd7a4b7fd8603765f547777",
+    "batch-focused-5.log": "498c0f9184d3733e64c920552e316f0410cf1d6a6dac024118153b0fe7f51f18",
+    "batch-focused-final.log": "9aec3345c098f00f0c7ddb9f2e6fcb216d9f923f9503e7981295a9a38bcf846d",
+    "batch-focused-sealed.log": "c338ecacb9c4afcfedebbdc112149a2ca71a5dbbb05f6b08f596ae81f92de234",
+    "fmt-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tests-final.log": "c933b5ed3ef90c0d4aeb495940aa1ac283e6841514258e66f85d5e6b42599a7b",
+    "clippy-final.log": "9f57cb3ce89ef2340f4fdea2b8f02fbe8197834aa8fa425b0669e57db1a0bf4f",
+    "fmt-sealed.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tests-sealed.log": "c2f578e0405a5f90b62896e0c188707898ce81a407bc2940ce7b1cd95a279b6b",
+    "clippy-sealed.log": "c0f5b0befdd8bcf7f83111bfa5f1fda3b431c4237f4f5d87e56a961e07f1a8f5"
+  },
+  "retained_artifacts_sha256": {
+    "batch-focused-3.log.summary.txt": "717b552e922714ec1b2c1816adcf8632602bf3a0bdca3b205fe505020b399410",
+    "batch-focused-4.log.summary.txt": "c36178f5418e2d49e81788922d8fdadb2e0a899a098b90cf27872b73bf5e59ab",
+    "batch-focused-5.log.summary.txt": "5ed6085615e4b590cfb80bed0e55204359de15c369487430102e07b15dda3e10",
+    "clippy-final.log.summary.txt": "0554fcce0e95d72000022dbc3205cf63e7eb0d8c0c1a35b1d6bfdc1b3ce642f3",
+    "fmt-sealed.log.summary.txt": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "clippy-sealed.log.summary.txt": "4697fdc41cc5e5aefa9e1adc2d4e4fb3cfdb03a9039680ef00613f198d178c63",
+    "batch-focused-2.log.summary.txt": "7898ca28d177580e270cd723523d346fb92bb757a321660af584cb8e530d4c5a",
+    "batch-focused-final.log.summary.txt": "866aafcf4597ecb5f7806b57fd4cf0a2e04bfa3a532eff45253ba71528b3589b",
+    "tests-sealed.log.summary.txt": "d91002c1d971143aba951e75fab375e125f6285a3f94f3cab3e2052c5af6ab7b",
+    "tests-final.log.summary.txt": "1db0bb49f487b8d24b5acf12063b0ad83149ca44408d318cb149f81ac0d34282",
+    "fmt-final.log.summary.txt": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "batch-focused.log.summary.txt": "152a949950227167d863e514a3ca7cfb0c4ed24e71d30319c59bac3876042715",
+    "batch-focused-sealed.log.summary.txt": "110669ace240ac52ea60e1eda1fe2a10310ab74cab04784e819e66b1262eb73a"
+  }
+}

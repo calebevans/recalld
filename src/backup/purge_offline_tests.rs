@@ -308,7 +308,7 @@ async fn purge_offline_completed_history_survives_each_restore_publication_bound
 }
 
 #[tokio::test]
-async fn purge_offline_malformed_history_and_unknown_batch_tables_reject_immutably() {
+async fn purge_offline_malformed_history_and_future_batch_tables_reject_immutably() {
     for mode in ["future", "orphan", "origin", "batch"] {
         let root = tempfile::tempdir().unwrap();
         let (source, namespace, _, _) = setup(root.path());
@@ -345,7 +345,7 @@ async fn purge_offline_malformed_history_and_unknown_batch_tables_reject_immutab
                 "batch" => {
                     tx.open_table(redb::TableDefinition::<&str, u32>::new("batch_schema"))
                         .unwrap()
-                        .insert("version", 1)
+                        .insert("version", 2)
                         .unwrap();
                     tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
                         "mutation_batches",
@@ -413,4 +413,430 @@ async fn purge_offline_restore_rejects_record_loss_without_ledger_proof() {
     assert_eq!(std::fs::read(source.join("meta.db")).unwrap(), before);
     assert_eq!(std::fs::read(&backup).unwrap(), archive_before);
     assert!(!root.path().join("source.recalld-restore-pending").exists());
+}
+
+// Exercise the real parser, catalog reservation and reserved child writers. No
+// hand-written completed manifests are used for the positive offline fixtures.
+fn batch_offline_run(
+    source: &Path,
+    kind: batch::BatchKind,
+    items: Vec<serde_json::Value>,
+    key: &str,
+    finish: bool,
+) -> batch::BatchProgress {
+    use batch::{BatchError, BatchInput, BatchItemPlan, BatchItemState};
+    let mut engine = RedbStorageEngine::open(source).unwrap();
+    let input = BatchInput {
+        result_version: 1,
+        kind,
+        items,
+        default_namespace: "default".into(),
+        store_id: Some(engine.control_state().unwrap().store_id),
+        idempotency_key: Some(key.into()),
+        batch_operation_id: None,
+    };
+    let plans: Vec<_> = crate::mcp::batches::prepare(&input)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.plan)
+        .collect();
+    let progress = engine
+        .meta_store()
+        .reserve_batch(&input.context(), kind, &plans)
+        .unwrap();
+    if finish {
+        for (index, plan) in plans.iter().enumerate() {
+            if !matches!(progress.items[index].state, BatchItemState::NotAttempted {}) {
+                continue;
+            }
+            let child = progress.child(index).unwrap();
+            match plan {
+                BatchItemPlan::Insert { input, .. } if input.summary == "final-error" => {
+                    engine
+                        .meta_store()
+                        .finalize_batch_error(&child, BatchError::new("CONFLICT"))
+                        .unwrap();
+                }
+                BatchItemPlan::Insert { input, .. } => {
+                    engine
+                        .insert_memory_reserved(&child.context(), input, &[], 123, Some(&child))
+                        .unwrap();
+                }
+                BatchItemPlan::Forget { id, .. } => {
+                    engine
+                        .tombstone_memory_reserved(&child.context(), *id, Some(&child))
+                        .unwrap();
+                }
+                BatchItemPlan::Invalid { .. } => unreachable!(),
+            }
+        }
+    }
+    let result = engine
+        .meta_store()
+        .lookup_batch(
+            progress.reservation_receipt.store_id,
+            progress.reservation_receipt.operation_id,
+        )
+        .unwrap()
+        .unwrap();
+    engine.sync().unwrap();
+    result
+}
+fn batch_offline_item(namespace: &str, summary: &str) -> serde_json::Value {
+    serde_json::json!({"namespace":namespace,"summary":summary,"fullText":summary,
+        "embedding":[1.,0.,0.,0.],"checkDuplicates":false})
+}
+fn batch_offline_history(source: &Path) -> Vec<batch::BatchProgress> {
+    let first = batch_offline_run(
+        source,
+        batch::BatchKind::Insert,
+        vec![
+            batch_offline_item("retired", "batch-retired-payload"),
+            serde_json::json!(17),
+            batch_offline_item("default", "final-error"),
+            batch_offline_item("default", "batch-retained"),
+        ],
+        "insert-history",
+        true,
+    );
+    assert_eq!(first.unresolved(), 0);
+    assert_eq!(first.bookkeeping_receipts.len(), 1);
+    let batch::BatchItemState::Ok { receipt } = &first.items[0].state else {
+        panic!()
+    };
+    let id = insertion::inserted_id(receipt).unwrap();
+    let second = batch_offline_run(
+        source,
+        batch::BatchKind::Forget,
+        vec![
+            serde_json::json!(id.to_string()),
+            serde_json::json!("not-a-uuid"),
+        ],
+        "forget-history",
+        true,
+    );
+    assert_eq!(second.unresolved(), 0);
+    vec![first, second]
+}
+
+#[tokio::test]
+async fn batch_offline_completed_manifests_survive_purge_transfer_and_repeated_restore() {
+    let root = tempfile::tempdir().unwrap();
+    let (source, retired, _, _) = setup(root.path());
+    let progress = batch_offline_history(&source);
+    complete(&source, retired);
+    // Reuse the NAME, never the original immutable namespace ID/defaults.
+    let mut engine = RedbStorageEngine::open(&source).unwrap();
+    let mut config = NamespaceConfig::default_namespace(0);
+    config.name = "retired".into();
+    config.embedding_dim = 4;
+    assert!(engine.create_namespace(&config).unwrap().get() > retired.get());
+    drop(engine);
+    let original = capture(&source).unwrap();
+    assert_eq!(original.batch_progress.as_ref().unwrap().len(), 2);
+    let before = std::fs::read(source.join("meta.db")).unwrap();
+    let canonical = root.path().join("canonical");
+    migrate(&source, &canonical);
+    assert_eq!(std::fs::read(source.join("meta.db")).unwrap(), before);
+    let stream = root.path().join("batch.jsonl");
+    let exported = logical_export::export_store(&canonical, &stream).unwrap();
+    let bytes = std::fs::read_to_string(&stream).unwrap();
+    assert!(!bytes.contains("batch-retired-payload"));
+    assert!(!bytes.contains("final-error"));
+    let imported = root.path().join("imported");
+    assert_eq!(
+        logical_export::import_store(&stream, &imported).unwrap(),
+        exported
+    );
+    assert_eq!(
+        logical_export::export_store(&imported, &root.path().join("again.jsonl"))
+            .unwrap()
+            .logical_sha256,
+        exported.logical_sha256
+    );
+    let backup = root.path().join("batch.zip");
+    archive(&imported, &backup);
+    let archive_before = std::fs::read(&backup).unwrap();
+    for n in 0..2 {
+        let restored = root.path().join(format!("historical-{n}"));
+        restore_from_backup(options(&backup, &restored, true))
+            .await
+            .unwrap();
+        let now = capture(&restored).unwrap();
+        assert_eq!(now.batch_progress, original.batch_progress);
+        assert_eq!(now.purge_progress, original.purge_progress);
+        assert!(
+            original
+                .receipts
+                .iter()
+                .all(|row| now.receipts.contains(row))
+        );
+        let rows = now.batch_progress.as_ref().unwrap();
+        for p in &progress {
+            let row = rows
+                .iter()
+                .find(|(k, _)| k == p.reservation_receipt.operation_id.as_bytes())
+                .unwrap();
+            assert_eq!(control::decode::<batch::BatchProgress>(&row.1).unwrap(), *p);
+        }
+        assert!(RedbStorageEngine::open(&restored).is_err());
+        if n == 0 {
+            archive(&restored, &root.path().join("fork.zip"));
+        }
+    }
+    // Also restore a backup of an already-forked store, proving bounded ancestors.
+    let twice = root.path().join("twice");
+    restore_from_backup(options(&root.path().join("fork.zip"), &twice, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        capture(&twice).unwrap().batch_progress,
+        original.batch_progress
+    );
+    assert_eq!(std::fs::read(&backup).unwrap(), archive_before);
+}
+
+#[tokio::test]
+async fn batch_offline_restore_merges_target_only_history_without_recreating_child_payloads() {
+    let root = tempfile::tempdir().unwrap();
+    let (source, retired, _, _) = setup(root.path());
+    let backup = root.path().join("before.zip");
+    archive(&source, &backup);
+    let batches = batch_offline_history(&source);
+    complete(&source, retired);
+    let before = capture(&source).unwrap();
+    let batch::BatchItemState::Ok { receipt } = &batches[0].items[3].state else {
+        panic!()
+    };
+    let absent = insertion::inserted_id(receipt).unwrap();
+    for _ in 0..2 {
+        restore_from_backup(options(&backup, &source, false))
+            .await
+            .unwrap();
+        let after = capture(&source).unwrap();
+        assert_eq!(after.batch_progress, before.batch_progress);
+        assert_eq!(after.purge_progress, before.purge_progress);
+        assert!(
+            before
+                .receipts
+                .iter()
+                .all(|row| after.receipts.contains(row))
+        );
+        let engine = RedbStorageEngine::open(&source).unwrap();
+        assert!(engine.get_record(absent).unwrap().is_none());
+        // Historical manifests cannot be resumed in the new retry domain.
+        assert!(matches!(
+            engine.meta_store().lookup_batch(
+                batches[0].reservation_receipt.store_id,
+                batches[0].reservation_receipt.operation_id
+            ),
+            Err(StorageError::StoreLineageMismatch)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn batch_offline_unresolved_rejects_all_offline_consumers_immutably() {
+    let root = tempfile::tempdir().unwrap();
+    let (source, _, _, _) = setup(root.path());
+    let backup = root.path().join("before.zip");
+    archive(&source, &backup);
+    let p = batch_offline_run(
+        &source,
+        batch::BatchKind::Insert,
+        vec![batch_offline_item("default", "pending-secret")],
+        "pending",
+        false,
+    );
+    assert_eq!(p.unresolved(), 1);
+    let before = std::fs::read(source.join("meta.db")).unwrap();
+    let archived = std::fs::read(&backup).unwrap();
+    assert!(validation::canonical_files(&source).is_err());
+    assert!(capture(&source).is_err());
+    assert!(offline_snapshot::OfflineSnapshot::open(&source).is_err());
+    let output = root.path().join("out.jsonl");
+    assert!(logical_export::export_store(&source, &output).is_err());
+    assert!(!output.exists());
+    let destination = root.path().join("migration");
+    assert!(
+        schema_migration::migrate_schema(
+            &source,
+            &destination,
+            &schema_migration::MigrationOptions {
+                migration_now: 200,
+                expected_source: control::GenerationRef {
+                    store_id: p.reservation_receipt.store_id,
+                    generation: p.reservation_receipt.committed_generation,
+                },
+                attestations: vec![],
+            }
+        )
+        .is_err()
+    );
+    assert!(!destination.exists());
+    assert!(
+        restore_from_backup(options(&backup, &source, false))
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(source.join("meta.db")).unwrap(), before);
+    assert_eq!(std::fs::read(&backup).unwrap(), archived);
+    assert!(!root.path().join("source.recalld-restore-pending").exists());
+}
+
+#[tokio::test]
+async fn batch_offline_conflicting_completed_bytes_reject_before_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let (source, _, _, _) = setup(root.path());
+    let p = batch_offline_run(
+        &source,
+        batch::BatchKind::Insert,
+        vec![batch_offline_item("default", "kept")],
+        "same-parent",
+        true,
+    );
+    let backup = root.path().join("before.zip");
+    archive(&source, &backup);
+    {
+        let db = redb::Database::open(source.join("meta.db")).unwrap();
+        let tx = db.begin_write().unwrap();
+        // Individually valid, semantically equal, but not the original immutable row bytes.
+        tx.open_table(metadata::batch::BATCHES)
+            .unwrap()
+            .insert(
+                p.reservation_receipt.operation_id.as_bytes().as_slice(),
+                serde_json::to_vec_pretty(&p).unwrap().as_slice(),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    capture(&source).unwrap();
+    let before = std::fs::read(source.join("meta.db")).unwrap();
+    let archived = std::fs::read(&backup).unwrap();
+    let err = restore_from_backup(options(&backup, &source, false))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("conflicting historical"), "{err}");
+    assert_eq!(std::fs::read(source.join("meta.db")).unwrap(), before);
+    assert_eq!(std::fs::read(&backup).unwrap(), archived);
+    assert!(!root.path().join("source.recalld-restore-pending").exists());
+}
+
+#[tokio::test]
+async fn batch_offline_malformed_schema_parent_and_child_evidence_reject_immutably() {
+    for mode in ["future", "parent", "child", "origin"] {
+        let root = tempfile::tempdir().unwrap();
+        let (source, _, _, _) = setup(root.path());
+        let p = batch_offline_run(
+            &source,
+            batch::BatchKind::Insert,
+            vec![batch_offline_item("default", "evidence")],
+            "evidence",
+            true,
+        );
+        let backup = root.path().join("valid.zip");
+        archive(&source, &backup);
+        {
+            let db = redb::Database::open(source.join("meta.db")).unwrap();
+            let tx = db.begin_write().unwrap();
+            match mode {
+                "future" => {
+                    tx.open_table(metadata::batch::SCHEMA)
+                        .unwrap()
+                        .insert("version", 2)
+                        .unwrap();
+                }
+                "parent" => {
+                    tx.open_table(metadata::batch::BATCHES)
+                        .unwrap()
+                        .remove(p.reservation_receipt.operation_id.as_bytes().as_slice())
+                        .unwrap();
+                }
+                "child" => {
+                    let batch::BatchItemState::Ok { receipt } = &p.items[0].state else {
+                        panic!()
+                    };
+                    let key = control::scoped_key(
+                        receipt.store_id,
+                        control::MutationScope::Namespace(
+                            p.items[0].defaults.as_ref().unwrap().namespace_id,
+                        ),
+                        receipt.operation_id.as_bytes(),
+                    );
+                    tx.open_table(control::RECEIPTS)
+                        .unwrap()
+                        .remove(key.as_slice())
+                        .unwrap();
+                }
+                "origin" => {
+                    let mut bad = p.clone();
+                    bad.reservation_receipt.store_id = uuid::Uuid::new_v4();
+                    tx.open_table(metadata::batch::BATCHES)
+                        .unwrap()
+                        .insert(
+                            p.reservation_receipt.operation_id.as_bytes().as_slice(),
+                            control::encode(&bad).unwrap().as_slice(),
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            tx.commit().unwrap();
+        }
+        let before = std::fs::read(source.join("meta.db")).unwrap();
+        assert!(capture(&source).is_err(), "{mode}");
+        assert!(validation::canonical_files(&source).is_err(), "{mode}");
+        let output = root.path().join("invalid.jsonl");
+        assert!(
+            logical_export::export_store(&source, &output).is_err(),
+            "{mode}"
+        );
+        assert!(!output.exists());
+        assert!(
+            restore_from_backup(options(&backup, &source, false))
+                .await
+                .is_err(),
+            "{mode}"
+        );
+        assert_eq!(
+            std::fs::read(source.join("meta.db")).unwrap(),
+            before,
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn batch_offline_origin_bound_includes_child_and_error_receipts_not_just_reservation() {
+    let root = tempfile::tempdir().unwrap();
+    let (source, _, _, _) = setup(root.path());
+    let p = batch_offline_run(
+        &source,
+        batch::BatchKind::Insert,
+        vec![
+            batch_offline_item("default", "child"),
+            batch_offline_item("default", "final-error"),
+        ],
+        "bounded",
+        true,
+    );
+    let (_copy, db) = validation::inspect_database(&source.join("meta.db")).unwrap();
+    let tx = db.begin_read().unwrap();
+    let mut state = control::validate_existing(&tx).unwrap().unwrap();
+    assert!(metadata::batch::validate_existing(&tx, Some(&state)).is_ok());
+    state.committed_generation = p.reservation_receipt.committed_generation;
+    let error = metadata::batch::validate_existing(&tx, Some(&state)).unwrap_err();
+    assert!(
+        error.to_string().contains("identity/version/item count"),
+        "{error}"
+    );
+    let batch::BatchItemState::Ok { receipt } = &p.items[0].state else {
+        panic!()
+    };
+    state.committed_generation = receipt.committed_generation;
+    let error = metadata::batch::validate_existing(&tx, Some(&state)).unwrap_err();
+    assert!(
+        error.to_string().contains("identity/version/item count"),
+        "{error}"
+    );
 }

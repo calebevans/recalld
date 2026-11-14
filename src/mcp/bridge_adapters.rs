@@ -4,6 +4,9 @@
 //! corresponding MCP bridge trait from `bridge.rs`. These adapters
 //! bridge between the MCP protocol layer and Recalld subsystem types.
 
+#[path = "batch_adapters.rs"]
+mod batch_adapters;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -773,31 +776,77 @@ impl McpStorageAdapter {
     }
 }
 
-#[async_trait]
-impl bridge::StorageEngine for McpStorageAdapter {
-    async fn store_memory(
+/// Typed until the final legacy bridge boundary. Batch consumers must never
+/// recover commit state by parsing an old single-write diagnostic string.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StoreWriteError {
+    #[error(transparent)]
+    Bridge(#[from] bridge::BridgeError),
+    #[error(transparent)]
+    Canonical(#[from] crate::storage::StorageError),
+}
+impl StoreWriteError {
+    fn into_bridge(self) -> bridge::BridgeError {
+        match self {
+            Self::Bridge(e) => e,
+            Self::Canonical(e) => map_mutation_error(e),
+        }
+    }
+}
+
+impl McpStorageAdapter {
+    pub(crate) async fn store_memory_reserved(
         &self,
         input: bridge::StoreInput,
-    ) -> Result<bridge::StoredMemory, bridge::BridgeError> {
+        child: Option<crate::storage::batch::BatchChild>,
+    ) -> Result<(bridge::StoredMemory, crate::storage::control::WriteReceipt), StoreWriteError>
+    {
+        // This is shared by direct single writes and reserved batch children.
+        // Validate before replay normalization, provider work or payload staging.
+        let (merged_tags, canonical_input) = crate::mcp::batches::canonical_input(&input)
+            .map_err(|error| bridge::BridgeError::InvalidInput(error.to_string()))?;
+        if let Some(child) = child.clone() {
+            let canonical = canonical_input.clone();
+            let storage = self.storage.clone();
+            let replay = tokio::task::spawn_blocking(move || {
+                storage
+                    .read()
+                    .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
+                    .meta_store()
+                    .lookup_insert_child(&child, &canonical)
+            })
+            .await
+            .map_err(|e| bridge::BridgeError::Internal(e.to_string()))??;
+            if let Some(receipt) = replay {
+                return Ok((
+                    crate::mcp::batches::stored_from_receipt(&input, &receipt, self.timezone)?,
+                    receipt,
+                ));
+            }
+        }
+
         effects_stamp(&self.storage).await?;
 
-        use crate::model::Tag;
         use crate::model::constants::{DUPLICATE_SIMILARITY_THRESHOLD, MAX_NEAR_DUPLICATE_MATCHES};
 
         // Resolve namespace.
         let ns_config = {
             let storage = self.storage.clone();
             let ns_name = input.namespace.clone();
+            let reserved_namespace = child.as_ref().map(|c| c.namespace());
             tokio::task::spawn_blocking(move || {
                 let storage_r = storage.read().map_err(|e| {
                     bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
                 })?;
-                storage_r
-                    .get_namespace_by_name(&ns_name)
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
-                    .ok_or_else(|| {
-                        bridge::BridgeError::NotFound(format!("namespace '{}' not found", ns_name,))
-                    })
+                (if let Some(id) = reserved_namespace {
+                    storage_r.get_namespace(id)
+                } else {
+                    storage_r.get_namespace_by_name(&ns_name)
+                })
+                .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
+                .ok_or_else(|| {
+                    bridge::BridgeError::NotFound(format!("namespace '{}' not found", ns_name,))
+                })
             })
             .await
             .map_err(|e| {
@@ -839,30 +888,6 @@ impl bridge::StorageEngine for McpStorageAdapter {
             .map_err(map_link_error)?;
         }
 
-        // Convert structured metadata fields to tags and merge with explicit
-        // tags. The prefixes come from `constants` because the label length
-        // limits reserve room for exactly these bytes.
-        use crate::model::constants::{EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, TOPIC_TAG_PREFIX};
-        let mut merged_tags = input.tags.clone();
-        for entity in &input.entities {
-            let tag = format!("{ENTITY_TAG_PREFIX}{}", entity.to_lowercase());
-            if !merged_tags.contains(&tag) {
-                merged_tags.push(tag);
-            }
-        }
-        for topic in &input.topics {
-            let tag = format!("{TOPIC_TAG_PREFIX}{}", topic.to_lowercase());
-            if !merged_tags.contains(&tag) {
-                merged_tags.push(tag);
-            }
-        }
-        for emotion in &input.emotions {
-            let tag = format!("{EMOTION_TAG_PREFIX}{}", emotion.to_lowercase());
-            if !merged_tags.contains(&tag) {
-                merged_tags.push(tag);
-            }
-        }
-
         // Generate full embedding (summary + full_text + tags for max surface).
         let raw_embedding = match &input.embedding {
             Some(emb) => emb.clone(),
@@ -895,8 +920,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             &mut embedding,
             ns_config.embedding_dim,
             input.embedding.is_some(),
-        )
-        .map_err(map_mutation_error)?;
+        )?;
 
         // Near-duplicate advisory.
         //
@@ -929,17 +953,10 @@ impl bridge::StorageEngine for McpStorageAdapter {
         if effects_stamp(&self.storage).await? != advisory_stamp {
             return Err(bridge::BridgeError::Storage(
                 "unavailable: effects changed during advisory".into(),
-            ));
+            )
+            .into());
         }
         let now = self.clock.now_millis();
-        // Over-long tags cannot reach this point: the shared request
-        // validator bounds every tag and reserves the `entity/` /
-        // `topic/` / `emotion/` prefix out of the label limits. A drop
-        // here therefore means a tag outside `Tag`'s alphabet, and it
-        // is logged rather than swallowed.
-        let parsed_tags: Vec<Tag> =
-            crate::model::parse_tags_lossy("store_memory.tags", &merged_tags);
-
         let completion = crate::derived_completion::DerivedCompletion {
             storage: self.storage.clone(),
             cache: self.cache.clone(),
@@ -949,33 +966,32 @@ impl bridge::StorageEngine for McpStorageAdapter {
             entities: self.entity_index.clone(),
         };
         let inserted = completion
-            .insert(
-                crate::storage::control::MutationContext::unkeyed(ns_config.id),
-                crate::storage::insertion::InsertMemory {
-                    id: None,
-                    summary: input.summary.clone(),
-                    full_text: input.full_text.clone(),
-                    tags: parsed_tags,
-                    embedding: input.embedding.clone(),
-                    initial_stability: input.initial_stability,
-                    created_at: None,
-                    parent_id: input.parent_id,
-                    supersedes: input.supersedes,
-                },
+            .insert_reserved(
+                child.as_ref().map(|c| c.context()).unwrap_or_else(|| {
+                    crate::storage::control::MutationContext::unkeyed(ns_config.id)
+                }),
+                canonical_input,
                 raw_embedding,
                 now,
+                child.clone(),
             )
-            .await
-            .map_err(map_mutation_error)?;
+            .await?;
         let receipt = inserted.receipt;
-        let record = inserted.record.ok_or_else(|| {
-            map_mutation_error(crate::storage::StorageError::CommittedMutation {
-                receipt: Box::new(receipt.clone()),
-                source: Box::new(crate::storage::StorageError::RecoveryRequired(
-                    "inserted record unavailable".into(),
-                )),
-            })
-        })?;
+        if receipt.replayed {
+            return Ok((
+                crate::mcp::batches::stored_from_receipt(&input, &receipt, self.timezone)?,
+                receipt,
+            ));
+        }
+        let record =
+            inserted
+                .record
+                .ok_or_else(|| crate::storage::StorageError::CommittedMutation {
+                    receipt: Box::new(receipt.clone()),
+                    source: Box::new(crate::storage::StorageError::RecoveryRequired(
+                        "inserted record unavailable".into(),
+                    )),
+                })?;
         let memory_id = record.id;
         let supersedes_outcome = input.supersedes.map(|id| {
             crate::model::SupersedesOutcome::new(id, crate::model::SupersedesStatus::Applied)
@@ -1076,22 +1092,49 @@ impl bridge::StorageEngine for McpStorageAdapter {
         }
 
         completion.complete().await.map_err(|source| {
-            map_mutation_error(crate::storage::StorageError::CommittedMutation {
-                receipt: Box::new(receipt),
+            crate::storage::StorageError::CommittedMutation {
+                receipt: Box::new(receipt.clone()),
                 source: Box::new(source),
-            })
+            }
         })?;
         self.cache.insert(memory_id, record.clone()).await;
-        Ok(bridge::StoredMemory {
-            id: memory_id.to_string(),
-            namespace: input.namespace,
-            phase: "Full".to_string(),
-            strength: record.strength,
-            stability: record.stability,
-            created_at: format_timestamp(record.created_at, self.timezone),
-            supersedes: supersedes_outcome,
-            near_duplicates,
-        })
+        Ok((
+            bridge::StoredMemory {
+                id: memory_id.to_string(),
+                namespace: input.namespace,
+                phase: "Full".to_string(),
+                strength: record.strength,
+                stability: record.stability,
+                created_at: format_timestamp(record.created_at, self.timezone),
+                supersedes: supersedes_outcome,
+                near_duplicates,
+            },
+            receipt,
+        ))
+    }
+}
+
+#[async_trait]
+impl bridge::StorageEngine for McpStorageAdapter {
+    fn supports_durable_batches(&self) -> bool {
+        true
+    }
+
+    async fn mutate_batch(
+        &self,
+        input: crate::storage::batch::BatchInput,
+    ) -> Result<crate::storage::batch::BatchOutcome, bridge::BridgeError> {
+        self.run_batch(input).await
+    }
+
+    async fn store_memory(
+        &self,
+        input: bridge::StoreInput,
+    ) -> Result<bridge::StoredMemory, bridge::BridgeError> {
+        self.store_memory_reserved(input, None)
+            .await
+            .map(|(record, _)| record)
+            .map_err(StoreWriteError::into_bridge)
     }
 
     async fn get_memory(
@@ -1199,20 +1242,46 @@ impl bridge::StorageEngine for McpStorageAdapter {
     }
 
     async fn delete_memories(&self, ids: &[MemoryId]) -> Result<Vec<bool>, bridge::BridgeError> {
-        let mut flags = Vec::with_capacity(ids.len());
-        for id in ids {
-            match self.delete_memory(*id).await {
-                Ok(flag) => flags.push(flag),
-                Err(error) if !flags.is_empty() => {
-                    return Err(bridge::BridgeError::PartiallyApplied(format!(
-                        "ordered forget stopped at index {}; completed flags {flags:?}; {error}",
-                        flags.len()
-                    )));
-                }
-                Err(error) => return Err(error),
-            }
+        if ids.is_empty() {
+            return Ok(vec![]);
         }
-        Ok(flags)
+        let outcome = self
+            .run_batch(crate::storage::batch::BatchInput {
+                result_version: 1,
+                kind: crate::storage::batch::BatchKind::Forget,
+                items: ids
+                    .iter()
+                    .map(|id| serde_json::Value::String(id.to_string()))
+                    .collect(),
+                default_namespace: String::new(),
+                store_id: None,
+                idempotency_key: None,
+                batch_operation_id: None,
+            })
+            .await?;
+        // The old daemon/bridge method still returns exactly Vec<bool>. Its
+        // historical missing/already-tombstoned=false conflation is explicit.
+        if outcome.items.iter().all(|item| {
+            item.ready
+                && (item.status == crate::storage::batch::BatchStatus::Ok
+                    || item.error.as_ref().is_some_and(|e| e.code == "NOT_FOUND"))
+        }) {
+            return Ok(outcome
+                .items
+                .iter()
+                .map(|item| {
+                    item.result
+                        .as_ref()
+                        .and_then(|v| v.get("deleted"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .collect());
+        }
+        Err(bridge::BridgeError::PartiallyApplied(
+            serde_json::to_string(&outcome)
+                .map_err(|e| bridge::BridgeError::Internal(e.to_string()))?,
+        ))
     }
 
     async fn reinforce_memory(
