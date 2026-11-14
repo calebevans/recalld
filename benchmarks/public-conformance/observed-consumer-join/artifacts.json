@@ -1,0 +1,31 @@
+{
+  "artifacts": [
+    {
+      "bytes": 765218,
+      "file": "development-attempts.tgz",
+      "label": "development: uncommitted pre-ownership source; earlier failed logs used earlier working revisions",
+      "sha256": "b40e56251f54c32b97582b4ce5072d995315618fcb223dc9bd74041aa7216806",
+      "sourcePath": "/var/folders/lg/pd7snpz15137ng972h102kqc0000gp/T/recalld-observed-join-95etatoe"
+    },
+    {
+      "bytes": 1078005,
+      "file": "validated-d075e4c.tgz",
+      "harnessCommit": "d6daac2ff1932fc4c9caacc578d3d71eb27d0f04",
+      "outputHashesVerified": 164,
+      "sha256": "96fb1bdcc73b6ed8859e7766531fb3270d19045319d7822cadd08b933463ce60",
+      "sourceCommit": "d075e4c19c2b03b2f0b7f6d0f07930507b22ccc2",
+      "sourceHashesVerified": 163,
+      "sourcePath": "/tmp/recalld-public-conformance-5bjktsl_"
+    },
+    {
+      "bytes": 1082362,
+      "file": "validated-1d52153.tgz",
+      "harnessCommit": "d6daac2ff1932fc4c9caacc578d3d71eb27d0f04",
+      "outputHashesVerified": 164,
+      "sha256": "070420202f3c0f994268ea4c930b96681c1a791857be7a0d231adabe012d2b54",
+      "sourceCommit": "1d52153db6520d9b64e568f281557441b11f0ff3",
+      "sourceHashesVerified": 163,
+      "sourcePath": "/tmp/recalld-public-conformance-3j81tywy"
+    }
+  ]
+}
