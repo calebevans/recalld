@@ -363,6 +363,7 @@ const MAX_CONNECTION_BONUS: f32 = 0.15;
 /// The runner holds `Arc` references to shared subsystems. It does NOT
 /// own those subsystems -- it borrows them via Arc for the background task.
 pub struct DecaySweepRunner {
+    completion: Option<crate::derived_completion::DerivedCompletion>,
     clock: Arc<dyn crate::time::Clock>,
     config: SweepConfig,
     decay_config: Arc<DecayConfig>,
@@ -411,7 +412,16 @@ impl DecaySweepRunner {
             global_decay_multiplier,
             shutdown_tx,
             trigger_notify: Arc::new(Notify::new()),
+            completion: None,
         })
+    }
+
+    pub(crate) fn with_completion(
+        mut self,
+        completion: crate::derived_completion::DerivedCompletion,
+    ) -> Self {
+        self.completion = Some(completion);
+        self
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
@@ -429,6 +439,7 @@ impl DecaySweepRunner {
     /// 2. Enters a loop: sleep for `interval`, then sweep
     /// 3. Exits when `shutdown()` is called
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
+        let completion = self.completion.clone();
         let clock = self.clock.clone();
         let config = self.config.clone();
         let decay_config = Arc::clone(&self.decay_config);
@@ -455,6 +466,11 @@ impl DecaySweepRunner {
                     Some(clock.now_millis()),
                 )
                 .await;
+                if let Some(completion) = &completion {
+                    if let Err(error) = completion.complete().await {
+                        tracing::error!(%error, "sweep effects remain pending; next sweep retries completion");
+                    }
+                }
                 Self::log_result(&result);
             }
 
@@ -502,6 +518,11 @@ impl DecaySweepRunner {
                     Some(clock.now_millis()),
                 )
                 .await;
+                if let Some(completion) = &completion {
+                    if let Err(error) = completion.complete().await {
+                        tracing::error!(%error, "sweep effects remain pending; next sweep retries completion");
+                    }
+                }
                 Self::log_result(&result);
             }
         })
@@ -1218,28 +1239,54 @@ impl DecaySweepRunner {
                 DecayPhase::Full => DecayPhase::Summary,
                 DecayPhase::Summary => DecayPhase::Ghost,
                 DecayPhase::Ghost => {
-                    // No graph mutation until the locked expected-state check and deletion.
-                    // External FTS/vector/entity indexes still retain orphan candidates;
-                    // canonical hydration filters them. Their cleanup is deferred.
-                    storage.delete_memory(t.memory_id).map_err(map_error)?;
-                    let removal = graph.remove_memory_with_bridging(t.memory_id);
-                    if let Some(bridge) = removal.bridge_created {
-                        if let (Some(source), Some(target)) = (
-                            graph.get_node_by_key(bridge.source),
-                            graph.get_node_by_key(bridge.target),
-                        ) {
-                            storage
-                                .batch_add_edges(&[crate::storage::edges::PersistedEdge {
-                                    source: source.memory_id,
-                                    target: target.memory_id,
-                                    edge_type: bridge.edge_type,
-                                    weight: bridge.weight,
-                                    auto_created: bridge.auto_created,
-                                    created_at: bridge.created_at as u64,
-                                }])
-                                .map_err(map_error)?;
-                        }
+                    let namespace = storage
+                        .get_namespace(crate::model::NamespaceId::new(current.namespace_id))
+                        .map_err(map_error)?;
+                    if namespace
+                        .as_ref()
+                        .map(serde_json::to_vec)
+                        .transpose()
+                        .map_err(|e| SweepError::Storage(e.to_string()))?
+                        != Some(
+                            serde_json::to_vec(&t.expected.namespace)
+                                .map_err(|e| SweepError::Storage(e.to_string()))?,
+                        )
+                    {
+                        return Ok(None);
                     }
+                    // Plan privately under the final expected-state and policy guards.
+                    let mut planned = (*graph).clone();
+                    let removal = planned.remove_memory_with_bridging(t.memory_id);
+                    let bridges = removal
+                        .bridge_created
+                        .into_iter()
+                        .map(|bridge| {
+                            let source = planned
+                                .get_node_by_key(bridge.source)
+                                .ok_or_else(|| SweepError::Storage("bridge source missing".into()))?
+                                .memory_id;
+                            let target = planned
+                                .get_node_by_key(bridge.target)
+                                .ok_or_else(|| SweepError::Storage("bridge target missing".into()))?
+                                .memory_id;
+                            Ok(crate::storage::PersistedEdge {
+                                source,
+                                target,
+                                edge_type: bridge.edge_type,
+                                weight: bridge.weight,
+                                auto_created: bridge.auto_created,
+                                created_at: bridge.created_at as u64,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, SweepError>>()?;
+                    let Some(_) = storage
+                        .delete_memory_with_edges(t.memory_id, &bridges)
+                        .map_err(map_error)?
+                    else {
+                        return Ok(None);
+                    };
+                    *graph = planned;
+                    // Derived invalidations remain pending until complete publication.
                     return Ok(Some(PhaseTransition::Deleted {
                         id: t.memory_id,
                         old_phase: t.from_phase,
@@ -1471,6 +1518,7 @@ mod tests {
 
         let id = MemoryId::new();
         let mut record = DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: namespace_id.get(),
@@ -2000,20 +2048,15 @@ mod storage_independent_review {
     async fn publish_edge(f: &Fixture, id: MemoryId, neighbor: MemoryId) {
         let mut graph = f.graph.write().await;
         let storage = f.storage.write().unwrap();
-        storage
-            .add_edge(
-                id,
-                neighbor,
-                crate::model::EdgeType::Associative,
-                1.,
-                false,
-                1,
-            )
-            .unwrap();
+        // A retained ghost may gain a live child; new associative ghost links are forbidden.
+        let kind = if storage.get_record(id).unwrap().unwrap().phase == DecayPhase::Ghost {
+            crate::model::EdgeType::ParentChild
+        } else {
+            crate::model::EdgeType::Associative
+        };
+        storage.add_edge(id, neighbor, kind, 1., false, 1).unwrap();
         storage.update_edge_count(id, 1).unwrap();
-        graph
-            .add_edge(id, neighbor, crate::model::EdgeType::Associative, 1., false)
-            .unwrap();
+        graph.add_edge(id, neighbor, kind, 1., false).unwrap();
     }
 
     async fn publish_neighbor_strength(f: &Fixture, neighbor: MemoryId, strength: f32) {

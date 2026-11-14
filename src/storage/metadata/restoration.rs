@@ -349,7 +349,7 @@ pub(crate) fn reconcile(
         let mut tags = tx.open_multimap_table(TAG_INDEX)?;
         let mut ns = tx.open_multimap_table(NAMESPACE_INDEX)?;
         for (id, record) in &desired {
-            table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
+            table.insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
             if record.phase != DecayPhase::Tombstone {
                 ns.insert(record.namespace_id, id.as_bytes().as_slice())?;
                 for tag in &record.tags {

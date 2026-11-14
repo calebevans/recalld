@@ -74,6 +74,18 @@ pub struct GenerationRef {
     pub generation: Generation,
 }
 
+/// Validate a generation in its own lineage. Standalone schema builds know only
+/// the active lineage. Restore integration delegates this boundary to
+/// `lineage::permits_origin`, which checks verified ancestor generation bounds.
+/// Unknown ancestry must remain rejected, never inferred from a receipt.
+pub(crate) fn permits_generation_origin(
+    _read: &ReadTransaction,
+    control: &ControlState,
+    origin: GenerationRef,
+) -> Result<bool, StorageError> {
+    Ok(origin.store_id == control.store_id && origin.generation <= control.committed_generation)
+}
+
 /// Versioned separately from the untouched DiskRecord v1 and payload layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -97,7 +109,7 @@ impl ControlState {
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         let state: Self = decode(bytes)?;
-        if state.control_schema_version != 1 || state.store_id.is_nil() {
+        if !matches!(state.control_schema_version, 1 | 2) || state.store_id.is_nil() {
             return Err(StorageError::InvalidControl(
                 "unsupported version or nil store ID".into(),
             ));
@@ -183,6 +195,19 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    GraphChanged {
+        edges_put: usize,
+        edges_removed: usize,
+        memories_removed: usize,
+    },
+    SchemaMigrated {
+        #[serde(rename = "migrationId")]
+        migration_id: Uuid,
+        #[serde(rename = "recordCount")]
+        record_count: u64,
+        #[serde(rename = "attestedNamespaces")]
+        attested_namespaces: u64,
+    },
     TextGenerationSelected {
         #[serde(rename = "generationId")]
         generation_id: Uuid,
@@ -234,10 +259,9 @@ pub(crate) fn validate_existing(
     tx: &ReadTransaction,
 ) -> Result<Option<ControlState>, StorageError> {
     let reserved = [CONTROL.name(), RECEIPTS.name(), KEYS.name()];
-    if tx
-        .list_multimap_tables()?
-        .any(|table| reserved.contains(&table.name()))
-    {
+    if tx.list_multimap_tables()?.any(|table| {
+        reserved.contains(&table.name()) || table.name() == super::canonical_schema::SCHEMA.name()
+    }) {
         return Err(StorageError::InvalidControl(
             "control table is a multimap".into(),
         ));
@@ -248,6 +272,14 @@ pub(crate) fn validate_existing(
         .collect();
     let present = reserved.map(|name| names.iter().any(|n| n == name));
     if !present.iter().any(|p| *p) {
+        if names
+            .iter()
+            .any(|n| n == super::canonical_schema::SCHEMA.name())
+        {
+            return Err(StorageError::InvalidControl(
+                "schema without control lineage".into(),
+            ));
+        }
         return Ok(None);
     }
     if !present.iter().all(|p| *p) {
@@ -270,6 +302,7 @@ pub(crate) fn validate_existing(
             .value(),
     )?;
     let ancestry = super::lineage::read_lineage(tx, &state)?;
+    super::canonical_schema::read_state(tx, &state)?;
     for entry in receipts.iter()? {
         let (key, value) = entry?;
         let (lineage, _, operation) = decode_scope(key.value())?;

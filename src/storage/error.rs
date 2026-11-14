@@ -38,6 +38,14 @@ pub enum StorageError {
         source: redb::CommitError,
     },
 
+    /// Canonical metadata is durable; materialization must resume after reopen.
+    #[error("operation {operation_id} committed; canonical effects unavailable: {source}")]
+    CommittedEffectsPending {
+        operation_id: Uuid,
+        #[source]
+        source: Box<StorageError>,
+    },
+
     // ── redb errors (from metadata.rs and edges.rs) ──────────────────
     /// A generic redb error.
     #[error("redb error: {0}")]
