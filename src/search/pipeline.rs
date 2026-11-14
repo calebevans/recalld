@@ -26,6 +26,10 @@ use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConf
 pub trait NamespaceResolver: Send + Sync {
     /// Look up a namespace by name, returning its configuration.
     async fn resolve(&self, name: &str) -> Result<NamespaceConfig>;
+    /// Resolve canonical by-ID scope without guessing a session default.
+    async fn resolve_id(&self, id: NamespaceId) -> Result<NamespaceConfig> {
+        Err(SearchError::NamespaceNotFound(format!("id {}", id.get())))
+    }
 }
 
 /// Per-namespace embedding provider registry.
@@ -87,6 +91,11 @@ pub trait RecordCache: Send + Sync {
 /// On-disk metadata storage fallback.
 #[async_trait::async_trait]
 pub trait MetadataStore: Send + Sync {
+    /// Internal effects admission stamp, not a canonical generation/read view.
+    async fn effects_stamp(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Get a single record by ID.
     async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>>;
     /// Batch load multiple records. Missing IDs are silently skipped.
@@ -348,7 +357,22 @@ impl QueryEngine {
     /// 8. **Rank**: Composite score, sort descending, truncate to limit.
     /// 9. **Return**: Assemble SearchResponse, record access events async.
     #[instrument(skip(self, query), fields(namespace = %query.namespace, mode = ?query.query_mode))]
-    pub async fn search(&self, mut query: SearchQuery) -> Result<SearchResponse> {
+    pub async fn search(&self, query: SearchQuery) -> Result<SearchResponse> {
+        let stamp = self.meta_store.effects_stamp().await?;
+        let result = self.search_admitted(query).await;
+        if self.meta_store.effects_stamp().await? != stamp {
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
+        }
+        result
+    }
+
+    pub(crate) async fn effects_stamp(&self) -> Result<u64> {
+        self.meta_store.effects_stamp().await
+    }
+
+    async fn search_admitted(&self, mut query: SearchQuery) -> Result<SearchResponse> {
         let pipeline_start = Instant::now();
         let mut timings = StageTimings::default();
 
@@ -356,12 +380,16 @@ impl QueryEngine {
         let stage_start = Instant::now();
         query.validate()?;
         let ns_config = self.namespace_resolver.resolve(&query.namespace).await?;
+        if let Some(embedding) = query.query_embedding.as_mut() {
+            super::query::normalize_query_embedding(embedding, ns_config.embedding_dim as usize)?;
+        }
         timings.parse_us = stage_start.elapsed().as_micros() as u64;
 
         // -- Stage 2: Embed ----------------------------------------------
         let stage_start = Instant::now();
         let query_embedding = match query.query_mode {
             QueryMode::MetadataOnly => None,
+            _ if query.query_embedding.is_some() => query.query_embedding.take(),
             _ => {
                 let text = query.text.as_ref().ok_or(SearchError::EmptyQuery)?;
                 let embedding = self
@@ -886,6 +914,23 @@ impl QueryEngine {
         id: MemoryId,
         record_access: bool,
     ) -> Result<Option<MemoryResponse>> {
+        let stamp = self.meta_store.effects_stamp().await?;
+        let result = self
+            .get_memory_with_access_admitted(id, record_access)
+            .await;
+        if self.meta_store.effects_stamp().await? != stamp {
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
+        }
+        result
+    }
+
+    async fn get_memory_with_access_admitted(
+        &self,
+        id: MemoryId,
+        record_access: bool,
+    ) -> Result<Option<MemoryResponse>> {
         let record = match record_access.then(|| self.cache.get(&id)).flatten() {
             Some(r) => r,
             None => match self.meta_store.get(&id).await? {
@@ -941,7 +986,38 @@ impl QueryEngine {
         k: usize,
         record_access: bool,
     ) -> Result<Vec<SearchResult>> {
-        let k = k.clamp(1, SearchQuery::MAX_USER_LIMIT);
+        self.similar_filtered_with_access(id, k, None, record_access)
+            .await
+    }
+
+    /// Select the final similarity response before recording any exposure.
+    pub async fn similar_filtered_with_access(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let stamp = self.meta_store.effects_stamp().await?;
+        let result = self
+            .similar_with_access_admitted(id, k, min_score, record_access)
+            .await;
+        if self.meta_store.effects_stamp().await? != stamp {
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
+        }
+        result
+    }
+
+    async fn similar_with_access_admitted(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let k = k.min(SearchQuery::MAX_USER_LIMIT);
 
         // By-ID scope comes from the canonical record, even if its cache entry is stale.
         let record = self
@@ -950,10 +1026,20 @@ impl QueryEngine {
             .await?
             .ok_or(SearchError::MemoryNotFound(id))?;
 
+        let namespace = self
+            .namespace_resolver
+            .resolve_id(record.namespace_id)
+            .await?;
+
         // Load the source memory's embedding from the vector index.
-        let source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
+        let mut source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
             SearchError::Internal(format!("no embedding found for memory {id:?}"))
         })?;
+
+        super::query::normalize_query_embedding(
+            &mut source_embedding,
+            namespace.embedding_dim as usize,
+        )?;
 
         // Over-fetch by 1 to account for self-match removal.
         let scored = self
@@ -963,12 +1049,12 @@ impl QueryEngine {
         // Remove the source memory from results.
         let filtered: Vec<ScoredResult> = scored
             .into_iter()
-            .filter(|s| s.memory_id != id)
+            .filter(|s| s.memory_id != id && min_score.is_none_or(|minimum| s.score >= minimum))
             .take(k)
             .collect();
 
         let result_ids: Vec<MemoryId> = filtered.iter().map(|s| s.memory_id).collect();
-        let records = self.load_records(&result_ids, record_access).await?;
+        let records = self.meta_store.get_batch(&result_ids).await?;
 
         // Build a lookup map so we can iterate `filtered` (which preserves
         // descending similarity order from the vector search) instead of
@@ -980,6 +1066,11 @@ impl QueryEngine {
             .iter()
             .filter_map(|scored| {
                 let rec = record_map.get(&scored.memory_id)?;
+                if rec.namespace_id != record.namespace_id
+                    || matches!(rec.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
+                {
+                    return None;
+                }
                 let score = Some(scored.score);
                 Some(SearchResult {
                     memory_id: rec.id,
@@ -1003,26 +1094,32 @@ impl QueryEngine {
                     activation_score: None,
                     is_permastore: rec.is_permastore,
                     stability: rec.stability,
-                    namespace: String::new(),
+                    namespace: namespace.name.clone(),
                 })
             })
             .collect();
 
-        // Record associative access for returned results.
-        let accesses: Vec<(MemoryId, AccessKind)> = results
-            .iter()
-            .map(|r| (r.memory_id, AccessKind::AssociativeRetrieval))
-            .collect();
-        if record_access && !accesses.is_empty() {
-            let recorder = Arc::clone(&self.access_recorder);
-            tokio::spawn(async move {
-                if let Err(e) = recorder.record_access_batch(&accesses).await {
-                    warn!("failed to record associative access: {e}");
-                }
-            });
+        if record_access {
+            self.record_similar_accesses(&results.iter().map(|r| r.memory_id).collect::<Vec<_>>())
+                .await?;
         }
-
         Ok(results)
+    }
+
+    /// Shared final-result exposure hook. REST calls this only after fallible
+    /// response hydration. Legacy batches are awaited, not receipt-atomic.
+    pub async fn record_similar_accesses(&self, ids: &[MemoryId]) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        let accesses: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .map(|id| (id, AccessKind::AssociativeRetrieval))
+            .collect();
+        if !accesses.is_empty() {
+            self.access_recorder.record_access_batch(&accesses).await?;
+        }
+        Ok(())
     }
 
     // =====================================================================
@@ -1456,6 +1553,79 @@ mod tests {
             Arc::new(Unused),
             Arc::new(Unused),
         )
+    }
+
+    #[tokio::test]
+    async fn effects_completed_during_query_cannot_return_a_successful_miss() {
+        use crate::storage::StorageEngine as _;
+        let fx = crate::test_support::Fixture::new();
+        let a = fx.insert_memory().await;
+        let b = fx.insert_memory().await;
+        fx.storage
+            .read()
+            .unwrap()
+            .add_edge(a, b, crate::model::EdgeType::Associative, 0.5, false, 1)
+            .unwrap();
+        fx.storage
+            .read()
+            .unwrap()
+            .meta_store()
+            .acknowledge_rebuilt_effects()
+            .unwrap();
+        struct MutatingLookup {
+            storage: Arc<std::sync::RwLock<crate::storage::engine::RedbStorageEngine>>,
+            target: MemoryId,
+        }
+        #[async_trait::async_trait]
+        impl MetadataStore for MutatingLookup {
+            async fn effects_stamp(&self) -> Result<u64> {
+                self.storage
+                    .read()
+                    .unwrap()
+                    .meta_store()
+                    .effects_stamp()
+                    .map_err(|e| SearchError::MetadataError(e.to_string()))
+            }
+            async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
+                let storage = self.storage.write().unwrap();
+                let old = storage
+                    .get_record(*id)
+                    .unwrap()
+                    .map(|r| CachedRecord::from(&r));
+                storage.remove_all_edges(self.target).unwrap();
+                // Even complete publication must be noticed by the in-flight query.
+                storage.meta_store().acknowledge_rebuilt_effects().unwrap();
+                Ok(old)
+            }
+            async fn get_batch(&self, _: &[MemoryId]) -> Result<Vec<CachedRecord>> {
+                unreachable!()
+            }
+        }
+        let mut engine = engine(StubGraph::default(), StubMetaStore::default());
+        engine.meta_store = Arc::new(MutatingLookup {
+            storage: fx.storage.clone(),
+            target: b,
+        });
+        let result = engine.get_memory(MemoryId::new()).await;
+        assert!(matches!(result, Err(SearchError::Unavailable(_))));
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .effects_stamp()
+                .is_ok()
+        );
+        assert_eq!(
+            fx.storage
+                .read()
+                .unwrap()
+                .get_record(a)
+                .unwrap()
+                .unwrap()
+                .edge_count,
+            0
+        );
     }
 
     /// Wire up "B is superseded by A", where A's record is `replacement`.

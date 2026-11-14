@@ -47,10 +47,11 @@ const HEALTH_REPORT_CACHE_TTL_SECS: u64 = 60;
 /// this fix). The `RwLock` ensures concurrent readers don't block each
 /// other and only one writer recomputes at a time.
 fn health_report_cache()
--> &'static RwLock<std::collections::HashMap<String, (Instant, HealthReport)>> {
+-> &'static RwLock<std::collections::HashMap<String, (u64, Instant, HealthReport)>> {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<RwLock<std::collections::HashMap<String, (Instant, HealthReport)>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        RwLock<std::collections::HashMap<String, (u64, Instant, HealthReport)>>,
+    > = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
@@ -80,7 +81,8 @@ async fn near_duplicate_report(
     embedding: &[f32],
     namespace_id: NamespaceId,
     check_duplicates: Option<bool>,
-) -> Option<crate::model::NearDuplicateReport> {
+) -> Result<Option<crate::model::NearDuplicateReport>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
     use crate::model::constants::{
         DUPLICATE_SIMILARITY_THRESHOLD, MAX_NEAR_DUPLICATE_MATCHES,
         NEAR_DUPLICATE_SUMMARY_MAX_BYTES,
@@ -88,7 +90,7 @@ async fn near_duplicate_report(
     use crate::model::{DecayPhase, NearDuplicateMatch, NearDuplicateReport, truncate_summary};
 
     if !check_duplicates.unwrap_or(true) {
-        return None;
+        return Ok(None);
     }
 
     let candidates = state
@@ -99,7 +101,7 @@ async fn near_duplicate_report(
             DUPLICATE_SIMILARITY_THRESHOLD as f32,
             MAX_NEAR_DUPLICATE_MATCHES,
         )
-        .await;
+        .await?;
 
     let mut matches = Vec::with_capacity(candidates.len());
     for (id, score) in candidates {
@@ -123,7 +125,16 @@ async fn near_duplicate_report(
         });
     }
 
-    NearDuplicateReport::from_matches(DUPLICATE_SIMILARITY_THRESHOLD, matches)
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during advisory hydration".into(),
+        )
+        .into());
+    }
+    Ok(NearDuplicateReport::from_matches(
+        DUPLICATE_SIMILARITY_THRESHOLD,
+        matches,
+    ))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -148,6 +159,9 @@ pub async fn create_memory(
     State(state): State<AppState>,
     Json(req): Json<CreateMemoryApiRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<MemoryResponse>>), AppError> {
+    let _publication = state.storage.publication_lease().await?;
+    state.storage.effects_stamp().await?;
+
     let start = Instant::now();
 
     // --- Validation ---
@@ -243,7 +257,7 @@ pub async fn create_memory(
     // Before the write, so the new memory is not yet in the vector index
     // and cannot match itself. See `near_duplicate_report`.
     let near_duplicates =
-        near_duplicate_report(&state, &embedding, ns.id, req.check_duplicates).await;
+        near_duplicate_report(&state, &embedding, ns.id, req.check_duplicates).await?;
 
     // --- Persist ---
     // Resolve initial stability: use caller-provided value, or fall back
@@ -355,6 +369,21 @@ pub async fn create_memory(
 /// 3. Record an access event (`DirectRetrieval`).
 /// 4. Return 200 with memory, or 404 if not found.
 pub async fn get_memory(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(options): Query<GetMemoryQuery>,
+) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = get_memory_admitted(State(state.clone()), Path(id), Query(options)).await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    result
+}
+
+async fn get_memory_admitted(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(options): Query<GetMemoryQuery>,
@@ -558,6 +587,8 @@ pub async fn list_memories(
     State(state): State<AppState>,
     Query(params): Query<ListMemoriesQuery>,
 ) -> Result<Json<ApiResponse<ListMemoriesResponse>>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
     let start = Instant::now();
 
     // Validate limit (cap at 1000)
@@ -749,6 +780,14 @@ pub async fn list_memories(
         data: response,
         took_us: Some(took),
     }))
+    }.await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during read".into(),
+        )
+        .into());
+    }
+    result
 }
 
 /// Helper: parse a UUID string from a path segment.
@@ -779,6 +818,20 @@ pub async fn search_memories(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = search_memories_admitted(State(state.clone()), Json(req)).await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    result
+}
+
+async fn search_memories_admitted(
+    State(state): State<AppState>,
+    Json(req): Json<SearchRequest>,
+) -> Result<Json<SearchResponse>, AppError> {
     let start = Instant::now();
 
     // Validate: need at least one search signal
@@ -786,14 +839,6 @@ pub async fn search_memories(
         return Err(AppError::BadRequest {
             message: "at least one of 'query', 'embedding', or 'tags' must be provided".into(),
             field: None,
-        });
-    }
-
-    // Validate: query and embedding are mutually exclusive
-    if req.query.is_some() && req.embedding.is_some() {
-        return Err(AppError::UnprocessableEntity {
-            message: "'query' and 'embedding' are mutually exclusive".into(),
-            field: Some("embedding".into()),
         });
     }
 
@@ -839,17 +884,16 @@ pub async fn search_memories(
         }
     }
 
-    let query_input = if let Some(ref text) = req.query {
-        Some(QueryInput::Text(text.clone()))
-    } else {
-        req.embedding
-            .as_ref()
-            .map(|vec| QueryInput::Vector(vec.clone()))
+    let query_input = match (req.query, req.embedding) {
+        (Some(text), Some(embedding)) => QueryInput::TextAndVector { text, embedding },
+        (Some(text), None) => QueryInput::Text(text),
+        (None, Some(embedding)) => QueryInput::Vector(embedding),
+        (None, None) => QueryInput::Text(String::new()),
     };
 
     let search_query = SearchQuery {
         record_access: req.record_access,
-        query: query_input.unwrap_or(QueryInput::Text(String::new())),
+        query: query_input,
         namespace_id: ns.id,
         namespace_name: ns.name.clone(),
         k: limit,
@@ -919,6 +963,22 @@ pub async fn find_similar(
     Path(id): Path<String>,
     Json(req): Json<FindSimilarRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = find_similar_admitted(State(state.clone()), Path(id), Json(req), stamp).await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    result
+}
+
+async fn find_similar_admitted(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<FindSimilarRequest>,
+    admitted_stamp: u64,
+) -> Result<Json<SearchResponse>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
@@ -930,86 +990,58 @@ pub async fn find_similar(
             .await?;
     }
 
-    // The source scope is canonical, never a session default or cached namespace.
-    let source = state
-        .storage
-        .get_record(memory_id)
-        .await
-        .ok_or_else(|| AppError::NotFound {
-            resource: "memory",
-            id: id.clone(),
-        })?;
-    let source_namespace = NamespaceId::new(source.namespace_id);
-
-    let source_embedding =
-        state
-            .search
-            .get_embedding(memory_id)
-            .ok_or_else(|| AppError::Internal {
-                source: "source memory has no indexed embedding".into(),
-            })?;
-
-    let limit = req.limit.min(100) as usize;
-
-    let ns_name = state
-        .namespaces
-        .name_for(source_namespace)
-        .unwrap_or_else(|| "default".to_string());
-
-    // Search using source embedding, requesting limit+1 to account
-    // for the source memory appearing in its own results.
-    let search_query = SearchQuery {
-        record_access: req.record_access,
-        query: QueryInput::Vector(source_embedding),
-        namespace_id: source_namespace,
-        namespace_name: ns_name,
-        k: limit + 1,
-        include_tags: vec![],
-        exclude_tags: vec![],
-        decay_phases: None,
-        min_score: req.min_score,
-        graph_depth: 0,
-        apply_rif: false,
-        time_range_start: None,
-        time_range_end: None,
-        entities: vec![],
-    };
-
-    let results = state.search.search(search_query).await?;
-
-    // Batch-load embeddings with a single lock acquisition if requested.
+    // The shared path resolves canonical scope, removes the source and applies
+    // similarity minScore before exposure. /search minStrength is independent.
+    let results = state
+        .search
+        .find_similar(memory_id, req.limit.min(100) as usize, req.min_score, false)
+        .await?;
     let embeddings = if req.include_embeddings {
-        let ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id).collect();
+        let ids: Vec<_> = results.iter().map(|r| r.memory_id).collect();
         state.search.get_embeddings_batch(&ids)
     } else {
         std::collections::HashMap::new()
     };
-
-    // Exclude source memory from results, loading full_text from storage
-    let filtered: Vec<_> = results
-        .into_iter()
-        .filter(|r| r.memory.id != memory_id)
-        .take(limit)
-        .collect();
-    let mut hits: Vec<SearchHit> = Vec::with_capacity(filtered.len());
-    for r in filtered {
-        let ns_name = state
-            .namespaces
-            .name_for(r.memory.namespace_id)
-            .unwrap_or_else(|| "unknown".to_string());
-        let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
-        mem.full_text = state
-            .storage
-            .get_full_text(r.memory.id)
-            .await
-            .unwrap_or(None);
-        if req.include_embeddings {
-            mem.embedding = embeddings.get(&r.memory.id).cloned();
+    let mut hits = Vec::with_capacity(results.len());
+    for r in results {
+        let record =
+            state
+                .storage
+                .get_record(r.memory_id)
+                .await
+                .ok_or_else(|| AppError::NotFound {
+                    resource: "memory",
+                    id: r.memory_id.to_string(),
+                })?;
+        if matches!(
+            record.phase,
+            crate::model::DecayPhase::Ghost | crate::model::DecayPhase::Tombstone
+        ) {
+            return Err(AppError::ServiceUnavailable {
+                message: "similarity result changed during hydration; retry".into(),
+            });
         }
+        // Search projections omit fields such as difficulty and may carry an
+        // adjusted effective score. REST metadata is the canonical record.
+        let mut memory =
+            MemoryResponse::from_cached(&crate::model::CachedRecord::from(&record), r.namespace);
+        memory.full_text = state.storage.get_full_text(r.memory_id).await?;
+        memory.embedding = embeddings.get(&r.memory_id).cloned();
         hits.push(SearchHit {
-            memory: mem,
-            score: r.score,
+            memory,
+            score: r.score.unwrap_or(0.0),
         });
+    }
+
+    // Reject read-admission drift and hydration errors before any observation.
+    if state.storage.effects_stamp().await? != admitted_stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    if req.record_access {
+        let ids: Vec<_> = hits.iter().map(|hit| hit.memory.id).collect();
+        state.search.record_similar_accesses(&ids).await?;
     }
 
     let total = hits.len() as u64;
@@ -1030,27 +1062,38 @@ pub async fn find_similar(
 pub async fn list_namespaces(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<Vec<NamespaceListItem>>>, AppError> {
-    let start = Instant::now();
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
+        let start = Instant::now();
 
-    let namespaces = state.namespaces.list_all().await;
+        let namespaces = state.namespaces.list_all().await;
 
-    let items: Vec<NamespaceListItem> = namespaces
-        .into_iter()
-        .map(|ns| NamespaceListItem {
-            id: ns.id,
-            name: ns.name,
-            embedding_dim: ns.embedding_dim,
-            memory_count: ns.memory_count,
-            created_at: ns.created_at,
-        })
-        .collect();
+        let items: Vec<NamespaceListItem> = namespaces
+            .into_iter()
+            .map(|ns| NamespaceListItem {
+                id: ns.id,
+                name: ns.name,
+                embedding_dim: ns.embedding_dim,
+                memory_count: ns.memory_count,
+                created_at: ns.created_at,
+            })
+            .collect();
 
-    let took = start.elapsed().as_micros() as u64;
+        let took = start.elapsed().as_micros() as u64;
 
-    Ok(Json(ApiResponse {
-        data: items,
-        took_us: Some(took),
-    }))
+        Ok(Json(ApiResponse {
+            data: items,
+            took_us: Some(took),
+        }))
+    }
+    .await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during read".into(),
+        )
+        .into());
+    }
+    result
 }
 
 /// POST /namespaces -- create a new namespace.
@@ -1128,44 +1171,55 @@ pub async fn namespace_stats(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<NamespaceStatsResponse>>, AppError> {
-    let start = Instant::now();
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
+        let start = Instant::now();
 
-    // Try parsing as integer ID first, then fall back to name lookup
-    let ns = if let Ok(numeric_id) = id.parse::<u32>() {
-        state.namespaces.get_by_id(numeric_id)
-    } else {
-        state.namespaces.resolve(&id)
+        // Try parsing as integer ID first, then fall back to name lookup
+        let ns = if let Ok(numeric_id) = id.parse::<u32>() {
+            state.namespaces.get_by_id(numeric_id)
+        } else {
+            state.namespaces.resolve(&id)
+        }
+        .ok_or_else(|| AppError::NotFound {
+            resource: "namespace",
+            id: id.clone(),
+        })?;
+
+        let stats = state.storage.namespace_stats(ns.id).await?;
+
+        let response = NamespaceStatsResponse {
+            name: ns.name,
+            id: ns.id.get(),
+            memory_count: stats.memory_count,
+            tombstone_count: stats.tombstone_count,
+            phase_counts: PhaseCounts {
+                full: stats.phase_1_count,
+                summary: stats.phase_2_count,
+                ghost: stats.phase_3_count,
+            },
+            permastore_count: stats.permastore_count,
+            avg_strength: stats.avg_strength,
+            edge_count: stats.edge_count,
+            embedding_dim: ns.embedding_dim,
+            vector_bytes: stats.memory_count * ns.embedding_dim as u64 * 4,
+        };
+
+        let took = start.elapsed().as_micros() as u64;
+
+        Ok(Json(ApiResponse {
+            data: response,
+            took_us: Some(took),
+        }))
     }
-    .ok_or_else(|| AppError::NotFound {
-        resource: "namespace",
-        id: id.clone(),
-    })?;
-
-    let stats = state.storage.namespace_stats(ns.id).await?;
-
-    let response = NamespaceStatsResponse {
-        name: ns.name,
-        id: ns.id.get(),
-        memory_count: stats.memory_count,
-        tombstone_count: stats.tombstone_count,
-        phase_counts: PhaseCounts {
-            full: stats.phase_1_count,
-            summary: stats.phase_2_count,
-            ghost: stats.phase_3_count,
-        },
-        permastore_count: stats.permastore_count,
-        avg_strength: stats.avg_strength,
-        edge_count: stats.edge_count,
-        embedding_dim: ns.embedding_dim,
-        vector_bytes: stats.memory_count * ns.embedding_dim as u64 * 4,
-    };
-
-    let took = start.elapsed().as_micros() as u64;
-
-    Ok(Json(ApiResponse {
-        data: response,
-        took_us: Some(took),
-    }))
+    .await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during read".into(),
+        )
+        .into());
+    }
+    result
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1275,93 +1329,106 @@ pub async fn health_report(
     State(state): State<AppState>,
     Query(params): Query<HealthReportQuery>,
 ) -> Result<Json<ApiResponse<HealthReport>>, AppError> {
-    let start = Instant::now();
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
+        let start = Instant::now();
 
-    // Resolve optional namespace filter (validate before cache check)
-    let namespace_filter: Option<NamespaceId> = if let Some(ref ns_name) = params.namespace {
-        Some(
-            state
-                .namespaces
-                .resolve(ns_name)
-                .ok_or_else(|| AppError::NotFound {
-                    resource: "namespace",
-                    id: ns_name.clone(),
-                })?
-                .id,
-        )
-    } else {
-        None
-    };
+        // Resolve optional namespace filter (validate before cache check)
+        let namespace_filter: Option<NamespaceId> = if let Some(ref ns_name) = params.namespace {
+            Some(
+                state
+                    .namespaces
+                    .resolve(ns_name)
+                    .ok_or_else(|| AppError::NotFound {
+                        resource: "namespace",
+                        id: ns_name.clone(),
+                    })?
+                    .id,
+            )
+        } else {
+            None
+        };
 
-    let scope = params.namespace.unwrap_or_else(|| "all".to_string());
+        let scope = params.namespace.unwrap_or_else(|| "all".to_string());
 
-    // --- Check cache ---
-    {
-        let cache = health_report_cache().read().await;
-        if let Some((generated_at, cached_report)) = cache.get(&scope) {
-            if generated_at.elapsed().as_secs() < HEALTH_REPORT_CACHE_TTL_SECS {
-                let took = start.elapsed().as_micros() as u64;
-                return Ok(Json(ApiResponse {
-                    data: cached_report.clone(),
-                    took_us: Some(took),
-                }));
+        // --- Check cache ---
+        {
+            let cache = health_report_cache().read().await;
+            if let Some((cached_stamp, generated_at, cached_report)) = cache.get(&scope) {
+                if *cached_stamp == stamp
+                    && generated_at.elapsed().as_secs() < HEALTH_REPORT_CACHE_TTL_SECS
+                {
+                    let took = start.elapsed().as_micros() as u64;
+                    return Ok(Json(ApiResponse {
+                        data: cached_report.clone(),
+                        took_us: Some(took),
+                    }));
+                }
             }
         }
+
+        // --- Cache miss: compute the report ---
+        let all_records = state.storage.scan_all().await?;
+
+        // Filter records by namespace if applicable
+        let filtered: Vec<_> = all_records
+            .iter()
+            .filter(|(_, r)| {
+                if let Some(ns_id) = namespace_filter {
+                    r.namespace_id == ns_id.get()
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        let overview = health_report_compute::compute_overview(&filtered);
+        let decay_forecast =
+            health_report_compute::compute_decay_forecast(&filtered, state.namespaces.as_ref());
+        let at_risk = health_report_compute::compute_at_risk(&filtered, state.namespaces.as_ref());
+        let age_distribution = health_report_compute::compute_age_distribution(&filtered);
+        let storage = health_report_compute::compute_storage_breakdown(
+            state.storage.as_ref(),
+            state.namespaces.as_ref(),
+            namespace_filter,
+        )
+        .await;
+        let metadata =
+            health_report_compute::compute_metadata_stats(state.storage.as_ref(), namespace_filter)
+                .await
+                .map_err(|e| AppError::Internal { source: e })?;
+
+        let report = HealthReport {
+            scope: scope.clone(),
+            overview,
+            decay_forecast,
+            at_risk,
+            age_distribution,
+            storage,
+            metadata,
+        };
+
+        // --- Store in cache ---
+        {
+            let mut cache = health_report_cache().write().await;
+            cache.insert(scope, (stamp, Instant::now(), report.clone()));
+        }
+
+        let took = start.elapsed().as_micros() as u64;
+
+        Ok(Json(ApiResponse {
+            data: report,
+            took_us: Some(took),
+        }))
     }
-
-    // --- Cache miss: compute the report ---
-    let all_records = state.storage.scan_all().await?;
-
-    // Filter records by namespace if applicable
-    let filtered: Vec<_> = all_records
-        .iter()
-        .filter(|(_, r)| {
-            if let Some(ns_id) = namespace_filter {
-                r.namespace_id == ns_id.get()
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    let overview = health_report_compute::compute_overview(&filtered);
-    let decay_forecast =
-        health_report_compute::compute_decay_forecast(&filtered, state.namespaces.as_ref());
-    let at_risk = health_report_compute::compute_at_risk(&filtered, state.namespaces.as_ref());
-    let age_distribution = health_report_compute::compute_age_distribution(&filtered);
-    let storage = health_report_compute::compute_storage_breakdown(
-        state.storage.as_ref(),
-        state.namespaces.as_ref(),
-        namespace_filter,
-    )
     .await;
-    let metadata =
-        health_report_compute::compute_metadata_stats(state.storage.as_ref(), namespace_filter)
-            .await
-            .map_err(|e| AppError::Internal { source: e })?;
-
-    let report = HealthReport {
-        scope: scope.clone(),
-        overview,
-        decay_forecast,
-        at_risk,
-        age_distribution,
-        storage,
-        metadata,
-    };
-
-    // --- Store in cache ---
-    {
-        let mut cache = health_report_cache().write().await;
-        cache.insert(scope, (Instant::now(), report.clone()));
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during health report".into(),
+        )
+        .into());
     }
-
-    let took = start.elapsed().as_micros() as u64;
-
-    Ok(Json(ApiResponse {
-        data: report,
-        took_us: Some(took),
-    }))
+    result
 }
 
 /// POST /memories/batch -- batch create memories (Issue 16).
@@ -1372,6 +1439,9 @@ pub async fn batch_store(
     State(state): State<AppState>,
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<BatchStoreResponse>>), AppError> {
+    let _publication = state.storage.publication_lease().await?;
+    state.storage.effects_stamp().await?;
+
     let start = Instant::now();
 
     if req.memories.is_empty() {
@@ -1517,7 +1587,7 @@ pub async fn batch_store(
         // so an intra-batch duplicate is reported too — same property the
         // MCP batch tool has.
         let near_duplicates =
-            near_duplicate_report(&state, &embedding, ns.id, mem_req.check_duplicates).await;
+            near_duplicate_report(&state, &embedding, ns.id, mem_req.check_duplicates).await?;
 
         // Persist — resolve initial stability from namespace config (matching MCP)
         let resolved_stability = mem_req.initial_stability.unwrap_or(ns.initial_stability);
@@ -1644,158 +1714,169 @@ pub async fn scan_duplicates(
     Path(name): Path<String>,
     Json(req): Json<ScanDuplicatesRequest>,
 ) -> Result<Json<ApiResponse<ScanDuplicatesResponse>>, AppError> {
-    let start = Instant::now();
+    let stamp = state.storage.effects_stamp().await?;
+    let result = async {
+        let start = Instant::now();
 
-    let ns = state
-        .namespaces
-        .resolve(&name)
-        .ok_or_else(|| AppError::NotFound {
-            resource: "namespace",
-            id: name.clone(),
-        })?;
+        let ns = state
+            .namespaces
+            .resolve(&name)
+            .ok_or_else(|| AppError::NotFound {
+                resource: "namespace",
+                id: name.clone(),
+            })?;
 
-    if !req.threshold.is_finite() || !(0.0..=1.0).contains(&req.threshold) {
-        return Err(AppError::BadRequest {
-            message: "threshold must be finite and between 0 and 1".into(),
-            field: Some("threshold".into()),
-        });
-    }
-    if !(1..=10_000).contains(&req.max_memories) {
-        return Err(AppError::BadRequest {
-            message: "maxMemories must be between 1 and 10000".into(),
-            field: Some("maxMemories".into()),
-        });
-    }
-    let threshold = req.threshold;
-    let max_memories = req.max_memories;
-
-    // Get memory IDs in this namespace
-    let filter = ListFilter {
-        namespace_id: Some(ns.id),
-        phase: None,
-        tags: vec![],
-        time_range_start: None,
-        time_range_end: None,
-    };
-    let records = state.storage.list_memories(&filter).await?;
-    let memory_ids: Vec<MemoryId> = records.iter().take(max_memories).map(|r| r.id).collect();
-
-    // Load embeddings
-    let embeddings = state.search.get_embeddings_batch(&memory_ids);
-    let sampled_count = memory_ids.len();
-    let id_embeddings: Vec<(MemoryId, Vec<f32>)> = memory_ids
-        .into_iter()
-        .filter_map(|mid| embeddings.get(&mid).map(|emb| (mid, emb.clone())))
-        .collect();
-
-    let coverage = DuplicateScanCoverage {
-        algorithm: "sampledPairs",
-        eligible_count: records.len(),
-        sampled_count,
-        skipped_vector_count: sampled_count - id_embeddings.len(),
-        sample_cap: max_memories,
-        neighbor_cap: None,
-        truncated: sampled_count < records.len(),
-        // This legacy scan has no generation-consistent read view.
-        complete: false,
-    };
-
-    // Union-Find based clustering
-    let n = id_embeddings.len();
-    let mut parent: Vec<usize> = (0..n).collect();
-
-    fn find(parent: &mut [usize], mut i: usize) -> usize {
-        while parent[i] != i {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
+        if !req.threshold.is_finite() || !(0.0..=1.0).contains(&req.threshold) {
+            return Err(AppError::BadRequest {
+                message: "threshold must be finite and between 0 and 1".into(),
+                field: Some("threshold".into()),
+            });
         }
-        i
-    }
-
-    fn union(parent: &mut [usize], a: usize, b: usize) {
-        let ra = find(parent, a);
-        let rb = find(parent, b);
-        if ra != rb {
-            parent[rb] = ra;
+        if !(1..=10_000).contains(&req.max_memories) {
+            return Err(AppError::BadRequest {
+                message: "maxMemories must be between 1 and 10000".into(),
+                field: Some("maxMemories".into()),
+            });
         }
-    }
+        let threshold = req.threshold;
+        let max_memories = req.max_memories;
 
-    let mut max_sim: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+        // Get memory IDs in this namespace
+        let filter = ListFilter {
+            namespace_id: Some(ns.id),
+            phase: None,
+            tags: vec![],
+            time_range_start: None,
+            time_range_end: None,
+        };
+        let records = state.storage.list_memories(&filter).await?;
+        let memory_ids: Vec<MemoryId> = records.iter().take(max_memories).map(|r| r.id).collect();
 
-    // Compare each memory's embedding against its nearest neighbors
-    for (i, (mid_i, _emb_i)) in id_embeddings.iter().enumerate() {
-        // Find similar via the search pipeline's get_embedding + manual cosine
-        if let Some(emb) = state.search.get_embedding(*mid_i) {
-            // Use pairwise comparison within the loaded set
-            for (j, (_mid_j, emb_j)) in id_embeddings.iter().enumerate() {
-                if i >= j {
-                    continue;
-                }
-                let score = crate::search::dot_product_simd(&emb, emb_j);
-                if score >= threshold {
-                    union(&mut parent, i, j);
-                    let root = find(&mut parent, i);
-                    let entry = max_sim.entry(root).or_insert(0.0);
-                    if score > *entry {
-                        *entry = score;
+        // Load embeddings
+        let embeddings = state.search.get_embeddings_batch(&memory_ids);
+        let sampled_count = memory_ids.len();
+        let id_embeddings: Vec<(MemoryId, Vec<f32>)> = memory_ids
+            .into_iter()
+            .filter_map(|mid| embeddings.get(&mid).map(|emb| (mid, emb.clone())))
+            .collect();
+
+        let coverage = DuplicateScanCoverage {
+            algorithm: "sampledPairs",
+            eligible_count: records.len(),
+            sampled_count,
+            skipped_vector_count: sampled_count - id_embeddings.len(),
+            sample_cap: max_memories,
+            neighbor_cap: None,
+            truncated: sampled_count < records.len(),
+            // This legacy scan has no generation-consistent read view.
+            complete: false,
+        };
+
+        // Union-Find based clustering
+        let n = id_embeddings.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[rb] = ra;
+            }
+        }
+
+        let mut max_sim: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+
+        // Compare each memory's embedding against its nearest neighbors
+        for (i, (mid_i, _emb_i)) in id_embeddings.iter().enumerate() {
+            // Find similar via the search pipeline's get_embedding + manual cosine
+            if let Some(emb) = state.search.get_embedding(*mid_i) {
+                // Use pairwise comparison within the loaded set
+                for (j, (_mid_j, emb_j)) in id_embeddings.iter().enumerate() {
+                    if i >= j {
+                        continue;
+                    }
+                    let score = crate::search::dot_product_simd(&emb, emb_j);
+                    if score >= threshold {
+                        union(&mut parent, i, j);
+                        let root = find(&mut parent, i);
+                        let entry = max_sim.entry(root).or_insert(0.0);
+                        if score > *entry {
+                            *entry = score;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Group into clusters
-    let mut clusters_map: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
-    for i in 0..n {
-        let root = find(&mut parent, i);
-        clusters_map.entry(root).or_default().push(i);
-    }
-
-    let mut clusters: Vec<DuplicateCluster> = Vec::new();
-    for (root, members) in &clusters_map {
-        if members.len() < 2 {
-            continue;
+        // Group into clusters
+        let mut clusters_map: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            clusters_map.entry(root).or_default().push(i);
         }
-        let entries: Vec<DuplicateEntry> = members
-            .iter()
-            .map(|&idx| {
-                let mid = id_embeddings[idx].0;
-                let summary = records
-                    .iter()
-                    .find(|r| r.id == mid)
-                    .map(|r| r.summary.clone())
-                    .unwrap_or_default();
-                DuplicateEntry {
-                    id: mid.to_string(),
-                    summary,
-                }
-            })
-            .collect();
-        let max_similarity = max_sim.get(root).copied().unwrap_or(0.0);
-        clusters.push(DuplicateCluster {
-            memories: entries,
-            max_similarity,
+
+        let mut clusters: Vec<DuplicateCluster> = Vec::new();
+        for (root, members) in &clusters_map {
+            if members.len() < 2 {
+                continue;
+            }
+            let entries: Vec<DuplicateEntry> = members
+                .iter()
+                .map(|&idx| {
+                    let mid = id_embeddings[idx].0;
+                    let summary = records
+                        .iter()
+                        .find(|r| r.id == mid)
+                        .map(|r| r.summary.clone())
+                        .unwrap_or_default();
+                    DuplicateEntry {
+                        id: mid.to_string(),
+                        summary,
+                    }
+                })
+                .collect();
+            let max_similarity = max_sim.get(root).copied().unwrap_or(0.0);
+            clusters.push(DuplicateCluster {
+                memories: entries,
+                max_similarity,
+            });
+        }
+
+        clusters.sort_by(|a, b| {
+            b.max_similarity
+                .partial_cmp(&a.max_similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        let total = clusters.len() as u64;
+        let took = start.elapsed().as_micros() as u64;
+
+        Ok(Json(ApiResponse {
+            data: ScanDuplicatesResponse {
+                clusters,
+                total,
+                coverage,
+            },
+            took_us: Some(took),
+        }))
     }
-
-    clusters.sort_by(|a, b| {
-        b.max_similarity
-            .partial_cmp(&a.max_similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let total = clusters.len() as u64;
-    let took = start.elapsed().as_micros() as u64;
-
-    Ok(Json(ApiResponse {
-        data: ScanDuplicatesResponse {
-            clusters,
-            total,
-            coverage,
-        },
-        took_us: Some(took),
-    }))
+    .await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(crate::storage::StorageError::RecoveryRequired(
+            "effects changed during read".into(),
+        )
+        .into());
+    }
+    result
 }
 
 /// GET /metrics -- Prometheus exposition format.

@@ -187,6 +187,11 @@ impl From<StorageError> for AppError {
                 resource: "namespace",
                 id: id.to_string(),
             },
+            StorageError::RecoveryRequired(_) | StorageError::CommittedEffectsPending { .. } => {
+                AppError::ServiceUnavailable {
+                    message: err.to_string(),
+                }
+            }
             StorageError::DatabaseLocked => AppError::ServiceUnavailable {
                 message: "database is locked by another process".to_string(),
             },
@@ -223,6 +228,9 @@ impl From<EmbeddingError> for AppError {
 impl From<SearchError> for AppError {
     fn from(err: SearchError) -> Self {
         match &err {
+            SearchError::Unavailable(message) => AppError::ServiceUnavailable {
+                message: message.clone(),
+            },
             SearchError::NamespaceNotFound(name) => AppError::NotFound {
                 resource: "namespace",
                 id: name.clone(),
@@ -233,6 +241,10 @@ impl From<SearchError> for AppError {
             SearchError::EmptyQuery => AppError::BadRequest {
                 message: "query text is required".to_string(),
                 field: Some("query".to_string()),
+            },
+            SearchError::InvalidEmbedding(message) => AppError::UnprocessableEntity {
+                message: message.clone(),
+                field: Some("embedding".into()),
             },
             SearchError::MemoryNotFound(id) => AppError::NotFound {
                 resource: "memory",

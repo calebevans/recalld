@@ -1638,6 +1638,7 @@ pub(super) async fn search_memories(
         };
         let query = SearchQuery {
             record_access: true,
+            query_embedding: None,
             text: Some(bq.query.clone()),
             fts_query: bq.fts_query.clone(),
             namespace: "default".to_string(),
@@ -1726,6 +1727,7 @@ pub(super) async fn search_memories(
                         };
                         let query = SearchQuery {
                             record_access: true,
+                            query_embedding: None,
                             text: Some(bq.query.clone()),
                             fts_query: bq.fts_query.clone(),
                             namespace: "default".to_string(),

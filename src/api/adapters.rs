@@ -99,9 +99,10 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         query: state::SearchQuery,
     ) -> Result<Vec<state::ResolvedSearchResult>, crate::search::SearchError> {
         // Convert API-layer SearchQuery to the pipeline's SearchQuery.
-        let text = match query.query {
-            state::QueryInput::Text(t) => Some(t),
-            state::QueryInput::Vector(_) => None,
+        let (text, query_embedding) = match query.query {
+            state::QueryInput::Text(t) => (Some(t), None),
+            state::QueryInput::Vector(vector) => (None, Some(vector)),
+            state::QueryInput::TextAndVector { text, embedding } => (Some(text), Some(embedding)),
         };
 
         // A label that cannot become a tag is an error, not a dropped
@@ -142,6 +143,7 @@ impl state::SearchPipeline for SearchPipelineAdapter {
 
         let pipeline_query = crate::search::SearchQuery {
             record_access: query.record_access,
+            query_embedding,
             text,
             fts_query: None,
             namespace: query.namespace_name.clone(), // Issue 1: pass actual namespace name
@@ -192,15 +194,44 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             .collect())
     }
 
+    async fn find_similar(
+        &self,
+        id: MemoryId,
+        limit: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, crate::search::SearchError> {
+        self.query_engine
+            .similar_filtered_with_access(id, limit, min_score, record_access)
+            .await
+    }
+
+    async fn record_similar_accesses(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<(), crate::search::SearchError> {
+        self.query_engine.record_similar_accesses(ids).await
+    }
+
     async fn near_duplicates(
         &self,
         embedding: &[f32],
         namespace_id: NamespaceId,
         threshold: f32,
         limit: usize,
-    ) -> Vec<(MemoryId, f32)> {
+    ) -> Result<Vec<(MemoryId, f32)>, super::errors::AppError> {
+        let stamp = self.query_engine.effects_stamp().await?;
         let index = self.vector_index.read().await;
-        crate::search::find_near_duplicates(&index, embedding, namespace_id, threshold, limit)
+        let result =
+            crate::search::find_near_duplicates(&index, embedding, namespace_id, threshold, limit);
+        drop(index);
+        if self.query_engine.effects_stamp().await? != stamp {
+            return Err(crate::storage::StorageError::RecoveryRequired(
+                "effects changed during advisory".into(),
+            )
+            .into());
+        }
+        Ok(result)
     }
 
     async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId) {
@@ -336,6 +367,7 @@ impl StorageEngineAdapter {
         entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
         graph: crate::graph::SharedGraph,
     ) -> Self {
+        cache.bind_storage(&storage);
         Self {
             clock: Arc::new(crate::time::SystemClock),
             storage,
@@ -355,6 +387,30 @@ impl StorageEngineAdapter {
 
 #[async_trait]
 impl state::StorageEngine for StorageEngineAdapter {
+    async fn publication_lease(
+        &self,
+    ) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, crate::storage::StorageError> {
+        Ok(Some(
+            crate::derived_completion::publication_gate(&self.storage)
+                .await?
+                .read_owned()
+                .await,
+        ))
+    }
+
+    async fn effects_stamp(&self) -> Result<u64, crate::storage::StorageError> {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            storage
+                .read()
+                .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
+                .meta_store()
+                .effects_stamp()
+        })
+        .await
+        .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
+    }
+
     async fn create_memory(
         &self,
         namespace_id: NamespaceId,
@@ -1118,6 +1174,7 @@ impl state::RelationshipGraph for RelationshipGraphAdapter {
 /// Adapts the decay subsystem to the API `FsrsEngine` trait.
 pub struct FsrsEngineAdapter {
     clock: Arc<dyn crate::time::Clock>,
+    completion: Option<crate::derived_completion::DerivedCompletion>,
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: Arc<CacheManager>,
     graph: crate::graph::SharedGraph,
@@ -1134,6 +1191,7 @@ impl FsrsEngineAdapter {
         config: Arc<RecalldConfig>,
         has_sweep: bool,
     ) -> Self {
+        cache.bind_storage(&storage);
         Self {
             clock: Arc::new(crate::time::SystemClock),
             storage,
@@ -1141,11 +1199,29 @@ impl FsrsEngineAdapter {
             graph,
             config,
             sweep_alive: has_sweep,
+            completion: None,
         }
     }
     /// Use the system instance's clock (or an isolated manual clock).
     pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+    /// Attach the live derived views so manual sweeps complete committed effects.
+    pub fn with_indexes(
+        mut self,
+        vectors: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
+        fts: Arc<tokio::sync::Mutex<FtsIndex>>,
+        entities: Arc<tokio::sync::RwLock<EntityIndex>>,
+    ) -> Self {
+        self.completion = Some(crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors,
+            fts,
+            entities,
+        });
         self
     }
 }
@@ -1233,6 +1309,17 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         )
         .await;
 
+        if let Some(completion) = &self.completion {
+            completion.complete().await?;
+        } else if self
+            .storage
+            .read()
+            .map_err(|e| e.to_string())?
+            .meta_store()
+            .needs_effects_rebuild()
+        {
+            return Err("derived completion handles missing; reopen required".into());
+        }
         Ok(result)
     }
 }

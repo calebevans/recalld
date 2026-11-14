@@ -67,7 +67,12 @@ pub struct SearchQuery {
     /// Permit legacy exposure recording. False also bypasses behavioral record caches.
     #[serde(default = "default_record_access")]
     pub record_access: bool,
-    /// Free-text query, embedded via the namespace's provider.
+    /// Precomputed vector for semantic search. Takes precedence over text for
+    /// embedding; text (or fts_query) still supplies the keyword channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_embedding: Option<Vec<f32>>,
+
+    /// Free-text query, embedded via the namespace's provider unless a vector is supplied.
     #[serde(default)]
     pub text: Option<String>,
 
@@ -157,7 +162,9 @@ impl SearchQuery {
         // Mode-specific validation
         match self.query_mode {
             QueryMode::EmbeddingOnly | QueryMode::EmbeddingPlusMetadata => {
-                if self.text.as_ref().is_none_or(|t| t.trim().is_empty()) {
+                if self.query_embedding.is_none()
+                    && self.text.as_ref().is_none_or(|t| t.trim().is_empty())
+                {
                     return Err(SearchError::EmptyQuery);
                 }
             }
@@ -174,4 +181,36 @@ impl SearchQuery {
 
         Ok(())
     }
+}
+
+/// Validate and normalize only explicitly supplied query vectors. Keep provider
+/// output handling unchanged for text-only legacy requests.
+pub(crate) fn normalize_query_embedding(
+    embedding: &mut [f32],
+    dimensions: usize,
+) -> Result<(), SearchError> {
+    if embedding.len() != dimensions {
+        return Err(SearchError::InvalidEmbedding(format!(
+            "embedding has {} dimensions, namespace requires {dimensions}",
+            embedding.len(),
+        )));
+    }
+    if embedding.iter().any(|x| !x.is_finite()) {
+        return Err(SearchError::InvalidEmbedding(
+            "embedding elements must be finite".into(),
+        ));
+    }
+    // f64 accumulation handles every finite f32, including huge values and
+    // subnormals, without the overflow/underflow of a squared f32 norm.
+    let norm_squared: f64 = embedding.iter().map(|&x| f64::from(x).powi(2)).sum();
+    if !norm_squared.is_finite() || norm_squared <= 0.0 {
+        return Err(SearchError::InvalidEmbedding(
+            "embedding must have a finite positive norm".into(),
+        ));
+    }
+    let norm = norm_squared.sqrt();
+    for x in embedding {
+        *x = (f64::from(*x) / norm) as f32;
+    }
+    Ok(())
 }

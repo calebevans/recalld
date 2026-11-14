@@ -122,7 +122,9 @@ impl PhaseIndex {
             .entry(namespace_id)
             .or_insert_with(NamespaceBitmaps::new);
         ns.bitmap_mut(from).remove(slot);
-        ns.bitmap_mut(to).insert(slot);
+        if to != DecayPhase::Tombstone {
+            ns.bitmap_mut(to).insert(slot);
+        }
     }
 
     /// Remove a memory entirely (after deletion).

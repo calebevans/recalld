@@ -396,7 +396,7 @@ async fn http_call(
     )
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_only_http_get_search_and_existing_similarity_error() {
+async fn read_only_http_get_search_and_similarity_success() {
     let h = Harness::new().await;
     let before = h.snapshot().await;
     let get = format!("/memories/{}", h.ids[0]);
@@ -418,8 +418,7 @@ async fn read_only_http_get_search_and_existing_similarity_error() {
     .await;
     assert!(status.is_success(), "{body}");
     assert_eq!(body["hits"].as_array().unwrap().len(), 3);
-    // Existing HTTP vector-only adapter rejects EmptyQuery. Verify false mode
-    // also bypasses the source cache before this failure; do not claim success.
+    // Joined vector support succeeds while false mode bypasses the source cache.
     let (status, _) = http_call(
         h.http(),
         "POST",
@@ -427,7 +426,7 @@ async fn read_only_http_get_search_and_existing_similarity_error() {
         json!({"recordAccess":false}),
     )
     .await;
-    assert!(status.is_client_error());
+    assert!(status.is_success());
     assert!(h.f.cache.get(h.ids[0]).await.is_none());
     h.assert_quiet(&before).await;
     for suffix in ["", "?recordAccess=true"] {
@@ -742,7 +741,7 @@ async fn scoped_read_only_controls_survive_http_mcp_and_framed_daemon() {
         .await;
         assert_eq!(
             status.as_u16(),
-            if namespace == "other" { 409 } else { 400 },
+            if namespace == "other" { 409 } else { 200 },
             "{body}"
         );
     }
@@ -897,5 +896,265 @@ async fn scoped_read_only_aliases_fail_closed_on_older_single_control_daemons() 
         );
         assert!(storage.get_memory(id, true, None).await.unwrap().is_some());
         server.await.unwrap();
+    }
+}
+
+// Real adapters and production handlers: threshold is cosine, not strength;
+// only final returned IDs may receive legacy associative exposure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn similarity_threshold_namespace_and_returned_only_exposure() {
+    for rest in [false, true] {
+        let mut h = Harness::new().await;
+        let namespace = h.f.create_namespace("similarity-scope");
+        let mut members = Vec::new();
+        for (vector, strength) in [
+            ([1.0, 0.0, 0.0, 0.0], 1.0),
+            ([0.8, 0.6, 0.0, 0.0], 0.01),
+            ([0.0, 1.0, 0.0, 0.0], 1.0),
+            ([0.6, 0.8, 0.0, 0.0], 1.0),
+        ] {
+            let id =
+                h.f.insert_memory_with(MemorySpec {
+                    embedding: Some(&vector),
+                    decay_strength: strength,
+                    ..MemorySpec::new(namespace)
+                })
+                .await;
+            h.f.vector_index
+                .write()
+                .await
+                .add(
+                    id,
+                    &vector,
+                    VectorMetadata {
+                        namespace_id: namespace,
+                        decay_phase: 1,
+                        tags: vec![],
+                    },
+                )
+                .unwrap();
+            members.push(id);
+            h.ids.push(id);
+        }
+        let bridge = h.bridge(); // default differs from canonical source scope
+        let before = h.snapshot().await;
+        // /search must still filter strength: the low-strength closest neighbor
+        // is excluded even though its cosine is .8.
+        let (status, search) = http_call(
+            h.http(),
+            "POST",
+            "/search",
+            json!({
+                "embedding": VECTOR, "namespace":"similarity-scope",
+                "recordAccess":false, "minStrength":0.5, "limit":20,
+            }),
+        )
+        .await;
+        assert!(status.is_success(), "{search}");
+        let hits = search["hits"].as_array().unwrap();
+        assert!(
+            hits.iter()
+                .any(|v| v["memory"]["id"] == members[2].to_string())
+        );
+        assert!(
+            !hits
+                .iter()
+                .any(|v| v["memory"]["id"] == members[1].to_string())
+        );
+        // Default/explicit scope, no score threshold, threshold, and empty results.
+        for (minimum, expected) in [(None, 3), (Some(0.1), 2), (Some(0.9), 0)] {
+            for explicit_scope in [false, true] {
+                let mut args =
+                    json!({"id":members[0].to_string(), "recordAccess":false, "limit":20});
+                if let Some(minimum) = minimum {
+                    args["minScore"] = json!(minimum);
+                }
+                if explicit_scope {
+                    args["namespace"] = json!("similarity-scope");
+                }
+                let hits = similarity_call(&h, &bridge, rest, args).await;
+                assert_eq!(hits.len(), expected);
+                for hit in &hits {
+                    let memory = if rest { &hit["memory"] } else { hit };
+                    assert_eq!(memory["namespace"], "similarity-scope");
+                    assert_ne!(memory["id"], members[0].to_string());
+                    if let Some(minimum) = minimum {
+                        assert!(hit["score"].as_f64().unwrap() >= minimum);
+                    }
+                }
+            }
+        }
+        h.assert_quiet(&before).await;
+        // No hits in true mode means no event, not exposure of discarded candidates.
+        let empty = similarity_call(
+            &h,
+            &bridge,
+            rest,
+            json!({
+                "id":members[0].to_string(), "minScore":0.9, "recordAccess":true,
+            }),
+        )
+        .await;
+        assert!(empty.is_empty());
+        h.assert_quiet(&before).await;
+        // Both implicit true and explicit true: source, below-threshold, foreign,
+        // and above-threshold but beyond-limit candidates remain unchanged.
+        for explicit_true in [false, true] {
+            let mut args = json!({"id":members[0].to_string(), "minScore":0.1, "limit":1});
+            if explicit_true {
+                args["recordAccess"] = json!(true);
+            }
+            let records: Vec<_> = h.ids.iter().map(|id| h.f.record(*id).unwrap()).collect();
+            let hits = similarity_call(&h, &bridge, rest, args).await;
+            assert_eq!(hits.len(), 1);
+            let returned = if rest {
+                &hits[0]["memory"]["id"]
+            } else {
+                &hits[0]["id"]
+            };
+            assert_eq!(returned, &json!(members[1].to_string()));
+            h.observed().await;
+            for (id, old) in h.ids.iter().zip(records) {
+                let new = h.f.record(*id).unwrap();
+                if *id == members[1] {
+                    assert_eq!(new.access_history.len(), old.access_history.len() + 1);
+                    assert_eq!(new.last_accessed_at, NOW);
+                    assert_eq!(new.stability, old.stability);
+                    assert_eq!(
+                        new.access_history.last().unwrap().kind,
+                        AccessKind::AssociativeRetrieval
+                    );
+                } else {
+                    assert_eq!(
+                        new.to_bytes(),
+                        old.to_bytes(),
+                        "excluded candidate {id} changed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn similarity_call(h: &Harness, bridge: &McpBridge, rest: bool, args: Value) -> Vec<Value> {
+    if rest {
+        let (status, body) = http_call(
+            h.http(),
+            "POST",
+            &format!("/similar/{}", args["id"].as_str().unwrap()),
+            args,
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+        body["hits"].as_array().unwrap().clone()
+    } else {
+        let result = crate::mcp::tools::dispatch_tool(bridge, "find_similar_memories", args).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let wire = serde_json::to_value(result).unwrap();
+        let body: Value =
+            serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap();
+        body["memories"].as_array().unwrap().clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn similarity_rest_preserves_canonical_metadata_and_full_text() {
+    let mut h = Harness::new().await;
+    let (status, created) = http_call(
+        h.http(),
+        "POST",
+        "/memories",
+        json!({
+            "summary":"canonical metadata", "fullText":"preserved full text",
+            "embedding":VECTOR, "checkDuplicates":false,
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{created}");
+    let id: MemoryId = MemoryId::from_uuid(
+        uuid::Uuid::parse_str(created["data"]["id"].as_str().unwrap()).unwrap(),
+    );
+    h.ids.push(id);
+    let mut disk = h.f.record(id).unwrap();
+    disk.difficulty = 7.25;
+    disk.strength = 0.23;
+    disk.decay_strength = 0.67;
+    disk.stability = 12.5;
+    h.f.storage
+        .read()
+        .unwrap()
+        .meta_store()
+        .batch_update_records(&[(id, disk.clone())])
+        .unwrap();
+    // A deliberately stale cache cannot replace the canonical response fields.
+    let mut stale = CachedRecord::from(&disk);
+    stale.difficulty = 1.0;
+    stale.strength = 0.99;
+    stale.decay_strength = 0.98;
+    h.f.cache.insert(id, stale).await;
+    let before = h.snapshot().await;
+    let (status, body) = http_call(
+        h.http(),
+        "POST",
+        &format!("/similar/{}", h.ids[0]),
+        json!({
+            "recordAccess":false, "includeEmbeddings":true, "limit":20, "minScore":0.1,
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let actual = &body["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["memory"]["id"] == id.to_string())
+        .unwrap()["memory"];
+    assert_eq!(actual["difficulty"], json!(7.25));
+    assert!((actual["strength"].as_f64().unwrap() - 0.23).abs() < 1e-6);
+    assert!((actual["decayStrength"].as_f64().unwrap() - 0.67).abs() < 1e-6);
+    let mut expected = crate::serialization::MemoryResponse::from_cached(
+        &CachedRecord::from(&disk),
+        "default".into(),
+    );
+    expected.full_text = Some("preserved full text".into());
+    expected.embedding = Some(VECTOR.to_vec());
+    // Match the actual HTTP JSON serialization, including f32's shortest
+    // round-tripping decimal representation (to_value instead promotes to f64).
+    let expected_wire: Value =
+        serde_json::from_str(&serde_json::to_string(&expected).unwrap()).unwrap();
+    assert_eq!(*actual, expected_wire);
+    h.assert_quiet(&before).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn similarity_rest_full_text_failure_rejects_without_exposure() {
+    let h = Harness::new().await;
+    let id = h.ids[1];
+    let mut disk = h.f.record(id).unwrap();
+    // Synthetic corrupt text reference: metadata and vector are readable, text is not.
+    disk.text_offset = 1_000_000;
+    disk.text_length = 16;
+    h.f.storage
+        .read()
+        .unwrap()
+        .meta_store()
+        .batch_update_records(&[(id, disk)])
+        .unwrap();
+    let before = h.snapshot().await;
+    for record_access in [false, true] {
+        let (status, body) = http_call(
+            h.http(),
+            "POST",
+            &format!("/similar/{}", h.ids[0]),
+            json!({
+                "recordAccess":record_access, "limit":20,
+            }),
+        )
+        .await;
+        assert!(
+            status.is_server_error(),
+            "full-text failure must not become successful missing text: {body}"
+        );
+        h.assert_quiet(&before).await;
     }
 }
