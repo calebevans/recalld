@@ -15,6 +15,7 @@ pub struct StrengthDiagnostics {
 
 pub(super) struct StrengthContext {
     namespace: NamespaceId,
+    pub requested_record_access: bool,
     schema: Option<NamespaceSchemaV2>,
     policy: Option<EffectiveLifecyclePolicy>,
     pub diagnostics: StrengthDiagnostics,
@@ -42,6 +43,7 @@ impl StrengthContext {
             .map_err(|e| SearchError::MetadataError(e.to_string()))?;
         Ok(Self {
             namespace: ns.id,
+            requested_record_access: record_access,
             schema: ns.schema.clone(),
             policy,
             diagnostics: StrengthDiagnostics {
@@ -127,6 +129,21 @@ impl StrengthContext {
 }
 
 impl QueryEngine {
+    /// The canonical source selects scope. Reuse its one resolved namespace and
+    /// one operation clock for both donor and returned-record projection.
+    pub(super) async fn by_id_strength_context(
+        &self,
+        namespace: &NamespaceConfig,
+        requested_record_access: bool,
+    ) -> Result<StrengthContext> {
+        let mut context = StrengthContext::pin(self, namespace, requested_record_access)?;
+        if context.explicit() {
+            let mut records = self.meta_store.namespace_records(namespace.id).await?;
+            context.project_namespace(&mut records, self.graph.as_ref())?;
+        }
+        Ok(context)
+    }
+
     /// Immutable inputs cloned into each operation; production uses the same
     /// instance clock and global multiplier as A3. Does not activate schema v2.
     pub fn with_lifecycle_inputs(
@@ -166,17 +183,4 @@ impl QueryEngine {
         }
         Ok(records)
     }
-}
-
-pub(super) fn require_legacy_helper(record: &CachedRecord) -> Result<()> {
-    if record
-        .lifecycle
-        .as_ref()
-        .is_some_and(|f| f.lifecycle_version == LifecycleVersion::ExplicitFeedbackV2)
-    {
-        return Err(SearchError::Internal(
-            "explicit-feedback direct/similar projection unavailable".into(),
-        ));
-    }
-    Ok(())
 }

@@ -481,17 +481,15 @@ async fn explicit_policy_fails_closed_before_legacy_exposure_under_either_semant
         engine
             .get_memory_with_access(f.ids[0], false)
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("projection unavailable")
+            .unwrap()
+            .is_some()
     );
     assert!(
         engine
             .similar_with_access(f.ids[0], 1, false)
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("projection unavailable")
+            .unwrap()
+            .is_empty()
     );
     assert!(engine.get_memory_with_access(f.ids[0], true).await.is_err());
     assert!(engine.similar_with_access(f.ids[0], 1, true).await.is_err());
@@ -786,4 +784,295 @@ async fn legacy_retrieval_graph_formulas_also_consume_explicit_policy_projection
     assert_eq!(target.retrievability, raw);
     assert!(target.effective_r > raw);
     assert_eq!(clock.calls.load(Ordering::SeqCst), 1);
+}
+
+struct ByIdNamespace {
+    view: Arc<OfflineSnapshot>,
+    calls: AtomicUsize,
+    wrong_scope: bool,
+}
+#[async_trait::async_trait]
+impl NamespaceResolver for ByIdNamespace {
+    async fn resolve(&self, _: &str) -> Result<NamespaceConfig> {
+        panic!("by-ID operation guessed a namespace name")
+    }
+    async fn resolve_id(&self, id: NamespaceId) -> Result<NamespaceConfig> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.view
+            .namespaces()
+            .iter()
+            .find(|ns| {
+                if self.wrong_scope {
+                    ns.id != id
+                } else {
+                    ns.id == id
+                }
+            })
+            .cloned()
+            .ok_or_else(|| SearchError::NamespaceNotFound(format!("id {}", id.get())))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn by_id_get_projects_once_and_retains_canonical_scope_phase_and_bytes() {
+    let f = offline(2, LifecycleVersion::ExplicitFeedbackV2, |_, r| {
+        r.phase = DecayPhase::Summary;
+        r.is_permastore = 1;
+        r.strength = 0.13;
+        r.decay_strength = 0.23;
+        r.last_accessed_at = 10 * DAY;
+        r.schema.as_mut().unwrap().lifecycle.retrieved_at = Some(10 * DAY);
+    })
+    .await;
+    let bytes = file_bytes(&f.files);
+    let clock = CountingClock::new(DAY);
+    let mut engine = engine(&f, clock.clone(), &[(0, 1, EdgeType::Associative)]);
+    let namespaces = Arc::new(ByIdNamespace {
+        view: f.view.clone(),
+        calls: AtomicUsize::new(0),
+        wrong_scope: false,
+    });
+    engine.namespace_resolver = namespaces.clone();
+    let first = engine
+        .get_memory_with_access(f.ids[0], false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(namespaces.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first.namespace, "default");
+    assert!(first.strength > 0.8 && first.strength < 1.0);
+    assert!(first.decay_strength > first.strength);
+    assert_eq!(first.phase, DecayPhase::Summary);
+    assert!(first.is_permastore);
+    assert_eq!(first.last_accessed_at, 10 * DAY);
+    assert_eq!(first.summary.as_deref(), Some("needle"));
+    clock.now.store(30 * DAY, Ordering::SeqCst);
+    let later = engine
+        .get_memory_with_access(f.ids[0], false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(later.strength < first.strength && later.decay_strength < first.decay_strength);
+    assert_eq!(later.phase, first.phase);
+    assert_eq!(later.summary, first.summary);
+    let foreign = engine
+        .get_memory_with_access(f.ids[2], false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(foreign.namespace, "foreign");
+    assert_eq!(
+        foreign.decay_strength, foreign.strength,
+        "foreign record has no same-scope donor"
+    );
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(namespaces.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(file_bytes(&f.files), bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn by_id_similarity_projects_strength_without_reordering_cosines_after_clock_advance() {
+    let f = offline(3, LifecycleVersion::ExplicitFeedbackV2, |i, r| {
+        r.stability = if i == 1 { 0.01 } else { 1000.0 };
+        r.strength = 0.4;
+        r.decay_strength = 0.5;
+    })
+    .await;
+    let bytes = file_bytes(&f.files);
+    let clock = CountingClock::new(DAY);
+    let mut engine = engine(&f, clock.clone(), &[(0, 1, EdgeType::Associative)]);
+    let namespaces = Arc::new(ByIdNamespace {
+        view: f.view.clone(),
+        calls: AtomicUsize::new(0),
+        wrong_scope: false,
+    });
+    engine.namespace_resolver = namespaces.clone();
+    let first = engine
+        .similar_with_access(f.ids[0], 10, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.iter().map(|r| r.memory_id).collect::<Vec<_>>(),
+        vec![f.ids[1], f.ids[2]]
+    );
+    assert!(
+        first[0].retrievability < first[1].retrievability,
+        "strength must not rerank cosine matches"
+    );
+    assert!(first[0].effective_r > first[0].retrievability);
+    assert_eq!(first[0].namespace, "default");
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(namespaces.calls.load(Ordering::SeqCst), 1);
+    clock.now.store(30 * DAY, Ordering::SeqCst);
+    let later = engine
+        .similar_with_access(f.ids[0], 10, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|r| (r.memory_id, r.score, r.composite_score))
+            .collect::<Vec<_>>(),
+        later
+            .iter()
+            .map(|r| (r.memory_id, r.score, r.composite_score))
+            .collect::<Vec<_>>()
+    );
+    assert!(later[0].retrievability < first[0].retrievability);
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(namespaces.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(file_bytes(&f.files), bytes);
+}
+
+#[path = "by_id_transport_tests.rs"]
+mod by_id_transport_tests;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn by_id_prepared_selection_preserves_original_true_intent_and_false_thresholds() {
+    let f = offline(3, LifecycleVersion::ExplicitFeedbackV2, |_, _| {}).await;
+    let bytes = file_bytes(&f.files);
+    let clock = CountingClock::new(DAY);
+    let engine = engine(&f, clock.clone(), &[]);
+    for (limit, minimum) in [(0, None), (10, Some(1.1)), (1, Some(0.9))] {
+        assert!(
+            engine
+                .prepare_similar_filtered(f.ids[0], limit, minimum, true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recordAccess must be false")
+        );
+    }
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
+    let selected = engine
+        .prepare_similar_filtered(f.ids[0], 1, Some(0.9), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.iter().map(|r| r.memory_id).collect::<Vec<_>>(),
+        vec![f.ids[1]]
+    );
+    assert!(
+        engine
+            .prepare_similar_filtered(f.ids[0], 0, None, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        engine
+            .prepare_similar_filtered(f.ids[0], 10, Some(1.1), false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A caller cannot bypass policy admission by directly invoking the late
+    // hook; it must not repin a clock or reach the legacy recorder either.
+    assert!(
+        engine
+            .record_similar_accesses(&[f.ids[1]])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("explicit-feedback exposure writer unavailable")
+    );
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(file_bytes(&f.files), bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn by_id_scope_and_record_policy_mismatches_fail_closed() {
+    let f = offline(2, LifecycleVersion::ExplicitFeedbackV2, |_, _| {}).await;
+    let bytes = file_bytes(&f.files);
+    let clock = CountingClock::new(DAY);
+    let mut engine = engine(&f, clock.clone(), &[]);
+    engine.namespace_resolver = Arc::new(ByIdNamespace {
+        view: f.view.clone(),
+        calls: AtomicUsize::new(0),
+        wrong_scope: true,
+    });
+    assert!(
+        engine
+            .get_memory_with_access(f.ids[0], false)
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .prepare_similar_filtered(f.ids[0], 10, None, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
+    engine.namespace_resolver = f.view.clone();
+    for corruption in 0..4 {
+        engine.meta_store = Arc::new(InvalidRevalidation {
+            source: f.view.clone(),
+            target: f.ids[0],
+            corruption,
+        });
+        assert!(
+            engine
+                .get_memory_with_access(f.ids[0], false)
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .prepare_similar_filtered(f.ids[0], 10, None, false)
+                .await
+                .is_err()
+        );
+        engine.meta_store = Arc::new(InvalidRevalidation {
+            source: f.view.clone(),
+            target: f.ids[1],
+            corruption,
+        });
+        assert!(
+            engine
+                .prepare_similar_filtered(f.ids[0], 10, None, false)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(file_bytes(&f.files), bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn by_id_legacy_strength_and_cosine_values_ignore_clock_advancement() {
+    let f = offline(2, LifecycleVersion::LegacyAccessV1, |_, r| {
+        r.strength = 0.23;
+        r.decay_strength = 0.67;
+        r.stability = 0.01;
+    })
+    .await;
+    let clock = CountingClock::new(DAY);
+    let engine = engine(&f, clock.clone(), &[(0, 1, EdgeType::Associative)]);
+    let first = engine
+        .prepare_similar_filtered(f.ids[0], 10, None, false)
+        .await
+        .unwrap();
+    for now in [DAY, 300 * DAY] {
+        clock.now.store(now, Ordering::SeqCst);
+        let fetched = engine
+            .get_memory_with_access(f.ids[0], false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((fetched.strength, fetched.decay_strength), (0.23, 0.67));
+        let selected = engine
+            .prepare_similar_filtered(f.ids[0], 10, None, false)
+            .await
+            .unwrap();
+        assert_eq!(selected.len(), first.len());
+        for (a, b) in selected.iter().zip(&first) {
+            assert_eq!(
+                (a.memory_id, a.score, a.composite_score),
+                (b.memory_id, b.score, b.composite_score)
+            );
+            assert_eq!((a.retrievability, a.effective_r), (0.23, 0.67));
+        }
+    }
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 5);
 }

@@ -994,7 +994,12 @@ async fn find_similar_admitted(
     // similarity minScore before exposure. /search minStrength is independent.
     let results = state
         .search
-        .find_similar(memory_id, req.limit.min(100) as usize, req.min_score, false)
+        .prepare_similar_filtered(
+            memory_id,
+            req.limit.min(100) as usize,
+            req.min_score,
+            req.record_access,
+        )
         .await?;
     let embeddings = if req.include_embeddings {
         let ids: Vec<_> = results.iter().map(|r| r.memory_id).collect();
@@ -1021,10 +1026,17 @@ async fn find_similar_admitted(
                 message: "similarity result changed during hydration; retry".into(),
             });
         }
-        // Search projections omit fields such as difficulty and may carry an
-        // adjusted effective score. REST metadata is the canonical record.
+        // Hydrate exact canonical metadata. Explicit-policy strengths are the
+        // prepared operation's projection, not persisted compatibility values.
         let mut memory =
             MemoryResponse::from_cached(&crate::model::CachedRecord::from(&record), r.namespace);
+        if record.schema.as_ref().is_some_and(|schema| {
+            schema.lifecycle.lifecycle_version
+                == crate::model::schema::LifecycleVersion::ExplicitFeedbackV2
+        }) {
+            memory.strength = r.retrievability;
+            memory.decay_strength = r.effective_r;
+        }
         memory.full_text = state.storage.get_full_text(r.memory_id).await?;
         memory.embedding = embeddings.get(&r.memory_id).cloned();
         hits.push(SearchHit {

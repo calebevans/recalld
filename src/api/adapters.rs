@@ -207,6 +207,18 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             .await
     }
 
+    async fn prepare_similar_filtered(
+        &self,
+        id: MemoryId,
+        limit: usize,
+        min_score: Option<f32>,
+        requested_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, crate::search::SearchError> {
+        self.query_engine
+            .prepare_similar_filtered(id, limit, min_score, requested_access)
+            .await
+    }
+
     async fn record_similar_accesses(
         &self,
         ids: &[MemoryId],

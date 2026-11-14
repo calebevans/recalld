@@ -481,14 +481,22 @@ impl QueryEngine {
         let stamp = self.meta_store.effects_stamp().await?;
         let result = self.search_admitted(query, semantics).await;
         if self.meta_store.effects_stamp().await? != stamp {
-            return Err(SearchError::Unavailable("graph effects changed during query".into()));
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
         }
         result
     }
 
-    pub(crate) async fn effects_stamp(&self) -> Result<u64> { self.meta_store.effects_stamp().await }
+    pub(crate) async fn effects_stamp(&self) -> Result<u64> {
+        self.meta_store.effects_stamp().await
+    }
 
-    async fn search_admitted(&self, mut query: SearchQuery, semantics: RetrievalSemantics) -> Result<SemanticsResponse> {
+    async fn search_admitted(
+        &self,
+        mut query: SearchQuery,
+        semantics: RetrievalSemantics,
+    ) -> Result<SemanticsResponse> {
         let mut diagnostics = SemanticsDiagnostics::new(semantics);
         let pipeline_start = Instant::now();
         let mut timings = StageTimings::default();
@@ -1206,22 +1214,25 @@ impl QueryEngine {
         id: MemoryId,
         record_access: bool,
     ) -> Result<Option<MemoryResponse>> {
-        let canonical = self.meta_store.get(&id).await?;
-        if let Some(record) = &canonical {
-            strength::require_legacy_helper(record)?;
-        }
-        let record = match record_access.then(|| self.cache.get(&id)).flatten() {
-            Some(r) => r,
-            None => match canonical {
-                Some(r) => r,
-                None => return Ok(None),
-            },
+        let Some(mut record) = self.meta_store.get(&id).await? else {
+            return Ok(None);
         };
-
-        strength::require_legacy_helper(&record)?;
+        let namespace = self
+            .namespace_resolver
+            .resolve_id(record.namespace_id)
+            .await?;
+        if namespace.id != record.namespace_id {
+            return Err(SearchError::MetadataError(
+                "resolved namespace differs from canonical source".into(),
+            ));
+        }
+        let context = self
+            .by_id_strength_context(&namespace, record_access)
+            .await?;
+        context.apply(&mut record)?;
 
         // Preserve legacy fire-and-forget only when access is permitted.
-        if record_access {
+        if context.requested_record_access {
             let recorder = Arc::clone(&self.access_recorder);
             let access_id = id;
             tokio::spawn(async move {
@@ -1235,7 +1246,7 @@ impl QueryEngine {
         }
         Ok(Some(MemoryResponse {
             id: record.id,
-            namespace: String::new(), // Resolved by API layer from namespace_id
+            namespace: namespace.name,
             created_at: record.created_at,
             last_accessed_at: record.last_accessed_at,
             summary: if record.phase != DecayPhase::Ghost && record.phase != DecayPhase::Tombstone {
@@ -1279,9 +1290,34 @@ impl QueryEngine {
         min_score: Option<f32>,
         record_access: bool,
     ) -> Result<Vec<SearchResult>> {
+        self.similar_with_access_checked(id, k, min_score, record_access, false)
+            .await
+    }
+
+    /// Preserve the caller's observation intent while deferring exposure until
+    /// the caller finishes fallible response hydration. Not a transport mode.
+    pub async fn prepare_similar_filtered(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        requested_access: bool,
+    ) -> Result<Vec<SearchResult>> {
+        self.similar_with_access_checked(id, k, min_score, requested_access, true)
+            .await
+    }
+
+    async fn similar_with_access_checked(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        requested_access: bool,
+        defer_recording: bool,
+    ) -> Result<Vec<SearchResult>> {
         let stamp = self.meta_store.effects_stamp().await?;
         let result = self
-            .similar_with_access_admitted(id, k, min_score, record_access)
+            .similar_with_access_admitted(id, k, min_score, requested_access, defer_recording)
             .await;
         if self.meta_store.effects_stamp().await? != stamp {
             return Err(SearchError::Unavailable(
@@ -1297,22 +1333,27 @@ impl QueryEngine {
         k: usize,
         min_score: Option<f32>,
         record_access: bool,
+        defer_recording: bool,
     ) -> Result<Vec<SearchResult>> {
         let k = k.min(SearchQuery::MAX_USER_LIMIT);
-
-        // By-ID scope comes from the canonical record, even if its cache entry is stale.
-        let record = self
+        let mut record = self
             .meta_store
             .get(&id)
             .await?
             .ok_or(SearchError::MemoryNotFound(id))?;
-
         let namespace = self
             .namespace_resolver
             .resolve_id(record.namespace_id)
             .await?;
-
-        strength::require_legacy_helper(&record)?;
+        if namespace.id != record.namespace_id {
+            return Err(SearchError::MetadataError(
+                "resolved namespace differs from canonical source".into(),
+            ));
+        }
+        let context = self
+            .by_id_strength_context(&namespace, record_access)
+            .await?;
+        context.apply(&mut record)?;
 
         // Load the source memory's embedding from the vector index.
         let mut source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
@@ -1337,10 +1378,7 @@ impl QueryEngine {
             .collect();
 
         let result_ids: Vec<MemoryId> = filtered.iter().map(|s| s.memory_id).collect();
-        let records = self.meta_store.get_batch(&result_ids).await?;
-        for record in &records {
-            strength::require_legacy_helper(record)?;
-        }
+        let records = self.strength_records(&result_ids, Some(&context)).await?;
 
         // Build a lookup map so we can iterate `filtered` (which preserves
         // descending similarity order from the vector search) instead of
@@ -1352,7 +1390,7 @@ impl QueryEngine {
             .iter()
             .filter_map(|scored| {
                 let rec = record_map.get(&scored.memory_id)?;
-                if rec.namespace_id != record.namespace_id
+                if rec.namespace_id != namespace.id
                     || matches!(rec.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
                 {
                     return None;
@@ -1385,7 +1423,7 @@ impl QueryEngine {
             })
             .collect();
 
-        if record_access {
+        if context.requested_record_access && !defer_recording {
             self.record_similar_accesses(&results.iter().map(|r| r.memory_id).collect::<Vec<_>>())
                 .await?;
         }
@@ -1396,6 +1434,19 @@ impl QueryEngine {
     /// response hydration. Legacy batches are awaited, not receipt-atomic.
     pub async fn record_similar_accesses(&self, ids: &[MemoryId]) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
+        // Consumer preflight only: a schema-aware observation writer must also
+        // enforce this under its publication guard on the later A3 join.
+        let records = self.meta_store.get_batch(ids).await?;
+        if records.iter().any(|r| {
+            r.lifecycle.as_ref().is_some_and(|fields| {
+                fields.lifecycle_version
+                    == crate::model::schema::LifecycleVersion::ExplicitFeedbackV2
+            })
+        }) {
+            return Err(SearchError::Unavailable(
+                "explicit-feedback exposure writer unavailable".into(),
+            ));
+        }
         let accesses: Vec<_> = ids
             .iter()
             .copied()
@@ -1867,6 +1918,9 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl MetadataStore for MutatingLookup {
+            async fn list_namespace_memories(&self, _: NamespaceId) -> Result<Vec<MemoryId>> {
+                Ok(Vec::new())
+            }
             async fn effects_stamp(&self) -> Result<u64> {
                 self.storage
                     .read()

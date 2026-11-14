@@ -54,6 +54,20 @@ pub trait SearchPipeline: Send + Sync {
         Err(SearchError::Internal("similarity unavailable".into()))
     }
 
+    /// Select without exposure while preserving the caller's observation intent
+    /// for policy admission. Implementations must not rewrite it to false.
+    async fn prepare_similar_filtered(
+        &self,
+        _id: MemoryId,
+        _limit: usize,
+        _min_score: Option<f32>,
+        _requested_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, SearchError> {
+        Err(SearchError::Unavailable(
+            "prepared similarity unavailable".into(),
+        ))
+    }
+
     /// Record the final, fully hydrated similarity result IDs exactly once.
     async fn record_similar_accesses(&self, _ids: &[MemoryId]) -> Result<(), SearchError> {
         Err(SearchError::Internal(
