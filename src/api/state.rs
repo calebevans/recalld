@@ -95,10 +95,15 @@ pub trait SearchPipeline: Send + Sync {
     async fn fts_remove(&self, memory_id: MemoryId);
 
     /// Add a memory to the entity index for entity-based linking.
-    async fn entity_index_add(&self, memory_id: MemoryId, entities: &[String]);
+    async fn entity_index_add(
+        &self,
+        namespace_id: NamespaceId,
+        memory_id: MemoryId,
+        entities: &[String],
+    );
 
     /// Remove a memory from the entity index.
-    async fn entity_index_remove(&self, memory_id: MemoryId, entities: &[String]);
+    async fn entity_index_remove(&self, namespace_id: NamespaceId, memory_id: MemoryId);
 }
 
 /// Persistent storage engine (meta.db, fulltext.dat, vectors.dat, edges.db).

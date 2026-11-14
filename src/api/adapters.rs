@@ -288,18 +288,23 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         }
     }
 
-    async fn entity_index_add(&self, memory_id: MemoryId, entities: &[String]) {
-        if !entities.is_empty() {
-            let mut idx = self.entity_index.write().await;
-            idx.add(memory_id, entities);
-        }
+    async fn entity_index_add(
+        &self,
+        namespace_id: NamespaceId,
+        memory_id: MemoryId,
+        entities: &[String],
+    ) {
+        self.entity_index
+            .write()
+            .await
+            .add(namespace_id, memory_id, entities);
     }
 
-    async fn entity_index_remove(&self, memory_id: MemoryId, entities: &[String]) {
-        if !entities.is_empty() {
-            let mut idx = self.entity_index.write().await;
-            idx.remove(memory_id, entities);
-        }
+    async fn entity_index_remove(&self, namespace_id: NamespaceId, memory_id: MemoryId) {
+        self.entity_index
+            .write()
+            .await
+            .remove(namespace_id, memory_id);
     }
 }
 
@@ -1489,7 +1494,7 @@ mod tests {
         fx.entity_index
             .write()
             .await
-            .add(id, &["Sarah".to_string()]);
+            .add(ns, id, &["Sarah".to_string()]);
 
         id
     }
