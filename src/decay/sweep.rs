@@ -708,8 +708,9 @@ impl DecaySweepRunner {
                 let meta = match meta_batch.get(memory_id) {
                     Some(m) => m.clone(),
                     None => {
-                        // Memory was deleted between bitmap load and now,
-                        // or had a load error (already recorded above).
+                        // Memory was deleted or forgotten between bitmap
+                        // load and now, or had a load error (already
+                        // recorded above).
                         debug!(id = %memory_id, "memory not found in batch, skipping");
                         continue;
                     }
@@ -812,8 +813,9 @@ impl DecaySweepRunner {
     /// happens under the caller's already-acquired storage lock, so the
     /// lock is held once per batch rather than once per record.
     ///
-    /// Missing records (deleted between bitmap load and now) are silently
-    /// omitted. Errors are collected in the returned vector.
+    /// Missing and tombstoned records (deleted or forgotten between
+    /// bitmap load and now) are silently omitted. Errors are collected
+    /// in the returned vector.
     fn load_metadata_batch(
         storage: &RedbStorageEngine,
         ids: &[MemoryId],
@@ -833,6 +835,15 @@ impl DecaySweepRunner {
         for &id in ids {
             match storage.get_record(id) {
                 Ok(Some(record)) => {
+                    // Forgotten between bitmap load and now -- skip.
+                    // `forget_memory` keeps the row, so unlike a deleted
+                    // record this one is still here to load, and the
+                    // sweep would evaluate it against the phase it was
+                    // in when the snapshot was taken.
+                    if record.phase == DecayPhase::Tombstone {
+                        continue;
+                    }
+
                     let decay_rate_multiplier =
                         ns_cache.get(&record.namespace_id).copied().flatten();
 
@@ -1348,5 +1359,73 @@ impl DecaySweepRunner {
             old_phase: DecayPhase::Ghost,
             retrievability: effective_r,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DiskRecord, NamespaceConfig};
+
+    const DIM: usize = 4;
+
+    /// An engine holding one live, Full-phase memory.
+    fn engine_with_one_memory() -> (tempfile::TempDir, RedbStorageEngine, MemoryId) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = RedbStorageEngine::open(dir.path()).expect("open engine");
+
+        let mut config = NamespaceConfig::default_namespace(0);
+        config.name = "sweep".to_string();
+        config.embedding_dim = DIM as u32;
+        let namespace_id = engine.create_namespace(&config).expect("create namespace");
+
+        let id = MemoryId::new();
+        let mut record = DiskRecord {
+            version: DiskRecord::CURRENT_VERSION,
+            id: *id.as_bytes(),
+            namespace_id: namespace_id.get(),
+            created_at: 0,
+            last_accessed_at: 0,
+            phase: DecayPhase::Full,
+            strength: 1.0,
+            decay_strength: 1.0,
+            stability: 1.0,
+            difficulty: 5.0,
+            is_permastore: 0,
+            vector_slot: 0,
+            edge_count: 0,
+            summary: "fixture".into(),
+            tags: Vec::new(),
+            access_history: Vec::new(),
+            text_offset: 0,
+            text_length: 0,
+        };
+        engine
+            .insert_memory(id, namespace_id, &mut record, &[0.0; DIM], None)
+            .expect("insert memory");
+
+        (dir, engine, id)
+    }
+
+    /// `sweep_phase` takes its list of ids once, up front, and loads each
+    /// chunk later. A memory forgotten in between is still on that list,
+    /// and `forget_memory` keeps the row, so nothing told the sweep it
+    /// was looking at a tombstone: it evaluated the record against the
+    /// phase it was sweeping and wrote that phase back.
+    #[test]
+    fn a_memory_tombstoned_after_the_phase_snapshot_is_not_swept() {
+        let (_dir, engine, id) = engine_with_one_memory();
+        let snapshot = engine.ids_in_phase(DecayPhase::Full).expect("ids in phase");
+        assert_eq!(snapshot, vec![id]);
+
+        engine.tombstone_memory(id).expect("tombstone");
+
+        let (batch, errors) = DecaySweepRunner::load_metadata_batch(&engine, &snapshot);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            !batch.contains_key(&id),
+            "a tombstone was handed to the sweep as a Full-phase memory"
+        );
     }
 }
