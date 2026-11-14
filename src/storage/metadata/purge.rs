@@ -563,7 +563,7 @@ impl MetadataStore {
             }
             let ctx = MutationContext::unkeyed(p.namespace_id);
             let result = self.finish_record_effects(
-                &guard,
+                guard,
                 tx,
                 &ctx,
                 [0; 32],
