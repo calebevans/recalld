@@ -604,6 +604,18 @@ impl GraphReader for SharedGraphReader {
             .map_err(|e| SearchError::Internal(e.into()))
     }
 
+    fn rif_edges(
+        &self,
+        anchor: MemoryId,
+        namespace: NamespaceId,
+    ) -> Result<Vec<crate::graph::query::RifEdge>> {
+        let graph = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.graph.read())
+        });
+        crate::graph::query::rif_edges(&graph, anchor, namespace)
+            .map_err(|error| SearchError::Unavailable(error.into()))
+    }
+
     fn neighbors(&self, id: &MemoryId) -> Vec<MemoryId> {
         let graph = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.graph.read())

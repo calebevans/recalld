@@ -62,8 +62,9 @@ pub struct FtsDiagnostics {
 #[derive(Debug)]
 pub struct SemanticsDiagnostics {
     pub semantics: RetrievalSemantics,
-    /// True when v2 forces RIF off; false preserves the configured legacy engine.
+    /// True when v2 leaves ranking unchanged (Off/Shadow); V1 keeps legacy configuration.
     pub rif_off: bool,
+    pub rif: Option<RifDiagnostics>,
     pub strength: Option<StrengthDiagnostics>,
     pub fts: FtsDiagnostics,
     /// V2-only observations. None means legacy instrumentation is unavailable.
@@ -84,6 +85,7 @@ impl SemanticsDiagnostics {
         Self {
             semantics,
             rif_off: semantics != RetrievalSemantics::V1,
+            rif: None,
             strength: None,
             fts: FtsDiagnostics::default(),
             channels: (semantics != RetrievalSemantics::V1)
@@ -105,6 +107,9 @@ impl SemanticsDiagnostics {
         self.observe_returned(candidates);
         let ids: HashSet<_> = candidates.iter().map(|c| c.record.id).collect();
         self.versions.retain(|id, _| ids.contains(id));
+        if let Some(rif) = &mut self.rif {
+            rif.returned_multipliers.retain(|id, _| ids.contains(id));
+        }
         self.graph_depths = candidates
             .iter()
             .filter_map(|c| c.graph_depth.map(|d| (c.record.id, d)))
@@ -219,7 +224,9 @@ impl QueryEngine {
         mode: VersionMode,
         diagnostics: &mut SemanticsDiagnostics,
         context: Option<&StrengthContext>,
+        mut rif_inputs: Option<&mut rif_experiment::ScoreContributions>,
     ) -> Result<()> {
+        let mut original_inputs = rif_inputs.as_mut().map(|inputs| std::mem::take(*inputs));
         let originals: HashMap<_, _> = candidates
             .iter()
             .map(|c| (c.record.id, c.clone()))
@@ -249,6 +256,14 @@ impl QueryEngine {
                     }
                 };
                 diagnostics.versions.insert(origin.id, status);
+                if let (Some(inputs), Some(original)) =
+                    (rif_inputs.as_mut(), original_inputs.as_mut())
+                {
+                    inputs.insert(
+                        origin.id,
+                        original.remove(&origin.id).expect("original RIF inputs"),
+                    );
+                }
                 resolved.insert(
                     origin.id,
                     Candidate {
@@ -276,6 +291,14 @@ impl QueryEngine {
             validate_record(&terminal)?;
             let id = terminal.id;
             diagnostics.versions.insert(id, VersionStatus::Current);
+            if let (Some(inputs), Some(original)) = (rif_inputs.as_mut(), original_inputs.as_mut())
+            {
+                inputs.entry(id).or_default().extend(
+                    original
+                        .remove(&candidate.record.id)
+                        .expect("original RIF inputs"),
+                );
+            }
             let replacement = resolved.entry(id).or_insert_with(|| {
                 let mut own = originals
                     .get(&id)
@@ -350,9 +373,22 @@ impl QueryEngine {
                 metadata.candidate_limited = Some(diagnostics.metadata_candidate_limited);
             }
         }
+        let mut rif_inputs = (self.rif_mode != RifMode::Off).then(|| {
+            let mut inputs = rif_experiment::ScoreContributions::new();
+            rif_experiment::remember(&mut inputs, candidates);
+            inputs
+        });
         if mode == VersionMode::Current {
-            self.resolve_versions2(candidates, query, namespace, mode, diagnostics, context)
-                .await?;
+            self.resolve_versions2(
+                candidates,
+                query,
+                namespace,
+                mode,
+                diagnostics,
+                context,
+                rif_inputs.as_mut(),
+            )
+            .await?;
         }
         timings.rank_us = stage_start.elapsed().as_micros() as u64;
         if query.graph_depth > 0 {
@@ -425,14 +461,25 @@ impl QueryEngine {
                     graph.candidate_limited = Some(true);
                 }
             }
+            if let Some(inputs) = &mut rif_inputs {
+                rif_experiment::remember(inputs, &discovered);
+            }
             candidates.extend(discovered);
             timings.graph_expansion_us = stage_start.elapsed().as_micros() as u64;
         }
         let stage_start = Instant::now();
-        // RIF is intentionally absent: v2 uses baseline formulas with no suppression.
+        // Resolve and rank once with RIF off before freezing experimental anchors.
         if mode == VersionMode::History || query.graph_depth > 0 {
-            self.resolve_versions2(candidates, query, namespace, mode, diagnostics, context)
-                .await?;
+            self.resolve_versions2(
+                candidates,
+                query,
+                namespace,
+                mode,
+                diagnostics,
+                context,
+                rif_inputs.as_mut(),
+            )
+            .await?;
         }
         for c in candidates.iter_mut() {
             if !c.composite_score.is_finite() {
@@ -444,6 +491,18 @@ impl QueryEngine {
         }
         candidates.sort_by(rank);
         timings.rank_us += stage_start.elapsed().as_micros() as u64;
+        if let Some(inputs) = &rif_inputs {
+            let rif_start = Instant::now();
+            diagnostics.rif =
+                Some(self.apply_rif_experiment(candidates, query, namespace, eligible, inputs)?);
+            timings.apply_rif_us = rif_start.elapsed().as_micros() as u64;
+            diagnostics.rif_off = self.rif_mode != RifMode::Experimental;
+            if self.rif_mode == RifMode::Experimental {
+                let rank_start = Instant::now();
+                candidates.sort_by(rank);
+                timings.rank_us += rank_start.elapsed().as_micros() as u64;
+            }
+        }
         Ok(())
     }
 }

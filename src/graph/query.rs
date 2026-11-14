@@ -219,3 +219,48 @@ pub fn expand(
         .sort_by(|a, b| b.activation.total_cmp(&a.activation).then(a.id.cmp(&b.id)));
     Ok(result)
 }
+
+/// Actual incident edges; namespace and lifecycle eligibility remain canonical.
+#[derive(Debug, Clone)]
+pub struct RifEdge {
+    pub target: MemoryId,
+    pub namespace: NamespaceId,
+    pub edge_type: EdgeType,
+    pub weight: f32,
+}
+
+pub fn rif_edges(
+    graph: &RelationshipGraph,
+    anchor: MemoryId,
+    namespace: NamespaceId,
+) -> Result<Vec<RifEdge>, &'static str> {
+    let node = graph.get_node(&anchor).ok_or("missing RIF anchor")?;
+    if node.namespace_id != namespace {
+        return Err("RIF anchor scope mismatch");
+    }
+    node.outgoing
+        .iter()
+        .chain(&node.incoming)
+        .map(|key| {
+            let edge = graph.edges.get(*key).ok_or("missing RIF edge")?;
+            let source = graph.nodes.get(edge.source).ok_or("missing RIF source")?;
+            let target = graph.nodes.get(edge.target).ok_or("missing RIF target")?;
+            let other = if source.memory_id == anchor {
+                target
+            } else if target.memory_id == anchor {
+                source
+            } else {
+                return Err("invalid RIF adjacency");
+            };
+            if !edge.weight.is_finite() || !(0.0..=1.0).contains(&edge.weight) {
+                return Err("invalid RIF edge weight");
+            }
+            Ok(RifEdge {
+                target: other.memory_id,
+                namespace: other.namespace_id,
+                edge_type: edge.edge_type,
+                weight: edge.weight,
+            })
+        })
+        .collect()
+}

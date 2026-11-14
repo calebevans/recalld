@@ -1184,3 +1184,105 @@ async fn by_id_legacy_strength_and_cosine_values_ignore_clock_advancement() {
     }
     assert_eq!(clock.calls.load(Ordering::SeqCst), 5);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rif_modes_real_canonical_snapshot_pin_one_clock_and_never_write() {
+    for version in [
+        LifecycleVersion::LegacyAccessV1,
+        LifecycleVersion::ExplicitFeedbackV2,
+    ] {
+        let f = offline(3, version, |_, r| {
+            r.stability = 10.0;
+            r.strength = 0.9;
+            r.decay_strength = 0.8;
+        })
+        .await;
+        let before = file_bytes(&f.files);
+        let clock = CountingClock::new(10 * DAY);
+        let mut e = engine(&f, clock.clone(), &[(0, 1, EdgeType::Associative)]);
+        let mut prior = None;
+        for mode in [RifMode::Off, RifMode::Shadow, RifMode::Experimental] {
+            e.rif_mode = mode;
+            let count = clock.calls.load(Ordering::SeqCst);
+            let got = e
+                .search_with_semantics(metadata(), current())
+                .await
+                .unwrap();
+            assert_eq!(clock.calls.load(Ordering::SeqCst), count + 1);
+            assert_eq!(got.diagnostics.strength.unwrap().evaluated_at, 10 * DAY);
+            assert_eq!(got.diagnostics.strength.unwrap().lifecycle_version, version);
+            let values: Vec<_> = got
+                .response
+                .results
+                .iter()
+                .map(|r| (r.memory_id, r.composite_score, r.effective_r))
+                .collect();
+            if mode == RifMode::Off {
+                prior = Some(values);
+            } else if mode == RifMode::Shadow {
+                assert_eq!(Some(values), prior);
+            } else {
+                let target = result(&got, f.ids[1]);
+                assert_eq!(target.stability, 10.0);
+                let expected = crate::rif::plasticity_multiplier(
+                    target.retrievability * 0.3,
+                    &crate::rif::RifConfig::default(),
+                );
+                assert!(
+                    (got.diagnostics.rif.as_ref().unwrap().returned_multipliers[&f.ids[1]]
+                        - expected)
+                        .abs()
+                        < 1e-6
+                );
+                assert!(
+                    target.effective_r
+                        < if version == LifecycleVersion::LegacyAccessV1 {
+                            0.8
+                        } else {
+                            1.0
+                        }
+                );
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(before, file_bytes(&f.files));
+        }
+        // Actual production vector/FTS/entity/graph adapters over the same
+        // canonical snapshot, not only metadata candidate selection.
+        let q = query(json!({"text":"needle","queryEmbedding":[1.0,0.0,0.0,0.0],
+            "entities":["caleb"],"graphDepth":1,"recordAccess":false,"limit":50}));
+        let mut baseline = None;
+        for mode in [RifMode::Off, RifMode::Shadow, RifMode::Experimental] {
+            e.rif_mode = mode;
+            let count = clock.calls.load(Ordering::SeqCst);
+            let got = e.search_with_semantics(q.clone(), current()).await.unwrap();
+            assert_eq!(clock.calls.load(Ordering::SeqCst), count + 1);
+            let values: Vec<_> = got
+                .response
+                .results
+                .iter()
+                .map(|r| (r.memory_id, r.composite_score, r.effective_r))
+                .collect();
+            if mode == RifMode::Off {
+                baseline = Some(values);
+            } else if mode == RifMode::Shadow {
+                assert_eq!(Some(values), baseline);
+            } else {
+                assert!(got.diagnostics.rif.as_ref().unwrap().suppressed_targets > 0);
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(before, file_bytes(&f.files));
+        }
+        drop(e);
+        let OfflineFixture {
+            _directory,
+            path,
+            view,
+            files,
+            ..
+        } = f;
+        drop(view);
+        let reopened = OfflineSnapshot::open(&path).unwrap();
+        assert_eq!(before, file_bytes(&files));
+        drop(reopened);
+    }
+}
