@@ -8,6 +8,7 @@
 //! See Spec 04 Section 7 for the design rationale.
 
 mod effects;
+mod text_compaction;
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -371,6 +372,7 @@ impl RedbStorageEngine {
             for name in ["meta.db", "edges.db", "fulltext.dat"] {
                 crate::storage::validation::require_file(&db_path.join(name))?;
             }
+            crate::storage::validation::preflight_text(&db_path)?;
         }
 
         // Step 2: Open meta.db.
@@ -381,7 +383,27 @@ impl RedbStorageEngine {
 
         // Legacy compaction was checked before opening any canonical file.
         // Step 5: Open fulltext.dat.
-        let text_store = TextStore::open(&db_path.join("fulltext.dat"))?;
+        if !existing {
+            let state = meta_store.control_state()?;
+            let (prepared, id) = TextStore::create_generation(&db_path, state.store_id)?;
+            let descriptor = prepared.seal(state.store_id, id, 2)?;
+            crate::storage::text::generation::write_rejection_gate(&db_path, &descriptor)?;
+            meta_store.select_text_generation(state.committed_generation, &descriptor, &vec![])?;
+        }
+        let selected_text = meta_store.text_selection_for_recovery()?;
+        let text_store = match &selected_text {
+            Some(selected) => TextStore::open_generation(&db_path, selected, true)?,
+            None => TextStore::open(&db_path.join("fulltext.dat"))?,
+        };
+        // Validate canonical text before effects replay or any cleanup.
+        for (_, record) in meta_store.scan_all_for_recovery()? {
+            if record.text_offset != 0 || record.text_length != 0 {
+                text_store.read(TextRef {
+                    file_offset: record.text_offset,
+                    length: record.text_length,
+                })?;
+            }
+        }
 
         // Step 6: Open vector files for each existing namespace.
         let mut vector_manager = VectorManager::new(db_path.clone());
@@ -413,6 +435,13 @@ impl RedbStorageEngine {
         // Step 7: Startup validation.
         engine.recover_pending_effects()?;
         engine.startup_validation()?;
+        if let Some(selected) = selected_text {
+            if let Err(error) =
+                crate::storage::text::generation::cleanup_orphans(&engine.db_path, &selected)
+            {
+                tracing::warn!(%error, "text orphan cleanup pending");
+            }
+        }
 
         Ok(engine)
     }
@@ -1172,6 +1201,12 @@ impl StorageEngine for RedbStorageEngine {
         full_text: Option<&str>,
     ) -> Result<(), StorageError> {
         self.ensure_available()?;
+        if record.version != 1 || record.schema.is_some() {
+            return Err(StorageError::RecoveryRequired(
+                "schema-v2 records require participating writers".into(),
+            ));
+        }
+        record.encode()?;
         // Reject identity conflicts before allocating or appending payloads.
         if record.id != *id.as_bytes() || record.namespace_id != namespace_id.get() {
             return Err(StorageError::InvalidMutation(
@@ -1493,11 +1528,7 @@ impl StorageEngine for RedbStorageEngine {
 
     fn compact_text_log(&mut self) -> Result<CompactionResult, StorageError> {
         self.ensure_available()?;
-        // ponytail: keep the append-only log until metadata can atomically
-        // select a durable text generation. Marker ordering cannot do this.
-        Err(StorageError::RecoveryRequired(
-            "text compaction is disabled until generation-selected recovery is implemented".into(),
-        ))
+        self.compact_text_at(|_| Ok(()))
     }
 
     // ── Tags ────────────────────────────────────────────────────────
@@ -2074,11 +2105,11 @@ mod tests {
     }
 
     #[test]
-    fn containment_disables_compaction_and_preserves_ambiguous_legacy_files() {
+    fn containment_preserves_ambiguous_legacy_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut engine = open_engine(dir.path());
         let text = std::fs::read(dir.path().join("fulltext.dat")).unwrap();
-        assert!(engine.compact_text_log().is_err());
+        engine.compact_text_log().unwrap();
         assert_eq!(
             std::fs::read(dir.path().join("fulltext.dat")).unwrap(),
             text
@@ -2163,6 +2194,7 @@ mod tests {
     fn add_memory(engine: &mut RedbStorageEngine, namespace_id: NamespaceId) -> MemoryId {
         let id = MemoryId::new();
         let mut record = DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: namespace_id.get(),
@@ -2399,7 +2431,18 @@ mod tests {
         // now fails closed instead (covered by the missing-payload regression).
         let older = tempfile::tempdir().unwrap();
         drop(open_engine(older.path()));
-        std::fs::copy(older.path().join("meta.db"), dir.path().join("meta.db")).unwrap();
+        // A selected text generation is part of the older catalog snapshot.
+        for entry in std::fs::read_dir(older.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == "meta.db"
+                || entry.file_name() == "fulltext.dat"
+                || crate::storage::metadata::text_generation::is_generation_filename(
+                    &entry.file_name().to_string_lossy(),
+                )
+            {
+                std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+            }
+        }
 
         {
             let _engine = open_engine(dir.path());
@@ -2923,5 +2966,174 @@ mod tests {
         db_path.join("meta.db").exists()
             && db_path.join("edges.db").exists()
             && db_path.join("fulltext.dat").exists()
+    }
+    fn independent_join_corrupt_peer_plan(path: &Path, applied: bool) {
+        use crate::storage::metadata::effects::{EFFECTS, PendingEffects};
+        use redb::ReadableTable;
+        let db = redb::Database::open(path.join("meta.db")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(EFFECTS).unwrap();
+            let (key, mut effect) = {
+                let row = table.iter().unwrap().next().unwrap().unwrap();
+                (
+                    row.0.value().to_vec(),
+                    crate::storage::control::decode::<PendingEffects>(row.1.value()).unwrap(),
+                )
+            };
+            assert!(!effect.peer_counts.is_empty());
+            effect.peer_counts[0].1 += 1;
+            effect.canonical_applied = applied;
+            table
+                .insert(
+                    key.as_slice(),
+                    crate::storage::control::encode(&effect).unwrap().as_slice(),
+                )
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn independent_join_recovery_plan_preflight_preserves_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "review");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .meta_store
+            .fail_effect_application
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            engine.add_edge(a, b, EdgeType::Associative, 0.5, false, 10),
+            Err(StorageError::CommittedEffectsPending { .. })
+        ));
+        drop(engine);
+        independent_join_corrupt_peer_plan(dir.path(), false);
+        let before = std::fs::read(dir.path().join("meta.db")).unwrap();
+        let result = RedbStorageEngine::open(dir.path());
+        assert!(result.is_err());
+        eprintln!("corrupt-plan open rejected: {:?}", result.err());
+        let after = std::fs::read(dir.path().join("meta.db")).unwrap();
+        assert!(
+            before == after,
+            "malformed pending plan changed original metadata before rejection"
+        );
+    }
+
+    #[test]
+    fn independent_join_ledger_receipt_snapshot_and_pending_barrier() {
+        use crate::storage::offline_snapshot::OfflineSnapshot;
+        use crate::storage::schema_migration::{MigrationOptions, inspect_schema, migrate_schema};
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "review");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .add_edge(a, b, EdgeType::Associative, 0.5, false, 10)
+            .unwrap();
+        engine.meta_store.acknowledge_rebuilt_effects().unwrap();
+        let before = engine.control_state().unwrap();
+        let effect = engine.delete_memory_with_edges(a, &[]).unwrap().unwrap();
+        let ledger = engine.meta_store.removal_ledger_export().unwrap();
+        let entry = ledger
+            .entries
+            .iter()
+            .find(|e| e.memory_uuid == a.into_inner())
+            .unwrap();
+        assert_eq!(entry.operation_id, effect.receipt.operation_id);
+        assert_eq!(entry.origin_lineage, effect.receipt.store_id);
+        assert_eq!(entry.generation, effect.receipt.committed_generation);
+        assert_eq!(
+            entry.generation,
+            before.committed_generation.next().unwrap()
+        );
+        let expected = engine.control_state().unwrap().generation_ref();
+        drop(engine);
+        let files = crate::storage::validation::canonical_files(dir.path()).unwrap();
+        let bytes: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let target_root = tempfile::tempdir().unwrap();
+        let target = target_root.path().join("schema");
+        let opts = MigrationOptions {
+            migration_now: 1234,
+            expected_source: expected,
+            attestations: vec![],
+        };
+        migrate_schema(dir.path(), &target, &opts).unwrap();
+        let view = OfflineSnapshot::open(&target).unwrap();
+        assert_eq!(view.control().generation_ref(), expected);
+        assert!(view.record(a).unwrap().is_none());
+        assert!(view.record(b).unwrap().is_some());
+        let read = view.metadata.begin_read().unwrap();
+        let copied =
+            crate::storage::metadata::removal_ledger::read_export(&read, Some(view.control()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(copied, ledger);
+        let pending = crate::storage::metadata::effects::validate_existing(&read).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].receipt, effect.receipt);
+        assert!(pending[0].canonical_applied);
+        drop(read);
+        drop(view);
+        assert!(inspect_schema(&target).is_ok());
+        assert_eq!(
+            files
+                .iter()
+                .map(|p| std::fs::read(p).unwrap())
+                .collect::<Vec<_>>(),
+            bytes
+        );
+        // Flip only the pending status in a separate synthetic fixture: offline consumers must refuse replay.
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "review");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        engine
+            .meta_store
+            .fail_effect_application
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            engine
+                .add_edge(a, b, EdgeType::Associative, 0.5, false, 10)
+                .is_err()
+        );
+        drop(engine);
+        let before = std::fs::read(dir.path().join("meta.db")).unwrap();
+        assert!(inspect_schema(dir.path()).is_err());
+        assert!(OfflineSnapshot::open(dir.path()).is_err());
+        assert!(migrate_schema(dir.path(), &target_root.path().join("blocked"), &opts).is_err());
+        assert!(!target_root.path().join("blocked").exists());
+        assert_eq!(std::fs::read(dir.path().join("meta.db")).unwrap(), before);
+    }
+
+    #[test]
+    fn preflight_preserves_valid_historical_applied_peer_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "history");
+        let a = add_memory(&mut engine, ns);
+        let b = add_memory(&mut engine, ns);
+        let c = add_memory(&mut engine, ns);
+        engine
+            .add_edge(a, b, EdgeType::Associative, 0.5, false, 10)
+            .unwrap();
+        engine
+            .add_edge(a, c, EdgeType::Associative, 0.5, false, 11)
+            .unwrap();
+        let effects = engine.meta_store.pending_effects().unwrap();
+        assert_eq!(effects.len(), 2);
+        assert!(effects.iter().all(|effect| effect.canonical_applied));
+        assert_eq!(effects[0].peer_counts[0].1, 1);
+        assert_eq!(engine.get_record(a).unwrap().unwrap().edge_count, 2);
+        let control = engine.control_state().unwrap();
+        drop(engine);
+        let reopened = open_engine(dir.path());
+        assert_eq!(reopened.control_state().unwrap(), control);
+        assert_eq!(reopened.get_record(a).unwrap().unwrap().edge_count, 2);
+        assert_eq!(reopened.meta_store.pending_effects().unwrap().len(), 2);
     }
 }

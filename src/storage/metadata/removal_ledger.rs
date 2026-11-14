@@ -358,6 +358,7 @@ mod tests {
 
     fn record(ns: u32) -> DiskRecord {
         DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *MemoryId::new().as_bytes(),
             namespace_id: ns,

@@ -490,3 +490,59 @@ pub(crate) fn crash_point(_point: &str) {
         std::process::exit(91);
     }
 }
+
+pub(crate) fn validate_plan(
+    effect: &PendingEffects,
+    records: &[(MemoryId, DiskRecord)],
+) -> Result<(), StorageError> {
+    if effect
+        .removed_ids
+        .iter()
+        .any(|id| records.iter().any(|(key, _)| key == id))
+    {
+        return Err(StorageError::InvalidControl(
+            "removed effect ID still exists".into(),
+        ));
+    }
+    for release in &effect.releases {
+        if records.iter().any(|(id, r)| {
+            *id == release.memory_id
+                || (r.phase != DecayPhase::Tombstone
+                    && r.namespace_id == release.namespace_id.get()
+                    && r.vector_slot == release.slot)
+        }) {
+            return Err(StorageError::OwnershipMismatch(
+                "effect attempts to release an owned vector".into(),
+            ));
+        }
+    }
+    for (id, count) in &effect.peer_counts {
+        if records
+            .iter()
+            .find(|(key, _)| key == id)
+            .is_none_or(|(_, r)| r.edge_count != *count)
+        {
+            return Err(StorageError::InvalidControl(
+                "effect peer count disagrees with canonical metadata".into(),
+            ));
+        }
+    }
+    for edge in &effect.puts {
+        let MutationScope::Namespace(namespace) = effect.scope else {
+            return Err(StorageError::InvalidControl(
+                "graph effect has catalog scope".into(),
+            ));
+        };
+        if [edge.source, edge.target].iter().any(|id| {
+            records
+                .iter()
+                .find(|(key, _)| key == id)
+                .is_none_or(|(_, record)| record.namespace_id != namespace.get())
+        }) {
+            return Err(StorageError::InvalidControl(
+                "effect put has missing or foreign endpoint".into(),
+            ));
+        }
+    }
+    Ok(())
+}

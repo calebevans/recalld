@@ -196,6 +196,8 @@ impl ValidationError {
 /// Errors from `DiskRecord::from_bytes()` deserialization.
 #[derive(Debug, Error)]
 pub enum DecodeError {
+    #[error("invalid canonical record: {0}")]
+    InvalidSchema(String),
     /// Record data is shorter than the minimum expected size.
     #[error(
         "record is truncated: expected at least {expected} bytes, \

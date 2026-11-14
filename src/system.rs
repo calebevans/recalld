@@ -751,6 +751,7 @@ impl Recalld {
 
             if !has_default {
                 let ns_config = crate::model::NamespaceConfig {
+                    schema: None,
                     id: crate::model::NamespaceId::UNSET,
                     name: crate::model::constants::DEFAULT_NAMESPACE_NAME.to_string(),
                     embedding_dim: config.embedding.dimensions as u32,
