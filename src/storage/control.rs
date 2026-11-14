@@ -207,6 +207,11 @@ pub enum MutationOutcome {
         #[serde(rename = "entriesKept")]
         entries_kept: u64,
     },
+    GraphChanged {
+        edges_put: usize,
+        edges_removed: usize,
+        memories_removed: usize,
+    },
     AccessRecorded {
         #[serde(rename = "memoryId")]
         memory_id: MemoryId,

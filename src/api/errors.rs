@@ -48,6 +48,9 @@ pub enum AppError {
         message: String,
     },
 
+    /// 409 -- Explicit by-ID namespace assertion failed.
+    NamespaceMismatch { message: String },
+
     /// 422 -- Semantically invalid request (e.g. dimension mismatch,
     /// mutually exclusive fields both provided).
     UnprocessableEntity {
@@ -94,6 +97,12 @@ impl IntoResponse for AppError {
                 "BAD_REQUEST".to_string(),
                 message.clone(),
                 field.clone(),
+            ),
+            AppError::NamespaceMismatch { message } => (
+                StatusCode::CONFLICT,
+                "NAMESPACE_MISMATCH".into(),
+                message.clone(),
+                Some("namespace".into()),
             ),
             AppError::Conflict { message } => (
                 StatusCode::CONFLICT,
@@ -157,6 +166,13 @@ pub use crate::storage::StorageError;
 impl From<StorageError> for AppError {
     fn from(err: StorageError) -> Self {
         match &err {
+            StorageError::NamespaceMismatch { .. } => AppError::NamespaceMismatch {
+                message: err.to_string(),
+            },
+            StorageError::InvalidNamespaceName { .. } => AppError::BadRequest {
+                message: err.to_string(),
+                field: Some("namespace".into()),
+            },
             StorageError::NotFound(uuid) => AppError::NotFound {
                 resource: "memory",
                 id: uuid.to_string(),
@@ -171,6 +187,11 @@ impl From<StorageError> for AppError {
                 resource: "namespace",
                 id: id.to_string(),
             },
+            StorageError::RecoveryRequired(_) | StorageError::CommittedEffectsPending { .. } => {
+                AppError::ServiceUnavailable {
+                    message: err.to_string(),
+                }
+            }
             StorageError::DatabaseLocked => AppError::ServiceUnavailable {
                 message: "database is locked by another process".to_string(),
             },
@@ -207,6 +228,9 @@ impl From<EmbeddingError> for AppError {
 impl From<SearchError> for AppError {
     fn from(err: SearchError) -> Self {
         match &err {
+            SearchError::Unavailable(message) => AppError::ServiceUnavailable {
+                message: message.clone(),
+            },
             SearchError::NamespaceNotFound(name) => AppError::NotFound {
                 resource: "namespace",
                 id: name.clone(),
@@ -217,6 +241,10 @@ impl From<SearchError> for AppError {
             SearchError::EmptyQuery => AppError::BadRequest {
                 message: "query text is required".to_string(),
                 field: Some("query".to_string()),
+            },
+            SearchError::InvalidEmbedding(message) => AppError::UnprocessableEntity {
+                message: message.clone(),
+                field: Some("embedding".into()),
             },
             SearchError::MemoryNotFound(id) => AppError::NotFound {
                 resource: "memory",

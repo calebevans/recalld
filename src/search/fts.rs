@@ -67,6 +67,15 @@ pub struct FtsIndex {
 }
 
 impl FtsIndex {
+    /// Drop all derived rows before a recovery rebuild, including deleted IDs.
+    pub(crate) fn clear(&self) -> Result<(), FtsError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM fts_content", [])?;
+        tx.execute("DELETE FROM id_map", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Open or create the FTS5 index database.
     ///
     /// The database file is stored at `{data_dir}/fts.db`.

@@ -38,6 +38,14 @@ pub enum StorageError {
         source: redb::CommitError,
     },
 
+    /// Canonical metadata is durable; materialization must resume after reopen.
+    #[error("operation {operation_id} committed; canonical effects unavailable: {source}")]
+    CommittedEffectsPending {
+        operation_id: Uuid,
+        #[source]
+        source: Box<StorageError>,
+    },
+
     // ── redb errors (from metadata.rs and edges.rs) ──────────────────
     /// A generic redb error.
     #[error("redb error: {0}")]
@@ -97,6 +105,15 @@ pub enum StorageError {
     /// No namespace exists for the given ID.
     #[error("namespace not found: {0}")]
     NamespaceNotFound(u32),
+
+    /// An explicit namespace assertion does not match the record's immutable scope.
+    #[error("NAMESPACE_MISMATCH: memory {id} does not belong to namespace '{namespace}'")]
+    NamespaceMismatch {
+        /// Memory being addressed.
+        id: Uuid,
+        /// Caller asserted namespace.
+        namespace: String,
+    },
 
     /// A secondary index is corrupt or inconsistent.
     #[error("corrupt index: {0}")]

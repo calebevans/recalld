@@ -130,7 +130,7 @@ fn decode_edge_value(value: &[u8]) -> Result<(f32, bool, u64), StorageError> {
 
 /// An edge record as stored in edges.db.
 /// Used for disk I/O -- the in-memory graph uses `GraphEdge` (CS-10).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedEdge {
     /// Source memory ID (edge origin).
     pub source: MemoryId,
@@ -195,6 +195,35 @@ impl EdgeStore {
             db,
             path: path.to_path_buf(),
         })
+    }
+
+    pub(crate) fn apply_effects(
+        &self,
+        puts: &[PersistedEdge],
+        deletes: &[PersistedEdge],
+    ) -> Result<(), StorageError> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut fwd = tx.open_table(FORWARD_EDGES)?;
+            let mut rev = tx.open_table(REVERSE_EDGES)?;
+            for e in deletes {
+                fwd.remove(encode_forward_key(&e.source, e.edge_type, &e.target).as_slice())?;
+                rev.remove(encode_reverse_key(&e.target, e.edge_type, &e.source).as_slice())?;
+            }
+            for e in puts {
+                fwd.insert(
+                    encode_forward_key(&e.source, e.edge_type, &e.target).as_slice(),
+                    encode_edge_value(e.weight, e.auto_created, e.created_at).as_slice(),
+                )?;
+                rev.insert(
+                    encode_reverse_key(&e.target, e.edge_type, &e.source).as_slice(),
+                    &(),
+                )?;
+            }
+        }
+        crate::storage::metadata::effects::crash_point("before_edge_commit");
+        tx.commit()?;
+        Ok(())
     }
 
     /// Persist a single edge to both forward and reverse indexes.

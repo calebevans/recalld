@@ -11,8 +11,8 @@ use crate::graph::SharedGraph;
 use crate::graph::structure::RelationshipGraph;
 use crate::model::{DecayPhase, EdgeType, MemoryId, NamespaceId};
 use crate::search::{EntityIndex, FlatVectorIndex, SearchFilter, VectorIndex};
+use crate::storage::PersistedEdge;
 use crate::storage::engine::RedbStorageEngine;
-use crate::storage::{PersistedEdge, StorageEngine as StorageEngineTrait};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Constants
@@ -159,23 +159,10 @@ pub enum AutoLinkError {
 // persist_edges — shared helper for edge persistence + graph insertion
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Insert edges into the in-memory graph, persist accepted edges to
-/// storage, and update the edge count on the source memory.
-///
-/// This helper consolidates the boilerplate that was previously duplicated
-/// across `perform_autolink`, `perform_entity_link`, and `perform_temporal_link`.
-///
-/// Edges are validated in the graph FIRST, and only edges that the graph
-/// accepts are persisted to storage. This prevents the TOCTOU race where
-/// edges written to storage before graph validation could be rejected by
-/// the graph but survive in edges.db, getting loaded back on restart
-/// without the bidirectional duplicate check.
-///
-/// # Returns
-///
-/// The number of edges successfully inserted into the graph.
+/// Plan under graph ownership, commit canonical effects, then publish.
+/// ponytail: cloning costs O(V+E); replace with a nonmutating planner if measured.
 pub(crate) async fn persist_edges(
-    new_memory_id: MemoryId,
+    _new_memory_id: MemoryId,
     persisted_edges: &[PersistedEdge],
     graph: &SharedGraph,
     storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
@@ -184,85 +171,78 @@ pub(crate) async fn persist_edges(
     if persisted_edges.is_empty() {
         return Ok(0);
     }
-
-    // Step 1: Write-lock graph for edge insertion. Validate edges in the
-    // graph first, collecting only the ones that succeed.
-    let accepted_edges: Vec<PersistedEdge> = {
-        let mut graph_w = graph.write().await;
-        let mut accepted = Vec::with_capacity(persisted_edges.len());
-        for pe in persisted_edges {
-            match graph_w.add_edge(pe.source, pe.target, pe.edge_type, pe.weight, true) {
-                Ok(_) => accepted.push(pe.clone()),
-                Err(crate::graph::GraphError::EdgeExists(_, _)) => {}
-                Err(crate::graph::GraphError::MemoryNotFound(_)) => {}
-                Err(e) => return Err(AutoLinkError::Graph(e)),
+    let live = graph.clone().write_owned().await;
+    let mut planned = (*live).clone();
+    let mut accepted = Vec::new();
+    for pe in persisted_edges {
+        match planned.add_edge(
+            pe.source,
+            pe.target,
+            pe.edge_type,
+            pe.weight,
+            pe.auto_created,
+        ) {
+            Ok(key) => {
+                planned.edges[key].created_at = pe.created_at as i64;
+                accepted.push(pe.clone());
             }
+            Err(
+                crate::graph::GraphError::EdgeExists(_, _)
+                | crate::graph::GraphError::MemoryNotFound(_),
+            ) => {}
+            Err(e) => return Err(AutoLinkError::Graph(e)),
         }
-        accepted
-    };
-
-    let edges_created = accepted_edges.len();
-
-    if edges_created == 0 {
+    }
+    if accepted.is_empty() {
         return Ok(0);
     }
+    publish_edge_plan(live, planned, accepted, storage, cache).await
+}
 
-    // Step 2: Persist only accepted edges to edges.db.
-    {
-        let storage = storage.clone();
-        tokio::task::spawn_blocking(move || {
-            let storage_r = storage
-                .read()
-                .map_err(|e| AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}")))?;
-            storage_r
-                .batch_add_edges(&accepted_edges)
-                .map_err(|e| AutoLinkError::Storage(e.to_string()))
-        })
-        .await
-        .map_err(|e| AutoLinkError::Storage(format!("blocking task join error: {e}")))??;
+pub(crate) async fn publish_edge_plan(
+    mut live: tokio::sync::OwnedRwLockWriteGuard<crate::graph::RelationshipGraph>,
+    planned: crate::graph::RelationshipGraph,
+    edges: Vec<PersistedEdge>,
+    storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: &Arc<CacheManager>,
+) -> Result<usize, AutoLinkError> {
+    let storage_commit = storage.clone();
+    let (result, live) = tokio::task::spawn_blocking(move || {
+        // Shared lifecycle order: graph -> storage -> metadata publication.
+        let store = storage_commit
+            .write()
+            .map_err(|e| AutoLinkError::LockPoisoned(e.to_string()))?;
+        let result = store
+            .put_edges_with_effects(&edges)
+            .map_err(|e| AutoLinkError::Storage(e.to_string()))?
+            .ok_or_else(|| AutoLinkError::Storage("empty edge plan".into()))?;
+        crate::storage::metadata::effects::crash_point("before_graph_publish");
+        *live = planned;
+        Ok::<_, AutoLinkError>((result, live))
+    })
+    .await
+    .map_err(|e| AutoLinkError::Storage(e.to_string()))??;
+    // Keep graph ownership across cache publication, preventing a later writer
+    // from publishing a newer absolute count before this one.
+    for (id, count) in &result.peer_counts {
+        cache.update_edge_count(*id, *count).await;
     }
-
-    // Step 3: Additive edge_count update.
-    {
-        let current_count = cache
-            .get(new_memory_id)
-            .await
-            .map(|r| r.edge_count)
-            .unwrap_or(0);
-        let new_count = current_count + edges_created as u16;
-        {
-            let storage = storage.clone();
-            match tokio::task::spawn_blocking(move || {
-                let storage_r = storage.read().map_err(|e| {
-                    AutoLinkError::LockPoisoned(format!("storage lock poisoned: {e}"))
-                })?;
-                storage_r
-                    .update_edge_count(new_memory_id, new_count)
-                    .map_err(|e| AutoLinkError::Storage(e.to_string()))
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        memory_id = %new_memory_id,
-                        error = %e,
-                        "Failed to update edge count in storage; cache is correct but on-disk record may be stale"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        memory_id = %new_memory_id,
-                        error = %e,
-                        "Edge count update task panicked; cache is correct but on-disk record may be stale"
-                    );
-                }
-            }
-        }
-        cache.update_edge_count(new_memory_id, new_count).await;
-    }
-
-    Ok(edges_created)
+    let created = result.edges_put;
+    let storage_ack = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = storage_ack
+            .write()
+            .map_err(|e| AutoLinkError::LockPoisoned(e.to_string()))?;
+        crate::storage::metadata::effects::crash_point("before_derived_ack");
+        store
+            .acknowledge_graph_effects(result.receipt.operation_id)
+            .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
+        drop(live);
+        Ok::<_, AutoLinkError>(())
+    })
+    .await
+    .map_err(|e| AutoLinkError::Storage(e.to_string()))??;
+    Ok(created)
 }
 
 // ═══════════════════════════════════════════════════════════════════════

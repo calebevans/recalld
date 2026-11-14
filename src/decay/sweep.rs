@@ -309,6 +309,7 @@ const MAX_CONNECTION_BONUS: f32 = 0.15;
 /// own those subsystems -- it borrows them via Arc for the background task.
 pub struct DecaySweepRunner {
     clock: Arc<dyn crate::time::Clock>,
+    completion: Option<crate::derived_completion::DerivedCompletion>,
     config: SweepConfig,
     decay_config: Arc<DecayConfig>,
     activation_config: ActivationConfig,
@@ -356,11 +357,19 @@ impl DecaySweepRunner {
             global_decay_multiplier,
             shutdown_tx,
             trigger_notify: Arc::new(Notify::new()),
+            completion: None,
         })
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+    pub(crate) fn with_completion(
+        mut self,
+        completion: crate::derived_completion::DerivedCompletion,
+    ) -> Self {
+        self.completion = Some(completion);
         self
     }
 
@@ -375,6 +384,7 @@ impl DecaySweepRunner {
     /// 3. Exits when `shutdown()` is called
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
         let clock = self.clock.clone();
+        let completion = self.completion.clone();
         let config = self.config.clone();
         let decay_config = Arc::clone(&self.decay_config);
         let activation_config = self.activation_config.clone();
@@ -400,6 +410,11 @@ impl DecaySweepRunner {
                     Some(clock.now_millis()),
                 )
                 .await;
+                if let Some(completion) = &completion {
+                    if let Err(error) = completion.complete().await {
+                        tracing::error!(%error, "sweep effects remain pending; next sweep retries completion");
+                    }
+                }
                 Self::log_result(&result);
             }
 
@@ -447,6 +462,11 @@ impl DecaySweepRunner {
                     Some(clock.now_millis()),
                 )
                 .await;
+                if let Some(completion) = &completion {
+                    if let Err(error) = completion.complete().await {
+                        tracing::error!(%error, "sweep effects remain pending; next sweep retries completion");
+                    }
+                }
                 Self::log_result(&result);
             }
         })
@@ -1129,28 +1149,41 @@ impl DecaySweepRunner {
                 DecayPhase::Full => DecayPhase::Summary,
                 DecayPhase::Summary => DecayPhase::Ghost,
                 DecayPhase::Ghost => {
-                    // No graph mutation until the locked expected-state check and deletion.
-                    // External FTS/vector/entity indexes still retain orphan candidates;
-                    // canonical hydration filters them. Their cleanup is deferred.
-                    storage.delete_memory(t.memory_id).map_err(map_error)?;
-                    let removal = graph.remove_memory_with_bridging(t.memory_id);
-                    if let Some(bridge) = removal.bridge_created {
-                        if let (Some(source), Some(target)) = (
-                            graph.get_node_by_key(bridge.source),
-                            graph.get_node_by_key(bridge.target),
-                        ) {
-                            storage
-                                .batch_add_edges(&[crate::storage::edges::PersistedEdge {
-                                    source: source.memory_id,
-                                    target: target.memory_id,
-                                    edge_type: bridge.edge_type,
-                                    weight: bridge.weight,
-                                    auto_created: bridge.auto_created,
-                                    created_at: bridge.created_at as u64,
-                                }])
-                                .map_err(map_error)?;
-                        }
-                    }
+                    // Retain the locked lifecycle guard, then publish graph changes
+                    // only after the effects-backed canonical deletion commits.
+                    let mut planned = (*graph).clone();
+                    let removal = planned.remove_memory_with_bridging(t.memory_id);
+                    let bridges = removal
+                        .bridge_created
+                        .into_iter()
+                        .map(|bridge| {
+                            let source = planned
+                                .get_node_by_key(bridge.source)
+                                .ok_or_else(|| SweepError::Storage("bridge source missing".into()))?
+                                .memory_id;
+                            let target = planned
+                                .get_node_by_key(bridge.target)
+                                .ok_or_else(|| SweepError::Storage("bridge target missing".into()))?
+                                .memory_id;
+                            Ok(crate::storage::PersistedEdge {
+                                source,
+                                target,
+                                edge_type: bridge.edge_type,
+                                weight: bridge.weight,
+                                auto_created: bridge.auto_created,
+                                created_at: bridge.created_at as u64,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, SweepError>>()?;
+                    storage
+                        .delete_memory_with_edges(t.memory_id, &bridges)
+                        .map_err(map_error)?
+                        .ok_or_else(|| {
+                            SweepError::Storage(
+                                "record disappeared before canonical deletion".into(),
+                            )
+                        })?;
+                    *graph = planned;
                     return Ok(Some(PhaseTransition::Deleted {
                         id: t.memory_id,
                         old_phase: t.from_phase,
@@ -1484,7 +1517,7 @@ mod independent_review_regressions {
         .unwrap();
         assert_eq!(transitions.len(), 1);
         // Deterministically insert feedback exactly between scan/plan and apply.
-        let feedback = adapter(&f, 8 * DAY).reinforce(id, 3).await.unwrap();
+        let feedback = adapter(&f, 8 * DAY).reinforce(id, 3, None).await.unwrap();
         assert!(feedback.is_permastore);
         let committed = f.record(id).unwrap();
         DecaySweepRunner::update_record_state(
@@ -1537,7 +1570,7 @@ mod independent_review_regressions {
     async fn review_access_must_not_move_feedback_anchor_backward() {
         let f = Fixture::new();
         let id = f.insert_memory().await;
-        adapter(&f, 8 * DAY).reinforce(id, 3).await.unwrap();
+        adapter(&f, 8 * DAY).reinforce(id, 3, None).await.unwrap();
         assert_eq!(f.record(id).unwrap().last_accessed_at, 8 * DAY);
         adapter(&f, DAY)
             .record_access(id, AccessKind::DirectRetrieval)
@@ -1665,10 +1698,13 @@ mod independent_review_regressions {
         })
         .await
         .expect("purge must release storage before awaiting graph");
-        tokio::time::timeout(Duration::from_secs(5), adapter(&f, DAY).reinforce(live, 3))
-            .await
-            .expect("feedback must not wait for graph holding storage")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            adapter(&f, DAY).reinforce(live, 3, None),
+        )
+        .await
+        .expect("feedback must not wait for graph holding storage")
+        .unwrap();
         assert!(
             !purge.is_finished(),
             "purge publication must wait for graph"

@@ -462,7 +462,12 @@ async fn run_serve(
                 Arc::new(system.config().clone()),
                 true,
             )
-            .with_clock(system.clock().clone()),
+            .with_clock(system.clock().clone())
+            .with_indexes(
+                system.vector_index().clone(),
+                system.fts_index().clone(),
+                system.entity_index().clone(),
+            ),
         );
         let namespaces: Arc<dyn recalld::api::NamespaceRegistry> =
             Arc::new(NamespaceRegistryAdapter::new(system.storage().clone()));
