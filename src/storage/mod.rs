@@ -23,6 +23,7 @@ pub mod fsync;
 pub mod indexes;
 pub mod lifecycle_migration;
 pub(crate) mod lineage;
+pub mod insertion;
 pub mod metadata;
 pub mod offline_snapshot;
 pub(crate) mod ownership;

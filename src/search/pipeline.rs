@@ -60,6 +60,12 @@ pub trait NamespaceResolver: Send + Sync {
 /// Per-namespace embedding provider registry.
 #[async_trait::async_trait]
 pub trait EmbeddingProviderRegistry: Send + Sync {
+    fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+        None
+    }
+    fn dimensions(&self) -> Option<usize> {
+        None
+    }
     /// Embed document text using the provider configured for a namespace.
     async fn embed(&self, namespace: &str, text: &str) -> Result<Vec<f32>>;
 
@@ -554,10 +560,27 @@ impl QueryEngine {
             _ if query.query_embedding.is_some() => query.query_embedding.take(),
             _ => {
                 let text = query.text.as_ref().ok_or(SearchError::EmptyQuery)?;
-                let embedding = self
+                let profile = self.embedding_providers.profile();
+                crate::embedding::runtime::check_namespace(&ns_config, profile.as_ref())
+                    .map_err(|e| SearchError::Unavailable(e.to_string()))?;
+                if self
+                    .embedding_providers
+                    .dimensions()
+                    .is_some_and(|dim| dim != ns_config.embedding_dim as usize)
+                {
+                    return Err(SearchError::Unavailable(
+                        "provider dimension differs from namespace".into(),
+                    ));
+                }
+                let mut embedding = self
                     .embedding_providers
                     .embed_query(&query.namespace, text)
                     .await?;
+                crate::embedding::validation::normalize_vector(
+                    &mut embedding,
+                    ns_config.embedding_dim as usize,
+                )
+                .map_err(SearchError::EmbeddingFailed)?;
                 Some(embedding)
             }
         };
@@ -1963,6 +1986,108 @@ mod tests {
             Arc::new(Unused),
             Arc::new(Unused),
         )
+    }
+
+    #[tokio::test]
+    async fn native_profile_query_rejects_wrong_binding_and_bad_vectors_before_indexes() {
+        use crate::embedding::runtime::tests::{bound, profile};
+        use crate::embedding::{EmbeddingError, EmbeddingProvider};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Namespace(NamespaceConfig);
+        #[async_trait::async_trait]
+        impl NamespaceResolver for Namespace {
+            async fn resolve(&self, _: &str) -> Result<NamespaceConfig> {
+                Ok(self.0.clone())
+            }
+        }
+        struct Provider {
+            calls: Arc<AtomicUsize>,
+            profile: Option<crate::model::schema::EmbeddingProfile>,
+            vector: Vec<f32>,
+        }
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for Provider {
+            async fn embed(&self, _: &str) -> std::result::Result<Vec<f32>, EmbeddingError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.vector.clone())
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            fn model_name(&self) -> &str {
+                "model"
+            }
+            fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+                self.profile.clone()
+            }
+        }
+        let mut wrong = profile();
+        wrong.model_id = "same-width-different-model".into();
+        for (ns, descriptor, vector, expected_calls, message) in [
+            (
+                bound(),
+                Some(wrong),
+                vec![1., 0., 0., 0.],
+                0,
+                "profile differs",
+            ),
+            (
+                bound(),
+                Some(profile()),
+                vec![1., 0., 0., 0.],
+                0,
+                "serving remains disabled",
+            ),
+            (
+                bound(),
+                None,
+                vec![1., 0., 0., 0.],
+                0,
+                "provenance is unknown",
+            ),
+            (
+                {
+                    let mut ns = bound();
+                    ns.schema = None;
+                    ns
+                },
+                Some(profile()),
+                vec![0.; 4],
+                1,
+                "positive norm",
+            ),
+            (
+                {
+                    let mut ns = bound();
+                    ns.schema = None;
+                    ns
+                },
+                None,
+                vec![1.; 3],
+                1,
+                "dimension",
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut pipeline = engine(StubGraph::default(), StubMetaStore::default());
+            pipeline.namespace_resolver = Arc::new(Namespace(ns));
+            pipeline.embedding_providers = Arc::new(
+                crate::search::adapters::SingleEmbeddingRegistry::new(Arc::new(Provider {
+                    calls: calls.clone(),
+                    profile: descriptor,
+                    vector,
+                })),
+            );
+            // All indexes/access callbacks are Unused: reaching one panics.
+            let error = pipeline
+                .search(query(
+                    serde_json::json!({"namespace":"default", "text":"probe"}),
+                ))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+        }
     }
 
     #[tokio::test]

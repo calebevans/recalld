@@ -8,6 +8,7 @@
 //! See CS-07 for the full specification.
 
 pub(crate) mod effects;
+mod insertion;
 mod lifecycle_updates;
 mod observation;
 pub(crate) mod removal_ledger;

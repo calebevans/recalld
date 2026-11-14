@@ -704,6 +704,9 @@ pub enum BridgeError {
     /// An explicit by-ID namespace assertion failed.
     #[error("{0}")]
     NamespaceMismatch(String),
+    /// A provider or required service cannot satisfy the operation.
+    #[error("Unavailable: {0}")]
+    Unavailable(String),
 
     /// A storage subsystem error occurred.
     #[error("Storage error: {0}")]

@@ -103,6 +103,19 @@ impl EmbeddingProvider for PrefixedProvider {
         self.inner.dimensions()
     }
 
+    fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+        let mut profile = self.inner.profile()?;
+        profile
+            .document_preprocessing
+            .prefix
+            .push_str(&self.document_prefix);
+        profile
+            .query_preprocessing
+            .prefix
+            .push_str(&self.query_prefix);
+        Some(profile)
+    }
+
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }

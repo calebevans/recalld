@@ -1,0 +1,37 @@
+{
+  "compile-initial.log": {
+    "path": "/tmp/recalld-native-profile-compile.log",
+    "bytes": 3963,
+    "sha256": "95f648c748c9e92a4f590c9f49790c67216fbda42bfb8ec3005126180932c3ba"
+  },
+  "focused-initial.log": {
+    "path": "/tmp/recalld-native-profile-focused.log",
+    "bytes": 3056,
+    "sha256": "776aef02e6ac602afb14efd4a55d4b3566edfd2a7c01be3a40ca72357263650f"
+  },
+  "focused-intermediate.log": {
+    "path": "/tmp/recalld-native-profile-focused-final.log",
+    "bytes": 3680,
+    "sha256": "ae1f8fa121a40a78be8241f7f333f1db6604ff5af72c91e397097844cdaf8f24"
+  },
+  "full-before-classification-fix.log": {
+    "path": "/tmp/recalld-native-profile-full.log",
+    "bytes": 60282,
+    "sha256": "7861a0f70dbdfd45f44f42dbc64726078861299e3263392cad31f3f6843e535e"
+  },
+  "full-final.log": {
+    "path": "/tmp/recalld-native-profile-validation/full.log",
+    "bytes": 60920,
+    "sha256": "3eff952c2a6763d816afc3fe5858166defc09d6deef10505c0a529e3313d186e"
+  },
+  "fmt-final.log": {
+    "path": "/tmp/recalld-native-profile-validation/fmt.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "clippy-final.log": {
+    "path": "/tmp/recalld-native-profile-validation/clippy.log",
+    "bytes": 322242,
+    "sha256": "db79c4247e6ff7079e30c3548e066f517cfad2297f459cf196daa6c394c37b86"
+  }
+}

@@ -144,6 +144,12 @@ impl SingleEmbeddingRegistry {
 
 #[async_trait]
 impl EmbeddingProviderRegistry for SingleEmbeddingRegistry {
+    fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+        self.provider.profile()
+    }
+    fn dimensions(&self) -> Option<usize> {
+        Some(self.provider.dimensions())
+    }
     async fn embed(&self, _namespace: &str, text: &str) -> Result<Vec<f32>> {
         self.provider
             .embed(text)

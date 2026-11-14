@@ -12,6 +12,8 @@ mod passthrough;
 mod prefix;
 pub mod profile;
 mod provider;
+pub mod runtime;
+pub mod validation;
 
 mod bedrock;
 
@@ -73,6 +75,12 @@ pub enum EmbeddingError {
 /// network services with non-trivial latency.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
+    /// Immutable configuration identity, not proof of remote model weights or
+    /// caller-supplied vector provenance. Custom legacy providers may omit it.
+    fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+        None
+    }
+
     /// Embed a single text string (document/ingest context).
     ///
     /// Returns a vector of exactly `self.dimensions()` length.
