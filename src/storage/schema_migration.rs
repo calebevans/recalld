@@ -696,3 +696,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod combined_fixture_tests;

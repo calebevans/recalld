@@ -10,8 +10,8 @@ use crate::model::{DecayPhase, MemoryId, NamespaceId};
 use crate::storage::StorageEngine;
 
 /// Serialize current-layout feedback with other users of the storage lock.
-/// A1 must replace the two writes with a receipt-backed canonical transaction;
-/// this compatibility adapter does not provide crash atomicity or retry safety.
+/// State and history commit together; public receipts and retry safety remain
+/// outside this legacy compatibility adapter.
 /// Lock order: storage only here. Do not acquire/await graph while holding this
 /// guard: sweep publication holds graph first, then acquires storage.
 pub async fn reinforce(
@@ -20,12 +20,27 @@ pub async fn reinforce(
     quality: u8,
     global_multiplier: f64,
     now_millis: i64,
+    expected_namespace: Option<String>,
 ) -> Result<super::lifecycle::FeedbackPlan, super::lifecycle::LifecycleError> {
     use super::lifecycle::{LifecycleError, plan_feedback, resolve_policy};
     tokio::task::spawn_blocking(move || {
         let storage = storage
             .write()
             .map_err(|e| LifecycleError::Storage(e.to_string()))?;
+        if let Some(namespace) = expected_namespace.as_deref() {
+            storage
+                .assert_memory_namespace(id, namespace)
+                .map_err(|error| match error {
+                    crate::storage::StorageError::NamespaceMismatch { .. } => {
+                        LifecycleError::NamespaceMismatch(error.to_string())
+                    }
+                    crate::storage::StorageError::NotFound(_) => LifecycleError::NotFound,
+                    crate::storage::StorageError::InvalidNamespaceName { .. } => {
+                        LifecycleError::InvalidInput("invalid namespace assertion")
+                    }
+                    _ => LifecycleError::Storage(error.to_string()),
+                })?;
+        }
         let record = storage
             .get_record(id)
             .map_err(|e| LifecycleError::Storage(e.to_string()))?
@@ -40,23 +55,14 @@ pub async fn reinforce(
             global_multiplier,
         )?;
         let plan = plan_feedback(&record, &policy, now_millis, quality)?;
-        storage
-            .update_decay_state(
-                id,
-                plan.phase,
-                plan.strength,
-                plan.strength,
-                plan.stability,
-                plan.is_permastore,
-            )
-            .map_err(|e| LifecycleError::Storage(e.to_string()))?;
-        storage
-            .update_access(
-                id,
-                plan.timestamp,
-                crate::model::AccessKind::ManualReinforcement,
-            )
-            .map_err(|e| LifecycleError::Storage(e.to_string()))?;
+        if !storage
+            .apply_legacy_feedback(id, &record, &namespace, &plan)
+            .map_err(|e| LifecycleError::Storage(e.to_string()))?
+        {
+            return Err(LifecycleError::Storage(
+                "lifecycle snapshot changed before feedback commit".into(),
+            ));
+        }
         Ok(plan)
     })
     .await

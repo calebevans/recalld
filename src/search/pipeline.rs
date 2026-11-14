@@ -50,6 +50,10 @@ pub use semantics::{
 pub trait NamespaceResolver: Send + Sync {
     /// Look up a namespace by name, returning its configuration.
     async fn resolve(&self, name: &str) -> Result<NamespaceConfig>;
+    /// Resolve canonical by-ID scope without guessing a session default.
+    async fn resolve_id(&self, id: NamespaceId) -> Result<NamespaceConfig> {
+        Err(SearchError::NamespaceNotFound(format!("id {}", id.get())))
+    }
 }
 
 /// Per-namespace embedding provider registry.
@@ -127,6 +131,11 @@ pub trait RecordCache: Send + Sync {
 /// On-disk metadata storage fallback.
 #[async_trait::async_trait]
 pub trait MetadataStore: Send + Sync {
+    /// Internal effects admission stamp, not a canonical generation/read view.
+    async fn effects_stamp(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Get a single record by ID.
     async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>>;
     /// Batch load multiple records. Missing IDs are silently skipped.
@@ -134,6 +143,11 @@ pub trait MetadataStore: Send + Sync {
     /// Enumerate all namespace members without a candidate/scan cap.
     /// IDs are discovery only; load canonical records before checking eligibility.
     async fn list_namespace_memories(&self, namespace_id: NamespaceId) -> Result<Vec<MemoryId>>;
+    /// Production adapters may load IDs and records in one metadata transaction.
+    async fn namespace_records(&self, namespace_id: NamespaceId) -> Result<Vec<CachedRecord>> {
+        let ids = self.list_namespace_memories(namespace_id).await?;
+        self.get_batch(&ids).await
+    }
 }
 
 /// RIF processor -- applies retrieval-induced forgetting.
@@ -461,6 +475,25 @@ impl QueryEngine {
     /// Rust-only harness entry point. No transport selects semantics2 until A1/A4 readiness.
     pub async fn search_with_semantics(
         &self,
+        query: SearchQuery,
+        semantics: RetrievalSemantics,
+    ) -> Result<SemanticsResponse> {
+        let stamp = self.meta_store.effects_stamp().await?;
+        let result = self.search_admitted(query, semantics).await;
+        if self.meta_store.effects_stamp().await? != stamp {
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
+        }
+        result
+    }
+
+    pub(crate) async fn effects_stamp(&self) -> Result<u64> {
+        self.meta_store.effects_stamp().await
+    }
+
+    async fn search_admitted(
+        &self,
         mut query: SearchQuery,
         semantics: RetrievalSemantics,
     ) -> Result<SemanticsResponse> {
@@ -477,12 +510,16 @@ impl QueryEngine {
         let ns_config = self.namespace_resolver.resolve(&query.namespace).await?;
         let mut strength_context = StrengthContext::pin(self, &ns_config, query.record_access)?;
         diagnostics.strength = Some(strength_context.diagnostics);
+        if let Some(embedding) = query.query_embedding.as_mut() {
+            super::query::normalize_query_embedding(embedding, ns_config.embedding_dim as usize)?;
+        }
         timings.parse_us = stage_start.elapsed().as_micros() as u64;
 
         // -- Stage 2: Embed ----------------------------------------------
         let stage_start = Instant::now();
         let query_embedding = match query.query_mode {
             QueryMode::MetadataOnly => None,
+            _ if query.query_embedding.is_some() => query.query_embedding.take(),
             _ => {
                 let text = query.text.as_ref().ok_or(SearchError::EmptyQuery)?;
                 let embedding = self
@@ -506,11 +543,7 @@ impl QueryEngine {
         // Canonical metadata, not cached/index metadata, decides hard eligibility.
         // ponytail: load every namespace member until A1 supplies certified filtered views.
         let stage_start = Instant::now();
-        let namespace_ids = self
-            .meta_store
-            .list_namespace_memories(ns_config.id)
-            .await?;
-        let mut namespace_records = self.meta_store.get_batch(&namespace_ids).await?;
+        let mut namespace_records = self.meta_store.namespace_records(ns_config.id).await?;
         strength_context.project_namespace(&mut namespace_records, self.graph.as_ref())?;
         let eligible_records: HashMap<MemoryId, CachedRecord> = namespace_records
             .into_iter()
@@ -1164,22 +1197,42 @@ impl QueryEngine {
         id: MemoryId,
         record_access: bool,
     ) -> Result<Option<MemoryResponse>> {
-        let canonical = self.meta_store.get(&id).await?;
-        if let Some(record) = &canonical {
-            strength::require_legacy_helper(record)?;
+        let stamp = self.meta_store.effects_stamp().await?;
+        let result = self
+            .get_memory_with_access_admitted(id, record_access)
+            .await;
+        if self.meta_store.effects_stamp().await? != stamp {
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
         }
-        let record = match record_access.then(|| self.cache.get(&id)).flatten() {
-            Some(r) => r,
-            None => match canonical {
-                Some(r) => r,
-                None => return Ok(None),
-            },
-        };
+        result
+    }
 
-        strength::require_legacy_helper(&record)?;
+    async fn get_memory_with_access_admitted(
+        &self,
+        id: MemoryId,
+        record_access: bool,
+    ) -> Result<Option<MemoryResponse>> {
+        let Some(mut record) = self.meta_store.get(&id).await? else {
+            return Ok(None);
+        };
+        let namespace = self
+            .namespace_resolver
+            .resolve_id(record.namespace_id)
+            .await?;
+        if namespace.id != record.namespace_id {
+            return Err(SearchError::MetadataError(
+                "resolved namespace differs from canonical source".into(),
+            ));
+        }
+        let context = self
+            .by_id_strength_context(&namespace, record_access)
+            .await?;
+        context.apply(&mut record)?;
 
         // Preserve legacy fire-and-forget only when access is permitted.
-        if record_access {
+        if context.requested_record_access {
             let recorder = Arc::clone(&self.access_recorder);
             let access_id = id;
             tokio::spawn(async move {
@@ -1193,7 +1246,7 @@ impl QueryEngine {
         }
         Ok(Some(MemoryResponse {
             id: record.id,
-            namespace: String::new(), // Resolved by API layer from namespace_id
+            namespace: namespace.name,
             created_at: record.created_at,
             last_accessed_at: record.last_accessed_at,
             summary: if record.phase != DecayPhase::Ghost && record.phase != DecayPhase::Tombstone {
@@ -1225,25 +1278,92 @@ impl QueryEngine {
         k: usize,
         record_access: bool,
     ) -> Result<Vec<SearchResult>> {
-        let k = k.clamp(1, SearchQuery::MAX_USER_LIMIT);
+        self.similar_filtered_with_access(id, k, None, record_access)
+            .await
+    }
 
-        let canonical = self
+    /// Select the final similarity response before recording any exposure.
+    pub async fn similar_filtered_with_access(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<SearchResult>> {
+        self.similar_with_access_checked(id, k, min_score, record_access, false)
+            .await
+    }
+
+    /// Preserve the caller's observation intent while deferring exposure until
+    /// the caller finishes fallible response hydration. Not a transport mode.
+    pub async fn prepare_similar_filtered(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        requested_access: bool,
+    ) -> Result<Vec<SearchResult>> {
+        self.similar_with_access_checked(id, k, min_score, requested_access, true)
+            .await
+    }
+
+    async fn similar_with_access_checked(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        requested_access: bool,
+        defer_recording: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let stamp = self.meta_store.effects_stamp().await?;
+        let result = self
+            .similar_with_access_admitted(id, k, min_score, requested_access, defer_recording)
+            .await;
+        if self.meta_store.effects_stamp().await? != stamp {
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
+            ));
+        }
+        result
+    }
+
+    async fn similar_with_access_admitted(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+        defer_recording: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let k = k.min(SearchQuery::MAX_USER_LIMIT);
+        let mut record = self
             .meta_store
             .get(&id)
             .await?
             .ok_or(SearchError::MemoryNotFound(id))?;
-        strength::require_legacy_helper(&canonical)?;
-        let record = match record_access.then(|| self.cache.get(&id)).flatten() {
-            Some(r) => r,
-            None => canonical,
-        };
-
-        strength::require_legacy_helper(&record)?;
+        let namespace = self
+            .namespace_resolver
+            .resolve_id(record.namespace_id)
+            .await?;
+        if namespace.id != record.namespace_id {
+            return Err(SearchError::MetadataError(
+                "resolved namespace differs from canonical source".into(),
+            ));
+        }
+        let context = self
+            .by_id_strength_context(&namespace, record_access)
+            .await?;
+        context.apply(&mut record)?;
 
         // Load the source memory's embedding from the vector index.
-        let source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
+        let mut source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
             SearchError::Internal(format!("no embedding found for memory {id:?}"))
         })?;
+
+        super::query::normalize_query_embedding(
+            &mut source_embedding,
+            namespace.embedding_dim as usize,
+        )?;
 
         // Over-fetch by 1 to account for self-match removal.
         let scored =
@@ -1253,15 +1373,12 @@ impl QueryEngine {
         // Remove the source memory from results.
         let filtered: Vec<ScoredResult> = scored
             .into_iter()
-            .filter(|s| s.memory_id != id)
+            .filter(|s| s.memory_id != id && min_score.is_none_or(|minimum| s.score >= minimum))
             .take(k)
             .collect();
 
         let result_ids: Vec<MemoryId> = filtered.iter().map(|s| s.memory_id).collect();
-        let records = self.meta_store.get_batch(&result_ids).await?;
-        for record in &records {
-            strength::require_legacy_helper(record)?;
-        }
+        let records = self.strength_records(&result_ids, Some(&context)).await?;
 
         // Build a lookup map so we can iterate `filtered` (which preserves
         // descending similarity order from the vector search) instead of
@@ -1273,6 +1390,11 @@ impl QueryEngine {
             .iter()
             .filter_map(|scored| {
                 let rec = record_map.get(&scored.memory_id)?;
+                if rec.namespace_id != namespace.id
+                    || matches!(rec.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
+                {
+                    return None;
+                }
                 let score = Some(scored.score);
                 Some(SearchResult {
                     memory_id: rec.id,
@@ -1296,26 +1418,45 @@ impl QueryEngine {
                     activation_score: None,
                     is_permastore: rec.is_permastore,
                     stability: rec.stability,
-                    namespace: String::new(),
+                    namespace: namespace.name.clone(),
                 })
             })
             .collect();
 
-        // Record associative access for returned results.
-        let accesses: Vec<(MemoryId, AccessKind)> = results
-            .iter()
-            .map(|r| (r.memory_id, AccessKind::AssociativeRetrieval))
-            .collect();
-        if record_access && !accesses.is_empty() {
-            let recorder = Arc::clone(&self.access_recorder);
-            tokio::spawn(async move {
-                if let Err(e) = recorder.record_access_batch(&accesses).await {
-                    warn!("failed to record associative access: {e}");
-                }
-            });
+        if context.requested_record_access && !defer_recording {
+            self.record_similar_accesses(&results.iter().map(|r| r.memory_id).collect::<Vec<_>>())
+                .await?;
         }
-
         Ok(results)
+    }
+
+    /// Shared final-result exposure hook. REST calls this only after fallible
+    /// response hydration. Legacy batches are awaited, not receipt-atomic.
+    pub async fn record_similar_accesses(&self, ids: &[MemoryId]) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        // Consumer preflight only: a schema-aware observation writer must also
+        // enforce this under its publication guard on the later A3 join.
+        let records = self.meta_store.get_batch(ids).await?;
+        if records.iter().any(|r| {
+            r.lifecycle.as_ref().is_some_and(|fields| {
+                fields.lifecycle_version
+                    == crate::model::schema::LifecycleVersion::ExplicitFeedbackV2
+            })
+        }) {
+            return Err(SearchError::Unavailable(
+                "explicit-feedback exposure writer unavailable".into(),
+            ));
+        }
+        let accesses: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .map(|id| (id, AccessKind::AssociativeRetrieval))
+            .collect();
+        if !accesses.is_empty() {
+            self.access_recorder.record_access_batch(&accesses).await?;
+        }
+        Ok(())
     }
 
     // =====================================================================
@@ -1752,6 +1893,82 @@ mod tests {
             Arc::new(Unused),
             Arc::new(Unused),
         )
+    }
+
+    #[tokio::test]
+    async fn effects_completed_during_query_cannot_return_a_successful_miss() {
+        use crate::storage::StorageEngine as _;
+        let fx = crate::test_support::Fixture::new();
+        let a = fx.insert_memory().await;
+        let b = fx.insert_memory().await;
+        fx.storage
+            .read()
+            .unwrap()
+            .add_edge(a, b, crate::model::EdgeType::Associative, 0.5, false, 1)
+            .unwrap();
+        fx.storage
+            .read()
+            .unwrap()
+            .meta_store()
+            .acknowledge_rebuilt_effects()
+            .unwrap();
+        struct MutatingLookup {
+            storage: Arc<std::sync::RwLock<crate::storage::engine::RedbStorageEngine>>,
+            target: MemoryId,
+        }
+        #[async_trait::async_trait]
+        impl MetadataStore for MutatingLookup {
+            async fn list_namespace_memories(&self, _: NamespaceId) -> Result<Vec<MemoryId>> {
+                Ok(Vec::new())
+            }
+            async fn effects_stamp(&self) -> Result<u64> {
+                self.storage
+                    .read()
+                    .unwrap()
+                    .meta_store()
+                    .effects_stamp()
+                    .map_err(|e| SearchError::MetadataError(e.to_string()))
+            }
+            async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
+                let storage = self.storage.write().unwrap();
+                let old = storage
+                    .get_record(*id)
+                    .unwrap()
+                    .map(|r| CachedRecord::from(&r));
+                storage.remove_all_edges(self.target).unwrap();
+                // Even complete publication must be noticed by the in-flight query.
+                storage.meta_store().acknowledge_rebuilt_effects().unwrap();
+                Ok(old)
+            }
+            async fn get_batch(&self, _: &[MemoryId]) -> Result<Vec<CachedRecord>> {
+                unreachable!()
+            }
+        }
+        let mut engine = engine(StubGraph::default(), StubMetaStore::default());
+        engine.meta_store = Arc::new(MutatingLookup {
+            storage: fx.storage.clone(),
+            target: b,
+        });
+        let result = engine.get_memory(MemoryId::new()).await;
+        assert!(matches!(result, Err(SearchError::Unavailable(_))));
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .effects_stamp()
+                .is_ok()
+        );
+        assert_eq!(
+            fx.storage
+                .read()
+                .unwrap()
+                .get_record(a)
+                .unwrap()
+                .unwrap()
+                .edge_count,
+            0
+        );
     }
 
     /// Wire up "B is superseded by A", where A's record is `replacement`.
