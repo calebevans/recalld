@@ -9,6 +9,7 @@
 
 mod effects;
 mod insertion;
+mod maintenance;
 mod text_compaction;
 mod tombstone;
 
@@ -1365,8 +1366,21 @@ impl StorageEngine for RedbStorageEngine {
         decay_strength: f32,
     ) -> Result<bool, StorageError> {
         self.ensure_available()?;
-        self.meta_store
-            .apply_legacy_decay(id, expected, namespace, phase, strength, decay_strength)
+        self.apply_legacy_decay_with_receipt(
+            &MutationContext::unkeyed(namespace.id),
+            id,
+            expected,
+            namespace,
+            phase,
+            strength,
+            decay_strength,
+        )
+        .map(|result| {
+            matches!(
+                result,
+                crate::storage::maintenance::DecayMutationResult::Committed(_)
+            )
+        })
     }
 
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {

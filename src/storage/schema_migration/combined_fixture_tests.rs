@@ -271,7 +271,7 @@ async fn combined_pending_effects_reject_migration_immutably_but_startup_preflig
             .store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(matches!(
             engine.delete_memory_with_edges(removed, &[]),
-            Err(StorageError::CommittedEffectsPending { .. })
+            Err(StorageError::CommittedMutation { receipt, .. }) if matches!(receipt.outcome, crate::storage::control::MutationOutcome::GraphChanged { memories_removed: 1, .. })
         ));
     }
     let source = fixture.close();

@@ -683,6 +683,9 @@ pub struct TriggerSweepRequest {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TriggerSweepResponse {
+    pub stale_skipped: u64,
+    pub unchanged_skipped: u64,
+    pub exempt_skipped: u64,
     pub memories_scanned: u64,
     pub full_to_summary: u64,
     pub summary_to_ghost: u64,
