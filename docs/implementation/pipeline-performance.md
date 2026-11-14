@@ -78,7 +78,11 @@ member and part hash, decompression roundtrip verification and original raw root
 The seven compressed parts remain untracked in the worktree archive directory:
 automatic approval review rejected their staging, interpreting the request as
 manifest-only and citing repository bloat. No archive was removed or silently
-excluded from the manifest; archive publication awaits clarification.
+excluded from the manifest. The user confirmed manifest-only Git publication;
+no archive staging retry or alternate upload is authorized. A second verified
+copy is at `/tmp/recalld-implementation/pipeline-performance/.validation/verified-archive-copy`;
+all seven copied hashes match the repository manifest. The manifest also records
+source, binary and probe hashes. Neither raw nor compressed payloads are in Git.
 The five original closed fixtures are retained; redundant post-query store copies
 stay outside Git. Bulky Cargo/target caches are never staged. One instrumentation
 and evidence PR targets #58; the orchestrator publishes it after this handoff.
@@ -86,3 +90,17 @@ and evidence PR targets #58; the orchestrator publishes it after this handoff.
 Remaining: full transport/provider/fsync/RIF/dense-graph/true-mode cost cells,
 transitive coherent readiness, later native integration and separate A6 quality
 and sample-sufficiency gates. No default enablement or full A5 completion claim.
+
+Untracked archive payloads at
+`/tmp/recalld-implementation/pipeline-performance/benchmarks/pipeline-performance/archives`:
+
+- `anchor-validation.tar.gz.part001`
+- `seed-7.tar.gz.part001`
+- `seed-19.tar.gz.part001`
+- `seed-41.tar.gz.part001`
+- `seed-73.tar.gz.part001`
+- `seed-101.tar.gz.part001`
+- `validation-and-host.tar.gz.part001`
+
+The orchestrator should push only the committed branch head; `.validation`,
+these parts and Python bytecode remain untracked local evidence/build state.

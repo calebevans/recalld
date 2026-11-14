@@ -1308,5 +1308,14 @@
   "compressed_bytes": 145349318,
   "parts": 7,
   "raw_bytes": 3739949676,
-  "roundtrip": "all archived file bytes and gzip trailers verified"
+  "roundtrip": "all archived file bytes and gzip trailers verified",
+  "archive_payloads_in_git": false,
+  "prepared_parts_root": "/tmp/recalld-implementation/pipeline-performance/benchmarks/pipeline-performance/archives",
+  "verified_copy_root": "/tmp/recalld-implementation/pipeline-performance/.validation/verified-archive-copy",
+  "verified_copy": "all seven copied part SHA256 hashes verified",
+  "binary_sha256": {
+    "candidate": "8e878b091971113de622d6c3913d8e710a30ef99e4cfeee74f8043d6c7f55830",
+    "anchor": "da1bb69833b40cdb1b28c69dc69692d6fc6e2bd3844e5bc422591635e0aac3bf"
+  },
+  "probe_sha256": "d7c1ca01f28ce3c91cd7411596f5085a83b9ca5e0b3dd75930e4994608503079"
 }
