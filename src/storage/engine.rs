@@ -322,7 +322,7 @@ pub struct RedbStorageEngine {
     /// Graph edge storage (redb) -- edges.db.
     edge_store: EdgeStore,
     /// Exclusive file lock preventing multi-process access.
-    _lock_file: std::fs::File,
+    _lock_file: crate::storage::ownership::OwnedFileLock,
     _ownership: crate::storage::ownership::StoreOwnership,
 }
 
