@@ -53,3 +53,27 @@ The purge overlap regression deliberately holds graph, observes canonical purge
 completion and a released storage lock, completes feedback, then releases graph
 and verifies purge and stale sweep finish. This is bounded coverage of those
 paths, not a proof of deadlock freedom or publication atomicity for all operations.
+
+## Published graph revalidation (P1)
+
+The independent 4.5-day/S=1 reproducer failed on this original lifecycle parent,
+not only the later atomic slice: a committed and published weight-1 associative
+edge raised effective strength from 0.6974858 to 0.7172529 across the 0.7 threshold,
+but the old transition still stripped content. The regression now passes.
+
+Each evaluation retains its sampled time, resolved policy and activation settings.
+Under graph -> storage locks, both strength-only writes and destructive transitions
+recheck the record/namespace and recompute projection from the held graph using
+those original inputs. Transition eligibility is rechecked before Full -> Summary,
+Summary -> Ghost, or Ghost deletion. A newly saving bonus skips the transition;
+a strength-only evaluation that newly crosses downward materializes current
+strength and leaves destructive reconsideration to the next sweep. No clock is
+sampled again. Tests also cover Summary/Ghost rescue, subsequent loss of the
+saving neighbor strength, and strength-only bonus growth/shrink with nondefault
+multiplier and cap. This covers current published graph state, not a promise that
+all separate canonical-edge/publication writers form one snapshot; that boundary
+remains owned by canonical effects integration.
+
+Offline Docker validation of this parent: 515 tests passed, four existing doctests
+ignored; formatting passed and Clippy completed with warnings. The original
+split-write limitation above remains on this parent until the atomic child lands.
