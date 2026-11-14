@@ -462,8 +462,7 @@ async fn dispatch(
             let p: DeleteMemoriesParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             // The socket is its own entry point: the tool layer's cap is
-            // not on this path, and an uncapped batch is one write
-            // transaction over an unbounded id list.
+            // not on this path. Bound the ordered independent child writes too.
             if p.ids.len() > crate::model::constants::MAX_BATCH_MEMORIES {
                 return Err(BridgeError::InvalidInput(format!(
                     "Too many ids ({}); the maximum is {} per call",

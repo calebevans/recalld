@@ -10,6 +10,7 @@
 mod effects;
 mod insertion;
 mod text_compaction;
+mod tombstone;
 
 use std::collections::HashSet;
 use std::ffi::OsStr;

@@ -193,6 +193,11 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    MemoryTombstoned {
+        #[serde(rename = "memoryId")]
+        memory_id: MemoryId,
+        status: super::tombstone::TombstoneStatus,
+    },
     MemoryInserted {
         #[serde(rename = "memoryId")]
         memory_id: MemoryId,
@@ -318,11 +323,11 @@ pub(crate) fn validate_existing(
         let stored = validate_receipt(value.value())?;
         if matches!(
             stored.receipt.outcome,
-            MutationOutcome::MemoryInserted { .. }
+            MutationOutcome::MemoryInserted { .. } | MutationOutcome::MemoryTombstoned { .. }
         ) && !matches!(scope, MutationScope::Namespace(_))
         {
             return Err(StorageError::InvalidControl(
-                "insertion receipt has catalog scope".into(),
+                "record mutation receipt has catalog scope".into(),
             ));
         }
         if lineage != state.store_id
@@ -478,6 +483,12 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
                 "invalid insertion receipt".into(),
             ));
         }
+    }
+    if matches!(stored.receipt.outcome, MutationOutcome::MemoryTombstoned { memory_id, .. } if memory_id == MemoryId::nil())
+    {
+        return Err(StorageError::InvalidControl(
+            "nil tombstone receipt identity".into(),
+        ));
     }
     Ok(stored)
 }
