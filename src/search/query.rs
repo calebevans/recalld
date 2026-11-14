@@ -13,9 +13,9 @@ use crate::model::{DecayPhase, Tag};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMode {
-    /// Vector similarity search only; skips metadata filtering.
+    /// Embedding-driven retrieval; all supplied hard filters still apply.
     EmbeddingOnly,
-    /// Vector search with post-hoc metadata filters (default).
+    /// Embedding-driven retrieval with explicit metadata criteria (default).
     EmbeddingPlusMetadata,
     /// Tag and attribute filtering without vector search.
     MetadataOnly,
@@ -31,7 +31,7 @@ impl Default for QueryMode {
 // SearchFilter (pipeline-level)
 // ---------------------------------------------------------------------------
 
-/// Post-retrieval filters applied after vector search and metadata loading.
+/// Canonical hard filters apply in every query mode, including EmbeddingOnly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchFilter {
@@ -79,7 +79,7 @@ pub struct SearchQuery {
     #[serde(default = "default_namespace")]
     pub namespace: String,
 
-    /// Post-retrieval filters.
+    /// Hard eligibility filters applied in every query mode.
     #[serde(default)]
     pub filter: SearchFilter,
 

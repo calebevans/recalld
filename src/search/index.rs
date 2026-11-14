@@ -271,6 +271,10 @@ impl FlatVectorIndex {
             let offset = i * self.dim;
             let candidate = &self.vectors[offset..offset + self.dim];
             let score = dot_product_simd(query, candidate);
+            if !score.is_finite() {
+                return Err(VectorError::CorruptIndex("nonfinite vector score".into()));
+            }
+            let score = if score == 0.0 { 0.0 } else { score };
 
             if score < min_score {
                 continue;

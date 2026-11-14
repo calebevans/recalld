@@ -187,7 +187,7 @@ impl FtsIndex {
              JOIN id_map m ON m.rowid = fts_content.rowid
              WHERE fts_content MATCH ?1
                AND m.namespace_id = ?2
-             ORDER BY score DESC
+             ORDER BY score DESC, m.memory_id ASC
              LIMIT ?3",
         )?;
 
@@ -592,5 +592,26 @@ mod tests {
 
         let result = escape_query("test\"injection");
         assert_eq!(result, "\"testinjection\"");
+    }
+    #[test]
+    fn equal_fts_scores_use_uuid_order_before_limit_and_after_reinsertion() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = FtsIndex::new(dir.path()).unwrap();
+        let ids: Vec<_> = (1u128..=3)
+            .map(|n| MemoryId::from_bytes(n.to_be_bytes()))
+            .collect();
+        for order in [vec![2, 1, 0], vec![0, 1, 2]] {
+            for n in order {
+                index
+                    .add(test_ns_id(), ids[n], "identical keyword", None, &[])
+                    .unwrap();
+            }
+            let results = index.search(test_ns_id(), "keyword", 2).unwrap();
+            assert_eq!(
+                results.iter().map(|r| r.0).collect::<Vec<_>>(),
+                vec![ids[0], ids[1]]
+            );
+            assert_eq!(results[0].1, results[1].1);
+        }
     }
 }

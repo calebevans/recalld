@@ -426,6 +426,33 @@ impl SharedGraphReader {
 }
 
 impl GraphReader for SharedGraphReader {
+    fn supersession_links(
+        &self,
+        id: MemoryId,
+        allowance: usize,
+    ) -> Result<crate::graph::query::SupersessionLinks> {
+        let graph = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.graph.read())
+        });
+        Ok(crate::graph::query::supersession_links(
+            &graph, id, allowance,
+        ))
+    }
+
+    fn expand_eligible(
+        &self,
+        seeds: &[(MemoryId, f32)],
+        namespace: NamespaceId,
+        depth: u8,
+        eligible: &std::collections::HashMap<MemoryId, CachedRecord>,
+    ) -> Result<crate::graph::query::GraphExpansion> {
+        let graph = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.graph.read())
+        });
+        crate::graph::query::expand(&graph, seeds, namespace, depth, eligible)
+            .map_err(|e| SearchError::Internal(e.into()))
+    }
+
     fn neighbors(&self, id: &MemoryId) -> Vec<MemoryId> {
         let graph = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.graph.read())
