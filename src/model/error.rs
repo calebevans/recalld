@@ -102,6 +102,10 @@ pub enum ValidationError {
         max_bytes: usize,
     },
 
+    /// One supplied raw tag would otherwise be silently discarded.
+    #[error("tags[{index}] is invalid: {source}")]
+    InvalidTagItem { index: usize, source: TagError },
+
     /// Legacy storage has no lossless carrier for this structured label.
     #[error(
         "{field}[{index}] cannot be represented by legacy storage; use a nonempty label containing ASCII letters, digits, /, _, ., :, or -"
@@ -180,7 +184,9 @@ impl ValidationError {
             | ValidationError::TooManyItems { field, .. }
             | ValidationError::ItemTooLong { field, .. }
             | ValidationError::UnrepresentableLegacyLabel { field, .. } => Some(field),
-            ValidationError::InvalidTag { .. } => Some("tags"),
+            ValidationError::InvalidTag { .. } | ValidationError::InvalidTagItem { .. } => {
+                Some("tags")
+            }
             ValidationError::DimensionMismatch { .. }
             | ValidationError::NonFiniteEmbedding { .. } => Some("embedding"),
             ValidationError::NamespaceNotFound { .. } => Some("namespace"),

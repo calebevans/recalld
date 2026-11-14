@@ -116,7 +116,7 @@ async fn legacy_labels_reject_before_provider_or_mutation_in_actual_http_batch_a
     );
     let before = files(f.path());
     let generation = f.storage.read().unwrap().control_state().unwrap();
-    for field in ["entities", "topics", "emotions"] {
+    for field in ["tags", "entities", "topics", "emotions"] {
         for label in ["John Smith", "José", "Alice's", "", " "] {
             let mut request =
                 serde_json::json!({"summary":"retained input", "namespace":"default"});
@@ -161,6 +161,7 @@ async fn legacy_labels_reject_before_provider_or_mutation_in_actual_http_batch_a
                 check_duplicates: None,
             };
             match field {
+                "tags" => input.tags.push(label.into()),
                 "entities" => input.entities.push(label.into()),
                 "topics" => input.topics.push(label.into()),
                 _ => input.emotions.push(label.into()),
@@ -188,7 +189,7 @@ async fn legacy_labels_normalized_positive_survive_receipted_rebuild_and_restart
     let adapter = f.storage_adapter();
     for _ in 0..2 {
         let mut input = crate::mcp::args::parse_store_input(&serde_json::json!({
-            "summary":"persisted labels", "entities":["Alice-1"], "topics":["RUST/lang"], "emotions":["Curious"], "embedding":[1.,0.,0.,0.]
+            "summary":"persisted labels", "tags":["USER/Chosen"], "entities":["Alice-1"], "topics":["RUST/lang"], "emotions":["Curious"], "embedding":[1.,0.,0.,0.]
         }), "default").unwrap();
         input.embedding = Some(vec![1., 0., 0., 0.]);
         adapter.store_memory(input).await.unwrap();
@@ -200,6 +201,7 @@ async fn legacy_labels_normalized_positive_survive_receipted_rebuild_and_restart
     assert_eq!(records.len(), 2);
     for (_, r) in records {
         let tags: Vec<_> = r.tags.iter().map(ToString::to_string).collect();
+        assert!(tags.contains(&"user/chosen".into()));
         assert!(tags.contains(&"entity/alice-1".into()));
         assert!(tags.contains(&"topic/rust/lang".into()));
         assert!(tags.contains(&"emotion/curious".into()));

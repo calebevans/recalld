@@ -69,6 +69,10 @@ pub fn validate_memory_input(input: MemoryInputRef<'_>) -> Result<(), Validation
 /// schema validation and retained native labels keep their UTF-8 semantics.
 pub fn validate_legacy_memory_input(input: MemoryInputRef<'_>) -> Result<(), ValidationError> {
     validate_memory_input(input)?;
+    for (index, tag) in input.tags.iter().enumerate() {
+        super::Tag::new(tag.clone())
+            .map_err(|source| ValidationError::InvalidTagItem { index, source })?;
+    }
     use super::constants::{EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, TOPIC_TAG_PREFIX};
     for (field, prefix, labels) in [
         ("entities", ENTITY_TAG_PREFIX, input.entities),
