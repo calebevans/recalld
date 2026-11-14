@@ -7,6 +7,8 @@
 //!
 //! See CS-07 for the full specification.
 
+mod lifecycle_updates;
+
 use std::collections::HashMap;
 use std::path::Path;
 

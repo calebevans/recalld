@@ -112,6 +112,26 @@ pub trait StorageEngine: Send + Sync {
         is_permastore: bool,
     ) -> Result<(), StorageError>;
 
+    /// Atomic v1 feedback state/history patch; false rejects a stale snapshot.
+    fn apply_legacy_feedback(
+        &self,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        plan: &crate::decay::lifecycle::FeedbackPlan,
+    ) -> Result<bool, StorageError>;
+
+    /// Atomic v1 strength/phase/content patch (same phase or one phase loss).
+    fn apply_legacy_decay(
+        &self,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        phase: DecayPhase,
+        strength: f32,
+        decay_strength: f32,
+    ) -> Result<bool, StorageError>;
+
     /// Zero the full_text pointer on a memory record.
     ///
     /// Called during Full -> Summary phase transitions to mark the
@@ -1297,6 +1317,32 @@ impl StorageEngine for RedbStorageEngine {
             stability,
             is_permastore,
         )
+    }
+
+    fn apply_legacy_feedback(
+        &self,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        plan: &crate::decay::lifecycle::FeedbackPlan,
+    ) -> Result<bool, StorageError> {
+        self.ensure_available()?;
+        self.meta_store
+            .apply_legacy_feedback(id, expected, namespace, plan)
+    }
+
+    fn apply_legacy_decay(
+        &self,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        phase: DecayPhase,
+        strength: f32,
+        decay_strength: f32,
+    ) -> Result<bool, StorageError> {
+        self.ensure_available()?;
+        self.meta_store
+            .apply_legacy_decay(id, expected, namespace, phase, strength, decay_strength)
     }
 
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {

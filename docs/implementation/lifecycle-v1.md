@@ -19,11 +19,12 @@ HTTP and MCP namespace creation adapters validate supplied lifecycle settings
 through the same resolver before creating a namespace. Existing invalid persisted
 policies fail closed; no automatic migration is supplied.
 
-Limitations: feedback state/history and sweep phase/content writes remain separate
-transactions. A failure can commit only part of an operation. The lock and snapshot
-check prevent the reproduced in-process stale-plan overwrite; they do not provide
-crash atomicity, general CAS, versioned plans, durable receipts or retry safety.
-The storage foundation must supply that boundary. Hard deletion still does not
+The follow-up [atomic legacy lifecycle slice](atomic-lifecycle-v1.md) couples
+feedback state/history and sweep phase/strength/content in one metadata transaction.
+It supersedes the original split-write limitation for these operations. The lock
+and snapshot check prevent the reproduced in-process stale-plan overwrite; they do
+not provide public CAS, versioned plans, durable lifecycle receipts or retry safety.
+Hard deletion still does not
 clean up external vector, FTS and entity indexes; canonical hydration drops their
 orphan candidates. No whole-store readiness or convergence guarantee is made.
 
