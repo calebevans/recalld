@@ -26,7 +26,7 @@ use crate::model::constants::{
 };
 use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
-use crate::model::validation::{MemoryInputRef, validate_memory_input};
+use crate::model::validation::{MemoryInputRef, validate_legacy_memory_input};
 use crate::serialization::{
     ApiResponse, MemoryResponse, NamespaceResponse, SearchHit, SearchRequest, SearchResponse,
 };
@@ -146,7 +146,7 @@ async fn near_duplicate_report(
 /// POST /memories -- create a new memory.
 ///
 /// Steps:
-/// 1. Validate request content limits (see [`validate_memory_input`]);
+/// 1. Validate request content limits (see [`validate_legacy_memory_input`]);
 ///    all length limits are UTF-8 bytes, not characters.
 /// 2. Resolve namespace by name -> NamespaceId.
 /// 3. Validate `parent_id` / `supersedes` targets, BEFORE any write, so a
@@ -166,7 +166,7 @@ pub async fn create_memory(
     let start = Instant::now();
 
     // --- Validation ---
-    validate_memory_input(MemoryInputRef {
+    validate_legacy_memory_input(MemoryInputRef {
         summary: &req.summary,
         full_text: req.full_text.as_deref(),
         tags: &req.tags,
@@ -1502,7 +1502,7 @@ pub async fn batch_store(
         // longer skips silently: every `continue` below records why. The
         // limits themselves are the shared ones, which keeps an oversized
         // summary from reaching the u16-prefixed on-disk record encoder.
-        if let Err(e) = validate_memory_input(MemoryInputRef {
+        if let Err(e) = validate_legacy_memory_input(MemoryInputRef {
             summary: &mem_req.summary,
             full_text: mem_req.full_text.as_deref(),
             tags: &mem_req.tags,

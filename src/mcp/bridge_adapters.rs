@@ -909,6 +909,17 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         input: bridge::StoreInput,
     ) -> Result<bridge::StoredMemory, bridge::BridgeError> {
+        crate::model::validation::validate_legacy_memory_input(
+            crate::model::validation::MemoryInputRef {
+                summary: &input.summary,
+                full_text: input.full_text.as_deref(),
+                tags: &input.tags,
+                entities: &input.entities,
+                topics: &input.topics,
+                emotions: &input.emotions,
+            },
+        )
+        .map_err(|error| bridge::BridgeError::InvalidInput(error.to_string()))?;
         effects_stamp(&self.storage).await?;
 
         use crate::model::Tag;

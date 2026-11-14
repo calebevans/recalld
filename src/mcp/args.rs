@@ -23,7 +23,7 @@
 //! 3. **Markup detection** ([`scan_client_markup`]) — text fields that
 //!    contain literal tool-call markup are rejected rather than stored.
 //! 4. Everything about *how long* or *how many* is delegated to
-//!    [`crate::model::validation::validate_memory_input`], which the
+//!    [`crate::model::validation::validate_legacy_memory_input`], which the
 //!    HTTP API shares.
 //!
 //! A *numeric* bound is treated the same way. An out-of-range `limit` is
@@ -52,7 +52,9 @@ use crate::model::MemoryId;
 use crate::model::constants::{
     DEFAULT_LIST_LIMIT, DEFAULT_TAG_LIMIT, MAX_LIST_LIMIT, MAX_TAG_LIMIT,
 };
-use crate::model::validation::{MemoryInputRef, truncate_on_char_boundary, validate_memory_input};
+use crate::model::validation::{
+    MemoryInputRef, truncate_on_char_boundary, validate_legacy_memory_input,
+};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Error type
@@ -701,7 +703,7 @@ pub fn reject_client_markup(field: &str, text: &str) -> Result<(), ArgError> {
 /// `summary` (presence, type, markup), `fullText` (type, markup), the
 /// four array fields, `namespace`, `parentId`, `supersedes`,
 /// `checkDuplicates`, and finally the shared content limits from
-/// [`validate_memory_input`](crate::model::validation::validate_memory_input).
+/// [`validate_legacy_memory_input`](crate::model::validation::validate_legacy_memory_input).
 pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreInput, ArgError> {
     if !item.is_object() {
         return Err(ArgError::new(
@@ -729,7 +731,7 @@ pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreI
     let supersedes = opt_uuid(item, "supersedes")?;
     let check_duplicates = opt_bool(item, "checkDuplicates")?;
 
-    validate_memory_input(MemoryInputRef {
+    validate_legacy_memory_input(MemoryInputRef {
         summary: &summary,
         full_text: full_text.as_deref(),
         tags: &tags,
