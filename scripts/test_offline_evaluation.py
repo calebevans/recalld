@@ -1,5 +1,6 @@
 """Runner boundary regression tests; execute in the isolated Rust container."""
 from pathlib import Path
+import json
 import runpy
 import subprocess
 import tempfile
@@ -81,6 +82,45 @@ class SourceSnapshotTests(unittest.TestCase):
         (self.root / "src").symlink_to(self.root / "elsewhere", target_is_directory=True)
         with self.assertRaises(RuntimeError):
             runner["snapshot_source"](self.root, self.output)
+
+    def test_replay_checks_stable_results_and_each_control_not_random_receipts(self):
+        memory = "00000000-0000-0000-0000-000000000001"
+        for run in range(3):
+            root = self.output / f"run-{run}"
+            root.mkdir(parents=True)
+            store = f"00000000-0000-0000-0001-{run+1:012d}"
+            operation = f"00000000-0000-0000-0002-{run+1:012d}"
+            identity = {"sourceId": 0, "memoryId": memory}
+            runner["save"](root / "fixture.json", {"sources": [identity]})
+            runner["save"](root / "replay.json", [])
+            for name in ("state-before.json", "state-after.json"):
+                runner["save"](root / name, {memory: []})
+            for name in ("control-before.json", "control-after.json"):
+                runner["save"](root / name, {"storeId": store, "committedGeneration": "5"})
+            receipt = {"storeId": store, "operationId": operation, "committedGeneration": "4",
+                       "receiptVersion": 1, "replayed": False,
+                       "outcome": {"kind": "memoryInserted", "memoryId": memory}}
+            ledger = [{**identity, "status": "attempted"},
+                      {**identity, "status": "accepted", "receipt": receipt}]
+            (root / "turn-ledger.jsonl").write_text("\n".join(map(json.dumps, ledger)) + "\n")
+        stable = runner["verify_replays"](self.output, 3)
+        self.assertNotIn("turn-ledger.jsonl", stable)
+        (self.output / "run-1/replay.json").write_text('{}\n')
+        with self.assertRaisesRegex(RuntimeError, "replay mismatch"):
+            runner["verify_replays"](self.output, 3)
+        runner["save"](self.output / "run-1/replay.json", [])
+        ledger[-1]["receipt"]["outcome"]["memoryId"] = store
+        (root / "turn-ledger.jsonl").write_text("\n".join(map(json.dumps, ledger)) + "\n")
+        with self.assertRaisesRegex(RuntimeError, "receipt outcome/write count"):
+            runner["verify_replays"](self.output, 3)
+        ledger[-1]["receipt"]["outcome"]["memoryId"] = memory
+        ledger[-1]["receipt"]["outcome"]["extraSemanticChange"] = True
+        (root / "turn-ledger.jsonl").write_text("\n".join(map(json.dumps, ledger)) + "\n")
+        with self.assertRaisesRegex(RuntimeError, "semantics differ"):
+            runner["verify_replays"](self.output, 3)
+        (self.output / "run-2/control-after.json").write_text('{}\n')
+        with self.assertRaisesRegex(RuntimeError, "false query changed control"):
+            runner["verify_replays"](self.output, 3)
 
 
 if __name__ == "__main__":

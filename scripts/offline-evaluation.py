@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
+import uuid
 
 IMAGE = "recalld-ci:1.94"
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +77,56 @@ def snapshot_source(root, destination):
 def source_patch(root, names):
     # Unrelated tracked changes can also contain credentials or bulky output.
     return subprocess.check_output(["git", "diff", "HEAD", "--binary", "--", *sorted(names)], cwd=root)
+
+
+def verify_replays(output, runs):
+    # Canonical receipts/store UUIDs stay in evidence but are not deterministic.
+    stable = ["fixture.json", "state-before.json", "state-after.json", "replay.json"]
+    for name in stable:
+        if len({sha(output / f"run-{run}" / name) for run in range(runs)}) != 1:
+            raise RuntimeError(f"replay mismatch: {name}")
+    receipt_semantics = []
+    controls = []
+    for run in range(runs):
+        root = output / f"run-{run}"
+        for kind in ("state", "control"):
+            if sha(root / f"{kind}-before.json") != sha(root / f"{kind}-after.json"):
+                raise RuntimeError(f"false query changed {kind}: run-{run}")
+        control = json.loads((root / "control-before.json").read_text())
+        store_id = control.pop("storeId")
+        if not uuid.UUID(store_id).int:
+            raise RuntimeError("nil store identity")
+        controls.append(control)
+        sources = json.loads((root / "fixture.json").read_text())["sources"]
+        state = json.loads((root / "state-before.json").read_text())
+        ledger = [json.loads(line) for line in (root / "turn-ledger.jsonl").read_text().splitlines()]
+        if len(ledger) != 2 * len(sources) or set(state) != {s["memoryId"] for s in sources}:
+            raise RuntimeError("fixture/ledger/record count mismatch")
+        operations, semantic = set(), []
+        for i, source in enumerate(sources):
+            attempted, accepted = ledger[2*i:2*i+2]
+            identity = {"sourceId": source["sourceId"], "memoryId": source["memoryId"]}
+            if attempted != {**identity, "status": "attempted"} or any(accepted[k] != v for k, v in identity.items()) or accepted["status"] != "accepted":
+                raise RuntimeError("ledger identity/reference mismatch")
+            receipt = accepted["receipt"].copy()
+            operation = receipt.pop("operationId")
+            if not uuid.UUID(operation).int or operation in operations or receipt.pop("storeId") != store_id:
+                raise RuntimeError("receipt identity mismatch")
+            operations.add(operation)
+            if (receipt["receiptVersion"] != 1 or receipt["replayed"] is not False
+                    or receipt["outcome"]["kind"] != "memoryInserted"
+                    or receipt["outcome"]["memoryId"] != source["memoryId"]
+                    or receipt["committedGeneration"] != str(i + 4)):
+                raise RuntimeError("receipt outcome/write count mismatch")
+            semantic.append({**accepted, "receipt": receipt})
+        # This source initializes control, creates two fixture namespaces, inserts
+        # N records, then production startup creates its default namespace.
+        if control["committedGeneration"] != str(len(sources) + 4):
+            raise RuntimeError("unexpected canonical write count")
+        receipt_semantics.append(semantic)
+    if any(value != receipt_semantics[0] for value in receipt_semantics[1:]) or any(value != controls[0] for value in controls[1:]):
+        raise RuntimeError("receipt/control semantics differ beyond declared generated identities")
+    return stable
 
 
 def main():
@@ -165,10 +216,10 @@ cat /sys/fs/cgroup/memory.max > /work/output/cgroup-memory.txt
 cat /sys/fs/cgroup/cpu.max > /work/output/cgroup-cpu.txt
 python3 scripts/test_offline_evaluation.py > /work/output/runner-tests.log 2>&1
 cargo fmt --all --check > /work/output/format.log 2>&1
+cargo clean -p recalld > /work/output/package-clean.log 2>&1
 cargo test --locked --offline --all-features --lib --bins --tests --examples -j1 > /work/output/library-tests.log 2>&1
 cargo test --locked --offline --example offline_eval > /work/output/harness-tests.log 2>&1
 cargo clippy --locked --offline --all-features --all-targets > /work/output/clippy.log 2>&1
-cargo clean -p recalld > /work/output/package-clean.log 2>&1
 cargo build --locked --offline --release --example offline_eval -j1 > /work/output/build.log 2>&1
 '''
     (scratch / "build.sh").write_text(inner)
@@ -187,10 +238,7 @@ cargo build --locked --offline --release --example offline_eval -j1 > /work/outp
                 cmd += [f"--{key}", str(getattr(args, key))]
             with (output / f"run-{run}.log").open("w") as log:
                 subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
-        stable = ["fixture.json", "turn-ledger.jsonl", "state-before.json", "state-after.json", "replay.json"]
-        for name in stable:
-            if len({sha(output / f"run-{run}" / name) for run in range(args.runs)}) != 1:
-                raise RuntimeError(f"replay mismatch: {name}")
+        stable = verify_replays(output, args.runs)
         manifest["status"] = "passed"
         manifest["replay"] = {"processes": args.runs, "identicalArtifacts": stable}
     except BaseException as exc:
