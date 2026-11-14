@@ -26,6 +26,9 @@ pub(crate) struct CapturedSnapshot {
     /// Raw values retain the original immutable completed progress encoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge_progress: Option<Rows>,
+    /// Completed immutable manifests, including reserved IDs and final errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_progress: Option<Rows>,
 }
 
 /// Read-only inspection copies metadata; caller holds stable ownership/legacy lock.
@@ -52,6 +55,8 @@ pub(crate) fn capture(path: &Path) -> Result<CapturedSnapshot, StorageError> {
         "logical_import_progress",
         "namespace_purge_schema",
         "namespace_purge_progress",
+        "batch_schema",
+        "mutation_batches",
     ];
     if read.list_tables()?.any(|t| !known.contains(&t.name()))
         || read
@@ -109,6 +114,14 @@ pub(crate) fn capture(path: &Path) -> Result<CapturedSnapshot, StorageError> {
             .any(|table| table.name() == purge::PROGRESS.name())
         {
             Some(rows(purge::PROGRESS)?)
+        } else {
+            None
+        },
+        batch_progress: if read
+            .list_tables()?
+            .any(|table| table.name() == batch::BATCHES.name())
+        {
+            Some(rows(batch::BATCHES)?)
         } else {
             None
         },
@@ -436,6 +449,12 @@ pub(crate) fn reconcile(
     if let Some(target) = target {
         merge_rows(&tx, control::RECEIPTS, &target.receipts)?;
         merge_rows(&tx, control::KEYS, &target.keys)?;
+        if let Some(rows) = &target.batch_progress {
+            tx.open_table(batch::SCHEMA)?.insert("version", 1)?;
+            // Both snapshots were validated complete. Equal keys must retain
+            // byte-identical headers/items/outcomes; never merge terminal states.
+            merge_rows(&tx, batch::BATCHES, rows)?;
+        }
     }
     if has_purge_schema {
         tx.open_table(purge::SCHEMA)?.insert("version", 1)?;

@@ -108,8 +108,9 @@ fn table_kind(name: &str) -> Option<TableKind> {
         | "mutation_keys"
         | "mutation_effects"
         | "removal_ledger"
-        | "namespace_purge_progress" => Some(TableKind::BytesBytes),
-        "namespace_counter" | "effects_schema" | "namespace_purge_schema" => {
+        | "namespace_purge_progress"
+        | "mutation_batches" => Some(TableKind::BytesBytes),
+        "namespace_counter" | "effects_schema" | "namespace_purge_schema" | "batch_schema" => {
             Some(TableKind::StrU32)
         }
         _ => None,

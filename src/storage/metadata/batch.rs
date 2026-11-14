@@ -103,8 +103,25 @@ pub(crate) fn validate_existing(
         let (key, bytes) = row?;
         let p: BatchProgress = control::decode(bytes.value())?;
         let parent = &p.reservation_receipt;
+        let latest = p
+            .bookkeeping_receipts
+            .iter()
+            .map(|r| r.committed_generation)
+            .chain(p.items.iter().filter_map(|item| match &item.state {
+                BatchItemState::Ok { receipt } => Some(receipt.committed_generation),
+                _ => None,
+            }))
+            .fold(parent.committed_generation, std::cmp::max);
+        let permitted_origin = crate::storage::lineage::permits_origin(
+            tx,
+            state,
+            control::GenerationRef {
+                store_id: parent.store_id,
+                generation: latest,
+            },
+        )? && (parent.store_id == state.store_id || p.unresolved() == 0);
         if p.version != 1
-            || parent.store_id != state.store_id
+            || !permitted_origin
             || parent.replayed
             || key.value() != parent.operation_id.as_bytes()
             || p.items.is_empty()
