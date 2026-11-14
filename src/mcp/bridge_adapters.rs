@@ -1937,23 +1937,15 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                     }
                 }
 
-                storage_w.purge_namespace(config.id).map_err(|e| {
-                    let error = if e.is_partial() {
-                        bridge::BridgeError::PartiallyApplied(format!(
-                            "Namespace '{name}' was PARTIALLY destroyed: {} memories are \
-                             permanently gone, and the namespace still exists holding the \
-                             rest. Re-run delete_namespace to finish it. Cause: {}",
-                            e.destroyed.len(),
-                            e.source
-                        ))
-                    } else {
-                        bridge::BridgeError::Storage(e.source.to_string())
-                    };
-                    DeleteFailure {
-                        destroyed: e.destroyed,
-                        error,
-                    }
-                })
+                storage_w
+                    .purge_namespace_checked(config.id, force)
+                    .map_err(|e| {
+                        let error = map_mutation_error(e.source);
+                        DeleteFailure {
+                            destroyed: e.destroyed,
+                            error,
+                        }
+                    })
             })
             .await
             .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
@@ -1980,7 +1972,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                     .await;
                 }
                 // Even a partial purge may have durable effects to publish.
-                self.complete_effects().await?;
+                let _ = self.complete_effects().await;
                 return Err(failure.error);
             }
         };
@@ -2005,7 +1997,14 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         )
         .await;
 
-        self.complete_effects().await?;
+        self.complete_effects().await.map_err(|source| {
+            map_mutation_error(crate::storage::StorageError::CommittedMutation {
+                receipt: Box::new(purged.receipt.clone()),
+                source: Box::new(crate::storage::StorageError::RecoveryRequired(
+                    source.to_string(),
+                )),
+            })
+        })?;
         Ok(bridge::DeleteNamespaceResult {
             name: purged.config.name.clone(),
             id: purged.config.id.get(),
@@ -3430,52 +3429,6 @@ mod tests {
                 "{bad:?}: {err:?}"
             );
         }
-    }
-
-    /// The migration case, and the reason the refusal is by name rather
-    /// than by lookup: a database created before the validator reached
-    /// this layer can already hold a row named `""`, whose directory
-    /// **is** the data directory. Planting the row directly is the only
-    /// way to reach that state now.
-    #[tokio::test]
-    async fn w47_a_legacy_empty_named_namespace_cannot_destroy_the_database() {
-        let fx = Fixture::new();
-
-        {
-            let mut config = crate::model::NamespaceConfig::default_namespace(0);
-            config.name = String::new();
-            config.embedding_dim = crate::test_support::DIM as u32;
-            fx.storage
-                .write()
-                .expect("storage lock")
-                .meta_store()
-                .create_namespace(&config)
-                .expect("plant a legacy row");
-        }
-
-        let err = fx
-            .namespace_adapter()
-            .delete_namespace(bridge::DeleteNamespaceInput {
-                name: String::new(),
-                force: true,
-            })
-            .await
-            .expect_err("an empty namespace name must be refused");
-        assert!(
-            matches!(err, bridge::BridgeError::InvalidInput(_)),
-            "{err:?}"
-        );
-
-        assert!(
-            fx.path().join("meta.db").exists()
-                && fx.path().join("edges.db").exists()
-                && fx.path().join("fulltext.dat").exists(),
-            "the database was destroyed"
-        );
-        assert!(
-            fx.namespace_dir("default").join("vectors.dat").exists(),
-            "the default namespace's vectors were destroyed"
-        );
     }
 
     // ── case-insensitive namespace identity ──────────────────────────

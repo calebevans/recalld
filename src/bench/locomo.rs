@@ -17,10 +17,9 @@ use comfy_table::{Cell, Table};
 use serde::{Deserialize, Serialize};
 
 use crate::config::RecalldConfig;
-use crate::model::record::DiskRecord;
-use crate::model::{CachedRecord, DecayPhase, MemoryId};
+use crate::model::MemoryId;
 use crate::search::PipelineSearchFilter;
-use crate::search::{QueryMode, SearchQuery, VectorIndex, VectorMetadata};
+use crate::search::{QueryMode, SearchQuery};
 use crate::storage::StorageEngine as _;
 use crate::system::Recalld;
 
@@ -1253,8 +1252,8 @@ pub(super) async fn store_single_memory(
 
     let tags: Vec<crate::model::Tag> = tag_strings
         .iter()
-        .filter_map(|t| crate::model::Tag::new(t).ok())
-        .collect();
+        .map(|t| crate::model::Tag::new(t.clone()))
+        .collect::<Result<_, _>>()?;
 
     let mut embed_text = match full_text {
         Some(ft) => format!("{}\n\n{}", summary, ft),
@@ -1272,76 +1271,24 @@ pub(super) async fn store_single_memory(
 
     let memory_id = MemoryId::new();
 
-    let mut record = DiskRecord {
-        schema: None,
-        version: DiskRecord::CURRENT_VERSION,
-        id: *memory_id.as_bytes(),
-        namespace_id: ns_config.id.get(),
-        created_at: timestamp_ms,
-        last_accessed_at: timestamp_ms,
-        phase: DecayPhase::Full,
-        strength: 1.0,
-        decay_strength: 1.0,
-        stability: ns_config.initial_stability,
-        difficulty: 5.0,
-        is_permastore: 0,
-        vector_slot: 0,
-        edge_count: 0,
-        summary: summary.to_string(),
-        tags,
-        access_history: Vec::new(),
-        text_offset: 0,
-        text_length: 0,
-    };
-
-    {
-        let mut storage_w = harness
-            .system
-            .storage()
-            .write()
-            .map_err(|e| format!("storage lock poisoned: {e}"))?;
-        storage_w.insert_memory(memory_id, ns_config.id, &mut record, &embedding, full_text)?;
-    }
-
-    let cached = CachedRecord::from(&record);
-    harness.system.cache().insert(memory_id, cached).await;
-
-    {
-        let mut index = harness.system.vector_index().write().await;
-        let metadata = VectorMetadata {
-            namespace_id: ns_config.id,
-            decay_phase: DecayPhase::Full.as_u8(),
-            tags: tag_strings.to_vec(),
-        };
-        index.add(memory_id, &embedding, metadata)?;
-    }
-
-    {
-        let fts = harness.system.fts_index().lock().await;
-        if let Err(e) = fts.add(ns_config.id, memory_id, summary, full_text, tag_strings) {
-            eprintln!("FTS index error: {e}");
-        }
-    }
-
-    {
-        let mut graph_w = harness.system.graph().write().await;
-        let _ = graph_w.add_node(
-            memory_id,
-            ns_config.id,
-            DecayPhase::Full,
-            1.0,
-            record.vector_slot,
-        );
-
-        if let Some(old_id) = supersedes {
-            let _ = graph_w.add_edge(
-                memory_id,
-                old_id,
-                crate::model::EdgeType::Supersedes,
-                1.0,
-                false,
-            );
-        }
+    let result = crate::derived_completion::DerivedCompletion {
+        storage: harness.system.storage().clone(),
+        cache: harness.system.cache().clone(),
+        graph: harness.system.graph().clone(),
+        vectors: harness.system.vector_index().clone(),
+        fts: harness.system.fts_index().clone(),
+        entities: harness.system.entity_index().clone(),
+    }.insert(
+        crate::storage::control::MutationContext::unkeyed(ns_config.id),
+        crate::storage::insertion::InsertMemory {
+            id: Some(memory_id), summary: summary.into(), full_text: full_text.map(str::to_owned),
+            tags, embedding: None, initial_stability: Some(ns_config.initial_stability),
+            created_at: Some(timestamp_ms), parent_id: None, supersedes,
+        },
+        embedding.clone().into(), timestamp_ms,
+    ).await?;
+    if result.record.is_none() {
+        return Err("committed benchmark insertion lacks its record".into());
     }
 
     let entities = llm_entities.to_vec();
@@ -1398,6 +1345,8 @@ pub(super) async fn store_single_memory(
         let mut idx = harness.system.entity_index().write().await;
         idx.add(memory_id, &entities);
     }
+
+    harness.system.complete_pending_effects().await?;
 
     Ok(memory_id)
 }

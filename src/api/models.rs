@@ -7,7 +7,7 @@
 //!
 //! This module adds HTTP-endpoint-specific types that only make sense
 //! in the context of the axum server (e.g. `CreateMemoryApiRequest`
-//! with `parent_id`, `ReinforceRequest`, health check types).
+//! with `parent_id`, reinforcement responses, health check types).
 
 use serde::{Deserialize, Serialize};
 
@@ -106,22 +106,6 @@ pub struct DeleteResponse {
 // ═══════════════════════════════════════════════════════════════════════
 // Reinforcement Endpoint
 // ═══════════════════════════════════════════════════════════════════════
-
-/// POST /memories/:id/reinforce -- manual reinforcement request.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReinforceRequest {
-    /// Quality of the reinforcement. Maps to FSRS rating:
-    ///   1 = "again" (forgot), 2 = "hard", 3 = "good", 4 = "easy".
-    /// Default: 3 (good).
-    #[serde(default = "default_quality")]
-    pub quality: u8,
-}
-
-/// Default FSRS quality rating (3 = "good").
-fn default_quality() -> u8 {
-    3
-}
 
 /// POST /memories/:id/reinforce -- response.
 #[derive(Debug, Serialize)]
@@ -644,10 +628,29 @@ fn default_max_scan() -> usize {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanDuplicatesResponse {
+    /// Limits and observed counts; never a claim of exhaustive namespace coverage.
+    pub coverage: DuplicateScanCoverage,
     /// Clusters of similar memories.
     pub clusters: Vec<DuplicateCluster>,
     /// Total clusters found.
     pub total: u64,
+}
+
+/// Coverage of the legacy HTTP duplicate scan, without a pinned read generation.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateScanCoverage {
+    pub algorithm: &'static str,
+    /// Live records before sampling, including records with missing vectors.
+    pub eligible_count: usize,
+    pub sampled_count: usize,
+    /// Sampled records whose vectors were absent from the index.
+    pub skipped_vector_count: usize,
+    pub sample_cap: usize,
+    /// No nearest-neighbor cap: all pairs in the HTTP sample are considered.
+    pub neighbor_cap: Option<usize>,
+    pub truncated: bool,
+    pub complete: bool,
 }
 
 /// A cluster of duplicate/near-duplicate memories.

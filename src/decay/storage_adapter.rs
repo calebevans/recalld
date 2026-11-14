@@ -116,6 +116,7 @@ pub fn ids_in_phase(
 }
 
 /// Update decay state with `SweepError` wrapping.
+#[cfg(test)]
 pub fn update_decay_state(
     storage: &dyn StorageEngine,
     id: MemoryId,

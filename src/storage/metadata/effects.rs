@@ -18,6 +18,7 @@ pub(super) enum RecordMutation<'a> {
         before: &'a DiskRecord,
         after: &'a DiskRecord,
     },
+    PurgeChunk(&'a crate::storage::purge::PurgeProgress),
     Inserted(&'a DiskRecord, u32),
     Tombstoned {
         record: &'a DiskRecord,
@@ -93,6 +94,8 @@ pub(crate) fn validate_existing(
                         | MutationOutcome::MemoryInserted { .. }
                         | MutationOutcome::MemoryTombstoned { .. }
                         | MutationOutcome::LifecycleMaterialized { .. }
+                        | MutationOutcome::NamespacePurgeStarted { .. }
+                        | MutationOutcome::NamespacePurgeAdvanced { .. }
                 ) {
                     return Err(StorageError::InvalidControl(
                         "effects schema missing from adopted store".into(),
@@ -186,6 +189,20 @@ pub(crate) fn validate_existing(
                 && effect.removed_ids.is_empty()
                 && effect.releases.is_empty()
                 && effect.invalidated_ids.contains(&memory_id) => {}
+            MutationOutcome::NamespacePurgeAdvanced {
+                stage,
+                removed,
+                edges_removed,
+                ..
+            } if effect.puts.is_empty()
+                && effect.releases.is_empty()
+                && removed == effect.removed_ids.len() as u64
+                && edges_removed == effect.deletes.len() as u64
+                && (stage == crate::storage::purge::PurgeStage::Deleting
+                    || (removed == 0
+                        && edges_removed == 0
+                        && effect.invalidated_ids.is_empty()
+                        && effect.peer_counts.is_empty())) => {}
             MutationOutcome::GraphChanged {
                 edges_put,
                 edges_removed,
@@ -321,6 +338,10 @@ impl MetadataStore {
             return Err(StorageError::NamespaceNotFound(namespace.get()));
         }
 
+        if !matches!(mutation, RecordMutation::PurgeChunk(_)) {
+            super::namespace_state::require_namespace_active(&tx, namespace)?;
+        }
+
         let mut removed = Vec::new();
         let mut releases = Vec::new();
         let mut invalidated: std::collections::HashSet<_> = incident_ids.iter().copied().collect();
@@ -330,7 +351,7 @@ impl MetadataStore {
             | RecordMutation::LifecyclePatched { after: record, .. } => {
                 invalidated.insert(MemoryId::from_bytes(record.id));
             }
-            RecordMutation::GraphOnly => {}
+            RecordMutation::GraphOnly | RecordMutation::PurgeChunk(_) => {}
         }
         if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
             if *old_phase != DecayPhase::Tombstone {
@@ -505,13 +526,25 @@ impl MetadataStore {
                     crate::storage::tombstone::TombstoneStatus::Tombstoned
                 },
             },
-            RecordMutation::GraphOnly => MutationOutcome::GraphChanged {
-                edges_put: actual_puts.len(),
-                edges_removed: deletes.len(),
-                memories_removed: removed.len(),
-            },
+            RecordMutation::GraphOnly | RecordMutation::PurgeChunk(_) => {
+                MutationOutcome::GraphChanged {
+                    edges_put: actual_puts.len(),
+                    edges_removed: deletes.len(),
+                    memories_removed: removed.len(),
+                }
+            }
         };
-        let receipt = control::record_receipt(&tx, ctx, hash, outcome)?;
+        let receipt = if let RecordMutation::PurgeChunk(progress) = &mutation {
+            super::purge::record_next(
+                &tx,
+                progress,
+                crate::storage::purge::PurgeStage::Deleting,
+                &removed,
+                deletes.len(),
+            )?
+        } else {
+            control::record_receipt(&tx, ctx, hash, outcome)?
+        };
         if let RecordMutation::LifecyclePatched { before, after } = &mutation {
             super::removal_ledger::record_change(
                 &tx,

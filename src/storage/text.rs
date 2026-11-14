@@ -195,7 +195,7 @@ impl TextStore {
     /// Open an existing fulltext.dat, or create a new one if the file
     /// does not exist. Validates the header and sets the write
     /// position to end-of-file.
-    pub fn open(path: &Path) -> Result<TextStore, StorageError> {
+    pub(super) fn open(path: &Path) -> Result<TextStore, StorageError> {
         if path.exists() {
             // --- Open existing ---
             let mut file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -245,7 +245,7 @@ impl TextStore {
     ///
     /// Returns a `TextRef` containing the file offset and payload
     /// length. The caller stores this in meta.db's `DiskRecord`.
-    pub fn append(&mut self, text: &str) -> Result<TextRef, StorageError> {
+    pub(super) fn append(&mut self, text: &str) -> Result<TextRef, StorageError> {
         let data = text.as_bytes();
         let length = data.len();
 
@@ -385,7 +385,7 @@ impl TextStore {
     }
 
     /// Legacy compaction is disabled until metadata selects text generations.
-    pub fn compact_write_new_file(
+    pub(super) fn compact_write_new_file(
         &mut self,
         _live_refs: &[(MemoryId, TextRef)],
     ) -> Result<(CompactionResult, bool), StorageError> {
@@ -395,7 +395,7 @@ impl TextStore {
     }
 
     /// Never finalize a marker-driven swap: the committed file is ambiguous.
-    pub fn compact_finalize(&mut self) -> Result<(), StorageError> {
+    pub(super) fn compact_finalize(&mut self) -> Result<(), StorageError> {
         Err(StorageError::RecoveryRequired(
             "legacy text compaction is disabled".into(),
         ))

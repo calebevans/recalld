@@ -674,3 +674,26 @@ async fn sweep_counts_known_canonical_transition_when_application_fails() {
     assert_eq!(result.errors.len(), 1);
     assert!(result.uncertain_operation.is_none());
 }
+
+#[tokio::test]
+async fn maintenance_and_tombstone_reject_deleting_namespace_without_new_receipts() {
+    let f = Fixture::new();
+    let ns = f.create_namespace("deleting");
+    let id = f.insert_memory_in(ns, &[]).await;
+    let mut e = f.storage.write().unwrap();
+    let expected = e.get_record(id).unwrap().unwrap();
+    let policy = e.get_namespace(ns).unwrap().unwrap();
+    let ctx = MutationContext::unkeyed(ns);
+    let progress = e.begin_namespace_purge(&ctx, true).unwrap();
+    let before = std::fs::read(e.db_path().join("meta.db")).unwrap();
+    assert!(e.apply_legacy_decay_with_receipt(&ctx, id, &expected, &policy, DecayPhase::Summary, 0.1, 0.1).is_err());
+    assert!(e.tombstone_memory_with_receipt(&ctx, id).is_err());
+    assert_eq!(std::fs::read(e.db_path().join("meta.db")).unwrap(), before);
+    assert_eq!(e.meta_store().purge_progress().unwrap(), vec![progress]);
+    // The durable final-transaction helper rejects even without consulting the
+    // fast admission flag, including a writer that already has a tx handle.
+    let tx = e.meta_store().db.begin_write().unwrap();
+    assert!(metadata::namespace_state::require_namespace_active(&tx, ns).is_err());
+    assert!(metadata::namespace_state::require_namespace_active(&tx, NamespaceId::new(1)).is_err());
+    tx.abort().unwrap();
+}

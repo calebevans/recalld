@@ -84,6 +84,9 @@ pub async fn dispatch_tool(
     name: &str,
     arguments: serde_json::Value,
 ) -> ToolCallResult {
+    if let Err(e) = args::require_object(&arguments) {
+        return ToolCallResult::error(e.to_string());
+    }
     match name {
         "store_memory" => handle_store_memory(bridge, arguments).await,
         "store_memories" => handle_store_memories(bridge, arguments).await,
@@ -175,9 +178,8 @@ fn store_memory_def() -> ToolInfo {
                     "description": "Emotional tone if relevant, e.g. [\"happy\", \"anxious\", \"grateful\"]"
                 },
                 "namespace": {
-                    "type": "string",
-                    "description": "Memory partition (default: \"default\")",
-                    "default": "default"
+                    "type": ["string", "null"],
+                    "description": "Memory partition (omitted or null: configured session default, then \"default\")"
                 },
                 "parentId": {
                     "type": "string",
@@ -197,9 +199,9 @@ fn store_memory_def() -> ToolInfo {
         }),
         annotations: Some(ToolAnnotations {
             read_only_hint: Some(false),
-            destructive_hint: Some(false),
+            destructive_hint: Some(true),
             idempotent_hint: Some(false),
-            open_world_hint: Some(false),
+            open_world_hint: Some(true),
         }),
     }
 }
@@ -297,9 +299,8 @@ fn store_memories_def() -> ToolInfo {
                                 "description": "Emotional tone if relevant"
                             },
                             "namespace": {
-                                "type": "string",
-                                "description": "Memory partition (default: \"default\")",
-                                "default": "default"
+                                "type": ["string", "null"],
+                                "description": "Memory partition (omitted or null: configured session default, then \"default\")"
                             },
                             "parentId": {
                                 "type": "string",
@@ -323,9 +324,9 @@ fn store_memories_def() -> ToolInfo {
         }),
         annotations: Some(ToolAnnotations {
             read_only_hint: Some(false),
-            destructive_hint: Some(false),
+            destructive_hint: Some(true),
             idempotent_hint: Some(false),
-            open_world_hint: Some(false),
+            open_world_hint: Some(true),
         }),
     }
 }
@@ -482,9 +483,8 @@ fn recall_memories_def() -> ToolInfo {
                     "maximum": 100
                 },
                 "namespace": {
-                    "type": "string",
-                    "description": "Which namespace to search (default: \"default\")",
-                    "default": "default"
+                    "type": ["string", "null"],
+                    "description": "Which namespace to search (omitted or null: configured session default, then \"default\")"
                 },
                 "tags": {
                     "type": "array",
@@ -542,10 +542,10 @@ fn recall_memories_def() -> ToolInfo {
             "required": ["query"]
         }),
         annotations: Some(ToolAnnotations {
-            read_only_hint: Some(true),
+            read_only_hint: Some(false),
             destructive_hint: Some(false),
-            idempotent_hint: Some(true),
-            open_world_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         }),
     }
 }
@@ -636,7 +636,8 @@ fn get_memory_def() -> ToolInfo {
     ToolInfo {
         name: "get_memory".to_string(),
         title: Some("Get Memory".to_string()),
-        description: "Retrieve a specific memory by its ID.".to_string(),
+        description: "Retrieve a specific memory by its ID. This MCP fetch does not record access."
+            .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -700,7 +701,7 @@ fn reinforce_memory_def() -> ToolInfo {
                 },
                 "quality": {
                     "type": "integer",
-                    "description": "Rating 1-4: 1=forgot, 2=hard, 3=good, 4=easy (default: 3)",
+                    "description": "Integer 1-4: 1=forgot, 2=hard, 3=good, 4=easy. Omitted: 3; null is invalid.",
                     "default": 3,
                     "minimum": 1,
                     "maximum": 4
@@ -710,8 +711,8 @@ fn reinforce_memory_def() -> ToolInfo {
         }),
         annotations: Some(ToolAnnotations {
             read_only_hint: Some(false),
-            destructive_hint: Some(false),
-            idempotent_hint: Some(true),
+            destructive_hint: Some(true),
+            idempotent_hint: Some(false),
             open_world_hint: Some(false),
         }),
     }
@@ -732,16 +733,10 @@ async fn handle_reinforce_memory(
     };
     let id = crate::model::MemoryId::from_uuid(uuid);
 
-    // Issue 4: Validate the u64 value BEFORE casting to u8 to prevent truncation
-    let quality_u64 = arguments
-        .get("quality")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3);
-
-    if !(1..=4).contains(&quality_u64) {
-        return ToolCallResult::error("Quality must be 1-4");
-    }
-    let quality = quality_u64 as u8;
+    let quality = match args::parse_quality(&arguments) {
+        Ok(quality) => quality,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
 
     match bridge.storage.reinforce_memory(id, quality).await {
         Ok(result) => match ToolCallResult::json(&result) {
@@ -996,10 +991,10 @@ fn find_similar_memories_def() -> ToolInfo {
         name: "find_similar_memories".to_string(),
         title: Some("Find Similar Memories".to_string()),
         description: "Find memories semantically similar to a specific existing \
-            memory, or scan an entire namespace for clusters of near-duplicate \
-            memories. Two modes: \"single\" (default) requires an id and finds \
-            similar memories to it; \"scan\" requires a namespace and detects \
-            clusters of near-duplicates across the namespace."
+            memory, or sample a namespace for clusters of near-duplicate \
+            memories (up to 200 records and 11 vector candidates per source, including self when returned; not exhaustive). Two modes: \"single\" (default) requires an id and finds \
+            similar memories to it; \"scan\" uses the configured default namespace when omitted. \
+            Clusters are threshold-connected, not necessarily all-pairs matches."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -1015,8 +1010,8 @@ fn find_similar_memories_def() -> ToolInfo {
                     "description": "Source memory UUID (required for \"single\" mode)"
                 },
                 "namespace": {
-                    "type": "string",
-                    "description": "Namespace to scan for duplicates (required for \"scan\" mode, defaults to session default for \"single\" mode)"
+                    "type": ["string", "null"],
+                    "description": "Namespace for \"scan\" mode; omitted or null uses the configured session default, then \"default\". Ignored in \"single\" mode, which uses the source record namespace."
                 },
                 "limit": {
                     "type": "integer",
@@ -1040,7 +1035,7 @@ fn find_similar_memories_def() -> ToolInfo {
                 },
                 "sameNamespace": {
                     "type": "boolean",
-                    "description": "Restrict to same namespace in \"single\" mode (default: true). Ignored in \"scan\" mode (scan always operates within the specified namespace).",
+                    "description": "Legacy selector (default: true). The current single-mode adapter always uses the source record namespace, including when false. Ignored in scan mode.",
                     "default": true
                 }
             }
@@ -1166,6 +1161,20 @@ async fn handle_find_similar_scan(
                 "threshold": threshold,
                 "clusters": clusters,
                 "clusterCount": clusters.len(),
+                // The legacy bridge returns clusters only. Do not manufacture scan
+                // counts from cluster membership or from a separate racy catalog read.
+                "coverage": {
+                    "algorithm": "sampledNearestNeighbors",
+                    "sampledCount": null,
+                    "eligibleCount": null,
+                    "skippedVectorCount": null,
+                    "sampleCap": MAX_SCAN_MEMORIES,
+                    // Ten neighbors plus one candidate to allow for self-removal.
+                    "neighborCap": 11,
+                    "complete": false,
+                    "truncated": null,
+                    "countsAvailable": false
+                },
             });
             match ToolCallResult::json(&response) {
                 Ok(r) => r,
@@ -1185,7 +1194,7 @@ fn create_namespace_def() -> ToolInfo {
         name: "create_namespace".to_string(),
         title: Some("Create Namespace".to_string()),
         description: "Create a new memory namespace for organizing memories by \
-            domain or project. Each namespace has its own embedding space and \
+            domain or project; namespaces are not access controls. Each namespace has its own embedding space and \
             decay configuration. You can set a custom decay rate multiplier to \
             make memories in this namespace decay faster, slower, or not at all. \
             Embedding dimensions are fixed after creation."
@@ -1200,24 +1209,29 @@ fn create_namespace_def() -> ToolInfo {
                 },
                 "embeddingDim": {
                     "type": "integer",
-                    "description": "Embedding dimensions, fixed after creation. Defaults to the same dimensions as the 'default' namespace."
+                    "description": "Integer 1-8192; null is invalid. Fixed after creation. Omission inherits the default namespace dimension (fallback 1536).",
+                    "minimum": 1,
+                    "maximum": 8192
                 },
                 "initialStability": {
-                    "type": "number",
-                    "description": "Starting stability in days for new memories (default: 3.7145)",
+                    "description": "Positive finite starting stability in days (omitted or null: 3.7145)",
+                    "type": ["number", "null"],
+                    "exclusiveMinimum": 0.0,
+                    "maximum": f32::MAX as f64,
                     "default": 3.7145
                 },
                 "desiredRetention": {
-                    "type": "number",
-                    "description": "Target retention rate 0.0-1.0 (default: 0.9)",
+                    "description": "Target retention rate 0.0-1.0 (omitted or null: 0.9)",
+                    "type": ["number", "null"],
                     "default": 0.9,
                     "minimum": 0.0,
                     "maximum": 1.0
                 },
                 "decayRateMultiplier": {
-                    "type": "number",
                     "description": "Decay rate multiplier for this namespace. 1.0 = normal (default), 2.0 = 2x slower decay, 0.5 = 2x faster decay, 0.0 = decay disabled. Omit to inherit global setting.",
-                    "minimum": 0.0
+                    "minimum": 0.0,
+                    "maximum": f32::MAX as f64,
+                    "type": ["number", "null"]
                 }
             },
             "required": ["name"]
@@ -1235,39 +1249,9 @@ async fn handle_create_namespace(
     bridge: &McpBridge,
     arguments: serde_json::Value,
 ) -> ToolCallResult {
-    let name = match arguments.get("name").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => return ToolCallResult::error("Missing required parameter: name"),
-    };
-
-    // Server-side validation of namespace name, shared with the HTTP API.
-    if let Err(e) = validate_namespace_name(&name) {
-        return ToolCallResult::error(e.to_string());
-    }
-
-    let embedding_dim = arguments
-        .get("embeddingDim")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u16);
-    let initial_stability = arguments
-        .get("initialStability")
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32);
-    let desired_retention = arguments
-        .get("desiredRetention")
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32);
-    let decay_rate_multiplier = arguments
-        .get("decayRateMultiplier")
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32);
-
-    let input = crate::mcp::bridge::CreateNamespaceInput {
-        name,
-        embedding_dim,
-        initial_stability,
-        desired_retention,
-        decay_rate_multiplier,
+    let input = match args::parse_create_namespace(&arguments) {
+        Ok(input) => input,
+        Err(e) => return ToolCallResult::error(e.to_string()),
     };
 
     match bridge.namespaces.create_namespace(input).await {
@@ -1409,9 +1393,8 @@ fn namespace_stats_def() -> ToolInfo {
             "type": "object",
             "properties": {
                 "namespace": {
-                    "type": "string",
-                    "description": "Namespace name to get stats for (default: \"default\")",
-                    "default": "default"
+                    "type": ["string", "null"],
+                    "description": "Namespace name to get stats for (omitted or null: configured session default, then \"default\")"
                 }
             }
         }),
@@ -1468,9 +1451,8 @@ fn list_memories_def() -> ToolInfo {
             "type": "object",
             "properties": {
                 "namespace": {
-                    "type": "string",
-                    "description": "Which namespace to list from (default: \"default\")",
-                    "default": "default"
+                    "type": ["string", "null"],
+                    "description": "Which namespace to list from (omitted or null: configured session default, then \"default\")"
                 },
                 "limit": {
                     "type": "integer",
@@ -1613,11 +1595,10 @@ fn list_tags_def() -> ToolInfo {
             "type": "object",
             "properties": {
                 "namespace": {
-                    "type": "string",
-                    "description": "Which namespace to count within (default: \"default\"). \
+                    "type": ["string", "null"],
+                    "description": "Which namespace to count within (omitted or null: configured session default, then \"default\"). \
                         Reads that namespace's memory records, costing about one \
-                        list_memories call.",
-                    "default": "default"
+                        list_memories call."
                 },
                 "allNamespaces": {
                     "type": "boolean",
@@ -2254,8 +2235,7 @@ mod tests {
 
     #[test]
     fn t38_read_only_tools_declare_the_read_only_hint() {
-        const READ_ONLY: [&str; 7] = [
-            "recall_memories",
+        const READ_ONLY: [&str; 6] = [
             "get_memory",
             "find_similar_memories",
             "namespace_stats",
@@ -2294,7 +2274,7 @@ mod tests {
     #[test]
     fn t40_list_tags_declares_both_scope_switches() {
         let props = list_tags_def().input_schema["properties"].clone();
-        assert_eq!(props["namespace"]["type"].as_str(), Some("string"));
+        assert_eq!(props["namespace"]["type"], json!(["string", "null"]));
         assert_eq!(props["allNamespaces"]["type"].as_str(), Some("boolean"));
         assert_eq!(props["allNamespaces"]["default"].as_bool(), Some(false));
         assert!(
@@ -2501,5 +2481,288 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+    // Regressions adapted from the exported November 2026 research probes: real temporary storage, no daemon or provider.
+    async fn research_quality_probe(value: Option<serde_json::Value>, reject: bool) -> bool {
+        let fixture = crate::test_support::Fixture::new();
+        let id = fixture.insert_memory().await;
+        let mut bridge = crate::test_support::StubBridge::default().into_bridge();
+        bridge.storage = std::sync::Arc::new(fixture.storage_adapter());
+        let before = fixture.record(id).expect("synthetic memory exists");
+        let mut args = json!({"id": id.to_string()});
+        if let Some(value) = &value {
+            args["quality"] = value.clone();
+        }
+        let result = dispatch_tool(&bridge, "reinforce_memory", args).await;
+        let after = fixture.record(id).expect("synthetic memory still exists");
+        let unchanged = format!("{before:?}") == format!("{after:?}");
+        let rendered = serde_json::to_string(&result).unwrap();
+        let ok = if reject {
+            result.is_error == Some(true)
+                && rendered.to_lowercase().contains("quality")
+                && unchanged
+        } else {
+            result.is_error != Some(true) && !unchanged
+        };
+        println!(
+            "QUALITY input={value:?} expected_reject={reject} unchanged={unchanged} matched={ok} response={rendered}"
+        );
+        ok
+    }
+
+    #[tokio::test]
+    async fn research_quality_wrong_json_types_are_rejected_without_mutation() {
+        let mut failures = Vec::new();
+        for value in [
+            json!(-1),
+            json!(1.5),
+            json!("3"),
+            json!(true),
+            json!(null),
+            json!([]),
+            json!({}),
+        ] {
+            if !research_quality_probe(Some(value.clone()), true).await {
+                failures.push(value);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "wrong quality values accepted or mutated storage: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn research_quality_integer_range_is_rejected_without_mutation() {
+        let mut failures = Vec::new();
+        for value in [0_u64, 5, 256, 259, u64::MAX] {
+            if !research_quality_probe(Some(json!(value)), true).await {
+                failures.push(value);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "out-of-range quality values: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn research_quality_valid_and_omitted_controls() {
+        for value in [
+            None,
+            Some(json!(1)),
+            Some(json!(2)),
+            Some(json!(3)),
+            Some(json!(4)),
+        ] {
+            assert!(research_quality_probe(value, false).await);
+        }
+    }
+
+    async fn research_namespace_probe(value: serde_json::Value, reject: bool) -> bool {
+        use crate::storage::StorageEngine as _;
+        let fixture = crate::test_support::Fixture::new();
+        let mut bridge = crate::test_support::StubBridge::default().into_bridge();
+        bridge.namespaces = std::sync::Arc::new(fixture.namespace_adapter());
+        let result = dispatch_tool(
+            &bridge,
+            "create_namespace",
+            json!({
+                "name": "synthetic-probe", "embeddingDim": value,
+            }),
+        )
+        .await;
+        let persisted = fixture
+            .storage
+            .read()
+            .unwrap()
+            .get_namespace_by_name("synthetic-probe")
+            .unwrap();
+        let actual_dim = persisted.as_ref().map(|ns| ns.embedding_dim);
+        let rendered = serde_json::to_string(&result).unwrap();
+        let lower = rendered.to_lowercase();
+        let ok = if reject {
+            result.is_error == Some(true)
+                && persisted.is_none()
+                && (lower.contains("dimension") || lower.contains("embedding"))
+        } else {
+            result.is_error != Some(true) && actual_dim.map(u64::from) == value.as_u64()
+        };
+        println!(
+            "NAMESPACE input={value} expected_reject={reject} stored_dimension={actual_dim:?} matched={ok} response={rendered}"
+        );
+        ok
+    }
+
+    #[tokio::test]
+    async fn research_namespace_dimension_range_is_rejected_without_creation() {
+        let mut failures = Vec::new();
+        for value in [0_u64, 8193, 65535, 65536, 65537, u64::MAX] {
+            if !research_namespace_probe(json!(value), true).await {
+                failures.push(value);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "invalid dimensions accepted or created namespaces: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn research_namespace_wrong_json_types_are_rejected_without_creation() {
+        let mut failures = Vec::new();
+        for value in [
+            json!(-1),
+            json!(1.5),
+            json!("4"),
+            json!(true),
+            json!(null),
+            json!([]),
+            json!({}),
+        ] {
+            if !research_namespace_probe(value.clone(), true).await {
+                failures.push(value);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "invalid dimension types accepted: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn research_namespace_dimension_boundary_controls() {
+        for value in [1, 8192] {
+            assert!(research_namespace_probe(json!(value), false).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn a4_optional_tool_arguments_preserve_no_arg_calls() {
+        use crate::mcp::protocol::LEGACY_PROTOCOL_VERSION;
+        use crate::mcp::server::{
+            McpServer,
+            tests::{initialize_request, modern_request, plain_request},
+        };
+
+        let fixture = crate::test_support::Fixture::new();
+        let mut bridge = crate::test_support::StubBridge::default().into_bridge();
+        bridge.namespaces = std::sync::Arc::new(fixture.namespace_adapter());
+        let bridge = std::sync::Arc::new(bridge);
+        for modern in [false, true] {
+            let mut server = McpServer::new(bridge.clone());
+            if !modern {
+                let response = server
+                    .handle_message(initialize_request(1, LEGACY_PROTOCOL_VERSION))
+                    .await
+                    .unwrap();
+                assert!(response.error.is_none());
+            }
+            for arguments in [None, Some(json!({})), Some(json!(null)), Some(json!([]))] {
+                let reject = arguments.as_ref().is_some_and(|value| !value.is_object());
+                let mut params = json!({"name": "list_namespaces"});
+                if let Some(arguments) = arguments {
+                    params["arguments"] = arguments;
+                }
+                let request = if modern {
+                    modern_request(2, "tools/call", params)
+                } else {
+                    plain_request(2, "tools/call", Some(params))
+                };
+                let response = server.handle_message(request).await.unwrap();
+                assert!(response.error.is_none(), "{response:?}");
+                let result = response.result.unwrap();
+                assert_eq!(
+                    result["isError"].as_bool().unwrap_or(false),
+                    reject,
+                    "modern={modern}: {result}"
+                );
+                let text = result["content"][0]["text"].as_str().unwrap();
+                if reject {
+                    assert!(text.contains("Arguments must be an object"), "{text}");
+                } else {
+                    let namespaces: serde_json::Value = serde_json::from_str(text).unwrap();
+                    assert!(
+                        namespaces
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|ns| ns["name"] == "default"),
+                        "{namespaces}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a4_object_boundary_rejects_before_any_bridge_call() {
+        let bridge = crate::test_support::StubBridge::default().into_bridge();
+        for name in DISPATCHED {
+            for arguments in [json!(null), json!([]), json!(true), json!(3), json!("x")] {
+                let result = dispatch_tool(&bridge, name, arguments).await;
+                assert_eq!(result.is_error, Some(true), "{name}");
+                assert!(serde_json::to_string(&result).unwrap().contains("object"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a4_mcp_get_does_not_change_the_record() {
+        let fixture = crate::test_support::Fixture::new();
+        let id = fixture.insert_memory().await;
+        let mut bridge = crate::test_support::StubBridge::default().into_bridge();
+        bridge.storage = std::sync::Arc::new(fixture.storage_adapter());
+        let before = format!("{:?}", fixture.record(id).unwrap());
+        for _ in 0..2 {
+            let result = dispatch_tool(&bridge, "get_memory", json!({"id": id.to_string()})).await;
+            assert_ne!(result.is_error, Some(true));
+            assert_eq!(before, format!("{:?}", fixture.record(id).unwrap()));
+        }
+    }
+
+    #[test]
+    fn a4_schemas_and_annotations_describe_current_behavior() {
+        for def in [
+            store_memory_def(),
+            store_memories_def(),
+            recall_memories_def(),
+            reinforce_memory_def(),
+            create_namespace_def(),
+        ] {
+            let annotations = def.annotations.unwrap();
+            assert_eq!(annotations.read_only_hint, Some(false), "{}", def.name);
+            assert_eq!(annotations.idempotent_hint, Some(false), "{}", def.name);
+            if ["store_memory", "store_memories", "reinforce_memory"].contains(&def.name.as_str()) {
+                assert_eq!(annotations.destructive_hint, Some(true), "{}", def.name);
+            }
+            if ["store_memory", "store_memories", "recall_memories"].contains(&def.name.as_str()) {
+                assert_eq!(annotations.open_world_hint, Some(true), "{}", def.name);
+            }
+        }
+        for def in tool_definitions() {
+            let properties = if def.name == "store_memories" {
+                &def.input_schema["properties"]["memories"]["items"]["properties"]
+            } else {
+                &def.input_schema["properties"]
+            };
+            if let Some(namespace) = properties.get("namespace") {
+                assert!(namespace.get("default").is_none(), "{}", def.name);
+                assert_eq!(namespace["type"], json!(["string", "null"]));
+            }
+        }
+        let schema = create_namespace_def().input_schema;
+        assert_eq!(schema["properties"]["embeddingDim"]["minimum"], 1);
+        assert_eq!(schema["properties"]["embeddingDim"]["maximum"], 8192);
+        for field in [
+            "initialStability",
+            "desiredRetention",
+            "decayRateMultiplier",
+        ] {
+            assert_eq!(
+                schema["properties"][field]["type"],
+                json!(["number", "null"])
+            );
+        }
     }
 }

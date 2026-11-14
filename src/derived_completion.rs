@@ -127,7 +127,8 @@ impl DerivedCompletion {
         let storage = self.storage.clone();
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || {
-            let storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            storage.resume_pending_purges()?;
             storage.ensure_available()?;
             if !storage.meta_store().needs_effects_rebuild() {
                 return Ok(());

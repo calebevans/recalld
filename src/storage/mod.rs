@@ -15,6 +15,7 @@
 //! - `fsync` — Filesystem sync helpers for crash safety
 
 pub mod canonical_schema;
+pub mod catalog;
 pub mod control;
 pub mod edges;
 pub mod engine;
@@ -28,6 +29,9 @@ mod maintenance_tests;
 pub mod metadata;
 pub mod offline_snapshot;
 pub(crate) mod ownership;
+pub mod purge;
+#[cfg(test)]
+mod purge_tests;
 pub mod schema_migration;
 pub mod text;
 pub mod text_migration;

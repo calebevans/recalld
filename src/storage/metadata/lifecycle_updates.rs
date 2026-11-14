@@ -36,7 +36,8 @@ impl MetadataStore {
 
     /// Materialize strength, optionally losing exactly one retained phase.
     /// V1 Summary->Ghost clears summary only; tags and other fields are retained.
-    pub fn apply_legacy_decay(
+    #[cfg(test)]
+    pub(super) fn apply_legacy_decay(
         &self,
         id: MemoryId,
         expected: &DiskRecord,
@@ -138,12 +139,11 @@ impl MetadataStore {
         // Concrete namespace configuration is the v1 policy snapshot; no invented
         // policy revision or public CAS token. Global config is caller-owned/frozen.
         {
-            let table = tx.open_table(NAMESPACE_TABLE)?;
-            let Some(value) = table.get(record.namespace_id)? else {
-                return Ok(StagedPatch::Skipped(DecaySkip::Stale));
+            let current = match namespace_state::require_namespace_active(tx, NamespaceId::new(record.namespace_id)) {
+                Ok(config) => config,
+                Err(StorageError::NamespaceNotFound(_)) => return Ok(StagedPatch::Skipped(DecaySkip::Stale)),
+                Err(error) => return Err(error),
             };
-            let current: NamespaceConfig = serde_json::from_slice(value.value())
-                .map_err(|e| StorageError::Deserialize(e.to_string()))?;
             if current.id != namespace.id
                 || current.id.get() != record.namespace_id
                 || serde_json::to_vec(&current)
