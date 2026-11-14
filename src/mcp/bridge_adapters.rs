@@ -383,10 +383,22 @@ impl bridge::SearchPipeline for McpSearchAdapter {
         threshold: f32,
         max_memories: usize,
     ) -> Result<Vec<bridge::DuplicateCluster>, bridge::BridgeError> {
+        Ok(self
+            .scan_duplicates_with_coverage(namespace, threshold, max_memories)
+            .await?
+            .clusters)
+    }
+
+    async fn scan_duplicates_with_coverage(
+        &self,
+        namespace: &str,
+        threshold: f32,
+        max_memories: usize,
+    ) -> Result<bridge::DuplicateScanReport, bridge::BridgeError> {
         // 1. Resolve namespace and get memory IDs.
         let storage = self.storage.clone();
         let ns_name = namespace.to_string();
-        let (ns_config, memory_ids) = tokio::task::spawn_blocking(move || {
+        let (ns_config, memory_ids, eligible_count) = tokio::task::spawn_blocking(move || {
             let storage_r = storage.read().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
             })?;
@@ -400,15 +412,25 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                 .meta_store()
                 .memories_in_namespace(ns.id)
                 .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
-            let ids: Vec<MemoryId> = all_ids.into_iter().take(max_memories).collect();
-            Ok::<_, bridge::BridgeError>((ns, ids))
+            let mut ids = Vec::new();
+            let mut eligible_count = 0;
+            for id in all_ids {
+                let record = storage_r
+                    .get_record(id)
+                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
+                if record.is_some_and(|r| {
+                    r.namespace_id == ns.id.get() && r.phase != DecayPhase::Tombstone
+                }) {
+                    eligible_count += 1;
+                    if ids.len() < max_memories {
+                        ids.push(id);
+                    }
+                }
+            }
+            Ok::<_, bridge::BridgeError>((ns, ids, eligible_count))
         })
         .await
         .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))??;
-
-        if memory_ids.len() < 2 {
-            return Ok(Vec::new());
-        }
 
         // 3. Load embeddings for all sampled memories via the vector index.
         let mut id_embeddings: Vec<(MemoryId, Vec<f32>)> = Vec::with_capacity(memory_ids.len());
@@ -418,8 +440,22 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             }
         }
 
+        let coverage = bridge::DuplicateScanCoverage {
+            algorithm: "sampledNearestNeighbors".into(),
+            eligible_count,
+            sampled_count: memory_ids.len(),
+            skipped_vector_count: memory_ids.len() - id_embeddings.len(),
+            sample_cap: max_memories,
+            neighbor_cap: bridge::DUPLICATE_NEIGHBOR_CAP,
+            truncated: memory_ids.len() < eligible_count,
+            counts_available: true,
+            complete: false,
+        };
         if id_embeddings.len() < 2 {
-            return Ok(Vec::new());
+            return Ok(bridge::DuplicateScanReport {
+                clusters: Vec::new(),
+                coverage: Some(coverage),
+            });
         }
 
         // 4. Union-Find based clustering: for each memory, find similar
@@ -457,14 +493,13 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             std::collections::HashMap::new();
 
         // For each memory, search for its K nearest neighbors and union
-        // those above threshold. Using K=10 is enough to find clusters
-        // without doing full O(n^2) pairwise comparison.
-        const NEIGHBORS_PER_QUERY: usize = 10;
+        // those above threshold. The bounded neighbor set can miss qualifying
+        // pairs even when all records fit in the sample.
 
         for (i, (_mid, embedding)) in id_embeddings.iter().enumerate() {
             let scored = self
                 .query_engine
-                .vector_search(ns_config.id, embedding, NEIGHBORS_PER_QUERY + 1)
+                .vector_search(ns_config.id, embedding, bridge::DUPLICATE_NEIGHBOR_CAP)
                 .map_err(|e| bridge::BridgeError::Search(e.to_string()))?;
 
             for result in scored {
@@ -549,7 +584,10 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        Ok(clusters)
+        Ok(bridge::DuplicateScanReport {
+            clusters,
+            coverage: Some(coverage),
+        })
     }
 }
 
