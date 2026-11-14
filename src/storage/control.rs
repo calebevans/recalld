@@ -175,10 +175,29 @@ impl MutationContext {
     }
 }
 
+/// One distinct record exposed by a legacy retrieval. No content is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExposureOutcome {
+    pub memory_id: MemoryId,
+    pub kind: crate::model::AccessKind,
+    pub accessed_at: i64,
+}
+
 /// Payload-free outcome; the timestamp is the originally committed value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
 pub enum MutationOutcome {
+    ExposuresRecorded {
+        accesses: Vec<ExposureOutcome>,
+    },
+    LegacyFeedbackRecorded {
+        #[serde(rename = "memoryId")]
+        memory_id: MemoryId,
+        quality: u8,
+        #[serde(rename = "appliedAt")]
+        applied_at: i64,
+    },
     AccessRecorded {
         #[serde(rename = "memoryId")]
         memory_id: MemoryId,
@@ -259,12 +278,17 @@ pub(crate) fn validate_existing(
     )?;
     for entry in receipts.iter()? {
         let (key, value) = entry?;
-        let (lineage, _, operation) = decode_scope(key.value())?;
+        let (lineage, scope, operation) = decode_scope(key.value())?;
         let stored = validate_receipt(value.value())?;
         if lineage != state.store_id
             || stored.receipt.store_id != lineage
             || operation != stored.receipt.operation_id.as_bytes()
             || stored.receipt.committed_generation > state.committed_generation
+            || (matches!(
+                stored.receipt.outcome,
+                MutationOutcome::ExposuresRecorded { .. }
+                    | MutationOutcome::LegacyFeedbackRecorded { .. }
+            ) && !matches!(scope, MutationScope::Namespace(_)))
         {
             return Err(StorageError::InvalidControl(
                 "receipt identity/generation disagrees with control".into(),
@@ -393,6 +417,42 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
         return Err(StorageError::InvalidControl(
             "unsupported receipt/hash version or invalid persisted receipt".into(),
         ));
+    }
+    match &stored.receipt.outcome {
+        MutationOutcome::ExposuresRecorded { accesses } => {
+            let mut seen = std::collections::HashSet::new();
+            if accesses.is_empty()
+                || accesses.iter().any(|a| {
+                    a.memory_id == MemoryId::nil()
+                        || chrono::DateTime::from_timestamp_millis(a.accessed_at).is_none()
+                        || !seen.insert(a.memory_id)
+                        || !matches!(
+                            a.kind,
+                            crate::model::AccessKind::DirectRetrieval
+                                | crate::model::AccessKind::AssociativeRetrieval
+                        )
+                })
+            {
+                return Err(StorageError::InvalidControl(
+                    "invalid exposure receipt outcome".into(),
+                ));
+            }
+        }
+        MutationOutcome::LegacyFeedbackRecorded {
+            memory_id,
+            quality,
+            applied_at,
+        } => {
+            if *memory_id == MemoryId::nil()
+                || !(1..=4).contains(quality)
+                || chrono::DateTime::from_timestamp_millis(*applied_at).is_none()
+            {
+                return Err(StorageError::InvalidControl(
+                    "invalid feedback receipt outcome".into(),
+                ));
+            }
+        }
+        MutationOutcome::AccessRecorded { .. } => {}
     }
     Ok(stored)
 }

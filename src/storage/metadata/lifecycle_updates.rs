@@ -122,34 +122,9 @@ impl MetadataStore {
         }
         match patch {
             LegacyPatch::Feedback(plan) => {
-                if !matches!(record.phase, DecayPhase::Full | DecayPhase::Summary)
-                    || (record.phase == DecayPhase::Summary && record.summary.is_empty())
-                {
+                if !patch_legacy_feedback(&mut record, plan)? {
                     return Ok(None);
                 }
-                if plan.phase != record.phase
-                    || plan.timestamp < record.created_at.max(record.last_accessed_at)
-                    || !plan.stability.is_finite()
-                    || plan.stability <= 0.0
-                    || !valid_strength(plan.strength)
-                    || (record.is_permastore != 0 && !plan.is_permastore)
-                {
-                    return Err(StorageError::InvalidMutation(
-                        "invalid legacy feedback patch".into(),
-                    ));
-                }
-                record.strength = plan.strength;
-                record.decay_strength = plan.strength;
-                record.stability = plan.stability;
-                record.is_permastore = u8::from(plan.is_permastore);
-                record.last_accessed_at = plan.timestamp;
-                if record.access_history.len() >= ACCESS_HISTORY_MAX {
-                    record.access_history.remove(0);
-                }
-                record.access_history.push(AccessEvent {
-                    timestamp: plan.timestamp,
-                    kind: AccessKind::ManualReinforcement,
-                });
             }
             LegacyPatch::Decay {
                 phase,
@@ -192,6 +167,42 @@ impl MetadataStore {
         control::advance_generation(&tx)?;
         Ok(Some((tx, record)))
     }
+}
+
+/// Shared patch semantics for planned legacy feedback and receipt-bearing feedback.
+pub(super) fn patch_legacy_feedback(
+    record: &mut DiskRecord,
+    plan: &FeedbackPlan,
+) -> Result<bool, StorageError> {
+    if !matches!(record.phase, DecayPhase::Full | DecayPhase::Summary)
+        || (record.phase == DecayPhase::Summary && record.summary.is_empty())
+    {
+        return Ok(false);
+    }
+    if plan.phase != record.phase
+        || plan.timestamp < record.created_at.max(record.last_accessed_at)
+        || !plan.stability.is_finite()
+        || plan.stability <= 0.0
+        || !valid_strength(plan.strength)
+        || (record.is_permastore != 0 && !plan.is_permastore)
+    {
+        return Err(StorageError::InvalidMutation(
+            "invalid legacy feedback patch".into(),
+        ));
+    }
+    record.strength = plan.strength;
+    record.decay_strength = plan.strength;
+    record.stability = plan.stability;
+    record.is_permastore = u8::from(plan.is_permastore);
+    record.last_accessed_at = plan.timestamp;
+    if record.access_history.len() >= ACCESS_HISTORY_MAX {
+        record.access_history.remove(0);
+    }
+    record.access_history.push(AccessEvent {
+        timestamp: plan.timestamp,
+        kind: AccessKind::ManualReinforcement,
+    });
+    Ok(true)
 }
 
 fn valid_strength(value: f32) -> bool {

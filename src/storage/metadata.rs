@@ -8,6 +8,7 @@
 //! See CS-07 for the full specification.
 
 mod lifecycle_updates;
+mod observation;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -435,15 +436,7 @@ impl MetadataStore {
         self.ensure_available()?;
         let publication = self.mutation_guard()?;
         let (tx, receipt) = self.prepare_access(&publication, ctx, id, timestamp, kind)?;
-        if !receipt.replayed {
-            tx.commit().map_err(|source| {
-                self.mark_unavailable();
-                StorageError::CommitOutcomeUnknown {
-                    operation_id: receipt.operation_id,
-                    source,
-                }
-            })?;
-        }
+        self.commit_observation(tx, &receipt)?;
         Ok(receipt)
     }
 
