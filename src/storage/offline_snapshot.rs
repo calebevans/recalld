@@ -29,7 +29,7 @@ pub struct OfflineSnapshot {
     text: TextStore,
     _meta_copy: tempfile::TempDir,
     _edges_copy: tempfile::TempDir,
-    _source_lock: crate::storage::ownership::OwnedFileLock,
+    _source_lock: super::ownership::OwnedFileLock,
     _owner: StoreOwnership,
 }
 

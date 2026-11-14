@@ -1,7 +1,8 @@
 # Awaited observations through final transport admission
 
 This joins awaited consumers #47 (`9ebe082`) with Hume's by-ID source
-`6f29a74`. The latter already contains the required #45 core, #46 strength,
+`6f29a74`, then published by-ID head `74c9bfb` (core `fb7ae7e`, schema
+`6c0aa74`). The latter already contains the required #45 core, #46 strength,
 #30 namespace batching and #51 similarity parents. It does not import the
 full integration branch or catalog/restore #48/#50. The user-authorized minimal
 #15 ownership fix `2788645` is also a parent; OfflineSnapshot retains its new
@@ -49,8 +50,9 @@ a blanket historical-receipt rejection policy.
 
 ## Validation and limits
 
-Validation is in progress; exact frozen source, commands, image and artifacts
-will be recorded after the full run. Development failed-request logs are retained.
+Pre-parent-update source `d075e4c` passed 742 library tests, one CLI test, seven
+runner tests, formatting/clippy and all nine public episodes. Final validation
+after joining published `74c9bfb` is in progress; exact artifacts will follow. Development failed-request logs are retained.
 The public replay remains legacy-v1 diagnostic evidence, not an A1 coherent
 snapshot, barrier guarantee, release gate or completed A6. Receipts retained
 internally do not introduce a public keyed query/replay protocol. Real wall-clock
