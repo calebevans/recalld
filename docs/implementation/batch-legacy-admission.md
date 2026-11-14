@@ -30,6 +30,6 @@ Single/unreserved writes retain PR68's early rejection with no mutation. Broader
 Unicode support requires a canonical native representation; this correction
 keeps the legacy ASCII prefixed-tag contract.
 
-Validation and exact source/binary hashes are recorded in
+Runtime `98dbef6` passed 3 new + 2 inherited focused tests, 722 library + 1 CLI tests, format and Clippy (warnings retained); four doctests were ignored. Exact source/binary hashes are recorded in
 [the evidence package](../evidence/batch-legacy-admission/README.md). All fixtures
 are synthetic temporary stores. Process reopen is not a power-loss experiment.
