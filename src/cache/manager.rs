@@ -112,6 +112,9 @@ pub struct CacheStats {
 pub struct CacheManager {
     /// Primary record cache (moka future::Cache).
     cache: RecordCache,
+    canonical: Arc<
+        std::sync::OnceLock<std::sync::Weak<std::sync::RwLock<crate::storage::RedbStorageEngine>>>,
+    >,
 
     /// The configured capacity in bytes (immutable after construction).
     configured_capacity: u64,
@@ -160,6 +163,7 @@ impl CacheManager {
         Self {
             cache,
             configured_capacity: capacity,
+            canonical: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -266,7 +270,39 @@ impl CacheManager {
     ///
     /// Returns `Some(Arc<CachedRecord>)` on cache hit, `None` on miss.
     pub async fn get(&self, id: MemoryId) -> Option<Arc<CachedRecord>> {
-        self.cache.get(&id).await
+        let cached = self.cache.get(&id).await?;
+        if let Some(weak) = self.canonical.get() {
+            let storage = weak.upgrade()?;
+            let candidate = cached.clone();
+            let valid = tokio::task::spawn_blocking(move || {
+                use crate::storage::StorageEngine;
+                let storage = storage.read().ok()?;
+                storage.meta_store().effects_stamp().ok()?;
+                let current = storage.get_record(id).ok()??;
+                Some(CachedRecord::from(&current) == *candidate)
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+            if !valid {
+                return None;
+            }
+        }
+        Some(cached)
+    }
+
+    /// Validate hits against canonical metadata. Old in-flight loads can insert
+    /// after invalidation; a cache hit alone is never publication evidence.
+    pub(crate) fn bind_storage(
+        &self,
+        storage: &Arc<std::sync::RwLock<crate::storage::RedbStorageEngine>>,
+    ) {
+        let _ = self.canonical.set(Arc::downgrade(storage));
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+        self.cache.invalidate_all();
     }
 
     /// Insert a record into the cache.
@@ -322,8 +358,8 @@ impl CacheManager {
     /// On cache miss: calls the provided `loader` to fetch from disk,
     /// inserts the result into the cache, and returns it.
     ///
-    /// **Coalescing**: moka's `try_get_with` ensures only ONE loader
-    /// invocation occurs for concurrent requests for the same key.
+    /// Bound production caches validate both hits and newly loaded values
+    /// against canonical metadata before returning them.
     pub async fn get_or_load<F, Fut>(
         &self,
         id: MemoryId,
@@ -334,7 +370,7 @@ impl CacheManager {
         Fut: std::future::Future<Output = std::result::Result<Option<CachedRecord>, anyhow::Error>>,
     {
         // Fast path: direct cache lookup.
-        if let Some(record) = self.cache.get(&id).await {
+        if let Some(record) = self.get(id).await {
             metrics::counter!("cache.hits").increment(1);
             return Ok(Some(record));
         }
@@ -346,7 +382,7 @@ impl CacheManager {
             Ok(Some(record)) => {
                 let arc_record = Arc::new(record);
                 self.cache.insert(id, Arc::clone(&arc_record)).await;
-                Ok(Some(arc_record))
+                Ok(self.get(id).await)
             }
             Ok(None) => Ok(None),
             Err(e) => Err(CacheError::StorageError(e)),

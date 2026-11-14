@@ -236,10 +236,10 @@ impl MetadataStore for StorageMetadataAdapter {
         tokio::task::spawn_blocking(move || {
             storage
                 .read()
-                .map_err(|e| SearchError::MetadataError(e.to_string()))?
+                .map_err(|e| SearchError::Unavailable(e.to_string()))?
                 .meta_store()
                 .effects_stamp()
-                .map_err(|e| SearchError::MetadataError(e.to_string()))
+                .map_err(|e| SearchError::Unavailable(e.to_string()))
         })
         .await
         .map_err(|e| SearchError::Internal(e.to_string()))?

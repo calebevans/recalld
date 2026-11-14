@@ -212,6 +212,9 @@ impl From<EmbeddingError> for AppError {
 impl From<SearchError> for AppError {
     fn from(err: SearchError) -> Self {
         match &err {
+            SearchError::Unavailable(message) => AppError::ServiceUnavailable {
+                message: message.clone(),
+            },
             SearchError::NamespaceNotFound(name) => AppError::NotFound {
                 resource: "namespace",
                 id: name.clone(),
