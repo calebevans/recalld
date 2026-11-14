@@ -1,9 +1,9 @@
 # Accepted work and metadata capture
 
 Status: implementation in progress on `impl/accepted-work`, based on the frozen
-purge runtime `f6e4d9263fe2d96fca16282eed47b1251ad5398b`. No validation result is
-claimed yet. The A5 exclusive measurement hold prohibits Docker, build, test and
-cache-copy work until explicit release. Previous public/evidence branches remain
+purge runtime `f6e4d9263fe2d96fca16282eed47b1251ad5398b`. The A5 exclusive measurement
+hold was respected; isolated validation began only after explicit release.
+Previous public/evidence branches remain
 unchanged, including PR64 tail `0dd9954d0b454726c333f7635300e5547790dd45`.
 
 ## Implemented boundary, pending validation
@@ -63,7 +63,14 @@ Actual coordinator regressions hold the derived publication or graph lock, queue
 insertion/purge completion, close admission, then release the lock. The expected
 result is completion through child tickets, durable acknowledgements, zero
 pending work and successful metadata capture. A cancelled queued forget must
-leave unresolved work without a canonical mutation. These tests have not run.
+leave unresolved work without a canonical mutation.
+
+Initial measured source `9b6c7eca79625766ac5bf118ebf5856922431e83` compiled and
+passed 13/14 tracker/metadata tests. The failed test incorrectly tried to purge
+the protected default namespace; it now uses a distinct namespace without
+changing production validation. Raw failure is retained at
+`/tmp/recalld-accepted-test-g8o6ohxe/output`. That run stopped before coordinator,
+full-suite and Clippy checks. Revised validation remains pending.
 
 After release: isolated Rust 1.94.1 formatting, focused tracker/coordinator tests,
 then the full library/CLI suite and Clippy using a fresh explicit source snapshot

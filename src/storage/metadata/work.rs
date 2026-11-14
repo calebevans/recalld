@@ -322,9 +322,9 @@ mod tests {
     fn capture_checks_durable_purge_even_if_volatile_pending_flag_is_stale() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
-        let ns = store
-            .create_namespace(&NamespaceConfig::default_namespace(0))
-            .unwrap();
+        let mut config = NamespaceConfig::default_namespace(0);
+        config.name = "drain-purge".into();
+        let ns = store.create_namespace(&config).unwrap();
         store
             .begin_purge(&MutationContext::unkeyed(ns), true)
             .unwrap();
