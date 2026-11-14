@@ -1,0 +1,18 @@
+{
+  "docs/implementation/native-record-mutations.md": "255432ccc8c3c88e106138043433b90a4b8f85c2a43bbab577202331d2eaad0a",
+  "src/storage/control.rs": "0e8f43c3cd9aec0b18598a28f012cafd5f50b4e208e769978effe775baa17d8d",
+  "src/storage/engine.rs": "6b02c96a6d247690ac1e353e1c889f4bc216d30a3519fc23c8ab51b93b90b082",
+  "src/storage/engine/native_records.rs": "9e0564904c67e99e18996246e9a067bcdbfe8d22604ec187d492d1e9b4d1ad08",
+  "src/storage/lifecycle_migration.rs": "9de832866c591786517c2b08a4187ebddd302b0afd5bc46bd9217a7ff65c3337",
+  "src/storage/metadata.rs": "e3716edf5a0bf413ba2346eedd96eb0479fecf5c625e7c457e3a67309cf112ca",
+  "src/storage/metadata/effects.rs": "2658ab4278855c54d1511f95da6c6971dbe9c87fbe5952e7fe4b36ec8d222607",
+  "src/storage/metadata/insertion.rs": "c895cf60f295d3ac5e44d12d730b7f24784ca1afdc96829a55ee2084433f91ae",
+  "src/storage/metadata/native_lifecycle.rs": "176ce92cdbf195a4656ae46d03d29e5585643a56d4065c665c6093cbae7ad21c",
+  "src/storage/metadata/native_lifecycle/tests.rs": "e2a517aa028a07be0781ac1d6866cfc6c1e3dd507d1a66fdc004618f780a0242",
+  "src/storage/metadata/native_records.rs": "dabc1627e32c1542879aa6ee9786c42653c4c1c82b72a82f67d4eb6b13e33119",
+  "src/storage/metadata/native_records/tests.rs": "dc8352b33de0c3e56f33c9f289ff2f6404fa729a5ce691027e1ebfabf0236f1e",
+  "src/storage/mod.rs": "e5173b7b665f77f0304f01a6d233f44bfaf9fa7440cbe0081046d711c26a3073",
+  "src/storage/native_lifecycle.rs": "4692129b19102933b4cedbf54640ee9e7553444b6c8cbbf6c0b7041938f93dd1",
+  "src/storage/native_records.rs": "342afb2d1f1177fa994a62e7f880f3c63c4e30e47fd01915fcc10f111aea1779",
+  "src/storage/validation.rs": "430bde99cb16f6acbf6c877426b24dce09c395c4f8b478e68170426f3d8fb618"
+}

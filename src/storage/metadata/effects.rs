@@ -6,6 +6,32 @@ use crate::storage::edges::PersistedEdge;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_BEFORE_RECORD_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_AFTER_RECORD_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Ephemeral inputs only; receipts and effects never retain stripped content.
+pub(super) enum RecordMutation<'a> {
+    GraphOnly,
+    PurgeChunk(&'a crate::storage::purge::PurgeProgress),
+    Inserted(&'a DiskRecord, u32),
+    NativeInserted(
+        &'a DiskRecord,
+        crate::storage::native_records::NativeRecordWrite,
+    ),
+    NativeTombstoned {
+        record: &'a DiskRecord,
+        old_phase: DecayPhase,
+        transition: crate::storage::native_records::NativeRecordWrite,
+    },
+    Tombstoned {
+        record: &'a DiskRecord,
+        old_phase: DecayPhase,
+    },
+}
+
 pub(crate) const SCHEMA: TableDefinition<&str, u32> = TableDefinition::new("effects_schema");
 pub(crate) const EFFECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mutation_effects");
 
@@ -71,6 +97,12 @@ pub(crate) fn validate_existing(
                 if matches!(
                     control::validate_receipt(value.value())?.receipt.outcome,
                     MutationOutcome::GraphChanged { .. }
+                        | MutationOutcome::MemoryInserted { .. }
+                        | MutationOutcome::MemoryTombstoned { .. }
+                        | MutationOutcome::NativeMemoryInserted { .. }
+                        | MutationOutcome::NativeMemoryTombstoned { .. }
+                        | MutationOutcome::NamespacePurgeStarted { .. }
+                        | MutationOutcome::NamespacePurgeAdvanced { .. }
                 ) {
                     return Err(StorageError::InvalidControl(
                         "effects schema missing from adopted store".into(),
@@ -126,7 +158,59 @@ pub(crate) fn validate_existing(
                 "effects receipt mismatch".into(),
             ));
         }
+        match &effect.receipt.outcome {
+            MutationOutcome::NativeMemoryInserted { .. } => validate_native_effect(&effect, true)?,
+            MutationOutcome::NativeMemoryTombstoned { .. } => {
+                validate_native_effect(&effect, false)?
+            }
+            _ => {}
+        }
         match effect.receipt.outcome {
+            MutationOutcome::NativeMemoryInserted { .. }
+            | MutationOutcome::NativeMemoryTombstoned { .. } => {}
+            MutationOutcome::MemoryTombstoned { memory_id, status }
+                if matches!(effect.scope, MutationScope::Namespace(_))
+                    && effect.puts.is_empty()
+                    && effect.deletes.is_empty()
+                    && effect.removed_ids.is_empty()
+                    && effect.peer_counts.is_empty()
+                    && effect.invalidated_ids == [memory_id]
+                    && match status {
+                        crate::storage::tombstone::TombstoneStatus::Tombstoned => {
+                            effect.releases.len() == 1
+                                && effect.releases.iter().all(|r| {
+                                    r.memory_id == memory_id
+                                        && effect.scope == MutationScope::Namespace(r.namespace_id)
+                                })
+                        }
+                        crate::storage::tombstone::TombstoneStatus::AlreadyTombstoned => {
+                            effect.releases.is_empty()
+                        }
+                    } => {}
+            MutationOutcome::MemoryInserted {
+                memory_id,
+                edges_put,
+                ..
+            } if matches!(effect.scope, MutationScope::Namespace(_))
+                && edges_put == effect.puts.len()
+                && effect.deletes.is_empty()
+                && effect.removed_ids.is_empty()
+                && effect.releases.is_empty()
+                && effect.invalidated_ids.contains(&memory_id) => {}
+            MutationOutcome::NamespacePurgeAdvanced {
+                stage,
+                removed,
+                edges_removed,
+                ..
+            } if effect.puts.is_empty()
+                && effect.releases.is_empty()
+                && removed == effect.removed_ids.len() as u64
+                && edges_removed == effect.deletes.len() as u64
+                && (stage == crate::storage::purge::PurgeStage::Deleting
+                    || (removed == 0
+                        && edges_removed == 0
+                        && effect.invalidated_ids.is_empty()
+                        && effect.peer_counts.is_empty())) => {}
             MutationOutcome::GraphChanged {
                 edges_put,
                 edges_removed,
@@ -140,11 +224,9 @@ pub(crate) fn validate_existing(
                 ));
             }
         }
-        if effect
-            .releases
-            .iter()
-            .any(|r| !effect.removed_ids.contains(&r.memory_id))
-        {
+        if effect.releases.iter().any(|r| {
+            !effect.removed_ids.contains(&r.memory_id) && !terminal_effect(&effect, r.memory_id)
+        }) {
             return Err(StorageError::InvalidControl(
                 "release without removed owner".into(),
             ));
@@ -189,15 +271,27 @@ impl MetadataStore {
     /// Called after every derived index is rebuilt, either during startup or
     /// under the online coordinator's publication/index/storage guards.
     pub(crate) fn acknowledge_rebuilt_effects(&self) -> Result<(), StorageError> {
-        let ids: Vec<_> = self
-            .pending_effects()?
-            .iter()
-            .map(|e| e.receipt.operation_id)
-            .collect();
-        for id in ids {
-            self.acknowledge_derived_effects(id)?;
-        }
-        Ok(())
+        self.acknowledge_rebuilt_effects_with_work(None)
+    }
+
+    pub(crate) fn acknowledge_rebuilt_effects_with_work(
+        &self,
+        parent: Option<&WorkTicket>,
+    ) -> Result<(), StorageError> {
+        let work = self.work_tracker.admit(parent)?;
+        let result = (|| {
+            let ids: Vec<_> = self
+                .pending_effects()?
+                .iter()
+                .map(|e| e.receipt.operation_id)
+                .collect();
+            for id in ids {
+                self.acknowledge_derived_effects_with_work(id, Some(&work))?;
+            }
+            Ok(())
+        })();
+        self.finish_work(work);
+        result
     }
 
     pub(crate) fn pending_effects(&self) -> Result<Vec<PendingEffects>, StorageError> {
@@ -207,7 +301,7 @@ impl MetadataStore {
     /// Caller holds the publication write gate, including the edge snapshot.
     pub(crate) fn commit_graph_effects(
         &self,
-        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
+        _guard: &MutationGuard<'_>,
         namespace: NamespaceId,
         existing_edges: &[PersistedEdge],
         puts: &[PersistedEdge],
@@ -215,8 +309,47 @@ impl MetadataStore {
         delete_records: bool,
         release_vectors: bool,
     ) -> Result<EffectResult, StorageError> {
+        _guard.check(self)?;
         self.ensure_available()?;
         let tx = self.db.begin_write()?;
+        let ctx = MutationContext::unkeyed(namespace);
+        let request = control::encode(&(puts, incident_ids, delete_records, release_vectors))?;
+        let hash = control::request_hash(&ctx, "graph_effects", &[&request]);
+        self.finish_record_effects(
+            _guard,
+            tx,
+            &ctx,
+            hash,
+            existing_edges,
+            puts,
+            incident_ids,
+            delete_records,
+            release_vectors,
+            RecordMutation::GraphOnly,
+        )
+    }
+
+    /// Shared transaction tail for graph mutations and canonical insertion.
+    /// Insertion has already staged its new row/indexes in this transaction.
+    pub(super) fn finish_record_effects(
+        &self,
+        _guard: &MutationGuard<'_>,
+        tx: redb::WriteTransaction,
+        ctx: &MutationContext,
+        hash: [u8; 32],
+        existing_edges: &[PersistedEdge],
+        puts: &[PersistedEdge],
+        incident_ids: &[MemoryId],
+        delete_records: bool,
+        release_vectors: bool,
+        mut mutation: RecordMutation<'_>,
+    ) -> Result<EffectResult, StorageError> {
+        _guard.check(self)?;
+        let MutationScope::Namespace(namespace) = ctx.scope else {
+            return Err(StorageError::InvalidMutationContext(
+                "record effects require namespace scope".into(),
+            ));
+        };
         if tx
             .open_table(NAMESPACE_TABLE)?
             .get(namespace.get())?
@@ -228,6 +361,28 @@ impl MetadataStore {
         let mut removed = Vec::new();
         let mut releases = Vec::new();
         let mut invalidated: std::collections::HashSet<_> = incident_ids.iter().copied().collect();
+        match &mutation {
+            RecordMutation::Inserted(record, _)
+            | RecordMutation::Tombstoned { record, .. }
+            | RecordMutation::NativeInserted(record, _)
+            | RecordMutation::NativeTombstoned { record, .. } => {
+                invalidated.insert(MemoryId::from_bytes(record.id));
+            }
+            RecordMutation::GraphOnly | RecordMutation::PurgeChunk(_) => {}
+        }
+        if let RecordMutation::Tombstoned { record, old_phase }
+        | RecordMutation::NativeTombstoned {
+            record, old_phase, ..
+        } = &mutation
+        {
+            if *old_phase != DecayPhase::Tombstone {
+                releases.push(VectorRelease {
+                    namespace_id: namespace,
+                    slot: record.vector_slot,
+                    memory_id: MemoryId::from_bytes(record.id),
+                });
+            }
+        }
         let mut final_edges: Vec<_> = existing_edges
             .iter()
             .filter(|e| !incident_ids.contains(&e.source) && !incident_ids.contains(&e.target))
@@ -267,7 +422,8 @@ impl MetadataStore {
                         EdgeType::ParentChild => id == edge.source || delete_records,
                         _ => false,
                     };
-                    if record.namespace_id != namespace.get()
+                    if record.id != *id.as_bytes()
+                        || record.namespace_id != namespace.get()
                         || (matches!(record.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
                             && !retained_structural)
                         || (delete_records && incident_ids.contains(&id))
@@ -283,13 +439,13 @@ impl MetadataStore {
                             && old.target == edge.target
                             && old.source != edge.source
                     }) {
-                        return Err(StorageError::InvalidMutation("supersedes branch".into()));
+                        return Err(StorageError::EdgeConflict("supersedes branch".into()));
                     }
                     let mut seen = std::collections::HashSet::new();
                     let mut visit = vec![edge.target];
                     while let Some(id) = visit.pop() {
                         if id == edge.source {
-                            return Err(StorageError::InvalidMutation("supersedes cycle".into()));
+                            return Err(StorageError::EdgeConflict("supersedes cycle".into()));
                         }
                         if seen.insert(id) {
                             visit.extend(
@@ -354,6 +510,37 @@ impl MetadataStore {
                             "outgoing edge count exceeds record capacity".into(),
                         )
                     })?;
+                if let RecordMutation::NativeInserted(_, proof) = &mut mutation {
+                    let change = proof
+                        .records
+                        .iter_mut()
+                        .find(|r| r.memory_id == id)
+                        .ok_or_else(|| {
+                            StorageError::InvalidControl("native edge source proof missing".into())
+                        })?;
+                    if let Some(before) = &change.before {
+                        if before.lifecycle
+                            != crate::storage::native_lifecycle::LifecycleState::capture(&record)?
+                            || before.edge_count != record.edge_count
+                        {
+                            return Err(StorageError::InvalidControl(
+                                "native peer changed within transaction".into(),
+                            ));
+                        }
+                        record
+                            .schema
+                            .as_mut()
+                            .ok_or_else(|| {
+                                StorageError::InvalidControl("native peer schema missing".into())
+                            })?
+                            .lifecycle
+                            .record_generation =
+                            before.lifecycle.lifecycle.record_generation.next()?;
+                        change.after.lifecycle.lifecycle.record_generation =
+                            record.schema.as_ref().unwrap().lifecycle.record_generation;
+                    }
+                    change.after.edge_count = count;
+                }
                 record.edge_count = count;
                 records.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
                 peer_counts.push((id, count));
@@ -363,18 +550,86 @@ impl MetadataStore {
         peer_counts.sort_by_key(|(id, _)| *id);
         let mut invalidated_ids: Vec<_> = invalidated.into_iter().collect();
         invalidated_ids.sort();
-        let ctx = MutationContext::unkeyed(namespace);
-        let request = control::encode(&(puts, incident_ids, delete_records, release_vectors))?;
-        let receipt = control::record_receipt(
-            &tx,
-            &ctx,
-            control::request_hash(&ctx, "graph_effects", &[&request]),
-            MutationOutcome::GraphChanged {
+        if let RecordMutation::NativeInserted(_, proof) = &mut mutation {
+            proof.edges = actual_puts
+                .iter()
+                .map(crate::storage::native_records::NativeEdgeProof::from)
+                .collect();
+        }
+        let outcome = match &mutation {
+            RecordMutation::NativeInserted(_, transition) => {
+                MutationOutcome::NativeMemoryInserted {
+                    transition: transition.clone(),
+                }
+            }
+            RecordMutation::NativeTombstoned { transition, .. } => {
+                MutationOutcome::NativeMemoryTombstoned {
+                    transition: transition.clone(),
+                }
+            }
+            RecordMutation::Inserted(record, embedding_dim) => MutationOutcome::MemoryInserted {
+                memory_id: MemoryId::from_bytes(record.id),
+                created_at: record.created_at,
+                initial_stability_bits: record.stability.to_bits(),
+                embedding_dim: *embedding_dim,
                 edges_put: actual_puts.len(),
-                edges_removed: deletes.len(),
-                memories_removed: removed.len(),
             },
-        )?;
+            RecordMutation::Tombstoned { record, old_phase } => MutationOutcome::MemoryTombstoned {
+                memory_id: MemoryId::from_bytes(record.id),
+                status: if *old_phase == DecayPhase::Tombstone {
+                    crate::storage::tombstone::TombstoneStatus::AlreadyTombstoned
+                } else {
+                    crate::storage::tombstone::TombstoneStatus::Tombstoned
+                },
+            },
+            RecordMutation::GraphOnly | RecordMutation::PurgeChunk(_) => {
+                MutationOutcome::GraphChanged {
+                    edges_put: actual_puts.len(),
+                    edges_removed: deletes.len(),
+                    memories_removed: removed.len(),
+                }
+            }
+        };
+        let receipt = if let RecordMutation::PurgeChunk(progress) = &mutation {
+            super::purge::record_next(
+                &tx,
+                progress,
+                crate::storage::purge::PurgeStage::Deleting,
+                &removed,
+                deletes.len(),
+            )?
+        } else {
+            control::record_receipt(&tx, ctx, hash, outcome)?
+        };
+        if let RecordMutation::Tombstoned { record, old_phase }
+        | RecordMutation::NativeTombstoned {
+            record, old_phase, ..
+        } = &mutation
+        {
+            if *old_phase != DecayPhase::Tombstone {
+                super::removal_ledger::record_removal(
+                    &tx,
+                    crate::storage::control::GenerationRef {
+                        store_id: receipt.store_id,
+                        generation: receipt.committed_generation,
+                    },
+                    record.namespace_id,
+                    MemoryId::from_bytes(record.id),
+                    Some(super::removal_ledger::TerminalKind::Tombstone),
+                    super::removal_ledger::ALL,
+                    receipt.operation_id,
+                )?;
+            }
+        }
+        match &receipt.outcome {
+            MutationOutcome::NativeMemoryInserted { transition } => {
+                transition.validate(&receipt, true)?
+            }
+            MutationOutcome::NativeMemoryTombstoned { transition } => {
+                transition.validate(&receipt, false)?
+            }
+            _ => {}
+        }
         // Removal evidence and effect receipt share this canonical transaction.
         for (id, record) in &removed {
             super::removal_ledger::record_removal(
@@ -406,6 +661,12 @@ impl MetadataStore {
             receipt.operation_id.as_bytes().as_slice(),
             control::encode(&pending)?.as_slice(),
         )?;
+        #[cfg(test)]
+        if FAIL_BEFORE_RECORD_COMMIT.with(|flag| flag.replace(false)) {
+            return Err(StorageError::InvalidMutation(
+                "injected precommit abandonment".into(),
+            ));
+        }
         crash_point("before_metadata_commit");
         // Publish dirty before advancing the epoch. Admission samples the
         // epoch twice; it cannot accept a new stamp with an old clean flag.
@@ -417,7 +678,20 @@ impl MetadataStore {
         self.derived_dirty.store(true, Ordering::SeqCst);
         self.canonical_pending.store(true, Ordering::SeqCst);
         self.effects_epoch.store(next, Ordering::SeqCst);
-        tx.commit().map_err(|source| {
+        let committed = tx.commit();
+        // Synthetic I/O ambiguity: the commit succeeded, but the caller must
+        // not assume failure means its staged bytes can be reclaimed.
+        #[cfg(test)]
+        let committed = committed.and_then(|()| {
+            if FAIL_AFTER_RECORD_COMMIT.with(|flag| flag.replace(false)) {
+                Err(redb::CommitError::Storage(redb::StorageError::Io(
+                    std::io::Error::other("injected unknown record commit"),
+                )))
+            } else {
+                Ok(())
+            }
+        });
+        committed.map_err(|source| {
             self.mark_unavailable();
             StorageError::CommitOutcomeUnknown {
                 operation_id: receipt.operation_id,
@@ -426,6 +700,25 @@ impl MetadataStore {
         })?;
         crash_point("after_metadata_commit");
         let mut phases = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+        if let RecordMutation::Inserted(record, _) | RecordMutation::NativeInserted(record, _) =
+            &mutation
+        {
+            phases.transition(
+                record.namespace_id,
+                record.vector_slot,
+                DecayPhase::Full,
+                record.phase,
+            );
+        }
+        if let RecordMutation::Tombstoned { record, old_phase }
+        | RecordMutation::NativeTombstoned {
+            record, old_phase, ..
+        } = &mutation
+        {
+            if *old_phase != DecayPhase::Tombstone {
+                phases.remove(record.namespace_id, record.vector_slot, *old_phase);
+            }
+        }
         for (_, record) in &removed {
             if record.phase != DecayPhase::Tombstone {
                 phases.remove(record.namespace_id, record.vector_slot, record.phase);
@@ -442,8 +735,10 @@ impl MetadataStore {
 
     pub(crate) fn acknowledge_canonical_effects(
         &self,
+        guard: &MutationGuard<'_>,
         effect: &PendingEffects,
     ) -> Result<(), StorageError> {
+        guard.check(self)?;
         let mut completed = effect.clone();
         completed.canonical_applied = true;
         let tx = self.db.begin_write()?;
@@ -451,7 +746,10 @@ impl MetadataStore {
             completed.receipt.operation_id.as_bytes().as_slice(),
             control::encode(&completed)?.as_slice(),
         )?;
-        self.commit(tx)?;
+        tx.commit().map_err(|error| {
+            self.mark_unavailable();
+            StorageError::RedbCommit(error)
+        })?;
         Ok(())
     }
 
@@ -459,7 +757,15 @@ impl MetadataStore {
         &self,
         operation_id: uuid::Uuid,
     ) -> Result<(), StorageError> {
-        let _publication = self.mutation_guard()?;
+        self.acknowledge_derived_effects_with_work(operation_id, None)
+    }
+
+    pub(crate) fn acknowledge_derived_effects_with_work(
+        &self,
+        operation_id: uuid::Uuid,
+        parent: Option<&WorkTicket>,
+    ) -> Result<(), StorageError> {
+        let _publication = self.mutation_guard_with_work(parent)?;
         let tx = self.db.begin_write()?;
         {
             let mut effects = tx.open_table(EFFECTS)?;
@@ -504,9 +810,68 @@ pub(crate) fn validate_plan(
             "removed effect ID still exists".into(),
         ));
     }
+    if let Some(proof) = native_proof(effect) {
+        for change in &proof.records {
+            let record = records
+                .iter()
+                .find(|(id, _)| *id == change.memory_id)
+                .map(|(_, r)| r)
+                .ok_or_else(|| {
+                    StorageError::InvalidControl("native pending record missing".into())
+                })?;
+            if record.namespace_id != proof.namespace_id.get()
+                || !change.after.matches_record(record)?
+            {
+                return Err(StorageError::InvalidControl(
+                    "native pending proof differs from canonical record".into(),
+                ));
+            }
+        }
+    }
+    if let MutationOutcome::MemoryInserted {
+        memory_id,
+        created_at,
+        ..
+    } = effect.receipt.outcome
+    {
+        if records
+            .iter()
+            .find(|(id, _)| *id == memory_id)
+            .is_none_or(|(_, record)| {
+                record.phase != DecayPhase::Full
+                    || record.created_at != created_at
+                    || effect.scope
+                        != MutationScope::Namespace(NamespaceId::new(record.namespace_id))
+            })
+        {
+            return Err(StorageError::InvalidControl(
+                "pending insertion disagrees with canonical record".into(),
+            ));
+        }
+    }
+    if let MutationOutcome::MemoryTombstoned { memory_id, .. } = effect.receipt.outcome {
+        if records
+            .iter()
+            .find(|(id, _)| *id == memory_id)
+            .is_none_or(|(_, record)| {
+                record.phase != DecayPhase::Tombstone
+                    || !record.summary.is_empty()
+                    || !record.tags.is_empty()
+                    || record.text_offset != 0
+                    || record.text_length != 0
+                    || effect.scope
+                        != MutationScope::Namespace(NamespaceId::new(record.namespace_id))
+                    || effect.releases.iter().any(|r| r.slot != record.vector_slot)
+            })
+        {
+            return Err(StorageError::InvalidControl(
+                "pending tombstone disagrees with canonical record".into(),
+            ));
+        }
+    }
     for release in &effect.releases {
         if records.iter().any(|(id, r)| {
-            *id == release.memory_id
+            (*id == release.memory_id && !terminal_effect(effect, *id))
                 || (r.phase != DecayPhase::Tombstone
                     && r.namespace_id == release.namespace_id.get()
                     && r.vector_slot == release.slot)
@@ -543,6 +908,76 @@ pub(crate) fn validate_plan(
                 "effect put has missing or foreign endpoint".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn native_proof(
+    effect: &PendingEffects,
+) -> Option<&crate::storage::native_records::NativeRecordWrite> {
+    match &effect.receipt.outcome {
+        MutationOutcome::NativeMemoryInserted { transition }
+        | MutationOutcome::NativeMemoryTombstoned { transition } => Some(transition),
+        _ => None,
+    }
+}
+fn terminal_effect(effect: &PendingEffects, id: MemoryId) -> bool {
+    matches!(effect.receipt.outcome,MutationOutcome::MemoryTombstoned {memory_id,..} if memory_id==id)
+        || matches!(&effect.receipt.outcome,MutationOutcome::NativeMemoryTombstoned {transition} if transition.memory_id==id)
+}
+fn validate_native_effect(effect: &PendingEffects, insertion: bool) -> Result<(), StorageError> {
+    use crate::storage::native_records::NativeEdgeProof;
+    let p = native_proof(effect).unwrap();
+    p.validate(&effect.receipt, insertion)?;
+    let mut invalidated = vec![p.memory_id];
+    for e in &effect.puts {
+        invalidated.extend([e.source, e.target]);
+    }
+    invalidated.sort();
+    invalidated.dedup();
+    let mut peers = effect.puts.iter().map(|e| e.source).collect::<Vec<_>>();
+    peers.sort();
+    peers.dedup();
+    let expected_peers = peers
+        .into_iter()
+        .map(|id| {
+            p.records
+                .iter()
+                .find(|r| r.memory_id == id)
+                .map(|r| (id, r.after.edge_count))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| StorageError::InvalidControl("native effect peer proof missing".into()))?;
+    let before = p.primary()?.before.as_ref();
+    let release = if insertion {
+        None
+    } else {
+        before
+            .filter(|b| b.lifecycle.phase != DecayPhase::Tombstone)
+            .and_then(|b| b.content.vector.as_ref())
+            .map(|v| v.slot)
+    };
+    if effect.scope != MutationScope::Namespace(p.namespace_id)
+        || !effect.removed_ids.is_empty()
+        || !effect.deletes.is_empty()
+        || effect
+            .puts
+            .iter()
+            .map(NativeEdgeProof::from)
+            .collect::<Vec<_>>()
+            != p.edges
+        || effect.peer_counts != expected_peers
+        || effect.invalidated_ids != invalidated
+        || effect.releases.len() != usize::from(release.is_some())
+        || effect.releases.iter().any(|r| {
+            Some(r.slot) != release
+                || r.memory_id != p.memory_id
+                || r.namespace_id != p.namespace_id
+        })
+    {
+        return Err(StorageError::InvalidControl(
+            "native effect actions disagree with receipt".into(),
+        ));
     }
     Ok(())
 }

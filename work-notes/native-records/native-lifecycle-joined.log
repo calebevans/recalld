@@ -1,0 +1,52 @@
+warning: method `insert_memory_with_work` is never used
+  --> src/storage/engine/insertion.rs:44:19
+   |
+ 4 | impl RedbStorageEngine {
+   | ---------------------- method in this implementation
+...
+44 |     pub(crate) fn insert_memory_with_work(
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `recalld` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-e423ca3d07310388)
+
+running 16 tests
+test storage::metadata::native_lifecycle::tests::capture_rechecks_poison_after_waiting_for_publication ... ok
+test storage::metadata::native_lifecycle::tests::abandoned_real_transaction_and_invalid_inputs_leave_records_receipts_and_history_unchanged ... ok
+test storage::metadata::native_lifecycle::tests::concurrent_identical_key_commits_once_and_other_key_gets_record_conflict ... ok
+test storage::metadata::native_lifecycle::tests::malformed_native_proof_and_missing_suffix_fail_read_only_inspection ... ok
+test storage::metadata::native_lifecycle::tests::mixed_native_policy_history_survives_rollback_copy_and_stale_policy_retry ... ok
+test storage::metadata::native_lifecycle::tests::mixed_format_rejected_before_either_writable_entry ... ok
+Starting backup...
+  Source: /tmp/.tmpLgBijc/v2
+  Destination: /tmp/.tmpLgBijc/native.zip
+Generating manifest...
+Creating archive...
+Backup complete!
+  Archive: /tmp/.tmpLgBijc/native.zip
+  Size: 0.02 MB (compressed)
+  Uncompressed: 7.05 MB
+  Compression ratio: 99.7%
+test storage::metadata::native_lifecycle::tests::native_contract_one_rejects_feedback_and_exposure_without_bytes_or_time_change ... ok
+test storage::metadata::native_lifecycle::tests::native_entry_excludes_other_owners_legacy_stores_and_unparticipating_writers ... ok
+native receipt scaling: receipts=6, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native feedback scaling: receipts=6, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native receipt scaling: receipts=22, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native feedback scaling: receipts=22, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native receipt scaling: receipts=71, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native feedback scaling: receipts=71, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+strict reopen receipt work: ValidationWork { full_validations: 9, receipt_decodes: 2884 }
+test storage::metadata::native_lifecycle::tests::native_hot_path_work_is_independent_of_receipt_count_but_reopen_checks_history ... ok
+test storage::metadata::native_lifecycle::tests::native_backup_fork_preserves_receipts_applies_later_deletion_and_blocks_historical_writes ... ok
+test storage::metadata::native_lifecycle::tests::native_open_rejects_unknown_canonical_tables_before_writable_open ... ok
+test storage::metadata::native_lifecycle::tests::replay_precedes_stale_tokens_policy_and_clock_but_not_lineage_or_payload ... ok
+test storage::metadata::native_lifecycle::tests::real_native_exposure_and_feedback_obey_both_policies_and_one_clock ... ok
+test storage::metadata::native_lifecycle::tests::source_tokens_and_bad_clock_reject_before_batch_mutation ... ok
+test storage::metadata::native_lifecycle::tests::summary_feedback_stays_stripped_and_permastore_sticky_under_clock_regression ... ok
+test storage::metadata::native_lifecycle::tests::uncertain_real_commit_poisoning_requires_reopen_then_reconciles_without_reapplying ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 776 filtered out; finished in 26.37s
+

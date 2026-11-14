@@ -1,0 +1,28 @@
+--- a/src/storage/metadata/insertion.rs
++++ b/src/storage/metadata/insertion.rs
+@@ -103,7 +103,7 @@
+                 .insert_memory_with_profile(&ctx, &input, &[1., 0., 0., 0.], descriptor, 123)
+                 .unwrap_err();
+             assert!(
+-                matches!(error, StorageError::RecoveryRequired(_)),
++                matches!(error, StorageError::ProviderVectorUnavailable(_)),
+                 "{error}"
+             );
+             assert!(error.to_string().contains(message), "{error}");
+@@ -170,14 +170,8 @@
+         if config.id != namespace {
+             return Err(StorageError::MutationNamespaceMismatch);
+         }
+-        crate::embedding::runtime::check_namespace(&config, profile).map_err(|e| {
+-            if config.schema.is_some() {
+-                // Preserve the existing schema writer-gate error classification.
+-                StorageError::RecoveryRequired(e.to_string())
+-            } else {
+-                StorageError::ProviderVectorUnavailable(e.to_string())
+-            }
+-        })?;
++        crate::embedding::runtime::check_namespace(&config, profile)
++            .map_err(|e| StorageError::ProviderVectorUnavailable(e.to_string()))?;
+         if config.schema.is_some() || control::read_control(&tx)?.control_schema_version != 1 {
+             return Err(StorageError::RecoveryRequired(
+                 "schema-v2 insertion requires participating writers; serving remains disabled"

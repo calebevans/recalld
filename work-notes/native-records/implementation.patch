@@ -1,0 +1,3614 @@
+diff --git a/docs/implementation/native-record-mutations.md b/docs/implementation/native-record-mutations.md
+new file mode 100644
+index 0000000..a9eb3c5
+--- /dev/null
++++ b/docs/implementation/native-record-mutations.md
+@@ -0,0 +1,72 @@
++# Explicit native insertion and tombstone
++
++This slice adds native record creation and forget to the existing owned
++`RedbStorageEngine`, metadata publication guard and canonical effects transaction.
++`NativeLifecycleSession` owns that same engine; it does not acquire another owner
++for each request. Ordinary schema-2 serving and legacy writers remain blocked.
++
++`NativeInsert` preserves the original summary, optional text, tags, UTF-8 entity,
++topic and emotion lists, optional creation/observation times, supplied ID, parent
++and supersession choices. Supplied embeddings require their explicit compatible
++profile. Generated embeddings carry the actual provider's profile separately.
++Structured labels persist exactly with `NativeV2` provenance; they are not
++converted into lossy compatibility tags. Unknown record extensions cannot be
++silently discarded by native forget.
++
++`capture_insert` and `capture_tombstone` bind opaque intents to the actual guarded
++metadata read, namespace policy and record tokens. `insert_prepared` and
++`tombstone` use the existing metadata transaction and `RecordMutation` effect
++tail. Final validation checks the current policy, tokens and namespace state.
++Creation, affected peers' edge counts/tokens, canonical edge plan, receipt and
++generation commit together. Forget strips retained content, structured labels
++and vector ownership, records the removal ledger and preserves content-free
++structural edges in that same transaction. Canonical file effects use the existing
++recovery outbox. Payload staging before a failed metadata commit can leave
++unreachable bytes; the handle is unavailable until strict reopen/recovery.
++
++Every fresh operation samples the injected clock once. Replay uses the saved
++original default/profile expansion from its receipt before consulting current
++namespace defaults or invoking a provider. The mutable-default regression changes
++defaults only in an abandoned real transaction; it is not evidence of a supported
++namespace-default writer. A separate regression performs an actual lifecycle
++policy migration and verifies zero provider calls on replay. Operation IDs and
++generated memory IDs remain nondeterministic. Legacy and native insertion share
++the owned `MetadataStore::allocate_memory_id` allocation point; no A6 RNG/reset
++claim follows from the injected clock.
++
++Receipts contain numeric state, identifiers and component hashes, never source
++strings. Reverse history validation carries these commitments instead of
++reconstructing forgotten strings. Current retained payload, labels, extensions,
++vector references and profile binding are checked against creation evidence;
++canonical inventory validation also hashes actual retained text. Legacy-inferred
++records do not acquire invented historical text commitments merely because a new
++child changes their edge count. Original schema publication state and receipts
++remain immutable. Only explicitly typed operations extend the contiguous proof.
++
++Restore preserves native creation receipts as historical evidence, applies later
++removal evidence before publication, and forks the store identity. Old-origin
++requests cannot replay as new-origin writes. Logical export/import retains the
++same immutable schema state and native component proof. Terminal UUID reuse is
++rejected. Explicit supplied-ID insertion currently scans historical creation
++receipts to reject reuse after a fork; exposure/feedback keep the bounded owned
++hot path from `b61cb665`.
++
++Work admission uses the real `MutationGuard` and owner-instance `WorkTicket`.
++Async generated insertion accepts a root before awaiting the provider; final
++canonical work consumes a descendant of that root. Foreign tickets, including
++another tracker with the same store UUID, fail. Admission closure prevents new
++roots. Uncertain completion leaves unresolved work and requires recovery.
++
++The minimal core joins native lifecycle/hotfix (`744ef3c` / `b61cb665`), real
++insertion+tombstone (`dad8465`), profile admission (`ed242ec`), accepted work
++(`20192bf`) and its completed-purge offline consumer (`d03116c`). The latter is
++required by the actual tracker ancestry and strict inventory; adding table names
++without the consumer would be insufficient. No maintenance or native purge writer
++is introduced. The pending batch join must pass `None` to its actual optional
++`BatchChild` tail, without inventing native batch support.
++
++This core does not certify derived readiness, coherent whole-query ReadViews,
++public keyed search, ordinary v2 serving, global generation comparability or
++deterministic ID generation. PR69 transport consumers require their actual reader
++parents and publication integration; a synthetic offline reader fixture alone
++does not establish that end-to-end contract.
+diff --git a/src/storage/control.rs b/src/storage/control.rs
+index c3a9965..1110620 100644
+--- a/src/storage/control.rs
++++ b/src/storage/control.rs
+@@ -213,6 +213,12 @@ impl MutationContext {
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "camelCase", tag = "kind")]
+ pub enum MutationOutcome {
++    NativeMemoryInserted {
++        transition: super::native_records::NativeRecordWrite,
++    },
++    NativeMemoryTombstoned {
++        transition: super::native_records::NativeRecordWrite,
++    },
+     LifecycleExposureRecorded {
+         transition: super::native_lifecycle::NativeLifecycleWrite,
+     },
+@@ -415,6 +421,8 @@ pub(crate) fn validate_existing(
+             MutationOutcome::LifecyclePolicyMigrated { .. }
+                 | MutationOutcome::LifecycleExposureRecorded { .. }
+                 | MutationOutcome::LifecycleFeedbackApplied { .. }
++                | MutationOutcome::NativeMemoryInserted { .. }
++                | MutationOutcome::NativeMemoryTombstoned { .. }
+         ) && state.control_schema_version != 2
+         {
+             return Err(StorageError::InvalidControl(
+@@ -576,6 +584,12 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
+         ));
+     }
+     match &stored.receipt.outcome {
++        MutationOutcome::NativeMemoryInserted { transition } => {
++            transition.validate(&stored.receipt, true)?
++        }
++        MutationOutcome::NativeMemoryTombstoned { transition } => {
++            transition.validate(&stored.receipt, false)?
++        }
+         MutationOutcome::LifecycleExposureRecorded { transition } => {
+             transition.validate(&stored.receipt, false)?
+         }
+diff --git a/src/storage/engine.rs b/src/storage/engine.rs
+index 6761485..2dc2f72 100644
+--- a/src/storage/engine.rs
++++ b/src/storage/engine.rs
+@@ -10,6 +10,7 @@
+ mod catalog;
+ mod effects;
+ mod insertion;
++mod native_records;
+ mod purge;
+ mod text_compaction;
+ mod tombstone;
+@@ -360,6 +361,15 @@ impl RedbStorageEngine {
+     /// 6. Opens vector files for all existing namespaces.
+     /// 7. Runs startup validation (rebuilds phase index, cleans orphans).
+     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
++        Self::open_mode(path, false)
++    }
++    pub(crate) fn open_native(path: &Path) -> Result<Self, StorageError> {
++        if !path.is_dir() {
++            return Err(StorageError::InvalidPath);
++        }
++        Self::open_mode(path, true)
++    }
++    fn open_mode(path: impl AsRef<Path>, native: bool) -> Result<Self, StorageError> {
+         let ownership =
+             crate::storage::ownership::StoreOwnership::acquire_recovering(path.as_ref())?;
+         let db_path = ownership.path.clone();
+@@ -377,11 +387,19 @@ impl RedbStorageEngine {
+             for name in ["meta.db", "edges.db", "fulltext.dat"] {
+                 crate::storage::validation::require_file(&db_path.join(name))?;
+             }
+-            crate::storage::validation::preflight_text(&db_path)?;
++            if native {
++                crate::storage::validation::preflight_native(&db_path)?;
++            } else {
++                crate::storage::validation::preflight_text(&db_path)?;
++            }
+         }
+ 
+         // Step 2: Open meta.db.
+-        let meta_store = MetadataStore::open(&db_path.join("meta.db"))?;
++        let meta_store = if native {
++            MetadataStore::open_native_lifecycle(&db_path.join("meta.db"))?
++        } else {
++            MetadataStore::open(&db_path.join("meta.db"))?
++        };
+ 
+         // Step 3: Open edges.db.
+         let edge_store = EdgeStore::open(&db_path.join("edges.db"))?;
+diff --git a/src/storage/engine/native_records.rs b/src/storage/engine/native_records.rs
+new file mode 100644
+index 0000000..710d8aa
+--- /dev/null
++++ b/src/storage/engine/native_records.rs
+@@ -0,0 +1,147 @@
++use super::*;
++use crate::embedding::runtime::GeneratedEmbedding;
++use crate::storage::native_lifecycle::NativePolicyInputs;
++use crate::storage::native_records::{NativeInsertIntent, NativeTombstoneIntent, hash_bytes};
++use crate::storage::work::WorkTicket;
++use crate::time::Clock;
++
++impl RedbStorageEngine {
++    fn native_text_hash(&self, id: MemoryId) -> Result<Option<[u8; 32]>, StorageError> {
++        let record = self
++            .meta_store
++            .get(id)?
++            .ok_or(StorageError::NotFound(id.into_inner()))?;
++        if record.text_length == 0 {
++            return Ok(None);
++        }
++        let text = self.text_store.read(TextRef {
++            file_offset: record.text_offset,
++            length: record.text_length,
++        })?;
++        Ok(Some(hash_bytes(text.as_bytes())))
++    }
++    pub(crate) fn insert_native_record(
++        &mut self,
++        ctx: &MutationContext,
++        intent: &NativeInsertIntent,
++        generated: &GeneratedEmbedding,
++        policy: &NativePolicyInputs,
++        clock: &dyn Clock,
++        parent: Option<&WorkTicket>,
++    ) -> Result<WriteReceipt, StorageError> {
++        // Replay before current row/policy/provider output, then repeat inside
++        // the actual final transaction. A miss here reserves nothing.
++        if let Some(receipt) =
++            self.meta_store
++                .lookup_native_insert(ctx, &intent.original, parent)?
++        {
++            return Ok(receipt);
++        }
++        let guard = self.meta_store.native_guard_with_work(parent)?;
++        let edges = self.edge_store.load_all_edges()?;
++        let mut hashes = std::collections::HashMap::new();
++        for (id, _) in &intent.capture.records {
++            hashes.insert(*id, self.native_text_hash(*id)?);
++        }
++        let embedding = intent
++            .original
++            .memory
++            .embedding
++            .as_deref()
++            .unwrap_or(&generated.values);
++        let profile = intent
++            .original
++            .embedding_profile
++            .as_ref()
++            .or(generated.profile.as_ref())
++            .ok_or_else(|| {
++                StorageError::InvalidMutation("native embedding profile missing".into())
++            })?;
++        let vectors = &mut self.vector_manager;
++        let text = &mut self.text_store;
++        let mut staged = false;
++        let result = self.meta_store.insert_native_with_effects(
++            &guard,
++            ctx,
++            intent,
++            policy,
++            clock,
++            embedding,
++            profile,
++            &edges,
++            &hashes,
++            |namespace, record, normalized| {
++                let store = vectors
++                    .get_mut(namespace.id)
++                    .ok_or(StorageError::NamespaceNotFound(namespace.id.get()))?;
++                staged = true;
++                record.vector_slot = store.insert_vector(normalized)?;
++                if let Some(value) = &intent.original.memory.full_text {
++                    let reference = text.append(value)?;
++                    record.text_offset = reference.file_offset;
++                    record.text_length = reference.length;
++                }
++                store.sync()?;
++                text.sync_data()?;
++                crate::storage::metadata::effects::crash_point("after_insert_payload_sync");
++                Ok(())
++            },
++        );
++        if result.is_err() && staged {
++            self.meta_store.mark_unavailable();
++        }
++        let receipt = result?;
++        if !receipt.replayed {
++            effects::apply_pending(
++                &self.meta_store,
++                &guard,
++                &self.edge_store,
++                Some(&mut self.vector_manager),
++            )
++            .map_err(|source| StorageError::CommittedMutation {
++                receipt: Box::new(receipt.clone()),
++                source: Box::new(source),
++            })?;
++        }
++        Ok(receipt)
++    }
++    pub(crate) fn tombstone_native_record(
++        &mut self,
++        ctx: &MutationContext,
++        intent: &NativeTombstoneIntent,
++        policy: &NativePolicyInputs,
++        clock: &dyn Clock,
++        parent: Option<&WorkTicket>,
++    ) -> Result<WriteReceipt, StorageError> {
++        let guard = self.meta_store.native_guard_with_work(parent)?;
++        if let Some(receipt) = self
++            .meta_store
++            .lookup_native_tombstone(&guard, ctx, intent)?
++        {
++            return Ok(receipt);
++        }
++        let text_hash = self.native_text_hash(intent.memory_id)?;
++        let receipt = self.meta_store.tombstone_native_with_effects(
++            &guard,
++            ctx,
++            intent,
++            policy,
++            clock,
++            &self.edge_store.load_all_edges()?,
++            text_hash,
++        )?;
++        if !receipt.replayed {
++            effects::apply_pending(
++                &self.meta_store,
++                &guard,
++                &self.edge_store,
++                Some(&mut self.vector_manager),
++            )
++            .map_err(|source| StorageError::CommittedMutation {
++                receipt: Box::new(receipt.clone()),
++                source: Box::new(source),
++            })?;
++        }
++        Ok(receipt)
++    }
++}
+diff --git a/src/storage/lifecycle_migration.rs b/src/storage/lifecycle_migration.rs
+index 0543a1f..766d537 100644
+--- a/src/storage/lifecycle_migration.rs
++++ b/src/storage/lifecycle_migration.rs
+@@ -83,7 +83,7 @@ fn invalid(message: &str) -> StorageError {
+     StorageError::InvalidControl(message.into())
+ }
+ fn token_digest(records: &[DiskRecord], rewind: u64) -> Result<String, StorageError> {
+-    let mut tokens = records
++    let tokens = records
+         .iter()
+         .map(|r| {
+             let token = r
+@@ -98,17 +98,21 @@ fn token_digest(records: &[DiskRecord], rewind: u64) -> Result<String, StorageEr
+             Ok((r.id, token))
+         })
+         .collect::<Result<Vec<_>, StorageError>>()?;
++    Ok(token_digest_values(tokens))
++}
++fn token_digest_values(values: impl IntoIterator<Item = ([u8; 16], u64)>) -> String {
++    let mut tokens = values.into_iter().collect::<Vec<_>>();
+     tokens.sort_unstable();
+     let mut digest = Sha256::new();
+     for (id, token) in tokens {
+         digest.update(id);
+         digest.update(token.to_be_bytes());
+     }
+-    Ok(digest
++    digest
+         .finalize()
+         .iter()
+         .map(|b| format!("{b:02x}"))
+-        .collect())
++        .collect()
+ }
+ 
+ /// Recognized in-place lifecycle operations and explicit policy migrations are
+@@ -179,7 +183,22 @@ pub(crate) fn validate_policy_history(
+             MutationOutcome::LifecycleExposureRecorded { transition: t }
+             | MutationOutcome::LifecycleFeedbackApplied { transition: t } => {
+                 // validate_receipt already verifies the exact numeric transition.
+-                native_history.push((receipt.clone(), t.clone()));
++                native_history.push((
++                    receipt.clone(),
++                    t.namespace_id,
++                    t.lifecycle_version,
++                    t.policy_revision,
++                ));
++                Some(t.namespace_id)
++            }
++            MutationOutcome::NativeMemoryInserted { transition: t }
++            | MutationOutcome::NativeMemoryTombstoned { transition: t } => {
++                native_history.push((
++                    receipt.clone(),
++                    t.namespace_id,
++                    t.lifecycle_version,
++                    t.policy_revision,
++                ));
+                 Some(t.namespace_id)
+             }
+             _ if active => return Err(invalid("unrecognized operation after schema publication")),
+@@ -217,25 +236,25 @@ pub(crate) fn validate_policy_history(
+     }
+     // Retained historical native operations still require an explicit policy
+     // selection. Their record sets need not survive a deletion-aware restore.
+-    for (receipt, t) in native_history {
+-        let version = if t.policy_revision == Generation::default() {
++    for (receipt, namespace_id, lifecycle_version, policy_revision) in native_history {
++        let version = if policy_revision == Generation::default() {
+             LifecycleVersion::LegacyAccessV1
+         } else {
+             policies
+-                .get(&t.namespace_id.get())
+-                .and_then(|h| h.get(&t.policy_revision))
++                .get(&namespace_id.get())
++                .and_then(|h| h.get(&policy_revision))
+                 .map(|(_, p)| p.to)
+                 .ok_or_else(|| invalid("native receipt lacks policy history"))?
+         };
+-        if version != t.lifecycle_version {
++        if version != lifecycle_version {
+             return Err(invalid("native receipt policy version mismatch"));
+         }
+-        if let Some(history) = policies.get(&t.namespace_id.get()) {
++        if let Some(history) = policies.get(&namespace_id.get()) {
+             for (revision, (policy_receipt, _)) in history {
+                 // Only compare generations from the same origin. Ancestry
+                 // bounds establish the retained foreign-origin proof instead.
+                 if policy_receipt.store_id == receipt.store_id
+-                    && ((*revision <= t.policy_revision)
++                    && ((*revision <= policy_revision)
+                         != (policy_receipt.committed_generation < receipt.committed_generation))
+                 {
+                     return Err(invalid(
+@@ -245,11 +264,33 @@ pub(crate) fn validate_policy_history(
+             }
+         }
+     }
+-    let mut records: HashMap<u32, Vec<DiskRecord>> = HashMap::new();
++    let configs = read
++        .open_table(NAMESPACE_TABLE)?
++        .iter()?
++        .map(|row| {
++            let (_, value) = row?;
++            let ns = NamespaceConfig::decode(value.value())?;
++            Ok((ns.id.get(), ns))
++        })
++        .collect::<Result<HashMap<_, _>, StorageError>>()?;
++    let creations = super::native_records::creation_proofs(read)?;
++    let ledger = super::metadata::removal_ledger::read_export(read, Some(control))?;
++    let mut records: HashMap<u32, Vec<super::native_records::ProofRecord>> = HashMap::new();
+     for row in read.open_table(META_TABLE)?.iter()? {
+         let (_, v) = row?;
+         let r = DiskRecord::from_bytes(v.value())?;
+-        records.entry(r.namespace_id).or_default().push(r);
++        let ns = configs
++            .get(&r.namespace_id)
++            .ok_or_else(|| invalid("record namespace missing"))?;
++        let creation = creations.get(&MemoryId::from_bytes(r.id));
++        super::native_records::validate_retained_creation(&r, ns, creation, ledger.as_ref())?;
++        let text_hash = creation
++            .map(|c| c.primary().map(|p| p.after.content.text_sha256))
++            .transpose()?
++            .flatten();
++        records.entry(r.namespace_id).or_default().push(
++            super::native_records::ProofRecord::capture(&r, ns, text_hash)?,
++        );
+     }
+     let mut current_policy = HashMap::new();
+     for row in read.open_table(NAMESPACE_TABLE)?.iter()? {
+@@ -283,11 +324,7 @@ pub(crate) fn validate_policy_history(
+             return Err(invalid("namespace policy lacks transition evidence"));
+         }
+         for record in records.entry(ns.id.get()).or_default().iter() {
+-            let t = &record
+-                .schema
+-                .as_ref()
+-                .ok_or_else(|| invalid("record lacks lifecycle schema"))?
+-                .lifecycle;
++            let t = &record.state.lifecycle.lifecycle;
+             if t.policy_revision != revision || t.lifecycle_version != version {
+                 return Err(invalid("record policy does not match migration"));
+             }
+@@ -308,12 +345,18 @@ pub(crate) fn validate_policy_history(
+                 let rows = records.get_mut(&t.namespace_id.get()).unwrap();
+                 if *policy != (t.to, t.next_revision)
+                     || t.record_count != rows.len() as u64
+-                    || t.record_token_digest != token_digest(rows, 0)?
++                    || t.record_token_digest
++                        != token_digest_values(rows.iter().map(|r| {
++                            (
++                                *r.id.as_bytes(),
++                                r.state.lifecycle.lifecycle.record_generation.get(),
++                            )
++                        }))
+                 {
+                     return Err(invalid("lifecycle affected-record proof mismatch"));
+                 }
+                 for r in rows {
+-                    let fields = &mut r.schema.as_mut().unwrap().lifecycle;
++                    let fields = &mut r.state.lifecycle.lifecycle;
+                     fields.record_generation = Generation::try_from(
+                         fields
+                             .record_generation
+@@ -340,6 +383,19 @@ pub(crate) fn validate_policy_history(
+                         .ok_or_else(|| invalid("native receipt namespace absent"))?,
+                 )?;
+             }
++            MutationOutcome::NativeMemoryInserted { transition: t }
++            | MutationOutcome::NativeMemoryTombstoned { transition: t } => {
++                if current_policy.get(&t.namespace_id.get())
++                    != Some(&(t.lifecycle_version, t.policy_revision))
++                {
++                    return Err(invalid("native record receipt is out of policy order"));
++                }
++                t.rewind(
++                    records
++                        .get_mut(&t.namespace_id.get())
++                        .ok_or_else(|| invalid("native record namespace absent"))?,
++                )?;
++            }
+             _ => return Err(invalid("unrecognized operation in lifecycle proof")),
+         }
+     }
+@@ -353,9 +409,10 @@ pub(crate) fn validate_policy_history(
+         ));
+     }
+     if schema.source.store_id == control.store_id
+-        && records.values().flatten().any(|r| {
+-            r.schema.as_ref().unwrap().lifecycle.record_generation != Generation::default()
+-        })
++        && records
++            .values()
++            .flatten()
++            .any(|r| r.state.lifecycle.lifecycle.record_generation != Generation::default())
+     {
+         return Err(invalid("unproven record token before lifecycle suffix"));
+     }
+diff --git a/src/storage/metadata.rs b/src/storage/metadata.rs
+index 7a5ef1a..b76e8f1 100644
+--- a/src/storage/metadata.rs
++++ b/src/storage/metadata.rs
+@@ -13,6 +13,7 @@ mod insertion;
+ mod lifecycle_updates;
+ pub(crate) mod namespace_state;
+ mod native_lifecycle;
++mod native_records;
+ pub(crate) mod purge;
+ pub(crate) mod removal_ledger;
+ pub(crate) mod restoration;
+diff --git a/src/storage/metadata/effects.rs b/src/storage/metadata/effects.rs
+index 9bbfb73..fc99dfc 100644
+--- a/src/storage/metadata/effects.rs
++++ b/src/storage/metadata/effects.rs
+@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
+ 
+ #[cfg(test)]
+ thread_local! {
++    pub(crate) static FAIL_BEFORE_RECORD_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+     pub(crate) static FAIL_AFTER_RECORD_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+ }
+ 
+@@ -16,6 +17,15 @@ pub(super) enum RecordMutation<'a> {
+     GraphOnly,
+     PurgeChunk(&'a crate::storage::purge::PurgeProgress),
+     Inserted(&'a DiskRecord, u32),
++    NativeInserted(
++        &'a DiskRecord,
++        crate::storage::native_records::NativeRecordWrite,
++    ),
++    NativeTombstoned {
++        record: &'a DiskRecord,
++        old_phase: DecayPhase,
++        transition: crate::storage::native_records::NativeRecordWrite,
++    },
+     Tombstoned {
+         record: &'a DiskRecord,
+         old_phase: DecayPhase,
+@@ -89,6 +99,8 @@ pub(crate) fn validate_existing(
+                     MutationOutcome::GraphChanged { .. }
+                         | MutationOutcome::MemoryInserted { .. }
+                         | MutationOutcome::MemoryTombstoned { .. }
++                        | MutationOutcome::NativeMemoryInserted { .. }
++                        | MutationOutcome::NativeMemoryTombstoned { .. }
+                         | MutationOutcome::NamespacePurgeStarted { .. }
+                         | MutationOutcome::NamespacePurgeAdvanced { .. }
+                 ) {
+@@ -146,7 +158,16 @@ pub(crate) fn validate_existing(
+                 "effects receipt mismatch".into(),
+             ));
+         }
++        match &effect.receipt.outcome {
++            MutationOutcome::NativeMemoryInserted { .. } => validate_native_effect(&effect, true)?,
++            MutationOutcome::NativeMemoryTombstoned { .. } => {
++                validate_native_effect(&effect, false)?
++            }
++            _ => {}
++        }
+         match effect.receipt.outcome {
++            MutationOutcome::NativeMemoryInserted { .. }
++            | MutationOutcome::NativeMemoryTombstoned { .. } => {}
+             MutationOutcome::MemoryTombstoned { memory_id, status }
+                 if matches!(effect.scope, MutationScope::Namespace(_))
+                     && effect.puts.is_empty()
+@@ -203,11 +224,9 @@ pub(crate) fn validate_existing(
+                 ));
+             }
+         }
+-        if effect
+-            .releases
+-            .iter()
+-            .any(|r| !effect.removed_ids.contains(&r.memory_id) && !matches!(effect.receipt.outcome, MutationOutcome::MemoryTombstoned { memory_id, .. } if memory_id == r.memory_id))
+-        {
++        if effect.releases.iter().any(|r| {
++            !effect.removed_ids.contains(&r.memory_id) && !terminal_effect(&effect, r.memory_id)
++        }) {
+             return Err(StorageError::InvalidControl(
+                 "release without removed owner".into(),
+             ));
+@@ -323,7 +342,7 @@ impl MetadataStore {
+         incident_ids: &[MemoryId],
+         delete_records: bool,
+         release_vectors: bool,
+-        mutation: RecordMutation<'_>,
++        mut mutation: RecordMutation<'_>,
+     ) -> Result<EffectResult, StorageError> {
+         _guard.check(self)?;
+         let MutationScope::Namespace(namespace) = ctx.scope else {
+@@ -343,12 +362,19 @@ impl MetadataStore {
+         let mut releases = Vec::new();
+         let mut invalidated: std::collections::HashSet<_> = incident_ids.iter().copied().collect();
+         match &mutation {
+-            RecordMutation::Inserted(record, _) | RecordMutation::Tombstoned { record, .. } => {
++            RecordMutation::Inserted(record, _)
++            | RecordMutation::Tombstoned { record, .. }
++            | RecordMutation::NativeInserted(record, _)
++            | RecordMutation::NativeTombstoned { record, .. } => {
+                 invalidated.insert(MemoryId::from_bytes(record.id));
+             }
+             RecordMutation::GraphOnly | RecordMutation::PurgeChunk(_) => {}
+         }
+-        if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
++        if let RecordMutation::Tombstoned { record, old_phase }
++        | RecordMutation::NativeTombstoned {
++            record, old_phase, ..
++        } = &mutation
++        {
+             if *old_phase != DecayPhase::Tombstone {
+                 releases.push(VectorRelease {
+                     namespace_id: namespace,
+@@ -484,6 +510,37 @@ impl MetadataStore {
+                             "outgoing edge count exceeds record capacity".into(),
+                         )
+                     })?;
++                if let RecordMutation::NativeInserted(_, proof) = &mut mutation {
++                    let change = proof
++                        .records
++                        .iter_mut()
++                        .find(|r| r.memory_id == id)
++                        .ok_or_else(|| {
++                            StorageError::InvalidControl("native edge source proof missing".into())
++                        })?;
++                    if let Some(before) = &change.before {
++                        if before.lifecycle
++                            != crate::storage::native_lifecycle::LifecycleState::capture(&record)?
++                            || before.edge_count != record.edge_count
++                        {
++                            return Err(StorageError::InvalidControl(
++                                "native peer changed within transaction".into(),
++                            ));
++                        }
++                        record
++                            .schema
++                            .as_mut()
++                            .ok_or_else(|| {
++                                StorageError::InvalidControl("native peer schema missing".into())
++                            })?
++                            .lifecycle
++                            .record_generation =
++                            before.lifecycle.lifecycle.record_generation.next()?;
++                        change.after.lifecycle.lifecycle.record_generation =
++                            record.schema.as_ref().unwrap().lifecycle.record_generation;
++                    }
++                    change.after.edge_count = count;
++                }
+                 record.edge_count = count;
+                 records.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
+                 peer_counts.push((id, count));
+@@ -493,7 +550,23 @@ impl MetadataStore {
+         peer_counts.sort_by_key(|(id, _)| *id);
+         let mut invalidated_ids: Vec<_> = invalidated.into_iter().collect();
+         invalidated_ids.sort();
++        if let RecordMutation::NativeInserted(_, proof) = &mut mutation {
++            proof.edges = actual_puts
++                .iter()
++                .map(crate::storage::native_records::NativeEdgeProof::from)
++                .collect();
++        }
+         let outcome = match &mutation {
++            RecordMutation::NativeInserted(_, transition) => {
++                MutationOutcome::NativeMemoryInserted {
++                    transition: transition.clone(),
++                }
++            }
++            RecordMutation::NativeTombstoned { transition, .. } => {
++                MutationOutcome::NativeMemoryTombstoned {
++                    transition: transition.clone(),
++                }
++            }
+             RecordMutation::Inserted(record, embedding_dim) => MutationOutcome::MemoryInserted {
+                 memory_id: MemoryId::from_bytes(record.id),
+                 created_at: record.created_at,
+@@ -528,7 +601,11 @@ impl MetadataStore {
+         } else {
+             control::record_receipt(&tx, ctx, hash, outcome)?
+         };
+-        if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
++        if let RecordMutation::Tombstoned { record, old_phase }
++        | RecordMutation::NativeTombstoned {
++            record, old_phase, ..
++        } = &mutation
++        {
+             if *old_phase != DecayPhase::Tombstone {
+                 super::removal_ledger::record_removal(
+                     &tx,
+@@ -544,6 +621,15 @@ impl MetadataStore {
+                 )?;
+             }
+         }
++        match &receipt.outcome {
++            MutationOutcome::NativeMemoryInserted { transition } => {
++                transition.validate(&receipt, true)?
++            }
++            MutationOutcome::NativeMemoryTombstoned { transition } => {
++                transition.validate(&receipt, false)?
++            }
++            _ => {}
++        }
+         // Removal evidence and effect receipt share this canonical transaction.
+         for (id, record) in &removed {
+             super::removal_ledger::record_removal(
+@@ -575,6 +661,12 @@ impl MetadataStore {
+             receipt.operation_id.as_bytes().as_slice(),
+             control::encode(&pending)?.as_slice(),
+         )?;
++        #[cfg(test)]
++        if FAIL_BEFORE_RECORD_COMMIT.with(|flag| flag.replace(false)) {
++            return Err(StorageError::InvalidMutation(
++                "injected precommit abandonment".into(),
++            ));
++        }
+         crash_point("before_metadata_commit");
+         // Publish dirty before advancing the epoch. Admission samples the
+         // epoch twice; it cannot accept a new stamp with an old clean flag.
+@@ -608,7 +700,9 @@ impl MetadataStore {
+         })?;
+         crash_point("after_metadata_commit");
+         let mut phases = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+-        if let RecordMutation::Inserted(record, _) = &mutation {
++        if let RecordMutation::Inserted(record, _) | RecordMutation::NativeInserted(record, _) =
++            &mutation
++        {
+             phases.transition(
+                 record.namespace_id,
+                 record.vector_slot,
+@@ -616,7 +710,11 @@ impl MetadataStore {
+                 record.phase,
+             );
+         }
+-        if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
++        if let RecordMutation::Tombstoned { record, old_phase }
++        | RecordMutation::NativeTombstoned {
++            record, old_phase, ..
++        } = &mutation
++        {
+             if *old_phase != DecayPhase::Tombstone {
+                 phases.remove(record.namespace_id, record.vector_slot, *old_phase);
+             }
+@@ -648,7 +746,10 @@ impl MetadataStore {
+             completed.receipt.operation_id.as_bytes().as_slice(),
+             control::encode(&completed)?.as_slice(),
+         )?;
+-        self.commit(tx)?;
++        tx.commit().map_err(|error| {
++            self.mark_unavailable();
++            StorageError::RedbCommit(error)
++        })?;
+         Ok(())
+     }
+ 
+@@ -709,6 +810,24 @@ pub(crate) fn validate_plan(
+             "removed effect ID still exists".into(),
+         ));
+     }
++    if let Some(proof) = native_proof(effect) {
++        for change in &proof.records {
++            let record = records
++                .iter()
++                .find(|(id, _)| *id == change.memory_id)
++                .map(|(_, r)| r)
++                .ok_or_else(|| {
++                    StorageError::InvalidControl("native pending record missing".into())
++                })?;
++            if record.namespace_id != proof.namespace_id.get()
++                || !change.after.matches_record(record)?
++            {
++                return Err(StorageError::InvalidControl(
++                    "native pending proof differs from canonical record".into(),
++                ));
++            }
++        }
++    }
+     if let MutationOutcome::MemoryInserted {
+         memory_id,
+         created_at,
+@@ -752,9 +871,7 @@ pub(crate) fn validate_plan(
+     }
+     for release in &effect.releases {
+         if records.iter().any(|(id, r)| {
+-            (*id == release.memory_id
+-                && !matches!(effect.receipt.outcome,
+-                MutationOutcome::MemoryTombstoned { memory_id, .. } if memory_id == *id))
++            (*id == release.memory_id && !terminal_effect(effect, *id))
+                 || (r.phase != DecayPhase::Tombstone
+                     && r.namespace_id == release.namespace_id.get()
+                     && r.vector_slot == release.slot)
+@@ -794,3 +911,73 @@ pub(crate) fn validate_plan(
+     }
+     Ok(())
+ }
++
++fn native_proof(
++    effect: &PendingEffects,
++) -> Option<&crate::storage::native_records::NativeRecordWrite> {
++    match &effect.receipt.outcome {
++        MutationOutcome::NativeMemoryInserted { transition }
++        | MutationOutcome::NativeMemoryTombstoned { transition } => Some(transition),
++        _ => None,
++    }
++}
++fn terminal_effect(effect: &PendingEffects, id: MemoryId) -> bool {
++    matches!(effect.receipt.outcome,MutationOutcome::MemoryTombstoned {memory_id,..} if memory_id==id)
++        || matches!(&effect.receipt.outcome,MutationOutcome::NativeMemoryTombstoned {transition} if transition.memory_id==id)
++}
++fn validate_native_effect(effect: &PendingEffects, insertion: bool) -> Result<(), StorageError> {
++    use crate::storage::native_records::NativeEdgeProof;
++    let p = native_proof(effect).unwrap();
++    p.validate(&effect.receipt, insertion)?;
++    let mut invalidated = vec![p.memory_id];
++    for e in &effect.puts {
++        invalidated.extend([e.source, e.target]);
++    }
++    invalidated.sort();
++    invalidated.dedup();
++    let mut peers = effect.puts.iter().map(|e| e.source).collect::<Vec<_>>();
++    peers.sort();
++    peers.dedup();
++    let expected_peers = peers
++        .into_iter()
++        .map(|id| {
++            p.records
++                .iter()
++                .find(|r| r.memory_id == id)
++                .map(|r| (id, r.after.edge_count))
++        })
++        .collect::<Option<Vec<_>>>()
++        .ok_or_else(|| StorageError::InvalidControl("native effect peer proof missing".into()))?;
++    let before = p.primary()?.before.as_ref();
++    let release = if insertion {
++        None
++    } else {
++        before
++            .filter(|b| b.lifecycle.phase != DecayPhase::Tombstone)
++            .and_then(|b| b.content.vector.as_ref())
++            .map(|v| v.slot)
++    };
++    if effect.scope != MutationScope::Namespace(p.namespace_id)
++        || !effect.removed_ids.is_empty()
++        || !effect.deletes.is_empty()
++        || effect
++            .puts
++            .iter()
++            .map(NativeEdgeProof::from)
++            .collect::<Vec<_>>()
++            != p.edges
++        || effect.peer_counts != expected_peers
++        || effect.invalidated_ids != invalidated
++        || effect.releases.len() != usize::from(release.is_some())
++        || effect.releases.iter().any(|r| {
++            Some(r.slot) != release
++                || r.memory_id != p.memory_id
++                || r.namespace_id != p.namespace_id
++        })
++    {
++        return Err(StorageError::InvalidControl(
++            "native effect actions disagree with receipt".into(),
++        ));
++    }
++    Ok(())
++}
+diff --git a/src/storage/metadata/insertion.rs b/src/storage/metadata/insertion.rs
+index f21fc34..c3ac5e4 100644
+--- a/src/storage/metadata/insertion.rs
++++ b/src/storage/metadata/insertion.rs
+@@ -118,6 +118,12 @@ mod profile_boundary_tests {
+ }
+ 
+ impl MetadataStore {
++    /// Shared owned-core allocation point for legacy/native receipt writers.
++    /// Still nondeterministic until the real scoped ID/RNG prerequisite lands.
++    pub(super) fn allocate_memory_id(&self, supplied: Option<MemoryId>) -> MemoryId {
++        supplied.unwrap_or_else(MemoryId::new)
++    }
++
+     pub(crate) fn lookup_insert_replay(
+         &self,
+         ctx: &MutationContext,
+@@ -220,7 +226,7 @@ impl MetadataStore {
+             config.embedding_dim,
+             input.embedding.is_some(),
+         )?;
+-        let id = input.id.unwrap_or_else(MemoryId::new);
++        let id = self.allocate_memory_id(input.id);
+         if id == MemoryId::nil() {
+             return Err(StorageError::InvalidMutation("nil memory ID".into()));
+         }
+@@ -232,28 +238,7 @@ impl MetadataStore {
+         {
+             return Err(StorageError::DuplicateId(id.into_inner()));
+         }
+-        // Validate explicit targets and branches before staging. The common
+-        // effect tail repeats endpoint checks inside this same transaction.
+-        for target in [input.parent_id, input.supersedes].into_iter().flatten() {
+-            if target == id {
+-                return Err(StorageError::InvalidMutation("self link".into()));
+-            }
+-            let row = tx.open_table(META_TABLE)?;
+-            let value = row
+-                .get(target.as_bytes().as_slice())?
+-                .ok_or(StorageError::NotFound(target.into_inner()))?;
+-            let record = DiskRecord::from_bytes(value.value())?;
+-            if record.id != *target.as_bytes() || record.namespace_id != namespace.get() {
+-                return Err(StorageError::MutationNamespaceMismatch);
+-            }
+-        }
+-        if input.supersedes.is_some_and(|target| {
+-            existing_edges
+-                .iter()
+-                .any(|edge| edge.edge_type == EdgeType::Supersedes && edge.target == target)
+-        }) {
+-            return Err(StorageError::EdgeConflict("supersedes branch".into()));
+-        }
++        validate_insert_targets(&tx, input, namespace, id, existing_edges)?;
+         let mut record = DiskRecord {
+             schema: None,
+             version: 1,
+@@ -275,32 +260,15 @@ impl MetadataStore {
+             text_offset: 0,
+             text_length: 0,
+         };
+-        record.encode()?;
+-        stage(&config, &mut record, &normalized)?;
+-        tx.open_table(META_TABLE)?
+-            .insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
+-        for tag in &record.tags {
+-            tx.open_multimap_table(TAG_INDEX)?
+-                .insert(tag.as_str(), id.as_bytes().as_slice())?;
+-        }
+-        tx.open_multimap_table(NAMESPACE_INDEX)?
+-            .insert(namespace.get(), id.as_bytes().as_slice())?;
+-        let mut puts = Vec::new();
+-        for (source, target, edge_type) in input
+-            .parent_id
+-            .map(|parent| (parent, id, EdgeType::ParentChild))
+-            .into_iter()
+-            .chain(input.supersedes.map(|old| (id, old, EdgeType::Supersedes)))
+-        {
+-            puts.push(PersistedEdge {
+-                source,
+-                target,
+-                edge_type,
+-                weight: 1.0,
+-                auto_created: false,
+-                created_at: sampled_at.max(0) as u64,
+-            });
+-        }
++        let puts = stage_insert(
++            &tx,
++            input,
++            &config,
++            &mut record,
++            &normalized,
++            sampled_at,
++            stage,
++        )?;
+         self.finish_record_effects(
+             guard,
+             tx,
+@@ -388,3 +356,77 @@ mod schema_tests {
+         assert!(store.scan_all().unwrap().is_empty());
+     }
+ }
++
++pub(super) fn validate_insert_targets(
++    tx: &redb::WriteTransaction,
++    input: &InsertMemory,
++    namespace: NamespaceId,
++    id: MemoryId,
++    existing_edges: &[PersistedEdge],
++) -> Result<(), StorageError> {
++    // Validate explicit targets and branches before staging. The common
++    // effect tail repeats endpoint checks inside this same transaction.
++    for target in [input.parent_id, input.supersedes].into_iter().flatten() {
++        if target == id {
++            return Err(StorageError::InvalidMutation("self link".into()));
++        }
++        let row = tx.open_table(META_TABLE)?;
++        let value = row
++            .get(target.as_bytes().as_slice())?
++            .ok_or(StorageError::NotFound(target.into_inner()))?;
++        let record = DiskRecord::from_bytes(value.value())?;
++        if record.id != *target.as_bytes() || record.namespace_id != namespace.get() {
++            return Err(StorageError::MutationNamespaceMismatch);
++        }
++    }
++    if input.supersedes.is_some_and(|target| {
++        existing_edges
++            .iter()
++            .any(|edge| edge.edge_type == EdgeType::Supersedes && edge.target == target)
++    }) {
++        return Err(StorageError::EdgeConflict("supersedes branch".into()));
++    }
++    Ok(())
++}
++pub(super) fn stage_insert(
++    tx: &redb::WriteTransaction,
++    input: &InsertMemory,
++    config: &NamespaceConfig,
++    record: &mut DiskRecord,
++    normalized: &[f32],
++    sampled_at: i64,
++    stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord, &[f32]) -> Result<(), StorageError>,
++) -> Result<Vec<PersistedEdge>, StorageError> {
++    let id = MemoryId::from_bytes(record.id);
++    let namespace = config.id;
++    record.encode()?;
++    stage(config, record, normalized)?;
++    if let Some(reference) = record.schema.as_mut().and_then(|s| s.vector.as_mut()) {
++        reference.slot = record.vector_slot;
++    }
++    tx.open_table(META_TABLE)?
++        .insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
++    for tag in &record.tags {
++        tx.open_multimap_table(TAG_INDEX)?
++            .insert(tag.as_str(), id.as_bytes().as_slice())?;
++    }
++    tx.open_multimap_table(NAMESPACE_INDEX)?
++        .insert(namespace.get(), id.as_bytes().as_slice())?;
++    let mut puts = Vec::new();
++    for (source, target, edge_type) in input
++        .parent_id
++        .map(|parent| (parent, id, EdgeType::ParentChild))
++        .into_iter()
++        .chain(input.supersedes.map(|old| (id, old, EdgeType::Supersedes)))
++    {
++        puts.push(PersistedEdge {
++            source,
++            target,
++            edge_type,
++            weight: 1.0,
++            auto_created: false,
++            created_at: sampled_at.max(0) as u64,
++        });
++    }
++    Ok(puts)
++}
+diff --git a/src/storage/metadata/native_lifecycle.rs b/src/storage/metadata/native_lifecycle.rs
+index e035f4c..645b489 100644
+--- a/src/storage/metadata/native_lifecycle.rs
++++ b/src/storage/metadata/native_lifecycle.rs
+@@ -90,13 +90,19 @@ impl MetadataStore {
+         crate::storage::lineage::ensure_serving(read, &state)?;
+         Ok(state)
+     }
+-    fn native_guard(&self) -> Result<MutationGuard<'_>, StorageError> {
++    pub(super) fn native_guard(&self) -> Result<MutationGuard<'_>, StorageError> {
+         if !self.native_lifecycle_only {
+             return Err(StorageError::RecoveryRequired(
+                 "explicit native lifecycle entry required".into(),
+             ));
+         }
+-        let guard = self.publication_guard(None)?;
++        self.native_guard_with_work(None)
++    }
++    pub(crate) fn native_guard_with_work(
++        &self,
++        parent: Option<&WorkTicket>,
++    ) -> Result<MutationGuard<'_>, StorageError> {
++        let guard = self.publication_guard(parent)?;
+         self.ensure_available()?;
+         let read = self.db.begin_read()?;
+         self.native_control_at(&read)?;
+@@ -132,7 +138,7 @@ impl MetadataStore {
+                 ids.push(id);
+             }
+         }
+-        let capture = self.capture_at(read, &scope, &ids, policy)?;
++        let capture = self.capture_at(read, &scope, &ids, policy, true)?;
+         Ok(ExposureIntent {
+             scope,
+             original,
+@@ -180,7 +186,7 @@ impl MetadataStore {
+             namespace_name: cfg.name,
+             source: None,
+         };
+-        let capture = self.capture_at(&read, &scope, &[id], policy)?;
++        let capture = self.capture_at(&read, &scope, &[id], policy, true)?;
+         Ok(FeedbackIntent {
+             scope,
+             id,
+@@ -188,12 +194,13 @@ impl MetadataStore {
+             capture,
+         })
+     }
+-    fn capture_at(
++    pub(super) fn capture_at(
+         &self,
+         read: &redb::ReadTransaction,
+         scope: &LifecycleScope,
+         ids: &[MemoryId],
+         policy: &NativePolicyInputs,
++        live_only: bool,
+     ) -> Result<CapturedLifecycle, StorageError> {
+         let state = self.native_control_at(read)?;
+         let ns = {
+@@ -222,7 +229,7 @@ impl MetadataStore {
+                 return Err(StorageError::MutationNamespaceMismatch);
+             }
+             let fields = LifecycleState::capture(&r)?;
+-            if !fields.eligible() {
++            if live_only && !fields.eligible() {
+                 return Err(StorageError::LifecycleContentUnavailable);
+             }
+             records.push((*id, fields.lifecycle.record_generation));
+@@ -235,6 +242,76 @@ impl MetadataStore {
+             records,
+         })
+     }
++    pub(super) fn check_native_capture(
++        &self,
++        tx: &redb::WriteTransaction,
++        scope: &LifecycleScope,
++        capture: &CapturedLifecycle,
++        policy: &NativePolicyInputs,
++        live_only: bool,
++    ) -> Result<
++        (
++            ControlState,
++            NamespaceConfig,
++            crate::decay::lifecycle::EffectiveLifecyclePolicy,
++            HashMap<MemoryId, DiskRecord>,
++        ),
++        StorageError,
++    > {
++        let state = control::read_control(tx)?;
++        if state.store_id != capture.generation.store_id {
++            return Err(StorageError::StoreLineageMismatch);
++        }
++        if capture.generation.generation > state.committed_generation {
++            return Err(StorageError::LifecycleConflict(
++                "capture generation is in the future".into(),
++            ));
++        }
++        let ns = namespace_state::require_namespace_active(tx, scope.namespace_id)?;
++        if ns.name != scope.namespace_name {
++            return Err(StorageError::MutationNamespaceMismatch);
++        }
++        let schema = ns
++            .schema
++            .as_ref()
++            .ok_or_else(|| invalid("native namespace schema missing"))?;
++        let resolved = policy.resolve(&ns)?;
++        if schema.lifecycle_version != capture.version
++            || schema.policy_revision != capture.revision
++            || policy_hash(&ns, &resolved)? != capture.policy_hash
++        {
++            return Err(StorageError::LifecycleConflict(
++                "namespace policy changed after capture".into(),
++            ));
++        }
++        let mut current = HashMap::new();
++        {
++            let table = tx.open_table(META_TABLE)?;
++            for (id, token) in &capture.records {
++                let value = table
++                    .get(id.as_bytes().as_slice())?
++                    .ok_or(StorageError::NotFound(id.into_inner()))?;
++                let record = DiskRecord::from_bytes(value.value())?;
++                if record.namespace_id != scope.namespace_id.get() {
++                    return Err(StorageError::MutationNamespaceMismatch);
++                }
++                let fields = LifecycleState::capture(&record)?;
++                if live_only && !fields.eligible() {
++                    return Err(StorageError::LifecycleContentUnavailable);
++                }
++                if fields.lifecycle.record_generation != *token
++                    || fields.lifecycle.lifecycle_version != capture.version
++                    || fields.lifecycle.policy_revision != capture.revision
++                {
++                    return Err(StorageError::LifecycleConflict(format!(
++                        "record {id} changed after capture"
++                    )));
++                }
++                current.insert(*id, record);
++            }
++        }
++        Ok((state, ns, resolved, current))
++    }
+     pub fn record_native_exposure(
+         &self,
+         ctx: &MutationContext,
+@@ -343,64 +420,8 @@ impl MetadataStore {
+         if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
+             return Ok((tx, Some(receipt)));
+         }
+-        let state = control::read_control(&tx)?;
+-        if state.store_id != capture.generation.store_id {
+-            return Err(StorageError::StoreLineageMismatch);
+-        }
+-        if capture.generation.generation > state.committed_generation {
+-            return Err(StorageError::LifecycleConflict(
+-                "capture generation is in the future".into(),
+-            ));
+-        }
+-        let ns = {
+-            let table = tx.open_table(NAMESPACE_TABLE)?;
+-            let value = table
+-                .get(scope.namespace_id.get())?
+-                .ok_or(StorageError::NamespaceNotFound(scope.namespace_id.get()))?;
+-            NamespaceConfig::decode(value.value())?
+-        };
+-        if ns.name != scope.namespace_name {
+-            return Err(StorageError::MutationNamespaceMismatch);
+-        }
+-        let schema = ns
+-            .schema
+-            .as_ref()
+-            .ok_or_else(|| invalid("native namespace schema missing"))?;
+-        let resolved = policy.resolve(&ns)?;
+-        if schema.lifecycle_version != capture.version
+-            || schema.policy_revision != capture.revision
+-            || policy_hash(&ns, &resolved)? != capture.policy_hash
+-        {
+-            return Err(StorageError::LifecycleConflict(
+-                "namespace policy changed after capture".into(),
+-            ));
+-        }
+-        let mut current = HashMap::new();
+-        {
+-            let table = tx.open_table(META_TABLE)?;
+-            for (id, token) in &capture.records {
+-                let value = table
+-                    .get(id.as_bytes().as_slice())?
+-                    .ok_or(StorageError::NotFound(id.into_inner()))?;
+-                let record = DiskRecord::from_bytes(value.value())?;
+-                if record.namespace_id != scope.namespace_id.get() {
+-                    return Err(StorageError::MutationNamespaceMismatch);
+-                }
+-                let fields = LifecycleState::capture(&record)?;
+-                if !fields.eligible() {
+-                    return Err(StorageError::LifecycleContentUnavailable);
+-                }
+-                if fields.lifecycle.record_generation != *token
+-                    || fields.lifecycle.lifecycle_version != capture.version
+-                    || fields.lifecycle.policy_revision != capture.revision
+-                {
+-                    return Err(StorageError::LifecycleConflict(format!(
+-                        "record {id} changed after capture"
+-                    )));
+-                }
+-                current.insert(*id, record);
+-            }
+-        }
++        let (state, _namespace, resolved, mut current) =
++            self.check_native_capture(&tx, scope, capture, policy, true)?;
+         if original.is_empty() {
+             return Ok((tx, None));
+         }
+diff --git a/src/storage/metadata/native_lifecycle/tests.rs b/src/storage/metadata/native_lifecycle/tests.rs
+index 4925f6b..a39c35f 100644
+--- a/src/storage/metadata/native_lifecycle/tests.rs
++++ b/src/storage/metadata/native_lifecycle/tests.rs
+@@ -140,7 +140,7 @@ fn ctx(d: &Data, g: GenerationRef, key: &str) -> MutationContext {
+     }
+ }
+ fn record(session: &NativeLifecycleSession, id: MemoryId) -> DiskRecord {
+-    session.metadata.get(id).unwrap().unwrap()
++    session.metadata().get(id).unwrap().unwrap()
+ }
+ fn open(d: &Data, clock: Arc<TestClock>) -> NativeLifecycleSession {
+     NativeLifecycleSession::open(&d.path, NativePolicyInputs::default(), clock).unwrap()
+@@ -153,7 +153,7 @@ fn outcome(receipt: &WriteReceipt) -> &NativeLifecycleWrite {
+     }
+ }
+ fn logical(session: &NativeLifecycleSession) -> Vec<Vec<u8>> {
+-    let read = session.metadata.db.begin_read().unwrap();
++    let read = session.metadata().db.begin_read().unwrap();
+     let mut rows = Vec::new();
+     for row in read.open_table(META_TABLE).unwrap().iter().unwrap() {
+         rows.push(row.unwrap().1.value().to_vec());
+@@ -290,7 +290,7 @@ async fn replay_precedes_stale_tokens_policy_and_clock_but_not_lineage_or_payloa
+     };
+     clock.set(i64::MAX);
+     let replay = session
+-        .metadata
++        .metadata()
+         .apply_native_feedback(&key, &intent, &wrong_policy, clock.as_ref())
+         .unwrap();
+     assert!(replay.replayed);
+@@ -302,7 +302,7 @@ async fn replay_precedes_stale_tokens_policy_and_clock_but_not_lineage_or_payloa
+     newkey.expected_generation = None;
+     assert!(matches!(
+         session
+-            .metadata
++            .metadata()
+             .apply_native_feedback(&newkey, &intent, &wrong_policy, clock.as_ref()),
+         Err(StorageError::LifecycleConflict(_))
+     ));
+@@ -341,9 +341,9 @@ async fn abandoned_real_transaction_and_invalid_inputs_leave_records_receipts_an
+     let intent = session.capture_feedback(d.a, None, 3).unwrap();
+     let key = ctx(&d, intent.capture_generation(), "abandoned");
+     {
+-        let guard = session.metadata.native_guard().unwrap();
++        let guard = session.metadata().native_guard().unwrap();
+         let (tx, receipt) = session
+-            .metadata
++            .metadata()
+             .prepare_native(
+                 &guard,
+                 &key,
+@@ -429,29 +429,29 @@ async fn native_entry_excludes_other_owners_legacy_stores_and_unparticipating_wr
+     let r = record(&session, d.a);
+     assert!(
+         session
+-            .metadata
++            .metadata()
+             .update_access(d.a, DAY, AccessKind::DirectRetrieval)
+             .is_err()
+     );
+-    assert!(session.metadata.tombstone(d.a).is_err());
+-    assert!(session.metadata.delete(d.a).is_err());
+-    assert!(session.metadata.strip_full_text(d.a).is_err());
++    assert!(session.metadata().tombstone(d.a).is_err());
++    assert!(session.metadata().delete(d.a).is_err());
++    assert!(session.metadata().strip_full_text(d.a).is_err());
+     assert!(
+         session
+-            .metadata
++            .metadata()
+             .update_decay_state(d.a, DecayPhase::Summary, 0.1, 0.1, 1., false)
+             .is_err()
+     );
+-    assert!(session.metadata.insert(MemoryId::new(), &r).is_err());
+-    assert!(session.metadata.persist_phase_index().is_err());
+-    assert!(session.metadata.rebuild_phase_index().is_err());
++    assert!(session.metadata().insert(MemoryId::new(), &r).is_err());
++    assert!(session.metadata().persist_phase_index().is_err());
++    assert!(session.metadata().rebuild_phase_index().is_err());
+     assert!(
+         session
+-            .metadata
++            .metadata()
+             .create_namespace(&NamespaceConfig::default_namespace(0))
+             .is_err()
+     );
+-    assert!(session.metadata.purge_namespace_records(d.ns, 1).is_err());
++    assert!(session.metadata().purge_namespace_records(d.ns, 1).is_err());
+     assert_eq!(logical(&session), before);
+     drop(session);
+     assert!(
+@@ -803,7 +803,7 @@ async fn native_backup_fork_preserves_receipts_applies_later_deletion_and_blocks
+         session.apply_feedback(&key, &intent),
+         Err(StorageError::StoreLineageMismatch)
+     ));
+-    let read = session.metadata.db.begin_read().unwrap();
++    let read = session.metadata().db.begin_read().unwrap();
+     let receipt_key = control::scoped_key(
+         receipt.store_id,
+         MutationScope::Namespace(d.ns),
+@@ -866,7 +866,7 @@ async fn malformed_native_proof_and_missing_suffix_fail_read_only_inspection() {
+         receipt.operation_id.as_bytes(),
+     );
+     let original = {
+-        let read = session.metadata.db.begin_read().unwrap();
++        let read = session.metadata().db.begin_read().unwrap();
+         let table = read.open_table(control::RECEIPTS).unwrap();
+         table.get(key.as_slice()).unwrap().unwrap().value().to_vec()
+     };
+@@ -1087,7 +1087,7 @@ async fn capture_rechecks_poison_after_waiting_for_publication() {
+     for feedback in [false, true] {
+         let session = open(&d, clock.clone());
+         let before = logical(&session);
+-        let guard = session.metadata.publication.write().unwrap();
++        let guard = session.metadata().publication.write().unwrap();
+         std::thread::scope(|threads| {
+             let (sender, checked) = std::sync::mpsc::channel();
+             let pending = threads.spawn(|| {
+@@ -1101,7 +1101,7 @@ async fn capture_rechecks_poison_after_waiting_for_publication() {
+                 }
+             });
+             checked.recv().unwrap(); // Capture passed its initial admission check.
+-            session.metadata.mark_unavailable(); // Publication fails while it waits.
++            session.metadata().mark_unavailable(); // Publication fails while it waits.
+             drop(guard);
+             assert!(matches!(
+                 pending.join().unwrap(),
+@@ -1142,7 +1142,7 @@ async fn native_hot_path_work_is_independent_of_receipt_count_but_reopen_checks_
+         let work = control::take_validation_work();
+         exposure_work.push(work);
+         if [1, 16, 64].contains(&n) {
+-            let read = session.metadata.db.begin_read().unwrap();
++            let read = session.metadata().db.begin_read().unwrap();
+             let count = read.open_table(control::RECEIPTS).unwrap().len().unwrap();
+             eprintln!("native receipt scaling: receipts={count}, work={work:?}");
+             drop(read);
+diff --git a/src/storage/metadata/native_records.rs b/src/storage/metadata/native_records.rs
+new file mode 100644
+index 0000000..8046cb2
+--- /dev/null
++++ b/src/storage/metadata/native_records.rs
+@@ -0,0 +1,438 @@
++//! Native record transactions use the existing publication, payload staging and
++//! canonical effect tail. No public serving or derived-readiness boundary.
++use super::*;
++use crate::model::schema::{LifecycleFields, RecordSchemaV2, TimestampOrigin, VectorReference};
++use crate::storage::control::Generation;
++use crate::storage::edges::PersistedEdge;
++use crate::storage::native_lifecycle::{LifecycleScope, NativePolicyInputs, invalid};
++use crate::storage::native_records::*;
++use crate::time::Clock;
++
++fn context(ctx: &MutationContext, namespace: NamespaceId) -> Result<(), StorageError> {
++    ctx.validate()?;
++    if ctx.contract_version != 2 {
++        return Err(StorageError::InvalidMutationContext(
++            "native records require contract version 2".into(),
++        ));
++    }
++    if ctx.scope != MutationScope::Namespace(namespace) {
++        return Err(StorageError::MutationNamespaceMismatch);
++    }
++    Ok(())
++}
++
++pub(super) fn replay_insert(
++    tx: &redb::WriteTransaction,
++    ctx: &MutationContext,
++    input: &NativeInsert,
++) -> Result<Option<WriteReceipt>, StorageError> {
++    let MutationScope::Namespace(namespace) = ctx.scope else {
++        return Err(StorageError::MutationNamespaceMismatch);
++    };
++    context(ctx, namespace)?;
++    let Some(stored) = control::keyed_receipt(tx, ctx)? else {
++        return Ok(None);
++    };
++    let MutationOutcome::NativeMemoryInserted { transition } = &stored.receipt.outcome else {
++        return Err(StorageError::IdempotencyConflict);
++    };
++    let original = &transition.primary()?.after;
++    let hash = input.request_hash(
++        ctx,
++        original.lifecycle.stability.get(),
++        original.lifecycle.difficulty.get(),
++        transition.embedding_dim,
++        original
++            .content
++            .profile_id
++            .as_deref()
++            .ok_or_else(|| invalid("creation profile missing"))?,
++    )?;
++    control::replay_or_check(tx, ctx, hash)
++}
++
++impl MetadataStore {
++    pub(crate) fn capture_native_insert(
++        &self,
++        scope: LifecycleScope,
++        input: &NativeInsert,
++        policy: &NativePolicyInputs,
++    ) -> Result<NativeInsertIntent, StorageError> {
++        self.ensure_available()?;
++        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
++        self.ensure_available()?;
++        input.validate()?;
++        let read = self.db.begin_read()?;
++        let mut ids = Vec::new();
++        for id in [input.memory.parent_id, input.memory.supersedes]
++            .into_iter()
++            .flatten()
++        {
++            if !ids.contains(&id) {
++                ids.push(id);
++            }
++        }
++        let capture = self.capture_at(&read, &scope, &ids, policy, false)?;
++        let namespace = NamespaceConfig::decode(
++            read.open_table(NAMESPACE_TABLE)?
++                .get(scope.namespace_id.get())?
++                .ok_or(StorageError::NamespaceNotFound(scope.namespace_id.get()))?
++                .value(),
++        )?;
++        if profile_id(&namespace).is_none() {
++            return Err(StorageError::InvalidMutation(
++                "native insertion requires an explicitly bound namespace profile".into(),
++            ));
++        }
++        Ok(NativeInsertIntent {
++            scope,
++            original: input.clone(),
++            namespace,
++            capture,
++        })
++    }
++    pub(crate) fn capture_native_tombstone(
++        &self,
++        id: MemoryId,
++        namespace: Option<NamespaceId>,
++        policy: &NativePolicyInputs,
++    ) -> Result<NativeTombstoneIntent, StorageError> {
++        self.ensure_available()?;
++        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
++        self.ensure_available()?;
++        let read = self.db.begin_read()?;
++        let record = DiskRecord::from_bytes(
++            read.open_table(META_TABLE)?
++                .get(id.as_bytes().as_slice())?
++                .ok_or(StorageError::NotFound(id.into_inner()))?
++                .value(),
++        )?;
++        let ns = NamespaceId::new(record.namespace_id);
++        if namespace.is_some_and(|n| n != ns) {
++            return Err(StorageError::MutationNamespaceMismatch);
++        }
++        let cfg = NamespaceConfig::decode(
++            read.open_table(NAMESPACE_TABLE)?
++                .get(ns.get())?
++                .ok_or(StorageError::NamespaceNotFound(ns.get()))?
++                .value(),
++        )?;
++        let scope = LifecycleScope {
++            namespace_id: ns,
++            namespace_name: cfg.name,
++            source: None,
++        };
++        let capture = self.capture_at(&read, &scope, &[id], policy, false)?;
++        Ok(NativeTombstoneIntent {
++            scope,
++            memory_id: id,
++            capture,
++        })
++    }
++    pub(crate) fn lookup_native_insert(
++        &self,
++        ctx: &MutationContext,
++        input: &NativeInsert,
++        parent: Option<&WorkTicket>,
++    ) -> Result<Option<WriteReceipt>, StorageError> {
++        let _guard = self.native_guard_with_work(parent)?;
++        replay_insert(&self.db.begin_write()?, ctx, input)
++    }
++    pub(crate) fn insert_native_with_effects(
++        &self,
++        guard: &MutationGuard<'_>,
++        ctx: &MutationContext,
++        intent: &NativeInsertIntent,
++        policy: &NativePolicyInputs,
++        clock: &dyn Clock,
++        embedding: &[f32],
++        profile: &crate::model::schema::EmbeddingProfile,
++        existing_edges: &[PersistedEdge],
++        text_hashes: &HashMap<MemoryId, Option<[u8; 32]>>,
++        stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord, &[f32]) -> Result<(), StorageError>,
++    ) -> Result<WriteReceipt, StorageError> {
++        guard.check(self)?;
++        context(ctx, intent.scope.namespace_id)?;
++        let tx = self.db.begin_write()?;
++        if let Some(receipt) = replay_insert(&tx, ctx, &intent.original)? {
++            return Ok(receipt);
++        }
++        let (state, ns, _, current) =
++            self.check_native_capture(&tx, &intent.scope, &intent.capture, policy, false)?;
++        let generation = state.committed_generation.next()?;
++        let input = &intent.original;
++        input.validate()?;
++        let binding = crate::embedding::profile::require_compatible(&ns, profile)
++            .map_err(|e| StorageError::InvalidMutation(e.to_string()))?;
++        if let Some(supplied) = &input.embedding_profile {
++            crate::embedding::profile::require_compatible(&ns, supplied)
++                .map_err(|e| StorageError::InvalidMutation(e.to_string()))?;
++        }
++        let stability = input
++            .memory
++            .initial_stability
++            .unwrap_or(ns.initial_stability);
++        if !stability.is_finite() || stability <= 0. {
++            return Err(StorageError::InvalidMutation(
++                "invalid initial stability".into(),
++            ));
++        }
++        let hash = input.request_hash(
++            ctx,
++            stability,
++            ns.default_difficulty,
++            ns.embedding_dim,
++            &binding,
++        )?;
++        control::replay_or_check(&tx, ctx, hash)?;
++        let mut normalized = embedding.to_vec();
++        crate::storage::insertion::normalize_embedding(
++            &mut normalized,
++            ns.embedding_dim,
++            input.memory.embedding.is_some(),
++        )?;
++        let id = self.allocate_memory_id(input.memory.id);
++        if id == MemoryId::nil() {
++            return Err(StorageError::InvalidMutation("nil memory ID".into()));
++        }
++        removal_ledger::ensure_insertable(&tx, id)?;
++        if tx
++            .open_table(META_TABLE)?
++            .get(id.as_bytes().as_slice())?
++            .is_some()
++        {
++            return Err(StorageError::DuplicateId(id.into_inner()));
++        }
++        // A supplied identity may also survive only in preserved creation history
++        // after a fork. No new index/schema is invented for this infrequent path.
++        if input.memory.id.is_some() {
++            for row in tx.open_table(control::RECEIPTS)?.iter()? {
++                let (_, bytes) = row?;
++                if matches!(control::validate_receipt(bytes.value())?.receipt.outcome,MutationOutcome::NativeMemoryInserted { transition } if transition.memory_id==id)
++                {
++                    return Err(StorageError::DuplicateId(id.into_inner()));
++                }
++            }
++        }
++        super::insertion::validate_insert_targets(&tx, &input.memory, ns.id, id, existing_edges)?;
++        let sampled = clock.now_millis();
++        let created = input.memory.created_at.unwrap_or(sampled);
++        if chrono::DateTime::from_timestamp_millis(sampled).is_none() {
++            return Err(StorageError::InvalidMutation("invalid clock sample".into()));
++        }
++        let vector_hash = hash_bytes(
++            &normalized
++                .iter()
++                .flat_map(|f| f.to_le_bytes())
++                .collect::<Vec<_>>(),
++        );
++        let mut record = DiskRecord {
++            version: 2,
++            id: *id.as_bytes(),
++            namespace_id: ns.id.get(),
++            created_at: created,
++            last_accessed_at: created,
++            phase: DecayPhase::Full,
++            strength: 1.,
++            decay_strength: 1.,
++            stability,
++            difficulty: ns.default_difficulty,
++            is_permastore: 0,
++            vector_slot: 0,
++            edge_count: 0,
++            summary: input.memory.summary.clone(),
++            tags: input.memory.tags.clone(),
++            access_history: vec![],
++            text_offset: 0,
++            text_length: 0,
++            schema: Some(RecordSchemaV2 {
++                lifecycle: LifecycleFields {
++                    observed_at: input.observed_at.unwrap_or(created),
++                    retrieved_at: None,
++                    reinforced_at: None,
++                    decay_anchor_at: created,
++                    lifecycle_version: intent.capture.version,
++                    lifecycle_updated_at: sampled.max(created),
++                    timestamp_origin: TimestampOrigin::Native,
++                    phase_changed_at: created,
++                    policy_revision: intent.capture.revision,
++                    record_generation: Generation::default().next()?,
++                },
++                labels: input.labels(),
++                vector: Some(VectorReference {
++                    slot: 0,
++                    allocation_epoch: generation,
++                    sha256: vector_hash,
++                }),
++                required_features: vec![],
++                extensions: Default::default(),
++            }),
++        };
++        let puts = super::insertion::stage_insert(
++            &tx,
++            &input.memory,
++            &ns,
++            &mut record,
++            &normalized,
++            sampled,
++            stage,
++        )?;
++        let after = NativeRecordState::capture(
++            &record,
++            &ns,
++            input
++                .memory
++                .full_text
++                .as_ref()
++                .map(|s| hash_bytes(s.as_bytes())),
++        )?;
++        let mut records = vec![NativeRecordChange {
++            memory_id: id,
++            before: None,
++            after,
++        }];
++        if let Some(parent) = input.memory.parent_id {
++            let before = NativeRecordState::capture(
++                current
++                    .get(&parent)
++                    .ok_or_else(|| invalid("parent capture missing"))?,
++                &ns,
++                *text_hashes
++                    .get(&parent)
++                    .ok_or_else(|| invalid("parent text snapshot missing"))?,
++            )?;
++            records.push(NativeRecordChange {
++                memory_id: parent,
++                before: Some(before.clone()),
++                after: before,
++            });
++        }
++        let transition = NativeRecordWrite {
++            namespace_id: ns.id,
++            memory_id: id,
++            lifecycle_version: intent.capture.version,
++            policy_revision: intent.capture.revision,
++            previous_generation: state.committed_generation,
++            capture_generation: intent.capture.generation,
++            sampled_at: sampled,
++            embedding_dim: ns.embedding_dim,
++            records,
++            edges: puts.iter().map(NativeEdgeProof::from).collect(),
++        };
++        self.finish_record_effects(
++            guard,
++            tx,
++            ctx,
++            hash,
++            existing_edges,
++            &puts,
++            &[],
++            false,
++            false,
++            effects::RecordMutation::NativeInserted(&record, transition),
++        )
++        .map(|r| r.receipt)
++    }
++    pub(crate) fn lookup_native_tombstone(
++        &self,
++        guard: &MutationGuard<'_>,
++        ctx: &MutationContext,
++        intent: &NativeTombstoneIntent,
++    ) -> Result<Option<WriteReceipt>, StorageError> {
++        guard.check(self)?;
++        context(ctx, intent.scope.namespace_id)?;
++        let hash = control::request_hash(ctx, "native_tombstone", &[intent.memory_id.as_bytes()]);
++        control::replay_or_check(&self.db.begin_write()?, ctx, hash)
++    }
++    pub(crate) fn tombstone_native_with_effects(
++        &self,
++        guard: &MutationGuard<'_>,
++        ctx: &MutationContext,
++        intent: &NativeTombstoneIntent,
++        policy: &NativePolicyInputs,
++        clock: &dyn Clock,
++        existing_edges: &[PersistedEdge],
++        text_hash: Option<[u8; 32]>,
++    ) -> Result<WriteReceipt, StorageError> {
++        guard.check(self)?;
++        context(ctx, intent.scope.namespace_id)?;
++        let tx = self.db.begin_write()?;
++        let hash = control::request_hash(ctx, "native_tombstone", &[intent.memory_id.as_bytes()]);
++        if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
++            return Ok(receipt);
++        }
++        let (state, ns, _, mut current) =
++            self.check_native_capture(&tx, &intent.scope, &intent.capture, policy, false)?;
++        state.committed_generation.next()?;
++        let mut record = current
++            .remove(&intent.memory_id)
++            .ok_or_else(|| invalid("tombstone capture missing"))?;
++        let before = NativeRecordState::capture(&record, &ns, text_hash)?;
++        // Fail unknown extension consumers before time, metadata, or payload changes.
++        before.content.erased()?;
++        let sampled = clock.now_millis();
++        if chrono::DateTime::from_timestamp_millis(sampled).is_none() {
++            return Err(StorageError::InvalidMutation("invalid clock sample".into()));
++        }
++        let after = before.tombstone(sampled)?;
++        let old_phase = record.phase;
++        if old_phase != DecayPhase::Tombstone {
++            for tag in &record.tags {
++                tx.open_multimap_table(TAG_INDEX)?
++                    .remove(tag.as_str(), intent.memory_id.as_bytes().as_slice())?;
++            }
++            tx.open_multimap_table(NAMESPACE_INDEX)?
++                .remove(record.namespace_id, intent.memory_id.as_bytes().as_slice())?;
++            after.lifecycle.apply(&mut record);
++            record.summary.clear();
++            record.tags.clear();
++            record.text_offset = 0;
++            record.text_length = 0;
++            let fields = record.schema.as_mut().unwrap();
++            fields.labels.entities.clear();
++            fields.labels.topics.clear();
++            fields.labels.emotions.clear();
++            fields.vector = None;
++            tx.open_table(META_TABLE)?.insert(
++                intent.memory_id.as_bytes().as_slice(),
++                record.encode()?.as_slice(),
++            )?;
++        }
++        let transition = NativeRecordWrite {
++            namespace_id: ns.id,
++            memory_id: intent.memory_id,
++            lifecycle_version: intent.capture.version,
++            policy_revision: intent.capture.revision,
++            previous_generation: state.committed_generation,
++            capture_generation: intent.capture.generation,
++            sampled_at: sampled,
++            embedding_dim: ns.embedding_dim,
++            records: vec![NativeRecordChange {
++                memory_id: intent.memory_id,
++                before: Some(before),
++                after,
++            }],
++            edges: vec![],
++        };
++        self.finish_record_effects(
++            guard,
++            tx,
++            ctx,
++            hash,
++            existing_edges,
++            &[],
++            &[],
++            false,
++            false,
++            effects::RecordMutation::NativeTombstoned {
++                record: &record,
++                old_phase,
++                transition,
++            },
++        )
++        .map(|r| r.receipt)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/src/storage/metadata/native_records/tests.rs b/src/storage/metadata/native_records/tests.rs
+new file mode 100644
+index 0000000..261e984
+--- /dev/null
++++ b/src/storage/metadata/native_records/tests.rs
+@@ -0,0 +1,733 @@
++use super::*;
++use crate::embedding::runtime::GeneratedEmbedding;
++use crate::model::schema::LifecycleVersion;
++use crate::storage::lifecycle_migration::{LifecycleMigrationOptions, migrate_lifecycle};
++use crate::storage::native_lifecycle::NativeLifecycleSession;
++use crate::storage::schema_migration::{
++    MigrationOptions, ProfileAttestationInput, inspect_schema, migrate_schema,
++};
++use crate::storage::{RedbStorageEngine, StorageEngine};
++use std::path::{Path, PathBuf};
++use std::sync::{
++    Arc,
++    atomic::{AtomicUsize, Ordering},
++};
++
++struct FixedClock(AtomicUsize);
++impl Clock for FixedClock {
++    fn now_millis(&self) -> i64 {
++        self.0.fetch_add(1, Ordering::SeqCst);
++        86_400_000
++    }
++}
++struct Data {
++    path: PathBuf,
++    ns: NamespaceId,
++    parent: MemoryId,
++    profile: crate::model::schema::EmbeddingProfile,
++}
++fn fixture(root: &Path) -> Data {
++    let source = root.join("legacy");
++    let mut engine = RedbStorageEngine::open(&source).unwrap();
++    let mut config = NamespaceConfig::default_namespace(0);
++    config.name = "native".into();
++    config.embedding_dim = 4;
++    let ns = engine.create_namespace(&config).unwrap();
++    let input = crate::storage::insertion::InsertMemory {
++        id: None,
++        summary: "original parent".into(),
++        full_text: Some("original parent full text".into()),
++        tags: vec![],
++        initial_stability: None,
++        created_at: Some(1000),
++        embedding: Some(vec![1., 0., 0., 0.]),
++        parent_id: None,
++        supersedes: None,
++    };
++    let receipt = engine
++        .insert_memory_with_receipt(&MutationContext::unkeyed(ns), &input, &[], 1000)
++        .unwrap();
++    let parent = crate::storage::insertion::inserted_id(&receipt).unwrap();
++    engine.sync().unwrap();
++    drop(engine);
++    let profile = crate::embedding::runtime::tests::profile();
++    let canonical = root.join("schema");
++    migrate_schema(
++        &source,
++        &canonical,
++        &MigrationOptions {
++            migration_now: 2000,
++            expected_source: inspect_schema(&source).unwrap().control.generation_ref(),
++            attestations: vec![ProfileAttestationInput {
++                namespace_id: ns,
++                namespace_name: "native".into(),
++                descriptor: profile.clone(),
++            }],
++        },
++    )
++    .unwrap();
++    let path = root.join("v2");
++    migrate_lifecycle(
++        &canonical,
++        &path,
++        &LifecycleMigrationOptions {
++            expected_source: inspect_schema(&canonical).unwrap().control.generation_ref(),
++            namespace_id: ns,
++            expected_policy_revision: Generation::default(),
++            target: LifecycleVersion::ExplicitFeedbackV2,
++            idempotency_key: "v2".into(),
++        },
++    )
++    .unwrap();
++    Data {
++        path,
++        ns,
++        parent,
++        profile,
++    }
++}
++fn scope(d: &Data) -> LifecycleScope {
++    LifecycleScope {
++        namespace_id: d.ns,
++        namespace_name: "native".into(),
++        source: None,
++    }
++}
++fn input(d: &Data) -> NativeInsert {
++    NativeInsert {
++        memory: crate::storage::insertion::InsertMemory {
++            id: None,
++            summary: "native exact summary".into(),
++            full_text: Some("native full text é中🙂".into()),
++            tags: vec![],
++            initial_stability: None,
++            created_at: Some(3000),
++            embedding: Some(vec![2., 0., 0., 0.]),
++            parent_id: Some(d.parent),
++            supersedes: None,
++        },
++        observed_at: Some(2500),
++        entities: vec!["é中🙂".into(), "unchanged Case".into()],
++        topics: vec!["Topic / exact".into()],
++        emotions: vec!["🙂".into()],
++        embedding_profile: Some(d.profile.clone()),
++    }
++}
++fn ctx(session: &NativeLifecycleSession, d: &Data, key: &str) -> MutationContext {
++    MutationContext {
++        store_id: Some(session.metadata().control_state().unwrap().store_id),
++        scope: MutationScope::Namespace(d.ns),
++        idempotency_key: Some(key.into()),
++        expected_generation: None,
++        contract_version: 2,
++    }
++}
++fn generated() -> GeneratedEmbedding {
++    GeneratedEmbedding {
++        values: vec![],
++        profile: None,
++    }
++}
++fn open(d: &Data, clock: Arc<FixedClock>) -> NativeLifecycleSession {
++    NativeLifecycleSession::open(&d.path, NativePolicyInputs::default(), clock).unwrap()
++}
++fn inserted(receipt: &WriteReceipt) -> MemoryId {
++    match &receipt.outcome {
++        MutationOutcome::NativeMemoryInserted { transition } => transition.memory_id,
++        _ => panic!("not native insertion"),
++    }
++}
++
++#[test]
++fn actual_native_insert_feedback_tombstone_replay_and_reopen_preserve_proof() {
++    let root = tempfile::tempdir().unwrap();
++    let d = fixture(root.path());
++    let clock = Arc::new(FixedClock(AtomicUsize::new(0)));
++    let mut session = open(&d, clock.clone());
++    let original = input(&d);
++    let intent = session.capture_insert(scope(&d), &original).unwrap();
++    let key = ctx(&session, &d, "create");
++    let receipt = session
++        .insert_prepared(&key, &intent, &generated())
++        .unwrap();
++    let id = inserted(&receipt);
++    let row = session.engine.get_record(id).unwrap().unwrap();
++    assert_eq!(row.schema.as_ref().unwrap().labels, original.labels());
++    assert_eq!(row.schema.as_ref().unwrap().lifecycle.observed_at, 2500);
++    assert_eq!(row.schema.as_ref().unwrap().lifecycle.decay_anchor_at, 3000);
++    assert_eq!(
++        row.schema
++            .as_ref()
++            .unwrap()
++            .lifecycle
++            .record_generation
++            .get(),
++        1
++    );
++    let parent = session.engine.get_record(d.parent).unwrap().unwrap();
++    assert_eq!(parent.edge_count, 1);
++    assert_eq!(
++        parent
++            .schema
++            .as_ref()
++            .unwrap()
++            .lifecycle
++            .record_generation
++            .get(),
++        2
++    ); // policy migration 1, edge mutation 1
++    let feedback = session.capture_feedback(id, None, 3).unwrap();
++    session
++        .apply_feedback(&ctx(&session, &d, "feedback"), &feedback)
++        .unwrap();
++    let terminal = session.capture_tombstone(id, None).unwrap();
++    let forget = ctx(&session, &d, "forget");
++    session.tombstone(&forget, &terminal).unwrap();
++    let row = session.engine.get_record(id).unwrap().unwrap();
++    assert_eq!(row.phase, DecayPhase::Tombstone);
++    assert!(row.summary.is_empty());
++    assert!(row.schema.as_ref().unwrap().labels.entities.is_empty());
++    assert!(row.schema.as_ref().unwrap().vector.is_none());
++    assert!(
++        session
++            .insert_prepared(
++                &key,
++                &intent,
++                &GeneratedEmbedding {
++                    values: vec![f32::NAN],
++                    profile: None
++                }
++            )
++            .unwrap()
++            .replayed
++    );
++    assert!(session.tombstone(&forget, &terminal).unwrap().replayed);
++    assert_eq!(clock.0.load(Ordering::SeqCst), 3);
++    drop(session);
++    inspect_schema(&d.path).unwrap();
++    let mut session = open(&d, clock.clone());
++    assert!(
++        session
++            .insert_prepared(&key, &intent, &generated())
++            .unwrap()
++            .replayed
++    );
++    assert_eq!(
++        session.engine.get_record(id).unwrap().unwrap().phase,
++        DecayPhase::Tombstone
++    );
++    assert!(RedbStorageEngine::open(&d.path).is_err());
++}
++
++struct Provider {
++    profile: crate::model::schema::EmbeddingProfile,
++    calls: AtomicUsize,
++    fail_if_called: bool,
++}
++#[async_trait::async_trait]
++impl crate::embedding::EmbeddingProvider for Provider {
++    fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
++        assert!(!self.fail_if_called);
++        self.calls.fetch_add(1, Ordering::SeqCst);
++        Some(self.profile.clone())
++    }
++    fn dimensions(&self) -> usize {
++        assert!(!self.fail_if_called);
++        self.calls.fetch_add(1, Ordering::SeqCst);
++        4
++    }
++    fn model_name(&self) -> &str {
++        "synthetic"
++    }
++    async fn embed(&self, _: &str) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
++        assert!(!self.fail_if_called);
++        self.calls.fetch_add(1, Ordering::SeqCst);
++        Ok(vec![1., 0., 0., 0.])
++    }
++}
++#[tokio::test]
++async fn original_expansion_replay_precedes_aborted_default_changes_and_real_policy_migration_provider()
++ {
++    let root = tempfile::tempdir().unwrap();
++    let mut d = fixture(root.path());
++    let clock = Arc::new(FixedClock(AtomicUsize::new(0)));
++    let mut session = open(&d, clock.clone());
++    let mut original = input(&d);
++    original.memory.embedding = None;
++    original.embedding_profile = None;
++    let key = ctx(&session, &d, "generated");
++    let provider = Provider {
++        profile: d.profile.clone(),
++        calls: AtomicUsize::new(0),
++        fail_if_called: false,
++    };
++    let receipt = session
++        .insert_generated(&key, scope(&d), &original, &provider)
++        .await
++        .unwrap();
++    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
++    let state = session.metadata().control_state().unwrap();
++    {
++        // This is deliberately an ABORTED transaction, not a valid published
++        // namespace-update API or a forged policy receipt. It tests only replay's
++        // original expansion lookup against mutable default/profile temptation.
++        let tx = session.metadata().db.begin_write().unwrap();
++        let mut ns = NamespaceConfig::decode(
++            tx.open_table(NAMESPACE_TABLE)
++                .unwrap()
++                .get(d.ns.get())
++                .unwrap()
++                .unwrap()
++                .value(),
++        )
++        .unwrap();
++        ns.initial_stability = 333.;
++        ns.default_difficulty = 9.;
++        ns.embedding_dim = 8;
++        let crate::model::schema::EmbeddingBinding::Bound {
++            descriptor,
++            profile_id,
++            ..
++        } = &mut ns.schema.as_mut().unwrap().embedding_binding
++        else {
++            panic!("unbound")
++        };
++        descriptor.dimension = 8;
++        *profile_id = descriptor.profile_id().unwrap();
++        tx.open_table(NAMESPACE_TABLE)
++            .unwrap()
++            .insert(d.ns.get(), serde_json::to_vec(&ns).unwrap().as_slice())
++            .unwrap();
++        let replay = super::replay_insert(&tx, &key, &original).unwrap().unwrap();
++        assert!(replay.replayed);
++        assert_eq!(replay.operation_id, receipt.operation_id);
++        drop(tx);
++    }
++    assert_eq!(session.metadata().control_state().unwrap(), state);
++    drop(session);
++    let rollback = root.path().join("rollback");
++    migrate_lifecycle(
++        &d.path,
++        &rollback,
++        &LifecycleMigrationOptions {
++            expected_source: inspect_schema(&d.path).unwrap().control.generation_ref(),
++            namespace_id: d.ns,
++            expected_policy_revision: "1".to_string().try_into().unwrap(),
++            target: LifecycleVersion::LegacyAccessV1,
++            idempotency_key: "rollback".into(),
++        },
++    )
++    .unwrap();
++    d.path = rollback;
++    let mut session = open(&d, clock.clone());
++    let never = Provider {
++        profile: d.profile.clone(),
++        calls: AtomicUsize::new(0),
++        fail_if_called: true,
++    };
++    let replay = session
++        .insert_generated(&key, scope(&d), &original, &never)
++        .await
++        .unwrap();
++    assert!(replay.replayed);
++    assert_eq!(replay.operation_id, receipt.operation_id);
++    assert_eq!(never.calls.load(Ordering::SeqCst), 0);
++    assert_eq!(clock.0.load(Ordering::SeqCst), 1);
++}
++
++#[test]
++fn invalid_native_vectors_profiles_labels_and_stale_intents_never_allocate() {
++    let root = tempfile::tempdir().unwrap();
++    let d = fixture(root.path());
++    let clock = Arc::new(FixedClock(AtomicUsize::new(0)));
++    let mut session = open(&d, clock.clone());
++    let state = session.metadata().control_state().unwrap();
++    let files =
++        || ["meta.db", "native/vectors.dat"].map(|p| std::fs::read(d.path.join(p)).unwrap());
++    for vector in [
++        vec![0.; 4],
++        vec![f32::NAN; 4],
++        vec![f32::INFINITY; 4],
++        vec![1.; 3],
++    ] {
++        let mut original = input(&d);
++        original.memory.embedding = Some(vector);
++        let intent = session.capture_insert(scope(&d), &original).unwrap();
++        let before = files();
++        assert!(
++            session
++                .insert_prepared(&ctx(&session, &d, "bad"), &intent, &generated())
++                .is_err()
++        );
++        assert_eq!(files(), before);
++    }
++    let mut original = input(&d);
++    original.embedding_profile.as_mut().unwrap().model_id = "other".into();
++    let intent = session.capture_insert(scope(&d), &original).unwrap();
++    let before = files();
++    assert!(
++        session
++            .insert_prepared(&ctx(&session, &d, "bad-profile"), &intent, &generated())
++            .is_err()
++    );
++    assert_eq!(files(), before);
++    let mut original = input(&d);
++    original.entities = vec!["é".repeat(65)];
++    assert!(session.capture_insert(scope(&d), &original).is_err());
++    assert_eq!(session.metadata().control_state().unwrap(), state);
++    assert_eq!(clock.0.load(Ordering::SeqCst), 0);
++    let intent = session.capture_insert(scope(&d), &input(&d)).unwrap();
++    let feedback = session.capture_feedback(d.parent, None, 3).unwrap();
++    session
++        .apply_feedback(&ctx(&session, &d, "parent-changed"), &feedback)
++        .unwrap();
++    let before = files();
++    assert!(matches!(
++        session.insert_prepared(&ctx(&session, &d, "stale"), &intent, &generated()),
++        Err(StorageError::LifecycleConflict(_))
++    ));
++    assert_eq!(files(), before);
++    assert_eq!(clock.0.load(Ordering::SeqCst), 1);
++}
++
++#[test]
++fn real_precommit_abandonment_and_ambiguous_commit_recover_records_edges_and_receipts() {
++    for after in [false, true] {
++        let root = tempfile::tempdir().unwrap();
++        let d = fixture(root.path());
++        let clock = Arc::new(FixedClock(AtomicUsize::new(0)));
++        let mut session = open(&d, clock.clone());
++        let mut original = input(&d);
++        let id = MemoryId::new();
++        original.memory.id = Some(id);
++        let intent = session.capture_insert(scope(&d), &original).unwrap();
++        let key = ctx(&session, &d, "uncertain-create");
++        let before = session.metadata().control_state().unwrap();
++        if after {
++            effects::FAIL_AFTER_RECORD_COMMIT.with(|f| f.set(true));
++        } else {
++            effects::FAIL_BEFORE_RECORD_COMMIT.with(|f| f.set(true));
++        }
++        let failure = session
++            .insert_prepared(&key, &intent, &generated())
++            .unwrap_err();
++        if after {
++            assert!(matches!(failure, StorageError::CommitOutcomeUnknown { .. }));
++        }
++        assert!(session.capture_feedback(d.parent, None, 3).is_err()); // staged failure poisons this owned handle
++        drop(session);
++        let mut session = open(&d, clock.clone());
++        assert_eq!(session.engine.get_record(id).unwrap().is_some(), after);
++        assert_eq!(
++            session
++                .metadata()
++                .control_state()
++                .unwrap()
++                .committed_generation
++                .get(),
++            before.committed_generation.get() + u64::from(after)
++        );
++        assert_eq!(
++            session
++                .engine
++                .get_record(d.parent)
++                .unwrap()
++                .unwrap()
++                .edge_count,
++            u16::from(after)
++        );
++        let fresh = session.capture_insert(scope(&d), &original).unwrap();
++        let receipt = session.insert_prepared(&key, &fresh, &generated()).unwrap();
++        assert_eq!(receipt.replayed, after);
++        assert_eq!(
++            session
++                .engine
++                .get_record(d.parent)
++                .unwrap()
++                .unwrap()
++                .edge_count,
++            1
++        );
++        let forget = ctx(&session, &d, "uncertain-forget");
++        let intent = session.capture_tombstone(id, None).unwrap();
++        let before = session.metadata().control_state().unwrap();
++        if after {
++            effects::FAIL_AFTER_RECORD_COMMIT.with(|f| f.set(true));
++        } else {
++            effects::FAIL_BEFORE_RECORD_COMMIT.with(|f| f.set(true));
++        }
++        assert!(session.tombstone(&forget, &intent).is_err());
++        drop(session);
++        let mut session = open(&d, clock.clone());
++        assert_eq!(
++            session.engine.get_record(id).unwrap().unwrap().phase,
++            if after {
++                DecayPhase::Tombstone
++            } else {
++                DecayPhase::Full
++            }
++        );
++        assert_eq!(
++            session
++                .metadata()
++                .control_state()
++                .unwrap()
++                .committed_generation
++                .get(),
++            before.committed_generation.get() + u64::from(after)
++        );
++        let fresh = session.capture_tombstone(id, None).unwrap();
++        assert_eq!(session.tombstone(&forget, &fresh).unwrap().replayed, after);
++        drop(session);
++        inspect_schema(&d.path).unwrap();
++    }
++}
++
++#[test]
++fn native_terminal_uuid_reuse_and_retained_payload_corruption_fail_closed() {
++    let root = tempfile::tempdir().unwrap();
++    let d = fixture(root.path());
++    let clock = Arc::new(FixedClock(AtomicUsize::new(0)));
++    let mut session = open(&d, clock.clone());
++    let original = input(&d);
++    let intent = session.capture_insert(scope(&d), &original).unwrap();
++    let receipt = session
++        .insert_prepared(&ctx(&session, &d, "create"), &intent, &generated())
++        .unwrap();
++    let id = inserted(&receipt);
++    drop(session);
++    let original_bytes = {
++        let db = redb::Database::open(d.path.join("meta.db")).unwrap();
++        let read = db.begin_read().unwrap();
++        let t = read.open_table(META_TABLE).unwrap();
++        let value = t.get(id.as_bytes().as_slice()).unwrap().unwrap();
++        value.value().to_vec()
++    };
++    for case in 0..3 {
++        let db = redb::Database::open(d.path.join("meta.db")).unwrap();
++        let tx = db.begin_write().unwrap();
++        let mut row = DiskRecord::from_bytes(&original_bytes).unwrap();
++        match case {
++            0 => row.summary = "changed retained text".into(),
++            1 => row.schema.as_mut().unwrap().labels.entities[0] = "changed label".into(),
++            2 => row.schema.as_mut().unwrap().vector.as_mut().unwrap().sha256[0] ^= 1,
++            _ => unreachable!(),
++        };
++        tx.open_table(META_TABLE)
++            .unwrap()
++            .insert(id.as_bytes().as_slice(), row.encode().unwrap().as_slice())
++            .unwrap();
++        tx.commit().unwrap();
++        drop(db);
++        let bytes = std::fs::read(d.path.join("meta.db")).unwrap();
++        assert!(inspect_schema(&d.path).is_err());
++        assert!(
++            NativeLifecycleSession::open(&d.path, NativePolicyInputs::default(), clock.clone())
++                .is_err()
++        );
++        assert_eq!(std::fs::read(d.path.join("meta.db")).unwrap(), bytes);
++        let db = redb::Database::open(d.path.join("meta.db")).unwrap();
++        let tx = db.begin_write().unwrap();
++        tx.open_table(META_TABLE)
++            .unwrap()
++            .insert(id.as_bytes().as_slice(), original_bytes.as_slice())
++            .unwrap();
++        tx.commit().unwrap();
++        drop(db);
++    }
++    let mut session = open(&d, clock.clone());
++    let forget = session.capture_tombstone(id, None).unwrap();
++    session
++        .tombstone(&ctx(&session, &d, "forget"), &forget)
++        .unwrap();
++    let mut reuse = input(&d);
++    reuse.memory.id = Some(id);
++    let intent = session.capture_insert(scope(&d), &reuse).unwrap();
++    let before = session.metadata().control_state().unwrap();
++    let calls = clock.0.load(Ordering::SeqCst);
++    assert!(
++        session
++            .insert_prepared(&ctx(&session, &d, "reuse"), &intent, &generated())
++            .is_err()
++    );
++    assert_eq!(session.metadata().control_state().unwrap(), before);
++    assert_eq!(clock.0.load(Ordering::SeqCst), calls);
++    let receipt = control::encode(&receipt).unwrap();
++    for forbidden in [
++        &original.memory.summary,
++        original.memory.full_text.as_ref().unwrap(),
++        &original.entities[0],
++    ] {
++        assert!(!String::from_utf8_lossy(&receipt).contains(forbidden));
++    }
++}
++
++#[tokio::test]
++async fn native_records_survive_export_and_restore_without_replaying_foreign_receipts_or_payload() {
++    use crate::backup::{RestoreOptions, restore_from_backup, run_backup};
++    use crate::storage::logical_export::{export_store, import_store};
++    let root = tempfile::tempdir().unwrap();
++    let d = fixture(root.path());
++    let clock = Arc::new(FixedClock(AtomicUsize::new(0)));
++    let mut session = open(&d, clock.clone());
++    let original = input(&d);
++    let intent = session.capture_insert(scope(&d), &original).unwrap();
++    let key = ctx(&session, &d, "create-before-backup");
++    let receipt = session
++        .insert_prepared(&key, &intent, &generated())
++        .unwrap();
++    let id = inserted(&receipt);
++    let survivor_intent = session.capture_insert(scope(&d), &original).unwrap();
++    let survivor = inserted(
++        &session
++            .insert_prepared(
++                &ctx(&session, &d, "survivor"),
++                &survivor_intent,
++                &generated(),
++            )
++            .unwrap(),
++    );
++    drop(session);
++    let schema = inspect_schema(&d.path).unwrap().schema.unwrap();
++    let stream = root.path().join("native.jsonl");
++    let imported = root.path().join("imported");
++    let exported = export_store(&d.path, &stream).unwrap();
++    assert_eq!(import_store(&stream, &imported).unwrap(), exported);
++    assert_eq!(inspect_schema(&imported).unwrap().schema.unwrap(), schema);
++    let mut imported_session =
++        NativeLifecycleSession::open(&imported, NativePolicyInputs::default(), clock.clone())
++            .unwrap();
++    assert_eq!(
++        imported_session
++            .engine
++            .get_record(id)
++            .unwrap()
++            .unwrap()
++            .schema
++            .unwrap()
++            .labels,
++        original.labels()
++    );
++    assert!(
++        imported_session
++            .insert_prepared(&key, &intent, &generated())
++            .unwrap()
++            .replayed
++    );
++    drop(imported_session);
++    let backup = run_backup(
++        &crate::config::RecalldConfig::default(),
++        &root.path().join("native.zip"),
++        Some(&d.path),
++        false,
++    )
++    .await
++    .unwrap();
++    let mut session = open(&d, clock.clone());
++    let terminal = session.capture_tombstone(id, None).unwrap();
++    session
++        .tombstone(&ctx(&session, &d, "forget-after-backup"), &terminal)
++        .unwrap();
++    drop(session);
++    restore_from_backup(RestoreOptions {
++        backup_path: backup,
++        data_dir: d.path.clone(),
++        force: true,
++        no_stop_daemon: true,
++        historical: false,
++    })
++    .await
++    .unwrap();
++    let inspection = inspect_schema(&d.path).unwrap();
++    assert_eq!(inspection.schema.unwrap(), schema);
++    assert_ne!(inspection.control.store_id, receipt.store_id);
++    let mut session = open(&d, clock.clone());
++    let row = session.engine.get_record(id).unwrap().unwrap();
++    assert_eq!(row.phase, DecayPhase::Tombstone);
++    assert!(row.summary.is_empty());
++    assert!(row.schema.as_ref().unwrap().labels.entities.is_empty());
++    assert!(row.schema.as_ref().unwrap().vector.is_none());
++    assert_eq!(
++        session
++            .engine
++            .get_record(survivor)
++            .unwrap()
++            .unwrap()
++            .schema
++            .unwrap()
++            .labels,
++        original.labels()
++    );
++    assert!(matches!(
++        session.insert_prepared(&key, &intent, &generated()),
++        Err(StorageError::StoreLineageMismatch)
++    ));
++    let read = session.metadata().db.begin_read().unwrap();
++    let receipt_key = control::scoped_key(
++        receipt.store_id,
++        MutationScope::Namespace(d.ns),
++        receipt.operation_id.as_bytes(),
++    );
++    let stored = control::validate_receipt(
++        read.open_table(control::RECEIPTS)
++            .unwrap()
++            .get(receipt_key.as_slice())
++            .unwrap()
++            .unwrap()
++            .value(),
++    )
++    .unwrap();
++    assert_eq!(stored.receipt, receipt);
++    drop(read);
++    let fresh = session.capture_feedback(survivor, None, 3).unwrap();
++    session
++        .apply_feedback(&ctx(&session, &d, "fresh-after-fork"), &fresh)
++        .unwrap();
++    drop(session);
++    inspect_schema(&d.path).unwrap();
++    assert!(RedbStorageEngine::open(&d.path).is_err());
++}
++
++#[test]
++fn native_admission_uses_the_owned_tracker_and_rejects_closed_or_foreign_work() {
++    use crate::storage::work::{WorkError, WorkTracker};
++    use std::time::{Duration, Instant};
++    let root = tempfile::tempdir().unwrap();
++    let d = fixture(root.path());
++    let clock = Arc::new(FixedClock(AtomicUsize::new(0)));
++    let mut session = open(&d, clock.clone());
++    let intent = session.capture_insert(scope(&d), &input(&d)).unwrap();
++    let key = ctx(&session, &d, "admission");
++    let before = std::fs::read(d.path.join("meta.db")).unwrap();
++    let tracker = session.metadata().work_tracker();
++    // Same store UUID is insufficient: tickets belong to this owner instance.
++    let foreign = WorkTracker::new(tracker.store_id());
++    let ticket = foreign.begin().unwrap();
++    assert!(matches!(
++        session.engine.insert_native_record(
++            &key,
++            &intent,
++            &generated(),
++            &NativePolicyInputs::default(),
++            clock.as_ref(),
++            Some(&ticket)
++        ),
++        Err(StorageError::Work(WorkError::InvalidTicket))
++    ));
++    ticket.finish();
++    let freeze = tracker
++        .close_and_drain(Instant::now() + Duration::from_secs(5))
++        .unwrap();
++    assert!(matches!(
++        session.insert_prepared(&key, &intent, &generated()),
++        Err(StorageError::Work(WorkError::AdmissionClosed))
++    ));
++    assert_eq!(std::fs::read(d.path.join("meta.db")).unwrap(), before);
++    assert_eq!(clock.0.load(Ordering::SeqCst), 0);
++    drop(freeze);
++    session
++        .insert_prepared(&key, &intent, &generated())
++        .unwrap();
++    assert_eq!(tracker.status().pending, 0);
++    assert_eq!(tracker.status().unresolved, 0);
++}
+diff --git a/src/storage/mod.rs b/src/storage/mod.rs
+index f88b56a..a19371e 100644
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@ -25,9 +25,10 @@ pub mod indexes;
+ pub mod insertion;
+ pub mod lifecycle_migration;
+ pub(crate) mod lineage;
++pub mod logical_export;
+ pub mod metadata;
+ pub mod native_lifecycle;
+-pub mod logical_export;
++pub mod native_records;
+ pub mod offline_snapshot;
+ pub(crate) mod ownership;
+ pub mod purge;
+diff --git a/src/storage/native_lifecycle.rs b/src/storage/native_lifecycle.rs
+index 8d9b8f8..d8b0e87 100644
+--- a/src/storage/native_lifecycle.rs
++++ b/src/storage/native_lifecycle.rs
+@@ -6,7 +6,6 @@ use std::path::Path;
+ use std::sync::Arc;
+ 
+ use super::control::{Generation, GenerationRef, MutationContext, WriteReceipt};
+-use super::ownership::{OwnedFileLock, StoreOwnership, lock_directory};
+ use super::{MetadataStore, StorageError};
+ use crate::decay::{
+     DecayConfig,
+@@ -100,7 +99,7 @@ impl LifecycleState {
+         matches!(self.phase, DecayPhase::Full | DecayPhase::Summary)
+             && (self.has_summary || (self.phase == DecayPhase::Full && self.has_text))
+     }
+-    fn validate(&self) -> Result<(), StorageError> {
++    pub(crate) fn validate(&self) -> Result<(), StorageError> {
+         let t = &self.lifecycle;
+         if self.stability.get() <= 0.
+             || !(1. ..=10.).contains(&self.difficulty.get())
+@@ -298,18 +297,19 @@ impl NativeLifecycleWrite {
+         }
+         Ok(())
+     }
+-    pub(crate) fn rewind(&self, rows: &mut [DiskRecord]) -> Result<(), StorageError> {
++    pub(crate) fn rewind(
++        &self,
++        rows: &mut [super::native_records::ProofRecord],
++    ) -> Result<(), StorageError> {
+         for step in &self.records {
+             let r = rows
+                 .iter_mut()
+-                .find(|r| r.id == *step.memory_id.as_bytes())
++                .find(|r| r.id == step.memory_id)
+                 .ok_or_else(|| invalid("native receipt record absent"))?;
+-            if LifecycleState::capture(r)? != step.after
+-                || history_hash(&r.access_history)? != step.history_after
+-            {
++            if r.state.lifecycle != step.after || history_hash(&r.history)? != step.history_after {
+                 return Err(invalid("native receipt does not match record state"));
+             }
+-            if r.access_history.pop()
++            if r.history.pop()
+                 != Some(AccessEvent {
+                     timestamp: step.after.lifecycle.lifecycle_updated_at,
+                     kind: step.kind,
+@@ -318,15 +318,16 @@ impl NativeLifecycleWrite {
+                 return Err(invalid("native receipt history event missing"));
+             }
+             if let Some(event) = step.evicted_event {
+-                if r.access_history.len() + 1 != crate::model::constants::ACCESS_HISTORY_MAX {
++                if r.history.len() + 1 != crate::model::constants::ACCESS_HISTORY_MAX {
+                     return Err(invalid("invalid native history eviction"));
+                 }
+-                r.access_history.insert(0, event);
++                r.history.insert(0, event);
+             }
+-            if history_hash(&r.access_history)? != step.history_before {
++            if history_hash(&r.history)? != step.history_before {
+                 return Err(invalid("native receipt prior history mismatch"));
+             }
+-            step.before.apply(r);
++            r.state.lifecycle = step.before.clone();
++            r.state.history_sha256 = step.history_before;
+         }
+         Ok(())
+     }
+@@ -399,13 +400,14 @@ impl FeedbackIntent {
+ }
+ 
+ pub struct NativeLifecycleSession {
+-    pub(crate) metadata: MetadataStore,
+-    policy: NativePolicyInputs,
+-    clock: Arc<dyn Clock>,
+-    _legacy_lock: OwnedFileLock,
+-    _owner: StoreOwnership,
++    pub(crate) engine: super::RedbStorageEngine,
++    pub(crate) policy: NativePolicyInputs,
++    pub(crate) clock: Arc<dyn Clock>,
+ }
+ impl NativeLifecycleSession {
++    pub(crate) fn metadata(&self) -> &MetadataStore {
++        self.engine.meta_store()
++    }
+     /// Reconcile an uncertain commit after reopening this same origin. This is
+     /// canonical receipt lookup, not a derived publication/readiness assertion.
+     pub fn lookup_operation(
+@@ -414,7 +416,7 @@ impl NativeLifecycleSession {
+         namespace_id: NamespaceId,
+         operation_id: uuid::Uuid,
+     ) -> Result<Option<WriteReceipt>, StorageError> {
+-        self.metadata.lookup_operation(
++        self.metadata().lookup_operation(
+             store_id,
+             super::control::MutationScope::Namespace(namespace_id),
+             operation_id,
+@@ -425,19 +427,11 @@ impl NativeLifecycleSession {
+         policy: NativePolicyInputs,
+         clock: Arc<dyn Clock>,
+     ) -> Result<Self, StorageError> {
+-        if !path.is_dir() {
+-            return Err(StorageError::InvalidPath);
+-        }
+-        let owner = StoreOwnership::acquire(path)?;
+-        let lock = lock_directory(&owner.path)?;
+-        super::validation::canonical_files(&owner.path)?;
+-        let metadata = MetadataStore::open_native_lifecycle(&owner.path.join("meta.db"))?;
++        let engine = super::RedbStorageEngine::open_native(path)?;
+         Ok(Self {
+-            metadata,
++            engine,
+             policy,
+             clock,
+-            _legacy_lock: lock,
+-            _owner: owner,
+         })
+     }
+     pub fn capture_exposure(
+@@ -445,7 +439,7 @@ impl NativeLifecycleSession {
+         scope: LifecycleScope,
+         original: &[(MemoryId, AccessKind)],
+     ) -> Result<ExposureIntent, StorageError> {
+-        self.metadata
++        self.metadata()
+             .capture_exposure(scope, original, &self.policy)
+     }
+     pub fn record_exposure(
+@@ -453,7 +447,7 @@ impl NativeLifecycleSession {
+         ctx: &MutationContext,
+         intent: &ExposureIntent,
+     ) -> Result<Option<WriteReceipt>, StorageError> {
+-        self.metadata
++        self.metadata()
+             .record_native_exposure(ctx, intent, &self.policy, self.clock.as_ref())
+     }
+     pub fn capture_feedback(
+@@ -462,7 +456,7 @@ impl NativeLifecycleSession {
+         namespace: Option<NamespaceId>,
+         quality: u8,
+     ) -> Result<FeedbackIntent, StorageError> {
+-        self.metadata
++        self.metadata()
+             .capture_feedback(id, namespace, quality, &self.policy)
+     }
+     pub fn apply_feedback(
+@@ -470,7 +464,7 @@ impl NativeLifecycleSession {
+         ctx: &MutationContext,
+         intent: &FeedbackIntent,
+     ) -> Result<WriteReceipt, StorageError> {
+-        self.metadata
++        self.metadata()
+             .apply_native_feedback(ctx, intent, &self.policy, self.clock.as_ref())
+     }
+ }
+diff --git a/src/storage/native_records.rs b/src/storage/native_records.rs
+new file mode 100644
+index 0000000..04f4489
+--- /dev/null
++++ b/src/storage/native_records.rs
+@@ -0,0 +1,719 @@
++//! Explicit native record intent and payload-free proof. Canonical record codecs
++//! remain in model::schema; hashes never substitute for validating retained bytes.
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++use std::collections::{BTreeMap, HashMap};
++
++use super::StorageError;
++use super::control::{Generation, GenerationRef, MutationContext, MutationOutcome, WriteReceipt};
++use super::insertion::InsertMemory;
++use super::native_lifecycle::{
++    CapturedLifecycle, LifecycleScope, LifecycleState, history_hash, invalid,
++};
++use crate::model::schema::{
++    EmbeddingBinding, EmbeddingProfile, LabelProvenance, LifecycleVersion, StructuredLabels,
++    TimestampOrigin, VectorReference,
++};
++use crate::model::{AccessEvent, DecayPhase, DiskRecord, MemoryId, NamespaceConfig};
++
++/// Original caller choices. Structured labels are persisted verbatim, never
++/// normalized into compatibility tags. Provider output is supplied separately.
++#[derive(Debug, Clone)]
++pub struct NativeInsert {
++    pub memory: InsertMemory,
++    pub observed_at: Option<i64>,
++    pub entities: Vec<String>,
++    pub topics: Vec<String>,
++    pub emotions: Vec<String>,
++    /// Required for a supplied embedding. Generated provenance comes from the
++    /// actual GeneratedEmbedding result and is not caller retry identity.
++    pub embedding_profile: Option<EmbeddingProfile>,
++}
++impl NativeInsert {
++    pub(crate) fn labels(&self) -> StructuredLabels {
++        StructuredLabels {
++            entities: self.entities.clone(),
++            topics: self.topics.clone(),
++            emotions: self.emotions.clone(),
++            provenance: LabelProvenance::NativeV2,
++        }
++    }
++    pub(crate) fn validate(&self) -> Result<(), StorageError> {
++        use crate::model::constants::*;
++        crate::model::validation::validate_memory_input(crate::model::validation::MemoryInputRef {
++            summary: &self.memory.summary,
++            full_text: self.memory.full_text.as_deref(),
++            tags: &self
++                .memory
++                .tags
++                .iter()
++                .map(ToString::to_string)
++                .collect::<Vec<_>>(),
++            entities: &[],
++            topics: &[],
++            emotions: &[],
++        })
++        .map_err(|e| StorageError::InvalidMutation(e.to_string()))?;
++        for (name, values, max) in [
++            ("entities", &self.entities, MAX_ENTITIES),
++            ("topics", &self.topics, MAX_TOPICS),
++            ("emotions", &self.emotions, MAX_EMOTIONS),
++        ] {
++            crate::model::validation::validate_count(name, values.len(), max)
++                .map_err(|e| StorageError::InvalidMutation(e.to_string()))?;
++            crate::model::validation::validate_item_lens(name, values, LABEL_MAX_BYTES)
++                .map_err(|e| StorageError::InvalidMutation(e.to_string()))?;
++        }
++        self.labels()
++            .validate()
++            .map_err(StorageError::InvalidMutation)?;
++        if self.memory.full_text.as_deref() == Some("") {
++            return Err(StorageError::EmptyText);
++        }
++        if self.memory.embedding.is_some() != self.embedding_profile.is_some() {
++            return Err(StorageError::InvalidMutation(
++                "supplied vector and explicit profile must be provided together".into(),
++            ));
++        }
++        for time in [self.observed_at, self.memory.created_at] {
++            if time.is_some_and(|t| chrono::DateTime::from_timestamp_millis(t).is_none()) {
++                return Err(StorageError::InvalidMutation(
++                    "unrepresentable native creation/observation time".into(),
++                ));
++            }
++        }
++        Ok(())
++    }
++    pub(crate) fn request_hash(
++        &self,
++        ctx: &MutationContext,
++        stability: f32,
++        difficulty: f32,
++        dimensions: u32,
++        profile_id: &str,
++    ) -> Result<[u8; 32], StorageError> {
++        // Reuse exact original caller float bits/default expansion. The v2
++        // operation tag and additional fields keep its identity distinct.
++        let original = self.memory.request_hash(ctx, stability, dimensions)?;
++        let supplied_profile = self
++            .embedding_profile
++            .as_ref()
++            .map(|p| p.profile_id())
++            .transpose()
++            .map_err(StorageError::InvalidMutation)?;
++        let extra = super::control::encode(&(
++            self.observed_at,
++            &self.entities,
++            &self.topics,
++            &self.emotions,
++            supplied_profile,
++            difficulty.to_bits(),
++            profile_id,
++        ))?;
++        Ok(super::control::request_hash(
++            ctx,
++            "memory_insert_v2",
++            &[&original, &extra],
++        ))
++    }
++}
++
++#[derive(Debug, Clone)]
++pub struct NativeInsertIntent {
++    pub(crate) scope: LifecycleScope,
++    pub(crate) original: NativeInsert,
++    pub(crate) namespace: NamespaceConfig,
++    pub(crate) capture: CapturedLifecycle,
++}
++#[derive(Debug, Clone)]
++pub struct NativeTombstoneIntent {
++    pub(crate) scope: LifecycleScope,
++    pub(crate) memory_id: MemoryId,
++    pub(crate) capture: CapturedLifecycle,
++}
++impl NativeInsertIntent {
++    pub fn capture_generation(&self) -> GenerationRef {
++        self.capture.generation
++    }
++}
++impl NativeTombstoneIntent {
++    pub fn capture_generation(&self) -> GenerationRef {
++        self.capture.generation
++    }
++}
++
++pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
++    Sha256::digest(bytes).into()
++}
++fn hash_value(v: &impl Serialize) -> Result<[u8; 32], StorageError> {
++    Ok(hash_bytes(&super::control::encode(v)?))
++}
++pub(crate) fn profile_id(namespace: &NamespaceConfig) -> Option<String> {
++    match &namespace.schema.as_ref()?.embedding_binding {
++        EmbeddingBinding::Bound { profile_id, .. } => Some(profile_id.clone()),
++        EmbeddingBinding::UnknownLegacy => None,
++    }
++}
++
++/// Component commitments permit validating retained fields after partial loss.
++/// Missing text hash means unknown legacy provenance when numeric.has_text is
++/// true, or no retained text otherwise. Native creation always has a known hash.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct ContentProof {
++    pub summary_sha256: [u8; 32],
++    pub tags_sha256: [u8; 32],
++    pub labels_sha256: [u8; 32],
++    pub label_provenance: LabelProvenance,
++    pub extensions_sha256: [u8; 32],
++    pub text_sha256: Option<[u8; 32]>,
++    pub vector: Option<VectorReference>,
++    pub profile_id: Option<String>,
++}
++impl ContentProof {
++    pub(crate) fn capture(
++        record: &DiskRecord,
++        namespace: &NamespaceConfig,
++        text_hash: Option<[u8; 32]>,
++    ) -> Result<Self, StorageError> {
++        let schema = record
++            .schema
++            .as_ref()
++            .ok_or_else(|| invalid("native record schema missing"))?;
++        Ok(Self {
++            summary_sha256: hash_bytes(record.summary.as_bytes()),
++            tags_sha256: hash_value(&record.tags)?,
++            labels_sha256: hash_value(&schema.labels)?,
++            label_provenance: schema.labels.provenance,
++            extensions_sha256: hash_value(&schema.extensions)?,
++            // Migrated legacy rows have no immutable native creation commitment.
++            // Keep that provenance unknown across peer-only edge mutations.
++            text_sha256: if record.text_length == 0
++                || schema.lifecycle.timestamp_origin == TimestampOrigin::LegacyInferred
++            {
++                None
++            } else {
++                text_hash
++            },
++            vector: schema.vector.clone(),
++            profile_id: profile_id(namespace),
++        })
++    }
++    pub(crate) fn erased(&self) -> Result<Self, StorageError> {
++        if self.extensions_sha256 != hash_value(&BTreeMap::<String, serde_json::Value>::new())? {
++            return Err(invalid(
++                "native forget needs a consumer for unknown record extensions",
++            ));
++        }
++        let mut result = self.clone();
++        result.summary_sha256 = hash_bytes(b"");
++        result.tags_sha256 = hash_value(&Vec::<crate::model::Tag>::new())?;
++        result.labels_sha256 = hash_value(&StructuredLabels {
++            entities: vec![],
++            topics: vec![],
++            emotions: vec![],
++            provenance: self.label_provenance,
++        })?;
++        result.text_sha256 = None;
++        result.vector = None;
++        Ok(result)
++    }
++}
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct NativeRecordState {
++    pub lifecycle: LifecycleState,
++    pub edge_count: u16,
++    pub history_sha256: [u8; 32],
++    pub content: ContentProof,
++}
++impl NativeRecordState {
++    pub(crate) fn capture(
++        r: &DiskRecord,
++        ns: &NamespaceConfig,
++        text_hash: Option<[u8; 32]>,
++    ) -> Result<Self, StorageError> {
++        Ok(Self {
++            lifecycle: LifecycleState::capture(r)?,
++            edge_count: r.edge_count,
++            history_sha256: history_hash(&r.access_history)?,
++            content: ContentProof::capture(r, ns, text_hash)?,
++        })
++    }
++    pub(crate) fn matches_record(&self, r: &DiskRecord) -> Result<bool, StorageError> {
++        let schema = r
++            .schema
++            .as_ref()
++            .ok_or_else(|| invalid("native schema missing"))?;
++        Ok(self.lifecycle == LifecycleState::capture(r)?
++            && self.edge_count == r.edge_count
++            && self.history_sha256 == history_hash(&r.access_history)?
++            && self.content.summary_sha256 == hash_bytes(r.summary.as_bytes())
++            && self.content.tags_sha256 == hash_value(&r.tags)?
++            && self.content.labels_sha256 == hash_value(&schema.labels)?
++            && self.content.extensions_sha256 == hash_value(&schema.extensions)?
++            && self.content.label_provenance == schema.labels.provenance
++            && self.content.vector == schema.vector)
++    }
++    pub(crate) fn tombstone(&self, now: i64) -> Result<Self, StorageError> {
++        if self.lifecycle.phase == DecayPhase::Tombstone {
++            return Ok(self.clone());
++        }
++        let mut result = self.clone();
++        let time = now.max(self.lifecycle.lifecycle.lifecycle_updated_at);
++        result.lifecycle.phase = DecayPhase::Tombstone;
++        result.lifecycle.strength = 0_f32.try_into().map_err(StorageError::InvalidControl)?;
++        result.lifecycle.decay_strength = 0_f32.try_into().map_err(StorageError::InvalidControl)?;
++        result.lifecycle.has_summary = false;
++        result.lifecycle.has_text = false;
++        result.lifecycle.lifecycle.lifecycle_updated_at = time;
++        result.lifecycle.lifecycle.phase_changed_at = time;
++        result.lifecycle.lifecycle.record_generation =
++            result.lifecycle.lifecycle.record_generation.next()?;
++        result.content = self.content.erased()?;
++        Ok(result)
++    }
++}
++
++/// Validation-only view; it never manufactures strings or restores payloads.
++pub(crate) struct ProofRecord {
++    pub id: MemoryId,
++    pub namespace: u32,
++    pub state: NativeRecordState,
++    pub history: Vec<AccessEvent>,
++}
++impl ProofRecord {
++    pub(crate) fn capture(
++        r: &DiskRecord,
++        ns: &NamespaceConfig,
++        text_hash: Option<[u8; 32]>,
++    ) -> Result<Self, StorageError> {
++        Ok(Self {
++            id: MemoryId::from_bytes(r.id),
++            namespace: r.namespace_id,
++            state: NativeRecordState::capture(r, ns, text_hash)?,
++            history: r.access_history.clone(),
++        })
++    }
++}
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct NativeRecordChange {
++    pub memory_id: MemoryId,
++    pub before: Option<NativeRecordState>,
++    pub after: NativeRecordState,
++}
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct NativeEdgeProof {
++    pub source: MemoryId,
++    pub target: MemoryId,
++    pub edge_type: crate::model::EdgeType,
++    pub weight_bits: u32,
++    pub auto_created: bool,
++    pub created_at: u64,
++}
++impl From<&super::edges::PersistedEdge> for NativeEdgeProof {
++    fn from(e: &super::edges::PersistedEdge) -> Self {
++        Self {
++            source: e.source,
++            target: e.target,
++            edge_type: e.edge_type,
++            weight_bits: e.weight.to_bits(),
++            auto_created: e.auto_created,
++            created_at: e.created_at,
++        }
++    }
++}
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct NativeRecordWrite {
++    pub namespace_id: crate::model::NamespaceId,
++    pub memory_id: MemoryId,
++    pub lifecycle_version: LifecycleVersion,
++    pub policy_revision: Generation,
++    pub previous_generation: Generation,
++    pub capture_generation: GenerationRef,
++    pub sampled_at: i64,
++    pub embedding_dim: u32,
++    pub records: Vec<NativeRecordChange>,
++    /// Actual canonical edge puts, retained as structural metadata only.
++    pub edges: Vec<NativeEdgeProof>,
++}
++impl NativeRecordWrite {
++    pub(crate) fn primary(&self) -> Result<&NativeRecordChange, StorageError> {
++        self.records
++            .iter()
++            .find(|r| r.memory_id == self.memory_id)
++            .ok_or_else(|| invalid("native mutation primary record absent"))
++    }
++    pub(crate) fn validate(
++        &self,
++        receipt: &WriteReceipt,
++        insertion: bool,
++    ) -> Result<(), StorageError> {
++        if self.namespace_id.is_unset()
++            || self.memory_id == MemoryId::nil()
++            || self.capture_generation.store_id != receipt.store_id
++            || self.capture_generation.generation > self.previous_generation
++            || self.previous_generation.next()? != receipt.committed_generation
++            || !(1..=8192).contains(&self.embedding_dim)
++            || chrono::DateTime::from_timestamp_millis(self.sampled_at).is_none()
++            || self.edges.len() > 2
++            || (!insertion && !self.edges.is_empty())
++        {
++            return Err(invalid("invalid native record receipt boundary"));
++        }
++        let primary = self.primary()?;
++        let mut edge_kinds = std::collections::HashSet::new();
++        for edge in &self.edges {
++            use crate::model::EdgeType;
++            if !edge_kinds.insert(edge.edge_type.as_u8())
++                || edge.source == edge.target
++                || edge.weight_bits != 1_f32.to_bits()
++                || edge.auto_created
++                || edge.created_at != self.sampled_at.max(0) as u64
++                || !matches!(edge.edge_type, EdgeType::ParentChild | EdgeType::Supersedes)
++                || (edge.edge_type == EdgeType::ParentChild && edge.target != self.memory_id)
++                || (edge.edge_type == EdgeType::Supersedes && edge.source != self.memory_id)
++            {
++                return Err(invalid("invalid native creation edge evidence"));
++            }
++        }
++        let mut ids = std::collections::HashSet::new();
++        for change in &self.records {
++            let after = &change.after;
++            let fields = &after.lifecycle.lifecycle;
++            after.lifecycle.validate()?;
++            if let Some(profile) = &after.content.profile_id {
++                if profile.len() != 68
++                    || !profile.starts_with("ep1:")
++                    || !profile.as_bytes()[4..]
++                        .iter()
++                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
++                {
++                    return Err(invalid("invalid native profile commitment"));
++                }
++            }
++            if let Some(before) = &change.before {
++                before.lifecycle.validate()?;
++            }
++            if !ids.insert(change.memory_id)
++                || change.memory_id == MemoryId::nil()
++                || fields.lifecycle_version != self.lifecycle_version
++                || fields.policy_revision != self.policy_revision
++            {
++                return Err(invalid("invalid native record receipt policy/identity"));
++            }
++            if change.memory_id == self.memory_id {
++                if insertion {
++                    let n = &after.lifecycle;
++                    if change.before.is_some()
++                        || fields.record_generation != Generation::default().next()?
++                        || fields.timestamp_origin != TimestampOrigin::Native
++                        || fields.retrieved_at.is_some()
++                        || fields.reinforced_at.is_some()
++                        || fields.decay_anchor_at != n.created_at
++                        || fields.phase_changed_at != n.created_at
++                        || fields.lifecycle_updated_at != self.sampled_at.max(n.created_at)
++                        || n.last_accessed_at != n.created_at
++                        || n.phase != DecayPhase::Full
++                        || !n.has_summary
++                        || n.is_permastore
++                        || n.strength.get() != 1.
++                        || n.decay_strength.get() != 1.
++                        || after.history_sha256 != history_hash(&[])?
++                        || after.content.label_provenance != LabelProvenance::NativeV2
++                        || after.content.profile_id.is_none()
++                        || after.content.vector.is_none()
++                        || after.content.extensions_sha256
++                            != hash_value(&BTreeMap::<String, serde_json::Value>::new())?
++                        || (n.has_text != after.content.text_sha256.is_some())
++                    {
++                        return Err(invalid("invalid native creation evidence"));
++                    }
++                    if after.content.vector.as_ref().unwrap().allocation_epoch
++                        != receipt.committed_generation
++                    {
++                        return Err(invalid(
++                            "native allocation epoch disagrees with its origin transaction",
++                        ));
++                    }
++                } else {
++                    let before = change
++                        .before
++                        .as_ref()
++                        .ok_or_else(|| invalid("native tombstone prior state missing"))?;
++                    if before.tombstone(self.sampled_at)? != *after {
++                        return Err(invalid("native tombstone transition mismatch"));
++                    }
++                }
++            } else {
++                if !insertion {
++                    return Err(invalid("native tombstone changed another record"));
++                }
++                let before = change
++                    .before
++                    .as_ref()
++                    .ok_or_else(|| invalid("native peer prior state missing"))?;
++                let mut expected = before.clone();
++                expected.lifecycle.lifecycle.record_generation =
++                    expected.lifecycle.lifecycle.record_generation.next()?;
++                let added = u16::try_from(
++                    self.edges
++                        .iter()
++                        .filter(|e| e.source == change.memory_id)
++                        .count(),
++                )
++                .map_err(|_| invalid("native peer edge count overflow"))?;
++                expected.edge_count = before
++                    .edge_count
++                    .checked_add(added)
++                    .ok_or_else(|| invalid("native peer edge count overflow"))?;
++                if expected != *after || before.edge_count == after.edge_count {
++                    return Err(invalid("native edge peer token/state mismatch"));
++                }
++                if !self.edges.iter().any(|e| e.source == change.memory_id) {
++                    return Err(invalid("native peer without an edge put"));
++                }
++            }
++        }
++        if insertion
++            && primary.after.edge_count
++                != self
++                    .edges
++                    .iter()
++                    .filter(|e| e.source == self.memory_id)
++                    .count() as u16
++        {
++            return Err(invalid("native creation outgoing count mismatch"));
++        }
++        if self.edges.iter().any(|edge| !ids.contains(&edge.source)) {
++            return Err(invalid(
++                "native edge source missing its atomic record proof",
++            ));
++        }
++        Ok(())
++    }
++    pub(crate) fn rewind(&self, rows: &mut Vec<ProofRecord>) -> Result<(), StorageError> {
++        for change in &self.records {
++            let index = rows
++                .iter()
++                .position(|r| r.id == change.memory_id)
++                .ok_or_else(|| invalid("native receipt record absent"))?;
++            if rows[index].namespace != self.namespace_id.get() || rows[index].state != change.after
++            {
++                return Err(invalid(
++                    "native record receipt does not match retained state",
++                ));
++            }
++            if let Some(before) = &change.before {
++                rows[index].state = before.clone();
++            } else {
++                rows.remove(index);
++            }
++        }
++        Ok(())
++    }
++}
++
++/// Creation commitments survive a fork. Actual retained text is checked by the
++/// canonical inventory consumer, not trusted merely because the receipt hashes it.
++pub(crate) fn creation_proofs(
++    read: &redb::ReadTransaction,
++) -> Result<HashMap<MemoryId, NativeRecordWrite>, StorageError> {
++    use redb::ReadableTable;
++    let mut result = HashMap::new();
++    for row in read.open_table(super::control::RECEIPTS)?.iter()? {
++        let (_, value) = row?;
++        let receipt = super::control::validate_receipt(value.value())?.receipt;
++        if let MutationOutcome::NativeMemoryInserted { transition } = receipt.outcome {
++            if result.insert(transition.memory_id, transition).is_some() {
++                return Err(invalid("duplicate native creation identity"));
++            }
++        }
++    }
++    Ok(result)
++}
++
++pub(crate) fn validate_retained_creation(
++    record: &DiskRecord,
++    namespace: &NamespaceConfig,
++    creation: Option<&NativeRecordWrite>,
++    ledger: Option<&super::metadata::removal_ledger::LedgerExport>,
++) -> Result<(), StorageError> {
++    let schema = record
++        .schema
++        .as_ref()
++        .ok_or_else(|| invalid("native canonical record schema missing"))?;
++    let Some(creation) = creation else {
++        if schema.lifecycle.timestamp_origin == TimestampOrigin::Native {
++            return Err(invalid("native record has no typed creation proof"));
++        }
++        return Ok(());
++    };
++    let original = &creation.primary()?.after;
++    let expected = &original.content;
++    let mask = ledger
++        .into_iter()
++        .flat_map(|l| &l.entries)
++        .filter(|e| {
++            e.namespace_id == record.namespace_id
++                && e.memory_uuid == MemoryId::from_bytes(record.id).into_inner()
++        })
++        .fold(0_u8, |mask, e| mask | e.removed_fields_mask);
++    use super::metadata::removal_ledger::{EMBEDDING, FULL_TEXT, SUMMARY, TAGS};
++    let current = ContentProof::capture(record, namespace, expected.text_sha256)?;
++    if record.namespace_id != creation.namespace_id.get()
++        || record.created_at != original.lifecycle.created_at
++        || schema.lifecycle.observed_at != original.lifecycle.lifecycle.observed_at
++        || schema.lifecycle.timestamp_origin != TimestampOrigin::Native
++        || record.difficulty != original.lifecycle.difficulty.get()
++        || current.label_provenance != LabelProvenance::NativeV2
++        || current.profile_id != expected.profile_id
++        || current.extensions_sha256 != expected.extensions_sha256
++        || (mask & SUMMARY == 0 && current.summary_sha256 != expected.summary_sha256)
++        || (mask & TAGS == 0
++            && (current.tags_sha256 != expected.tags_sha256
++                || current.labels_sha256 != expected.labels_sha256))
++        || (mask & FULL_TEXT == 0 && (record.text_length != 0) != original.lifecycle.has_text)
++        || (mask & EMBEDDING == 0 && current.vector != expected.vector)
++    {
++        return Err(invalid(
++            "retained native record disagrees with its creation commitment",
++        ));
++    }
++    Ok(())
++}
++pub(crate) fn validate_retained_text(
++    record: &DiskRecord,
++    creation: Option<&NativeRecordWrite>,
++    text: &str,
++) -> Result<(), StorageError> {
++    if let Some(creation) = creation {
++        if record.text_length != 0
++            && creation.primary()?.after.content.text_sha256 != Some(hash_bytes(text.as_bytes()))
++        {
++            return Err(invalid(
++                "retained native text disagrees with creation commitment",
++            ));
++        }
++    }
++    Ok(())
++}
++
++impl super::native_lifecycle::NativeLifecycleSession {
++    pub fn capture_insert(
++        &self,
++        scope: LifecycleScope,
++        input: &NativeInsert,
++    ) -> Result<NativeInsertIntent, StorageError> {
++        self.metadata()
++            .capture_native_insert(scope, input, &self.policy)
++    }
++    pub fn insert_prepared(
++        &mut self,
++        ctx: &MutationContext,
++        intent: &NativeInsertIntent,
++        generated: &crate::embedding::runtime::GeneratedEmbedding,
++    ) -> Result<WriteReceipt, StorageError> {
++        self.engine.insert_native_record(
++            ctx,
++            intent,
++            generated,
++            &self.policy,
++            self.clock.as_ref(),
++            None,
++        )
++    }
++    pub fn capture_tombstone(
++        &self,
++        id: MemoryId,
++        namespace: Option<crate::model::NamespaceId>,
++    ) -> Result<NativeTombstoneIntent, StorageError> {
++        self.metadata()
++            .capture_native_tombstone(id, namespace, &self.policy)
++    }
++    pub fn tombstone(
++        &mut self,
++        ctx: &MutationContext,
++        intent: &NativeTombstoneIntent,
++    ) -> Result<WriteReceipt, StorageError> {
++        self.engine
++            .tombstone_native_record(ctx, intent, &self.policy, self.clock.as_ref(), None)
++    }
++    /// Explicit offline wrapper only. The accepted root lives across provider
++    /// await; no publication/storage lock or second ownership session does.
++    pub async fn insert_generated(
++        &mut self,
++        ctx: &MutationContext,
++        scope: LifecycleScope,
++        input: &NativeInsert,
++        provider: &dyn crate::embedding::EmbeddingProvider,
++    ) -> Result<WriteReceipt, StorageError> {
++        let root = self.metadata().work_tracker().begin()?;
++        let result = self
++            .insert_accepted(ctx, scope, input, provider, &root)
++            .await;
++        self.metadata().finish_work(root);
++        result
++    }
++    async fn insert_accepted(
++        &mut self,
++        ctx: &MutationContext,
++        scope: LifecycleScope,
++        input: &NativeInsert,
++        provider: &dyn crate::embedding::EmbeddingProvider,
++        root: &super::work::WorkTicket,
++    ) -> Result<WriteReceipt, StorageError> {
++        if ctx.scope != super::control::MutationScope::Namespace(scope.namespace_id) {
++            return Err(StorageError::MutationNamespaceMismatch);
++        }
++        if let Some(receipt) = self
++            .metadata()
++            .lookup_native_insert(ctx, input, Some(root))?
++        {
++            return Ok(receipt);
++        }
++        let intent = self.capture_insert(scope, input)?;
++        let generated = if input.memory.embedding.is_some() {
++            crate::embedding::runtime::GeneratedEmbedding {
++                values: vec![],
++                profile: None,
++            }
++        } else {
++            let profile = provider.profile().ok_or_else(|| {
++                StorageError::ProviderVectorUnavailable("provider identity missing".into())
++            })?;
++            crate::embedding::profile::require_compatible(&intent.namespace, &profile)
++                .map_err(|e| StorageError::ProviderVectorUnavailable(e.to_string()))?;
++            if provider.dimensions() != intent.namespace.embedding_dim as usize {
++                return Err(StorageError::ProviderVectorUnavailable(
++                    "provider dimension differs".into(),
++                ));
++            }
++            let values = provider
++                .embed(
++                    input
++                        .memory
++                        .full_text
++                        .as_deref()
++                        .unwrap_or(&input.memory.summary),
++                )
++                .await
++                .map_err(|e| StorageError::ProviderVectorUnavailable(e.to_string()))?;
++            crate::embedding::runtime::GeneratedEmbedding {
++                values,
++                profile: Some(profile),
++            }
++        };
++        self.engine.insert_native_record(
++            ctx,
++            &intent,
++            &generated,
++            &self.policy,
++            self.clock.as_ref(),
++            Some(root),
++        )
++    }
++}
+diff --git a/src/storage/validation.rs b/src/storage/validation.rs
+index 83e2df1..3ffc5d3 100644
+--- a/src/storage/validation.rs
++++ b/src/storage/validation.rs
+@@ -106,16 +106,21 @@ fn selected_text(path: &Path, read: &redb::ReadTransaction) -> Result<TextStore,
+ /// Caller owns/quiesces the store, or supplies an inaccessible staging copy.
+ /// Returns the required canonical inventory derived from validated metadata.
+ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageError> {
+-    validate_snapshot(path, false)
++    validate_snapshot(path, false, false)
+ }
+-
+-/// Only the logical importer may inspect its unpublished, explicitly importing
+-/// stage. Ordinary inspection/export/backup must not treat partial imports as snapshots.
++/// Only the logical importer may inspect its unpublished, explicitly importing stage.
+ pub(crate) fn validate_import_stage(path: &Path) -> Result<HashSet<String>, StorageError> {
+-    validate_snapshot(path, true)
++    validate_snapshot(path, true, false)
+ }
+-
+-fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, StorageError> {
++/// Strict private-native preflight admits only validated native recovery plans.
++pub(crate) fn preflight_native(path: &Path) -> Result<(), StorageError> {
++    validate_snapshot(path, false, true).map(|_| ())
++}
++fn validate_snapshot(
++    path: &Path,
++    importing: bool,
++    native_recovery: bool,
++) -> Result<HashSet<String>, StorageError> {
+     if !importing && std::fs::symlink_metadata(path.join(".recalld-importing")).is_ok() {
+         return Err(StorageError::RecoveryRequired(
+             "incomplete logical import; resume using its original export".into(),
+@@ -128,6 +133,22 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
+     let (_meta_copy, meta) = inspect_database(&path.join("meta.db"))?;
+     let read = meta.begin_read()?;
+     let control = super::control::validate_existing(&read)?;
++    if native_recovery {
++        let state = control
++            .as_ref()
++            .ok_or_else(|| StorageError::InvalidControl("native control missing".into()))?;
++        if state.control_schema_version != 2
++            || super::metadata::text_generation::read_selection(&read)?.is_none()
++        {
++            return Err(StorageError::InvalidControl(
++                "native entry requires gated schema 2".into(),
++            ));
++        }
++        super::lineage::ensure_serving(&read, state)?;
++        super::metadata::restoration::validate_inventory(&read)?;
++        super::canonical_schema::validate_metadata_format(&read, Some(state))?;
++    }
++
+     if super::metadata::purge::validate_existing(&read, control.as_ref())?
+         .iter()
+         .any(|p| p.stage != super::purge::PurgeStage::Complete)
+@@ -137,6 +158,14 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
+         ));
+     }
+     super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
++    let native_creations = if control
++        .as_ref()
++        .is_some_and(|c| c.control_schema_version == 2)
++    {
++        super::native_records::creation_proofs(&read)?
++    } else {
++        HashMap::new()
++    };
+     let schema_state = control
+         .as_ref()
+         .map(|c| super::canonical_schema::read_state(&read, c))
+@@ -145,10 +174,16 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
+     if control.is_some() {
+         read.open_table(super::metadata::NAMESPACE_COUNTER)?;
+     }
+-    if super::metadata::effects::validate_existing(&read)?
+-        .iter()
+-        .any(|e| !e.canonical_applied)
+-    {
++    let effects = super::metadata::effects::validate_existing(&read)?;
++    if effects.iter().any(|e| {
++        !e.canonical_applied
++            && (!native_recovery
++                || !matches!(
++                    e.receipt.outcome,
++                    super::control::MutationOutcome::NativeMemoryInserted { .. }
++                        | super::control::MutationOutcome::NativeMemoryTombstoned { .. }
++                ))
++    }) {
+         return Err(StorageError::RecoveryRequired(
+             "pending canonical effects; reopen before backup".into(),
+         ));
+@@ -203,6 +238,7 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
+     let records = read.open_table(META_TABLE)?;
+     let mut ids = HashSet::new();
+     let mut owners = HashSet::new();
++    let mut decoded = Vec::new();
+     for item in records.iter()? {
+         let (key, value) = item?;
+         let record = DiskRecord::from_bytes(value.value())?;
+@@ -212,6 +248,7 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
+             ));
+         }
+         let id = MemoryId::from_bytes(record.id);
++        decoded.push((id, record.clone()));
+         ids.insert(id);
+         let namespace = configs
+             .get(&record.namespace_id)
+@@ -261,12 +298,20 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
+             }
+         }
+         if record.text_offset != 0 || record.text_length != 0 {
+-            text.read(TextRef {
++            let retained = text.read(TextRef {
+                 file_offset: record.text_offset,
+                 length: record.text_length,
+             })?;
++            super::native_records::validate_retained_text(
++                &record,
++                native_creations.get(&id),
++                &retained,
++            )?;
+         }
+     }
++    for effect in effects.iter().filter(|e| !e.canonical_applied) {
++        super::metadata::effects::validate_plan(effect, &decoded)?;
++    }
+     let (_edges_copy, edges) = inspect_database(&path.join("edges.db"))?;
+     let read = edges.begin_read()?;
+     let forward = read.open_table(FORWARD_EDGES)?;

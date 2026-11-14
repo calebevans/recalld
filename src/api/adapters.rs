@@ -89,9 +89,10 @@ impl state::SearchPipeline for SearchPipelineAdapter {
     async fn embed_text(
         &self,
         text: &str,
-        _namespace_id: NamespaceId,
-    ) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
-        self.embedding.embed(text).await
+        namespace: &NamespaceConfig,
+    ) -> Result<crate::embedding::runtime::GeneratedEmbedding, crate::embedding::EmbeddingError>
+    {
+        crate::embedding::runtime::generate(self.embedding.as_ref(), namespace, text).await
     }
 
     async fn search(
@@ -389,6 +390,49 @@ impl state::StorageEngine for StorageEngineAdapter {
         .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
     }
 
+    async fn insert_memory(
+        &self,
+        namespace_id: NamespaceId,
+        input: crate::storage::insertion::InsertMemory,
+        generated_embedding: crate::embedding::runtime::GeneratedEmbedding,
+    ) -> Result<crate::storage::insertion::InsertResult, crate::storage::StorageError> {
+        crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
+        }
+        .insert(
+            crate::storage::control::MutationContext::unkeyed(namespace_id),
+            input,
+            generated_embedding,
+            self.clock.now_millis(),
+        )
+        .await
+    }
+
+    async fn complete_insertion(
+        &self,
+        receipt: &crate::storage::control::WriteReceipt,
+    ) -> Result<(), crate::storage::StorageError> {
+        crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
+        }
+        .complete()
+        .await
+        .map_err(|source| crate::storage::StorageError::CommittedMutation {
+            receipt: Box::new(receipt.clone()),
+            source: Box::new(source),
+        })
+    }
+
     async fn create_memory(
         &self,
         namespace_id: NamespaceId,
@@ -399,72 +443,30 @@ impl state::StorageEngine for StorageEngineAdapter {
         initial_stability: Option<f32>,
         created_at: Option<i64>,
     ) -> Result<CachedRecord, crate::storage::StorageError> {
-        use crate::model::Tag;
-        use crate::model::record::DiskRecord;
-
-        let id = MemoryId::new();
-        let now = self.clock.now_millis();
-        let ts = created_at.unwrap_or(now);
-        // Over-long tags cannot reach this point: the shared request
-        // validator bounds every tag and reserves the `entity/` /
-        // `topic/` / `emotion/` prefix out of the label limits. A drop
-        // here therefore means a tag outside `Tag`'s alphabet, and it
-        // is logged rather than swallowed.
-        let parsed_tags: Vec<Tag> = crate::model::parse_tags_lossy("create_memory.tags", tags);
-
-        let mut record = DiskRecord {
-            schema: None,
-            version: DiskRecord::CURRENT_VERSION,
-            id: *id.as_bytes(),
-            namespace_id: namespace_id.get(),
-            created_at: ts,
-            last_accessed_at: ts,
-            phase: DecayPhase::Full,
-            strength: 1.0,
-            decay_strength: 1.0,
-            stability: initial_stability.unwrap_or(3.7145),
-            difficulty: 5.0,
-            is_permastore: 0,
-            vector_slot: 0,
-            edge_count: 0,
-            summary: summary.to_string(),
-            tags: parsed_tags,
-            access_history: Vec::new(),
-            text_offset: 0,
-            text_length: 0,
-        };
-
-        let storage = self.storage.clone();
-        let embedding_vec = embedding.to_vec();
-        let full_text_owned = full_text.map(|s| s.to_string());
-
-        let record = tokio::task::spawn_blocking(move || {
-            let mut storage_w = storage.write().map_err(|e| {
-                crate::storage::StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("storage lock poisoned: {e}"),
-                ))
-            })?;
-            storage_w.insert_memory(
-                id,
+        let result = self
+            .insert_memory(
                 namespace_id,
-                &mut record,
-                &embedding_vec,
-                full_text_owned.as_deref(),
-            )?;
-            Ok::<_, crate::storage::StorageError>(record)
+                crate::storage::insertion::InsertMemory {
+                    id: None,
+                    summary: summary.into(),
+                    full_text: full_text.map(str::to_owned),
+                    tags: crate::model::parse_tags_lossy("create_memory.tags", tags),
+                    embedding: Some(embedding.to_vec()),
+                    initial_stability,
+                    created_at,
+                    parent_id: None,
+                    supersedes: None,
+                },
+                vec![].into(),
+            )
+            .await?;
+        result.record.ok_or_else(|| {
+            crate::storage::StorageError::NotFound(
+                crate::storage::insertion::inserted_id(&result.receipt)
+                    .expect("insertion receipt")
+                    .into_inner(),
+            )
         })
-        .await
-        .map_err(|e| {
-            crate::storage::StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("blocking task join error: {e}"),
-            ))
-        })??;
-
-        let cached = CachedRecord::from(&record);
-        self.cache.insert(id, cached.clone()).await;
-        Ok(cached)
     }
 
     async fn get_record(&self, id: MemoryId) -> Option<DiskRecord> {
@@ -479,91 +481,16 @@ impl state::StorageEngine for StorageEngineAdapter {
     }
 
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, crate::storage::StorageError> {
-        let storage = self.storage.clone();
-
-        // Perform read, tombstone check, tombstone, and free_vector_slot
-        // atomically under a single write lock to prevent TOCTOU races.
-        // Without this, two concurrent deletes could both read the record
-        // as non-tombstoned, both tombstone it, and both free the same
-        // vector slot -- corrupting the free list into a self-referential
-        // cycle.
-        // Returns the PRE-tombstone record, not a bool: `tombstone`
-        // erases the tag list, and the tag list is where the entity
-        // names live. A bool here would leave the entity index with no
-        // way to know what to unlink.
-        let deleted = tokio::task::spawn_blocking(move || {
-            let mut storage_w = storage.write().map_err(|e| {
-                crate::storage::StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("storage lock poisoned: {e}"),
-                ))
-            })?;
-
-            // Check if the record exists and is not already tombstoned.
-            let existing_record = match storage_w.get_record(id)? {
-                Some(r) => r,
-                None => {
-                    return Ok::<Option<crate::model::DiskRecord>, crate::storage::StorageError>(
-                        None,
-                    );
-                }
-            };
-
-            if existing_record.phase == DecayPhase::Tombstone {
-                return Ok(None);
-            }
-
-            // Tombstone the record.
-            storage_w.tombstone_memory(id)?;
-
-            // Free the vector slot.
-            let ns_id = NamespaceId::new(existing_record.namespace_id);
-            if let Err(e) = storage_w.free_vector_slot(ns_id, existing_record.vector_slot) {
-                tracing::warn!(
-                    memory_id = %id,
-                    vector_slot = existing_record.vector_slot,
-                    %e,
-                    "vector slot free failed (non-fatal)"
-                );
-            }
-
-            Ok(Some(existing_record))
-        })
+        crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
+        }
+        .forget(id)
         .await
-        .map_err(|e| {
-            crate::storage::StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("blocking task join error: {e}"),
-            ))
-        })??;
-
-        let Some(record) = deleted else {
-            return Ok(false);
-        };
-
-        // This used to stop at `cache.invalidate`, so an HTTP-deleted
-        // memory kept its vector-index entry (burning a top-k slot in
-        // every search and reading as a live autolink target), kept its
-        // FTS row — which survives restart, because the FTS index is
-        // only rebuilt when it is empty — and kept a graph node
-        // reporting Full phase at strength 1.0, still propping up its
-        // neighbours' decay resistance. Same helper as the MCP path now,
-        // so the two cannot drift apart again.
-        crate::index_cleanup::purge_from_indexes(
-            &crate::index_cleanup::IndexHandles {
-                cache: &self.cache,
-                vector_index: &self.vector_index,
-                fts_index: &self.fts_index,
-                entity_index: &self.entity_index,
-                graph: &self.graph,
-            },
-            std::slice::from_ref(&(id, record)),
-            crate::index_cleanup::FtsAction::PerRecord,
-            crate::index_cleanup::GraphAction::MarkTombstoned,
-        )
-        .await;
-
-        Ok(true)
     }
 
     async fn namespace_stats(
@@ -1449,6 +1376,120 @@ mod tests {
     use crate::api::state::StorageEngine as _;
     use crate::search::{VectorIndex as _, VectorMetadata};
     use crate::test_support::{DIM, Fixture, MemorySpec};
+
+    #[tokio::test]
+    async fn insertion_http_boundary_distinguishes_provider_unavailable_from_caller_invalid() {
+        use axum::response::IntoResponse;
+        let fx = Fixture::new();
+        for supplied in [false, true] {
+            let input = crate::storage::insertion::InsertMemory {
+                id: None,
+                summary: "vector boundary".into(),
+                full_text: None,
+                tags: vec![],
+                initial_stability: None,
+                created_at: None,
+                embedding: supplied.then(|| vec![0.; DIM]),
+                parent_id: None,
+                supersedes: None,
+            };
+            let before = fx
+                .storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation;
+            let error = match adapter(&fx)
+                .insert_memory(NamespaceId::new(1), input, vec![0.; DIM].into())
+                .await
+            {
+                Ok(_) => panic!("zero vector accepted"),
+                Err(error) => error,
+            };
+            let response = super::super::errors::AppError::from(error).into_response();
+            assert_eq!(
+                response.status(),
+                if supplied {
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY
+                } else {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            );
+            assert_eq!(
+                fx.storage
+                    .read()
+                    .unwrap()
+                    .control_state()
+                    .unwrap()
+                    .committed_generation,
+                before
+            );
+            assert!(fx.storage.read().unwrap().scan_all().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_http_insertion_adapter_reports_durable_receipt_if_publication_fails() {
+        use axum::response::IntoResponse;
+        let fx = Fixture::new();
+        *fx.vector_index.write().await = FlatVectorIndex::new(DIM + 1);
+        let error = match adapter(&fx)
+            .insert_memory(
+                NamespaceId::new(1),
+                crate::storage::insertion::InsertMemory {
+                    id: None,
+                    summary: "http committed insertion".into(),
+                    full_text: None,
+                    tags: vec![],
+                    initial_stability: None,
+                    created_at: None,
+                    embedding: Some(unit_vector()),
+                    parent_id: None,
+                    supersedes: None,
+                },
+                vec![].into(),
+            )
+            .await
+        {
+            Ok(_) => panic!("publication failure reported success"),
+            Err(error) => error,
+        };
+        let response = super::super::errors::AppError::from(error).into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["commitState"], "committed");
+        assert_eq!(body["ready"], false);
+        let receipt: crate::storage::control::WriteReceipt =
+            serde_json::from_value(body["receipt"].clone()).unwrap();
+        let id = crate::storage::insertion::inserted_id(&receipt).unwrap();
+        assert!(fx.record(id).is_some());
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .effects_stamp()
+                .is_err()
+        );
+        *fx.vector_index.write().await = FlatVectorIndex::new(DIM);
+        adapter(&fx).complete_insertion(&receipt).await.unwrap();
+        assert!(fx.vector_index.read().await.get_vector(id).is_some());
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .effects_stamp()
+                .is_ok()
+        );
+    }
 
     /// A vector of the fixture's width, so it matches the index.
     fn unit_vector() -> Vec<f32> {

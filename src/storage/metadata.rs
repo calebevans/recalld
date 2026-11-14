@@ -7,12 +7,19 @@
 //!
 //! See CS-07 for the full specification.
 
+mod catalog;
 pub(crate) mod effects;
+mod insertion;
 mod lifecycle_updates;
+pub(crate) mod namespace_state;
 mod native_lifecycle;
+mod native_records;
+pub(crate) mod purge;
 pub(crate) mod removal_ledger;
 pub(crate) mod restoration;
 pub(crate) mod text_generation;
+mod tombstone;
+mod work;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,6 +38,9 @@ use crate::storage::control::{
 };
 use crate::storage::error::StorageError;
 use crate::storage::indexes::PhaseIndex;
+use crate::storage::work::{WorkTicket, WorkTracker};
+pub use work::MetadataFreeze;
+pub(crate) use work::MutationGuard;
 
 // ═══════════════════════════════════════════════════════════════════════
 // redb Table Definitions
@@ -75,13 +85,17 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 pub struct MetadataStore {
     db: Database,
     native_lifecycle_only: bool,
+    work_tracker: WorkTracker,
     unavailable: std::sync::atomic::AtomicBool,
+    purge_pending: std::sync::atomic::AtomicBool,
     pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
     derived_dirty: std::sync::atomic::AtomicBool,
     effects_epoch: std::sync::atomic::AtomicU64,
     pub(crate) derived_publication: std::sync::Arc<tokio::sync::RwLock<()>>,
     #[cfg(test)]
     pub(crate) fail_effect_application: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_purge_child_commit: std::sync::atomic::AtomicBool,
     // Lock order: engine gate -> publication -> redb -> phase_index.
     // Hold across commit and bitmap publication, including direct callers.
     publication: std::sync::RwLock<()>,
@@ -110,6 +124,13 @@ impl MetadataStore {
     fn open_mode(path: &Path, native_lifecycle_only: bool) -> Result<Self, StorageError> {
         if native_lifecycle_only && (!path.is_file() || path.metadata()?.len() == 0) {
             return Err(StorageError::InvalidPath);
+        }
+        if let Some(parent) = path.parent() {
+            if std::fs::symlink_metadata(parent.join(".recalld-importing")).is_ok() {
+                return Err(StorageError::RecoveryRequired(
+                    "incomplete logical import; resume using its original export".into(),
+                ));
+            }
         }
         // redb's writable open can change bookkeeping. Reject historical mode
         // on a disposable copy even for callers bypassing the engine.
@@ -170,8 +191,18 @@ impl MetadataStore {
             effects::validate_existing(&read)?;
         }
 
-        // Native entry never adopts tables or rewrites derived checkpoints.
-        if !native_lifecycle_only {
+        // Native entry never initializes tables or rewrites checkpoints.
+        let store_id = if native_lifecycle_only {
+            let read = db.begin_read()?;
+            let table = read.open_table(control::CONTROL)?;
+            ControlState::decode(
+                table
+                    .get("state")?
+                    .ok_or_else(|| StorageError::InvalidControl("missing native control".into()))?
+                    .value(),
+            )?
+            .store_id
+        } else {
             let write_txn = db.begin_write()?;
             control::initialize(&write_txn)?;
             effects::initialize(&write_txn)?;
@@ -182,35 +213,43 @@ impl MetadataStore {
             let _ = write_txn.open_multimap_table(TAG_INDEX)?;
             let _ = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             removal_ledger::initialize(&write_txn, pristine)?;
+            let store_id = control::read_control(&write_txn)?.store_id;
             write_txn.commit()?;
-        }
-
+            store_id
+        };
         // Legacy checkpoints have no generation watermark. Always rebuild
         // from canonical records, even for direct MetadataStore callers.
         let store = Self {
             db,
             native_lifecycle_only,
+            work_tracker: WorkTracker::new(store_id),
             unavailable: std::sync::atomic::AtomicBool::new(false),
+            purge_pending: std::sync::atomic::AtomicBool::new(false),
             canonical_pending: std::sync::atomic::AtomicBool::new(false),
             derived_dirty: std::sync::atomic::AtomicBool::new(false),
             effects_epoch: std::sync::atomic::AtomicU64::new(0),
             derived_publication: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             fail_effect_application: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_purge_child_commit: std::sync::atomic::AtomicBool::new(false),
             publication: std::sync::RwLock::new(()),
             phase_index: std::sync::RwLock::new(PhaseIndex::new()),
         };
-        if native_lifecycle_only {
-            let rows = store.scan_all_for_recovery()?;
-            let phases = rows
+        store.purge_pending.store(
+            store
+                .purge_progress()?
                 .iter()
-                .map(|(_, r)| (r.namespace_id, r.vector_slot, r.phase))
-                .collect::<Vec<_>>();
-            *store.phase_index.write().unwrap_or_else(|e| e.into_inner()) =
-                PhaseIndex::rebuild_from_records(&phases);
-        } else {
-            store.rebuild_phase_index()?;
-        }
+                .any(|p| p.stage != crate::storage::purge::PurgeStage::Complete),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let records = store.scan_all_for_recovery()?;
+        let phases: Vec<_> = records
+            .iter()
+            .map(|(_, r)| (r.namespace_id, r.vector_slot, r.phase))
+            .collect();
+        *store.phase_index.write().unwrap_or_else(|e| e.into_inner()) =
+            PhaseIndex::rebuild_from_records(&phases);
         let pending = store.pending_effects()?;
         store.canonical_pending.store(
             pending.iter().any(|e| !e.canonical_applied),
@@ -232,6 +271,11 @@ impl MetadataStore {
     }
 
     pub(crate) fn ensure_available(&self) -> Result<(), StorageError> {
+        self.ensure_handle_available()?;
+        self.require_no_active_purge()
+    }
+
+    pub(crate) fn ensure_handle_available(&self) -> Result<(), StorageError> {
         if self.unavailable.load(std::sync::atomic::Ordering::Acquire)
             || self
                 .canonical_pending
@@ -259,23 +303,6 @@ impl MetadataStore {
             ));
         }
         Ok(())
-    }
-
-    pub(crate) fn mutation_guard(
-        &self,
-    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
-        self.ensure_legacy_operation()?;
-        let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
-        // Recheck after waiting: the preceding writer may have failed.
-        self.ensure_available()?;
-        let read = self.db.begin_read()?;
-        let table = read.open_table(control::CONTROL)?;
-        let value = table
-            .get("state")?
-            .ok_or_else(|| StorageError::InvalidControl("missing control".into()))?;
-        let control = ControlState::decode(value.value())?;
-        crate::storage::lineage::ensure_serving(&read, &control)?;
-        Ok(guard)
     }
 }
 
@@ -534,7 +561,7 @@ impl MetadataStore {
         scope: MutationScope,
         operation_id: uuid::Uuid,
     ) -> Result<Option<WriteReceipt>, StorageError> {
-        self.ensure_available()?;
+        self.ensure_handle_available()?;
         let tx = self.db.begin_read()?;
         let table = tx.open_table(control::CONTROL)?;
         let value = table
@@ -583,12 +610,13 @@ impl MetadataStore {
     // transaction at the last pre-commit boundary, without a fake backend.
     fn prepare_access(
         &self,
-        _publication: &std::sync::RwLockWriteGuard<'_, ()>,
+        _publication: &MutationGuard<'_>,
         ctx: &MutationContext,
         id: MemoryId,
         timestamp: i64,
         kind: AccessKind,
     ) -> Result<(redb::WriteTransaction, WriteReceipt), StorageError> {
+        _publication.check(self)?;
         let kind_bytes = control::encode(&kind)?;
         let hash = control::request_hash(ctx, "record_access", &[id.as_bytes(), &kind_bytes]);
         let tx = self.db.begin_write()?;
@@ -1296,64 +1324,17 @@ impl MetadataStore {
     /// - `StorageError::DuplicateName` if a namespace with this name
     ///   already exists.
     pub fn create_namespace(&self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
-        self.ensure_available()?;
-        let _publication = self.mutation_guard()?;
-        let write_txn = self.db.begin_write()?;
-        let new_id;
-        {
-            // Check name uniqueness by scanning existing namespaces.
-            //
-            // Case-INSENSITIVELY, because the name becomes a directory
-            // name and macOS APFS, Windows NTFS and a case-insensitive
-            // ext4 volume all give "notes" and "Notes" the SAME
-            // directory. Two rows sharing one directory is not a
-            // cosmetic collision:
-            //
-            // - delete "notes" (row gone, remove_dir_all fails, warn
-            //   only), create "Notes", and the new namespace adopts the
-            //   old one's `vectors.dat` — somebody else's embeddings.
-            // - `create_namespace("Default")` used to pass the
-            //   uniqueness check, commit its row, no-op `create_dir_all`
-            //   onto `default/` and only then fail on the exclusive
-            //   flock. The row survived, and `delete_namespace("Default")`
-            //   walked past the `!= "default"` guard and unlinked the
-            //   real default's vectors.
-            //
-            // `validate_namespace_name` restricts names to ASCII, so
-            // ASCII case folding is total here.
-            let ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
-            for result in ns_table.iter()? {
-                let (_, value) = result?;
-                let existing: NamespaceConfig = serde_json::from_slice(value.value())
-                    .map_err(|e| StorageError::Deserialize(e.to_string()))?;
-                if existing.name.eq_ignore_ascii_case(&config.name) {
-                    return Err(StorageError::DuplicateName(config.name.clone()));
-                }
-            }
-            drop(ns_table);
-
-            // Assign next ID.
-            let mut counter_table = write_txn.open_table(NAMESPACE_COUNTER)?;
-            let current_max = counter_table.get("max_id")?.map(|v| v.value()).unwrap_or(0);
-            new_id = current_max
-                .checked_add(1)
-                .ok_or_else(|| StorageError::InvalidControl("namespace ID exhausted".into()))?;
-            counter_table.insert("max_id", new_id)?;
-            drop(counter_table);
-
-            // Write the namespace config with the assigned ID.
-            let mut stored_config = config.clone();
-            stored_config.id = NamespaceId::new(new_id);
-            let bytes = serde_json::to_vec(&stored_config)
-                .map_err(|e| StorageError::Serialize(e.to_string()))?;
-
-            let mut ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
-            ns_table.insert(new_id, bytes.as_slice())?;
+        let ctx = MutationContext {
+            scope: MutationScope::Catalog,
+            ..MutationContext::unkeyed(NamespaceId::new(1))
+        };
+        let receipt = self.create_catalog(&ctx, config, |_| Ok(()))?;
+        match receipt.outcome {
+            MutationOutcome::NamespaceCreated { namespace_id, .. } => Ok(namespace_id),
+            _ => Err(StorageError::InvalidControl(
+                "create receipt outcome mismatch".into(),
+            )),
         }
-        control::advance_generation(&write_txn)?;
-        self.commit(write_txn)?;
-
-        Ok(NamespaceId::new(new_id))
     }
 
     /// List all namespace configurations.
@@ -2268,7 +2249,7 @@ mod tests {
         let ctx = keyed_context(&store, 1, "abort");
         let before = store.control_state().unwrap();
         // All three writes have been staged in the real redb transaction.
-        let publication = store.publication.write().unwrap();
+        let publication = store.mutation_guard().unwrap();
         let (tx, abandoned) = store
             .prepare_access(&publication, &ctx, id, 123, AccessKind::DirectRetrieval)
             .unwrap();

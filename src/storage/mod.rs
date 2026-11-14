@@ -15,24 +15,35 @@
 //! - `fsync` — Filesystem sync helpers for crash safety
 
 pub mod canonical_schema;
+pub mod catalog;
 pub mod control;
 pub mod edges;
 pub mod engine;
 pub mod error;
 pub mod fsync;
 pub mod indexes;
+pub mod insertion;
 pub mod lifecycle_migration;
 pub(crate) mod lineage;
+pub mod logical_export;
 pub mod metadata;
 pub mod native_lifecycle;
+pub mod native_records;
 pub mod offline_snapshot;
 pub(crate) mod ownership;
+pub mod purge;
+#[cfg(test)]
+mod purge_tests;
 pub(crate) mod restore_journal;
 pub mod schema_migration;
 pub mod text;
 pub mod text_migration;
+pub mod tombstone;
+#[cfg(test)]
+mod tombstone_tests;
 pub(crate) mod validation;
 pub mod vectors;
+pub mod work;
 
 // ── Re-exports ──────────────────────────────────────────────────────
 

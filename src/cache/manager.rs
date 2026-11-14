@@ -301,10 +301,6 @@ impl CacheManager {
         let _ = self.canonical.set(Arc::downgrade(storage));
     }
 
-    pub(crate) fn invalidate_all(&self) {
-        self.cache.invalidate_all();
-    }
-
     /// Insert a record into the cache.
     pub async fn insert(&self, id: MemoryId, record: CachedRecord) {
         self.cache.insert(id, Arc::new(record)).await;

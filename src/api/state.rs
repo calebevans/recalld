@@ -37,8 +37,8 @@ pub trait SearchPipeline: Send + Sync {
     async fn embed_text(
         &self,
         text: &str,
-        namespace_id: NamespaceId,
-    ) -> Result<Vec<f32>, EmbeddingError>;
+        namespace: &NamespaceConfig,
+    ) -> Result<crate::embedding::runtime::GeneratedEmbedding, EmbeddingError>;
 
     /// Execute a search query, returning scored results.
     async fn search(&self, query: SearchQuery) -> Result<Vec<ResolvedSearchResult>, SearchError>;
@@ -113,6 +113,18 @@ pub trait StorageEngine: Send + Sync {
     async fn effects_stamp(&self) -> Result<u64, StorageError> {
         Ok(0)
     }
+
+    async fn insert_memory(
+        &self,
+        namespace_id: NamespaceId,
+        input: crate::storage::insertion::InsertMemory,
+        generated_embedding: crate::embedding::runtime::GeneratedEmbedding,
+    ) -> Result<crate::storage::insertion::InsertResult, StorageError>;
+
+    async fn complete_insertion(
+        &self,
+        receipt: &crate::storage::control::WriteReceipt,
+    ) -> Result<(), StorageError>;
 
     /// Create a new memory record and persist it.
     async fn create_memory(

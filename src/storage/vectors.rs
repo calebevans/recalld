@@ -274,7 +274,7 @@ impl VectorFileHeader {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Number of slots to pre-allocate when the file must grow.
-const GROWTH_CHUNK: u32 = 1024;
+pub(crate) const GROWTH_CHUNK: u32 = 1024;
 
 /// Per-namespace vector storage. Owns the mmap (read) and file handle
 /// (write). Not internally synchronized -- the caller wraps in
@@ -308,6 +308,10 @@ impl VectorStore {
     /// * `dir` -- directory that will contain the file (created if absent).
     /// * `dim` -- embedding dimensionality for this namespace.
     ///
+    pub(crate) fn relocate_path(&mut self, dir: &Path) {
+        self.path = dir.join("vectors.dat");
+    }
+
     /// On create: writes a 64-byte header and zero vector slots.
     /// On open: validates the header, acquires an exclusive file lock.
     pub fn open(dir: &Path, dim: usize) -> Result<Self> {
@@ -837,6 +841,10 @@ impl VectorManager {
             self.stores.insert(namespace_id, store);
         }
         Ok(self.stores.get_mut(&namespace_id).unwrap())
+    }
+
+    pub(crate) fn install_prepared(&mut self, id: NamespaceId, store: VectorStore) {
+        self.stores.insert(id, store);
     }
 
     /// Get a shared reference to an already-opened store.

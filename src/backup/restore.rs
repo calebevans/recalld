@@ -194,12 +194,25 @@ fn read_manifest(backup_path: &Path) -> Result<BackupManifest, RestoreError> {
     let mut archive = ZipArchive::new(file)?;
 
     // Find manifest file.
-    let mut manifest_file = archive
+    let manifest_file = archive
         .by_name("backup_manifest.json")
         .map_err(|_| RestoreError::InvalidArchive("missing backup_manifest.json".to_string()))?;
 
+    let limit = super::manifest::MAX_MANIFEST_BYTES;
+    if manifest_file.size() > limit {
+        return Err(RestoreError::ManifestError(
+            "manifest exceeds 16 MiB limit".into(),
+        ));
+    }
     let mut contents = String::new();
-    manifest_file.read_to_string(&mut contents)?;
+    manifest_file
+        .take(limit + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > limit {
+        return Err(RestoreError::ManifestError(
+            "manifest exceeds 16 MiB limit".into(),
+        ));
+    }
 
     serde_json::from_str(&contents).map_err(|e| RestoreError::ManifestError(e.to_string()))
 }
@@ -426,6 +439,7 @@ fn extract_backup(
     {
         return Err(invalid("manifest contains a noncanonical namespace file"));
     }
+    super::schema_manifest::validate_manifest_snapshot(data_dir, manifest)?;
     Ok(())
 }
 
@@ -445,9 +459,18 @@ mod tests {
         root: &Path,
         embedding: &[f32],
     ) -> (PathBuf, BackupManifest) {
+        fixture_with_namespace(root, embedding, "default")
+    }
+
+    fn fixture_with_namespace(
+        root: &Path,
+        embedding: &[f32],
+        name: &str,
+    ) -> (PathBuf, BackupManifest) {
         let source = root.join("source");
         let mut engine = RedbStorageEngine::open(&source).unwrap();
         let mut ns = NamespaceConfig::default_namespace(0);
+        ns.name = name.into();
         ns.embedding_dim = 4;
         let ns = engine.create_namespace(&ns).unwrap();
         let id = MemoryId::new();
@@ -480,6 +503,27 @@ mod tests {
         let files = canonical_files(&source).unwrap();
         let manifest = generate_manifest(&source, &files).unwrap();
         (source, manifest)
+    }
+
+    // Deliberately bypass production generation for semantically corrupt but
+    // checksum-consistent archives. Production generation now rejects these.
+    pub(super) fn checksum_valid_manifest(
+        source: &Path,
+        mut manifest: BackupManifest,
+    ) -> BackupManifest {
+        manifest.total_size_bytes = 0;
+        for entry in &mut manifest.files {
+            let bytes = fs::read(source.join(&entry.name)).unwrap();
+            entry.size_bytes = bytes.len() as u64;
+            entry.crc32 = crc32fast::hash(&bytes);
+            if entry.sha256.is_some() {
+                entry.sha256 = Some(
+                    super::super::schema_manifest::sha256_file(&source.join(&entry.name)).unwrap(),
+                );
+            }
+            manifest.total_size_bytes += entry.size_bytes;
+        }
+        manifest
     }
 
     fn archive(root: &Path, source: &Path, manifest: &BackupManifest) -> PathBuf {
@@ -556,12 +600,7 @@ mod tests {
         assert!(RedbStorageEngine::open(&source).is_err());
         assert_eq!(fs::read(source.join("meta.db")).unwrap(), metadata_before);
         // Recompute every manifest checksum/size: rejection must be semantic.
-        let files: Vec<_> = manifest
-            .files
-            .iter()
-            .map(|f| source.join(&f.name))
-            .collect();
-        let forged_manifest = generate_manifest(&source, &files).unwrap();
+        let forged_manifest = checksum_valid_manifest(&source, manifest);
         let archive = archive(root.path(), &source, &forged_manifest);
         let target = root.path().join("target");
         fs::create_dir(&target).unwrap();
@@ -825,12 +864,7 @@ mod tests {
             assert!(canonical_files(&source).is_err());
             assert_eq!(fs::read(source.join("meta.db")).unwrap(), source_before);
             // Use a checksum-valid archive to isolate semantic validation.
-            let files: Vec<_> = manifest
-                .files
-                .iter()
-                .map(|f| source.join(&f.name))
-                .collect();
-            let manifest = generate_manifest(&source, &files).unwrap();
+            let manifest = checksum_valid_manifest(&source, manifest);
             let archive = archive(root.path(), &source, &manifest);
             let target = root.path().join("target");
             fs::create_dir(&target).unwrap();
@@ -1230,7 +1264,11 @@ mod tests {
     async fn retained_restore_terminal_ledger_survives_tombstone_and_namespace_purge() {
         for purge in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let (target, manifest) = fixture(root.path());
+            let (target, manifest) = fixture_with_namespace(
+                root.path(),
+                &[1., 2., 3., 4.],
+                if purge { "retired" } else { "default" },
+            );
             let backup = archive(root.path(), &target, &manifest);
             let mut engine = RedbStorageEngine::open(&target).unwrap();
             let (id, original) = engine.scan_all().unwrap().remove(0);
@@ -1253,13 +1291,19 @@ mod tests {
                 assert!(record.summary.is_empty() && record.tags.is_empty());
                 assert_eq!((record.text_offset, record.text_length), (0, 0));
             }
-            assert!(
-                engine
-                    .vector_manager()
-                    .get(ns)
-                    .unwrap()
-                    .is_free(original.vector_slot)
-            );
+            if purge {
+                assert!(engine.vector_manager().get(ns).is_none());
+                assert!(engine.get_namespace(ns).unwrap().is_none());
+                assert!(!target.join("retired").exists());
+            } else {
+                assert!(
+                    engine
+                        .vector_manager()
+                        .get(ns)
+                        .unwrap()
+                        .is_free(original.vector_slot)
+                );
+            }
             let fts = crate::search::FtsIndex::new(&target).unwrap();
             assert!(fts.search(ns, "backup fixture", 10).unwrap().is_empty());
             let mut reused = original;
@@ -1405,3 +1449,7 @@ mod tests {
 #[cfg(test)]
 #[path = "schema_restore_tests.rs"]
 mod schema_tests;
+
+#[cfg(test)]
+#[path = "purge_offline_tests.rs"]
+mod purge_offline_tests;

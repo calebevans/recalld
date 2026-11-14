@@ -1,0 +1,15 @@
+{
+  "REPORT.md": "995aeecfe8b7da36747bb2e7139f07359caac4d91d2e48436bc0e287ab882eda",
+  "ancestry.json": "b2e165140efa010ab8a63f54d89baaa06ed9c08b6cec2b8ada391696aac0fd20",
+  "implementation.patch": "609b832c65b907319b3dc5937bac455d21a2041018b900a77bf55e391dab660a",
+  "native-lifecycle-joined.log": "73fc2bc9e294cd51bc4e43b20c92ea65df4236d1a9076691dc3b164de43c5d5c",
+  "native-record-first.log": "e41497992d4c78fd23071f30c3349a5cb9f01b829218466e7448fface75a3fc4",
+  "native-record-first2.log": "64945d7a55ab51519496f10ad2f82ee14fd5bf5f12c623e418bf904daff7686e",
+  "native-records-clippy.log": "675800052670df47d2b50fa137ff0c26b685bff5551a53ac12ab1c023a411ec9",
+  "native-records-fork.log": "150dbb25f69253bff7f3da43133832ca75276647422fac7b0101dcc4efdf2826",
+  "native-records-full.log": "369974dd115ecb89b1765d489e356e64e3f3498aa38d69f59481ce42b845c90c",
+  "native-records-recovery.log": "31d103209efc253091b7112d48f5eb5fe85a7b459d67c06b67f1a9d2278c7be3",
+  "source-files.json": "59776e8801227f64465b7660e85a44d7b4035f26f6e0c70f9595fac799808cb2",
+  "source.tar.gz": "368f523873cd41f7ff44cc7cd9fd500935ee8d01544955502b0937799b80040c",
+  "test-binary.json": "2007b5181102e6514d7d4d9a6ee1d24d06661434141e70f8a64d11620f0843ed"
+}

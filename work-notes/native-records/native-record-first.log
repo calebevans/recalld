@@ -1,0 +1,31 @@
+   Compiling recalld v1.0.0 (/work)
+warning: method `insert_memory_with_work` is never used
+  --> src/storage/engine/insertion.rs:44:19
+   |
+ 4 | impl RedbStorageEngine {
+   | ---------------------- method in this implementation
+...
+44 |     pub(crate) fn insert_memory_with_work(
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `recalld` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.71s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-e423ca3d07310388)
+
+running 1 test
+
+thread 'storage::metadata::native_records::tests::actual_native_insert_feedback_tombstone_replay_and_reopen_preserve_proof' (286) panicked at src/storage/metadata/native_records/tests.rs:207:29:
+called `Result::unwrap()` on an `Err` value: InvalidControl("native record receipt does not match retained state")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test storage::metadata::native_records::tests::actual_native_insert_feedback_tombstone_replay_and_reopen_preserve_proof ... FAILED
+
+failures:
+
+failures:
+    storage::metadata::native_records::tests::actual_native_insert_feedback_tombstone_replay_and_reopen_preserve_proof
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 771 filtered out; finished in 1.87s
+
+error: test failed, to rerun pass `--lib`
