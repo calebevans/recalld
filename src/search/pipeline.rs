@@ -134,6 +134,11 @@ pub trait MetadataStore: Send + Sync {
     /// Enumerate all namespace members without a candidate/scan cap.
     /// IDs are discovery only; load canonical records before checking eligibility.
     async fn list_namespace_memories(&self, namespace_id: NamespaceId) -> Result<Vec<MemoryId>>;
+    /// Production adapters may load IDs and records in one metadata transaction.
+    async fn namespace_records(&self, namespace_id: NamespaceId) -> Result<Vec<CachedRecord>> {
+        let ids = self.list_namespace_memories(namespace_id).await?;
+        self.get_batch(&ids).await
+    }
 }
 
 /// RIF processor -- applies retrieval-induced forgetting.
@@ -506,11 +511,7 @@ impl QueryEngine {
         // Canonical metadata, not cached/index metadata, decides hard eligibility.
         // ponytail: load every namespace member until A1 supplies certified filtered views.
         let stage_start = Instant::now();
-        let namespace_ids = self
-            .meta_store
-            .list_namespace_memories(ns_config.id)
-            .await?;
-        let mut namespace_records = self.meta_store.get_batch(&namespace_ids).await?;
+        let mut namespace_records = self.meta_store.namespace_records(ns_config.id).await?;
         strength_context.project_namespace(&mut namespace_records, self.graph.as_ref())?;
         let eligible_records: HashMap<MemoryId, CachedRecord> = namespace_records
             .into_iter()

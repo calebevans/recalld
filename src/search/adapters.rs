@@ -328,6 +328,22 @@ impl MetadataStore for StorageMetadataAdapter {
         .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
     }
 
+    async fn namespace_records(&self, namespace_id: NamespaceId) -> Result<Vec<CachedRecord>> {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let storage = storage
+                .read()
+                .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
+            storage
+                .meta_store()
+                .records_in_namespace(namespace_id)
+                .map(|records| records.iter().map(CachedRecord::from).collect())
+                .map_err(|e| SearchError::MetadataError(e.to_string()))
+        })
+        .await
+        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
+    }
+
     async fn list_namespace_memories(&self, namespace_id: NamespaceId) -> Result<Vec<MemoryId>> {
         let storage = self.storage.clone();
         tokio::task::spawn_blocking(move || {
@@ -691,6 +707,19 @@ mod tests {
             .insert_memory_in(foreign_namespace, &["project/recalld"])
             .await;
         let adapter = StorageMetadataAdapter::new(fixture.storage.clone());
+        let snapshot = adapter.namespace_records(namespace).await.unwrap();
+        assert_eq!(
+            snapshot.iter().map(|r| r.id).collect::<HashSet<_>>(),
+            HashSet::from([live, ghost, removed])
+        );
+        assert!(snapshot.iter().all(|r| r.namespace_id == namespace));
+        assert!(
+            adapter
+                .namespace_records(NamespaceId::new(999))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let mut ids = adapter.list_namespace_memories(namespace).await.unwrap();
         assert_eq!(
             ids.iter().copied().collect::<HashSet<_>>(),
@@ -713,6 +742,17 @@ mod tests {
 
         // The batch read must observe canonical state, not treat an enumerated ID as eligible.
         fixture.tombstone(removed);
+        let after = adapter.namespace_records(namespace).await.unwrap();
+        assert_eq!(
+            after.iter().map(|r| r.id).collect::<HashSet<_>>(),
+            HashSet::from([live, ghost])
+        );
+        assert!(
+            after
+                .iter()
+                .any(|r| r.id == ghost && r.phase == DecayPhase::Ghost)
+        );
+
         ids.push(MemoryId::new()); // A missing canonical row is skipped.
         let records = adapter.get_batch(&ids).await.unwrap();
         assert_eq!(records.len(), 3);
