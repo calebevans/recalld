@@ -193,6 +193,9 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    LifecyclePolicyMigrated {
+        transition: super::lifecycle_migration::PolicyTransition,
+    },
     GraphChanged {
         edges_put: usize,
         edges_removed: usize,

@@ -21,6 +21,7 @@ pub mod engine;
 pub mod error;
 pub mod fsync;
 pub mod indexes;
+pub mod lifecycle_migration;
 pub(crate) mod lineage;
 pub mod metadata;
 pub mod offline_snapshot;
