@@ -624,6 +624,11 @@ impl Recalld {
                 graph_reader,
                 rif_proc,
                 access_rec,
+            )
+            .with_lifecycle_inputs(
+                clock.clone(),
+                DecayConfig::default(),
+                config.decay.decay_rate_multiplier,
             );
             tracing::info!("query engine initialized");
             Arc::new(engine)

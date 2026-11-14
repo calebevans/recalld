@@ -362,6 +362,7 @@ mod tests {
     /// A `MemoryResponse` as every read endpoint produces it.
     fn response() -> MemoryResponse {
         let record = CachedRecord {
+            lifecycle: None,
             id: MemoryId::new(),
             namespace_id: crate::model::NamespaceId::new(1),
             created_at: 0,

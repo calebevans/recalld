@@ -64,6 +64,7 @@ pub struct SemanticsDiagnostics {
     pub semantics: RetrievalSemantics,
     /// True when v2 forces RIF off; false preserves the configured legacy engine.
     pub rif_off: bool,
+    pub strength: Option<StrengthDiagnostics>,
     pub fts: FtsDiagnostics,
     /// V2-only observations. None means legacy instrumentation is unavailable.
     pub channels: Option<BTreeMap<RetrievalChannel, ChannelDiagnostics>>,
@@ -83,6 +84,7 @@ impl SemanticsDiagnostics {
         Self {
             semantics,
             rif_off: semantics != RetrievalSemantics::V1,
+            strength: None,
             fts: FtsDiagnostics::default(),
             channels: (semantics != RetrievalSemantics::V1)
                 .then(super::diagnostics::empty_channels),
@@ -155,6 +157,7 @@ impl QueryEngine {
         origin: CachedRecord,
         namespace: NamespaceId,
         diagnostics: &mut SemanticsDiagnostics,
+        context: Option<&StrengthContext>,
     ) -> Result<Resolution> {
         let mut record = origin;
         let mut seen = HashSet::new();
@@ -196,7 +199,7 @@ impl QueryEngine {
                         return Ok(Resolution::Unresolved(UnresolvedReason::HopLimit));
                     }
                     path.push(record.id);
-                    record = match self.meta_store.get(successor).await? {
+                    record = match self.strength_record(successor, context).await? {
                         Some(record) => record,
                         None => return Ok(Resolution::Unresolved(UnresolvedReason::MissingRecord)),
                     };
@@ -215,6 +218,7 @@ impl QueryEngine {
         namespace: NamespaceId,
         mode: VersionMode,
         diagnostics: &mut SemanticsDiagnostics,
+        context: Option<&StrengthContext>,
     ) -> Result<()> {
         let originals: HashMap<_, _> = candidates
             .iter()
@@ -223,7 +227,7 @@ impl QueryEngine {
         candidates.sort_by_key(|c| c.record.id); // Work-budget winners cannot depend on insertion order.
         let mut resolved = BTreeMap::<MemoryId, Candidate>::new();
         for candidate in std::mem::take(candidates) {
-            let Some(origin) = self.meta_store.get(&candidate.record.id).await? else {
+            let Some(origin) = self.strength_record(&candidate.record.id, context).await? else {
                 diagnostics.reject(UnresolvedReason::MissingRecord);
                 continue;
             };
@@ -233,7 +237,7 @@ impl QueryEngine {
             }
             validate_record(&origin)?;
             let resolution = self
-                .resolve_path(origin.clone(), namespace, diagnostics)
+                .resolve_path(origin.clone(), namespace, diagnostics, context)
                 .await?;
             if mode == VersionMode::History {
                 let status = match resolution {
@@ -304,6 +308,7 @@ impl QueryEngine {
         eligible: &HashMap<MemoryId, CachedRecord>,
         diagnostics: &mut SemanticsDiagnostics,
         timings: &mut StageTimings,
+        context: Option<&StrengthContext>,
     ) -> Result<()> {
         let RetrievalSemantics::V2(mode) = diagnostics.semantics else {
             unreachable!("v2-only pipeline");
@@ -346,7 +351,7 @@ impl QueryEngine {
             }
         }
         if mode == VersionMode::Current {
-            self.resolve_versions2(candidates, query, namespace, mode, diagnostics)
+            self.resolve_versions2(candidates, query, namespace, mode, diagnostics, context)
                 .await?;
         }
         timings.rank_us = stage_start.elapsed().as_micros() as u64;
@@ -384,7 +389,7 @@ impl QueryEngine {
                     overlapping += 1;
                     continue;
                 }
-                let Some(record) = self.meta_store.get(&hit.id).await? else {
+                let Some(record) = self.strength_record(&hit.id, context).await? else {
                     continue;
                 };
                 if !Self::passes_hard_filters(&record, query, namespace)
@@ -426,7 +431,7 @@ impl QueryEngine {
         let stage_start = Instant::now();
         // RIF is intentionally absent: v2 uses baseline formulas with no suppression.
         if mode == VersionMode::History || query.graph_depth > 0 {
-            self.resolve_versions2(candidates, query, namespace, mode, diagnostics)
+            self.resolve_versions2(candidates, query, namespace, mode, diagnostics, context)
                 .await?;
         }
         for c in candidates.iter_mut() {

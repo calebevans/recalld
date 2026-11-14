@@ -50,8 +50,8 @@ pub use pipeline::{
     EntityIndexReader, EntityRecallResult, FtsAvailability, FtsDiagnostics, FtsIndexRegistry,
     FtsResult, GraphReader, MetadataStore, NamespaceResolver, QueryEngine, RecordCache,
     ResultProvenance, RetrievalChannel, RetrievalSemantics, RifProcessor, RifSuppression,
-    ScoredResult, SemanticsDiagnostics, SemanticsResponse, UnresolvedReason, VectorIndexRegistry,
-    VersionMode, VersionStatus,
+    ScoredResult, SemanticsDiagnostics, SemanticsResponse, StrengthDiagnostics, UnresolvedReason,
+    VectorIndexRegistry, VersionMode, VersionStatus,
 };
 pub use query::SearchFilter as PipelineSearchFilter;
 pub use query::{QueryMode, SearchQuery};

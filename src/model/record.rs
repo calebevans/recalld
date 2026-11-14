@@ -432,6 +432,8 @@ fn access_kind_from_u8(val: u8) -> Result<AccessKind, DecodeError> {
 /// Estimated size per entry: ~634 bytes (see Spec 01 section 3.4).
 #[derive(Debug, Clone)]
 pub struct CachedRecord {
+    /// Exact canonical lifecycle provenance; None for legacy physical records.
+    pub lifecycle: Option<crate::model::schema::LifecycleFields>,
     /// Unique identifier.
     pub id: MemoryId,
     /// Namespace this memory belongs to.
@@ -537,6 +539,7 @@ impl From<&DiskRecord> for CachedRecord {
     fn from(d: &DiskRecord) -> Self {
         let entities = crate::model::parse_structured_tags(&d.tags).entities;
         CachedRecord {
+            lifecycle: d.schema.as_ref().map(|s| s.lifecycle.clone()),
             id: MemoryId::from_bytes(d.id),
             namespace_id: NamespaceId::new(d.namespace_id),
             created_at: d.created_at,

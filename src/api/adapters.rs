@@ -170,6 +170,7 @@ impl state::SearchPipeline for SearchPipelineAdapter {
                 let metadata = parse_structured_tags(&r.tags);
                 state::ResolvedSearchResult {
                     memory: CachedRecord {
+                        lifecycle: None,
                         id: r.memory_id,
                         namespace_id: query.namespace_id, // Issue 6: use actual namespace_id
                         created_at: r.created_at,
