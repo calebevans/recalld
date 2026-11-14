@@ -42,7 +42,7 @@ fn state(f: &Fixture, provider: Arc<CountingProvider>) -> AppState {
             Arc::new(crate::rif::RifEngine::new(Default::default())),
             f.graph.clone(),
         )),
-        Arc::new(StorageAccessRecorder::new(f.storage.clone())),
+        Arc::new(StorageAccessRecorder::new(f.storage.clone(), f.cache.clone())),
     ));
     AppState::new(
         Arc::new(SearchPipelineAdapter::new(
