@@ -375,6 +375,21 @@ impl MetadataStore {
                 memories_removed: removed.len(),
             },
         )?;
+        // Removal evidence and effect receipt share this canonical transaction.
+        for (id, record) in &removed {
+            super::removal_ledger::record_removal(
+                &tx,
+                crate::storage::control::GenerationRef {
+                    store_id: receipt.store_id,
+                    generation: receipt.committed_generation,
+                },
+                record.namespace_id,
+                *id,
+                Some(super::removal_ledger::TerminalKind::HardDelete),
+                super::removal_ledger::ALL,
+                receipt.operation_id,
+            )?;
+        }
         let pending = PendingEffects {
             version: 1,
             receipt: receipt.clone(),

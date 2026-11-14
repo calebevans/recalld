@@ -81,6 +81,8 @@ pub struct ControlState {
     pub control_schema_version: u32,
     pub store_id: Uuid,
     pub committed_generation: Generation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_ledger_version: Option<u32>,
 }
 
 impl ControlState {
@@ -330,6 +332,7 @@ pub(crate) fn initialize(tx: &WriteTransaction) -> Result<(), StorageError> {
             control_schema_version: 1,
             store_id: Uuid::new_v4(),
             committed_generation: Generation::default(),
+            removal_ledger_version: None,
         };
         tx.open_table(CONTROL)?
             .insert("state", encode(&state)?.as_slice())?;
