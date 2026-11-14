@@ -1,0 +1,121 @@
+diff --cc src/daemon/server.rs
+index c38b3a5,4581274..2d7878c
+--- a/src/daemon/server.rs
++++ b/src/daemon/server.rs
+@@@ -1157,6 -1018,10 +1228,14 @@@ mod tests 
+      }
+  }
+  
+ +#[cfg(test)]
+ +#[path = "batch_label_tests.rs"]
+ +mod batch_label_tests;
+++
++ #[cfg(test)]
++ #[path = "read_only_tests.rs"]
++ mod read_only_tests;
++ 
++ #[cfg(test)]
++ #[path = "scope_tests.rs"]
++ mod scope_tests;
+diff --cc src/mcp/bridge_adapters.rs
+index b420020,f0a9da3..1ead98d
+--- a/src/mcp/bridge_adapters.rs
++++ b/src/mcp/bridge_adapters.rs
+@@@ -4,9 -4,7 +4,10 @@@
+  //! corresponding MCP bridge trait from `bridge.rs`. These adapters
+  //! bridge between the MCP protocol layer and Recalld subsystem types.
+  
+ +#[path = "batch_adapters.rs"]
+ +mod batch_adapters;
+ +
++ use crate::decay::observation::Observed;
+  use std::sync::Arc;
+  
+  use async_trait::async_trait;
+diff --cc src/storage/control.rs
+index b537e3e,fa40afd..5d4af71
+--- a/src/storage/control.rs
++++ b/src/storage/control.rs
+@@@ -189,21 -198,33 +198,44 @@@ impl MutationContext 
+      }
+  }
+  
++ /// One distinct record exposed by a legacy retrieval. No content is retained.
++ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++ #[serde(rename_all = "camelCase", deny_unknown_fields)]
++ pub struct ExposureOutcome {
++     pub memory_id: MemoryId,
++     pub kind: crate::model::AccessKind,
++     pub accessed_at: i64,
++ }
++ 
+  /// Payload-free outcome; the timestamp is the originally committed value.
+  #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+- #[serde(rename_all = "camelCase", tag = "kind")]
++ #[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
+  pub enum MutationOutcome {
+ +    BatchReserved {
+ +        batch_kind: super::batch::BatchKind,
+ +        item_count: u32,
+ +        caller_hash: [u8; 32],
+ +        resolution_hash: [u8; 32],
+ +    },
+ +    BatchItemRejected {
+ +        batch_operation_id: Uuid,
+ +        index: u32,
+ +        error: super::batch::BatchError,
+ +    },
++     LifecycleMaterialized {
++         #[serde(rename = "memoryId")]
++         memory_id: MemoryId,
++         #[serde(rename = "fromPhase")]
++         from_phase: crate::model::DecayPhase,
++         #[serde(rename = "toPhase")]
++         to_phase: crate::model::DecayPhase,
++         #[serde(rename = "strengthBits")]
++         strength_bits: u32,
++         #[serde(rename = "decayStrengthBits")]
++         decay_strength_bits: u32,
++         #[serde(rename = "removedFieldsMask")]
++         removed_fields_mask: u8,
++     },
+      NamespacePurgeStarted {
+          namespace_id: NamespaceId,
+          name_hash: [u8; 32],
+diff --cc src/storage/metadata.rs
+index 467615b,97647fb..6d987f5
+--- a/src/storage/metadata.rs
++++ b/src/storage/metadata.rs
+@@@ -108,14 -107,7 +111,14 @@@ impl MetadataStore 
+      /// - Sets a 16 MB read cache (covers top B+tree levels).
+      /// - Creates all tables on first open.
+      /// - Loads or rebuilds the phase index from persisted bitmaps.
+-     pub fn open(path: &Path) -> Result<Self, StorageError> {
++     pub(crate) fn open(path: &Path) -> Result<Self, StorageError> {
+ +        if let Some(parent) = path.parent() {
+ +            if std::fs::symlink_metadata(parent.join(".recalld-importing")).is_ok() {
+ +                return Err(StorageError::RecoveryRequired(
+ +                    "incomplete logical import; resume using its original export".into(),
+ +                ));
+ +            }
+ +        }
+          // redb's writable open can change bookkeeping. Reject historical mode
+          // on a disposable copy even for callers bypassing the engine.
+          if path.try_exists()? && path.metadata()?.len() > 0 {
+diff --cc src/storage/mod.rs
+index 941391a,484b0d7..aca1322
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@@ -24,8 -23,11 +24,12 @@@ pub mod error
+  pub mod fsync;
+  pub mod indexes;
+  pub mod insertion;
++ pub mod lifecycle_migration;
+  pub(crate) mod lineage;
+ +pub mod logical_export;
++ pub mod maintenance;
++ #[cfg(test)]
++ mod maintenance_tests;
+  pub mod metadata;
+  pub mod offline_snapshot;
+  pub(crate) mod ownership;
