@@ -896,7 +896,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             ns_config.embedding_dim,
             input.embedding.is_some(),
         )
-        .map_err(map_insertion_error)?;
+        .map_err(map_mutation_error)?;
 
         // Near-duplicate advisory.
         //
