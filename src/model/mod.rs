@@ -25,6 +25,7 @@ pub mod id;
 pub mod memory;
 pub mod namespace;
 pub mod record;
+pub mod schema;
 pub mod tag;
 pub mod validation;
 

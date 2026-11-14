@@ -107,6 +107,13 @@ impl MetadataStore {
         read_selection(&self.db.begin_read()?)
     }
 
+    /// Constructor-only read before canonical effects replay; the engine has not escaped.
+    pub(crate) fn text_selection_for_recovery(
+        &self,
+    ) -> Result<Option<TextGeneration>, StorageError> {
+        read_selection(&self.db.begin_read()?)
+    }
+
     /// The caller holds the exclusive engine gate through file and handle publication.
     pub(crate) fn select_text_generation(
         &self,
@@ -186,7 +193,7 @@ impl MetadataStore {
                 }
                 record.text_offset = reference.file_offset;
                 record.text_length = reference.length;
-                records.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
+                records.insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
             }
         }
         {

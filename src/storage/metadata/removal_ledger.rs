@@ -165,6 +165,10 @@ fn validate_retained_record(entry: &RemovalEntry, record: &DiskRecord) -> Result
             && (record.text_offset != 0 || record.text_length != 0))
         || (entry.removed_fields_mask & SUMMARY != 0 && !record.summary.is_empty())
         || (entry.removed_fields_mask & TAGS != 0 && !record.tags.is_empty())
+        || (entry.removed_fields_mask & TAGS != 0
+            && record.schema.as_ref().is_some_and(|s| !s.labels.is_empty()))
+        || (entry.removed_fields_mask & EMBEDDING != 0
+            && record.schema.as_ref().is_some_and(|s| s.vector.is_some()))
     {
         return Err(invalid("record contradicts retained removal evidence"));
     }
@@ -363,6 +367,7 @@ mod tests {
 
     fn record(ns: u32) -> DiskRecord {
         DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *MemoryId::new().as_bytes(),
             namespace_id: ns,

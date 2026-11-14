@@ -241,8 +241,8 @@ enum EdgeApplication {
     AlreadyPresent,
     /// The graph refused the edge (carries the reason).
     Rejected(String),
-    /// Live in this process's graph but not written to disk.
-    NotDurable(String),
+    /// Publication failed; canonical outcome may require reconciliation.
+    Unavailable(String),
 }
 
 /// Insert one caller-specified edge into the graph and persist it.
@@ -258,22 +258,13 @@ async fn apply_explicit_edge(
     storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: &Arc<CacheManager>,
 ) -> EdgeApplication {
-    // Insert into the in-memory graph, then release the write lock before
-    // touching storage. Holding the graph lock across a storage acquisition
-    // would invert the lock order used everywhere else.
-    let insert_result = {
-        let mut graph_w = graph.write().await;
-        graph_w.add_edge(source, target, edge_type, 1.0, false)
-    };
-
-    match insert_result {
-        Ok(_) => {}
-        Err(crate::graph::GraphError::EdgeExists(_, _)) => {
-            return EdgeApplication::AlreadyPresent;
-        }
+    let live = graph.clone().write_owned().await;
+    let mut planned = (*live).clone();
+    let key = match planned.add_edge(source, target, edge_type, 1.0, false) {
+        Ok(key) => key,
+        Err(crate::graph::GraphError::EdgeExists(_, _)) => return EdgeApplication::AlreadyPresent,
         Err(e) => return EdgeApplication::Rejected(e.to_string()),
-    }
-
+    };
     let persisted = PersistedEdge {
         source,
         target,
@@ -286,35 +277,11 @@ async fn apply_explicit_edge(
             .as_millis() as u64,
     };
 
-    let persist_result = {
-        let storage = storage.clone();
-        tokio::task::spawn_blocking(move || {
-            let storage_r = storage
-                .read()
-                .map_err(|e| format!("storage lock poisoned: {e}"))?;
-            storage_r
-                .batch_add_edges(&[persisted])
-                .map_err(|e| e.to_string())
-        })
-        .await
-    };
-
-    let persist_error = match persist_result {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(e),
-        Err(e) => Some(format!("blocking task join error: {e}")),
-    };
-
-    if let Some(message) = persist_error {
-        return EdgeApplication::NotDurable(message);
+    planned.edges[key].created_at = persisted.created_at as i64;
+    match super::autolink::publish_edge_plan(live, planned, vec![persisted], storage, cache).await {
+        Ok(_) => EdgeApplication::Created,
+        Err(e) => EdgeApplication::Unavailable(e.to_string()),
     }
-
-    // `edge_count` counts OUTGOING edges, so only the source's count moves.
-    // The update is additive and runs before autolink, which re-reads the
-    // cache, so the two stay in agreement.
-    bump_edge_count(source, storage, cache).await;
-
-    EdgeApplication::Created
 }
 
 /// Create and persist the `Supersedes` edge for a memory that has already
@@ -368,20 +335,18 @@ pub async fn apply_supersedes_edge(
             )
         }
 
-        EdgeApplication::NotDurable(message) => {
+        EdgeApplication::Unavailable(message) => {
             tracing::error!(
                 memory_id = %new_memory_id,
                 superseded = %target,
                 error = %message,
-                "supersedes edge is live in the graph but could not be persisted to edges.db; \
-                 it will be lost on restart"
+                "supersedes edge publication unavailable; reconcile canonical outcome after reopen"
             );
             SupersedesOutcome::with_detail(
                 target,
-                SupersedesStatus::AppliedNotDurable,
+                SupersedesStatus::Failed,
                 format!(
-                    "the supersedes edge is active for this process but was not written to \
-                     disk and will be lost on restart: {message}"
+                    "edge publication unavailable; canonical outcome requires reconciliation after reopen: {message}"
                 ),
             )
         }
@@ -409,58 +374,13 @@ pub async fn apply_parent_edge(
             error = %message,
             "parent edge could not be added to the graph after pre-validation passed"
         ),
-        EdgeApplication::NotDurable(message) => tracing::error!(
+        EdgeApplication::Unavailable(message) => tracing::error!(
             memory_id = %child,
             parent = %parent,
             error = %message,
-            "parent edge is live in the graph but could not be persisted to edges.db; \
-             it will be lost on restart"
+            "parent edge publication unavailable; canonical outcome requires reconciliation"
         ),
     }
-}
-
-/// Additively increment a memory's cached outgoing-edge count by one,
-/// in both storage and the RAM cache. Mirrors `autolink::persist_edges`:
-/// a failure here is a stale counter, not a lost edge, so it only warns.
-async fn bump_edge_count(
-    memory_id: MemoryId,
-    storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
-    cache: &Arc<CacheManager>,
-) {
-    let new_count = cache
-        .get(memory_id)
-        .await
-        .map(|r| r.edge_count)
-        .unwrap_or(0)
-        .saturating_add(1);
-
-    {
-        let storage = storage.clone();
-        match tokio::task::spawn_blocking(move || {
-            let storage_r = storage
-                .read()
-                .map_err(|e| format!("storage lock poisoned: {e}"))?;
-            storage_r
-                .update_edge_count(memory_id, new_count)
-                .map_err(|e| e.to_string())
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(
-                memory_id = %memory_id,
-                error = %e,
-                "Failed to update edge count in storage; cache is correct but on-disk record may be stale"
-            ),
-            Err(e) => tracing::warn!(
-                memory_id = %memory_id,
-                error = %e,
-                "Edge count update task panicked; cache is correct but on-disk record may be stale"
-            ),
-        }
-    }
-
-    cache.update_edge_count(memory_id, new_count).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -479,6 +399,113 @@ mod tests {
     // ── Live-storage fixtures ────────────────────────────────────────
 
     use crate::test_support::Fixture;
+
+    #[tokio::test]
+    async fn effects_stale_autolink_plan_cannot_attach_to_tombstone() {
+        let fx = Fixture::new();
+        let a = fx.insert_memory().await;
+        let b = fx.insert_memory().await;
+        // Candidate discovery saw two live nodes. Canonical tombstone wins
+        // before the final graph/storage/publication guard; graph is stale.
+        fx.storage.write().unwrap().tombstone_memory(b).unwrap();
+        let before = fx.storage.read().unwrap().control_state().unwrap();
+        let edge = PersistedEdge {
+            source: a,
+            target: b,
+            edge_type: EdgeType::Associative,
+            weight: 0.8,
+            auto_created: true,
+            created_at: 1,
+        };
+        assert!(
+            crate::graph::autolink::persist_edges(a, &[edge], &fx.graph, &fx.storage, &fx.cache)
+                .await
+                .is_err()
+        );
+        assert_eq!(fx.graph.read().await.edge_count(), 0);
+        assert_eq!(fx.storage.read().unwrap().control_state().unwrap(), before);
+        // The v1 explicit correction exception is intentional and payload-free.
+        assert!(matches!(
+            apply_explicit_edge(
+                a,
+                b,
+                EdgeType::Supersedes,
+                &fx.graph,
+                &fx.storage,
+                &fx.cache
+            )
+            .await,
+            EdgeApplication::Created
+        ));
+    }
+
+    #[tokio::test]
+    async fn effects_failed_commit_never_publishes_live_graph_and_keeps_receipt() {
+        let fx = Fixture::new();
+        let a = fx.insert_memory().await;
+        let b = fx.insert_memory().await;
+        fx.storage
+            .read()
+            .unwrap()
+            .meta_store()
+            .fail_effect_application
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = apply_explicit_edge(
+            a,
+            b,
+            EdgeType::ParentChild,
+            &fx.graph,
+            &fx.storage,
+            &fx.cache,
+        )
+        .await;
+        assert!(matches!(result, EdgeApplication::Unavailable(_)));
+        assert_eq!(fx.graph.read().await.edge_count(), 0);
+        assert!(fx.storage.read().unwrap().get_record(a).is_err());
+        let dir = fx.close();
+        let engine = RedbStorageEngine::open(dir.path()).unwrap();
+        assert_eq!(engine.load_all_edges().unwrap().len(), 1);
+        assert!(engine.meta_store().effects_stamp().is_err());
+    }
+
+    #[tokio::test]
+    async fn effects_graph_waiter_does_not_hold_storage_and_cache_counts_are_absolute() {
+        let fx = Fixture::new();
+        let a = fx.insert_memory().await;
+        let b = fx.insert_memory().await;
+        let c = fx.insert_memory().await;
+        let cached = crate::model::CachedRecord::from(
+            &fx.storage.read().unwrap().get_record(a).unwrap().unwrap(),
+        );
+        fx.cache.insert(a, cached).await;
+        let held = fx.graph.clone().write_owned().await;
+        let graph = fx.graph.clone();
+        let storage = fx.storage.clone();
+        let cache = fx.cache.clone();
+        let writer =
+            tokio::spawn(async move { apply_parent_edge(a, b, &graph, &storage, &cache).await });
+        tokio::task::yield_now().await;
+        assert!(
+            fx.storage.try_write().is_ok(),
+            "a graph waiter must not hold storage"
+        );
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        apply_parent_edge(a, c, &fx.graph, &fx.storage, &fx.cache).await;
+        assert_eq!(fx.edge_count(a), 2);
+        assert_eq!(fx.cache.get(a).await.unwrap().edge_count, 2);
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .effects_stamp()
+                .is_ok()
+        );
+    }
 
     /// Regression: a `parentId` edge must move `edge_count`, whichever door
     /// created it.

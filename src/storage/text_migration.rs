@@ -163,6 +163,7 @@ mod tests {
         let ns = engine.create_namespace(&ns).unwrap();
         let id = MemoryId::new();
         let mut r = DiskRecord {
+            schema: None,
             version: 1,
             id: *id.as_bytes(),
             namespace_id: ns.get(),

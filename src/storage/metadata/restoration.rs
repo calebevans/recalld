@@ -29,7 +29,7 @@ pub(crate) fn capture(path: &Path) -> Result<CapturedSnapshot, StorageError> {
     crate::storage::validation::validate_existing(path)?;
     let (_copy, db) = crate::storage::validation::inspect_database(&path.join("meta.db"))?;
     let read = db.begin_read()?;
-    // Pending effects and record-v2 migration need their owners' restore consumers.
+    // Only layouts with an explicit staging consumer are supported.
     let known = [
         "memories",
         "namespaces",
@@ -42,6 +42,9 @@ pub(crate) fn capture(path: &Path) -> Result<CapturedSnapshot, StorageError> {
         "removal_ledger",
         "removal_ledger_state",
         "restore_lineage_v1",
+        "canonical_schema",
+        "effects_schema",
+        "mutation_effects",
     ];
     if read.list_tables()?.any(|t| !known.contains(&t.name()))
         || read
@@ -215,6 +218,14 @@ pub(crate) fn reconcile(
     let read = db.begin_read()?;
     let selected = text_generation::read_selection(&read)?.ok_or(StorageError::InvalidTextRef)?;
     let old_text = TextStore::open_generation(stage, &selected, false)?;
+    // Validate in the original lineage before the private fork. Applied rows
+    // describe old derived views; never replay them against reconciled records.
+    let applied_effects = effects::validate_existing(&read)?;
+    if applied_effects.iter().any(|e| !e.canonical_applied) {
+        return Err(StorageError::RecoveryRequired(
+            "restore requires canonical effects to be applied before backup".into(),
+        ));
+    }
     let mut records: Vec<(MemoryId, DiskRecord)> = read
         .open_table(META_TABLE)?
         .iter()?
@@ -285,6 +296,24 @@ pub(crate) fn reconcile(
         } else if mask & ledger::FULL_TEXT != 0 && record.phase == DecayPhase::Full {
             record.phase = DecayPhase::Summary;
         }
+        if let Some(schema) = &mut record.schema {
+            if mask != 0 && !schema.extensions.is_empty() {
+                return Err(StorageError::RecoveryRequired("destructive restore with unknown record extensions requires a versioned removal consumer".into()));
+            }
+            if mask & ledger::TAGS != 0
+                || matches!(record.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
+            {
+                schema.labels.entities.clear();
+                schema.labels.topics.clear();
+                schema.labels.emotions.clear();
+            }
+            if terminal.is_some() {
+                schema.vector = None;
+            }
+            // Ledger entries carry no event time. Preserve the existing
+            // lifecycle timestamps/provenance rather than invent a phase time.
+        }
+        record.encode()?; // Validate all schema/lifecycle/ownership invariants.
         desired.push((id, record));
     }
     // Multi-file work is confined to staging; interruption cannot expose it.
@@ -343,13 +372,19 @@ pub(crate) fn reconcile(
     tx.delete_multimap_table(TAG_INDEX)?;
     tx.delete_multimap_table(NAMESPACE_INDEX)?;
     tx.delete_table(INDEX_TABLE)?;
-    tx.open_table(INDEX_TABLE)?;
+    let phase_rows: Vec<_> = desired
+        .iter()
+        .map(|(_, r)| (r.namespace_id, r.vector_slot, r.phase))
+        .collect();
+    let phases = crate::storage::PhaseIndex::rebuild_from_records(&phase_rows);
+    tx.open_table(INDEX_TABLE)?
+        .insert("phase_bitmaps", phases.to_bytes().as_slice())?;
     {
         let mut table = tx.open_table(META_TABLE)?;
         let mut tags = tx.open_multimap_table(TAG_INDEX)?;
         let mut ns = tx.open_multimap_table(NAMESPACE_INDEX)?;
         for (id, record) in &desired {
-            table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
+            table.insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
             if record.phase != DecayPhase::Tombstone {
                 ns.insert(record.namespace_id, id.as_bytes().as_slice())?;
                 for tag in &record.tags {
@@ -390,7 +425,6 @@ pub(crate) fn reconcile(
         )?;
         table.insert("active", control::encode(&descriptor.id)?.as_slice())?;
     }
-    tx.commit()?;
     // Build the persisted derived text index from reconciled content before
     // publication; a partially rebuilt index must never become queryable.
     let fts = crate::search::FtsIndex::new(stage)
@@ -419,6 +453,16 @@ pub(crate) fn reconcile(
     }
     drop(fts); // Closing the only SQLite connection checkpoints its private WAL.
     std::fs::File::open(stage.join("fts.db"))?.sync_all()?;
+    // Only private, already-validated applied effects are consumed. The fork
+    // invalidates old in-memory views; persisted indexes above are rebuilt.
+    // All historical receipts/keys remain untouched, including these operations.
+    if !applied_effects.is_empty() {
+        let mut pending = tx.open_table(effects::EFFECTS)?;
+        for effect in applied_effects {
+            pending.remove(effect.receipt.operation_id.as_bytes().as_slice())?;
+        }
+    }
+    tx.commit()?;
     drop((old_text, text, edges, db));
     // The old generation is an unselected staging copy, never the source archive.
     std::fs::remove_file(stage.join(selected.filename))?;

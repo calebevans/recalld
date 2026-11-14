@@ -438,6 +438,13 @@ mod tests {
     use redb::ReadableTable;
 
     fn fixture(root: &Path) -> (PathBuf, BackupManifest) {
+        fixture_with_embedding(root, &[1., 2., 3., 4.])
+    }
+
+    pub(super) fn fixture_with_embedding(
+        root: &Path,
+        embedding: &[f32],
+    ) -> (PathBuf, BackupManifest) {
         let source = root.join("source");
         let mut engine = RedbStorageEngine::open(&source).unwrap();
         let mut ns = NamespaceConfig::default_namespace(0);
@@ -445,6 +452,7 @@ mod tests {
         let ns = engine.create_namespace(&ns).unwrap();
         let id = MemoryId::new();
         let mut record = DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: ns.get(),
@@ -465,13 +473,7 @@ mod tests {
             text_length: 0,
         };
         engine
-            .insert_memory(
-                id,
-                ns,
-                &mut record,
-                &[1., 2., 3., 4.],
-                Some("retained text"),
-            )
+            .insert_memory(id, ns, &mut record, embedding, Some("retained text"))
             .unwrap();
         engine.sync().unwrap();
         drop(engine);
@@ -994,7 +996,7 @@ mod tests {
         (source, backup, a, b, c, receipt)
     }
 
-    fn retained_options(backup: &Path, target: &Path) -> RestoreOptions {
+    pub(super) fn retained_options(backup: &Path, target: &Path) -> RestoreOptions {
         RestoreOptions {
             backup_path: backup.to_owned(),
             data_dir: target.to_owned(),
@@ -1399,3 +1401,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "schema_restore_tests.rs"]
+mod schema_tests;

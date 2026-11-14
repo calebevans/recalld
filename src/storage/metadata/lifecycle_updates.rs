@@ -240,6 +240,7 @@ mod tests {
             .insert(
                 id,
                 &DiskRecord {
+                    schema: None,
                     version: DiskRecord::CURRENT_VERSION,
                     id: *id.as_bytes(),
                     namespace_id: ns.id.get(),
