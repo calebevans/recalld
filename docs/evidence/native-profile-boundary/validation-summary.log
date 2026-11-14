@@ -1,0 +1,23 @@
+full-final.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.32s
+test embedding::openai::response_shape_tests::native_profile_openai_real_response_fixtures_require_exact_index_cover ... ok
+test embedding::runtime::tests::native_profile_cache_rejects_bad_generated_vectors_and_batches_without_caching ... ok
+test embedding::runtime::tests::native_profile_factory_and_wrappers_preserve_effective_credential_free_identity ... ok
+test embedding::runtime::tests::native_profile_generation_checks_binding_before_provider_and_keeps_legacy_unverified ... ok
+test mcp::bridge_adapters::tests::native_profile_mcp_store_rejects_runtime_dimension_before_provider_and_writes ... ok
+test search::pipeline::tests::native_profile_query_rejects_wrong_binding_and_bad_vectors_before_indexes ... ok
+test storage::metadata::insertion::profile_boundary_tests::native_profile_final_transaction_rechecks_canonical_binding_before_allocation ... ok
+test storage::metadata::insertion::profile_boundary_tests::native_profile_legacy_insertion_remains_unverified_and_replay_precedes_profile ... ok
+test result: ok. 657 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 73.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+fmt-final.log
+
+clippy-final.log
+warning: `recalld` (lib) generated 373 warnings (run `cargo clippy --fix --lib -p recalld` to apply 88 suggestions)
+warning: `recalld` (lib test) generated 385 warnings (373 duplicates) (run `cargo clippy --fix --lib -p recalld --tests` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.66s
