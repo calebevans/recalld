@@ -654,6 +654,176 @@ async fn v2_rejects_nonfinite_canonical_and_graph_sources() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fts_refill_uses_canonical_filters_before_cap_and_keeps_v1_behavior() {
+    use crate::search::{FtsIndex, adapters::SharedFtsIndexRegistry};
+    let dir = tempfile::tempdir().unwrap();
+    let index = FtsIndex::new(dir.path()).unwrap();
+    let mut records = Vec::new();
+    for n in (1..=305).rev() {
+        index.add(ns(), mid(n), "keyword", None, &[]).unwrap();
+        let mut record = rec(mid(n));
+        record.tags = vec![Tag::new("keep").unwrap()];
+        if n <= 300 {
+            match n % 6 {
+                0 => continue, // stale index hit, missing canonical record
+                1 => record.namespace_id = other_ns(),
+                2 => record.phase = DecayPhase::Tombstone,
+                3 => record.phase = DecayPhase::Ghost,
+                4 => record.strength = 0.1,
+                _ => record.tags.clear(),
+            }
+        }
+        records.push(record);
+    }
+    let (mut engine, _) = graph_engine(records, &[], &[]);
+    engine.fts_index = Arc::new(SharedFtsIndexRegistry::new(Arc::new(
+        tokio::sync::Mutex::new(index),
+    )));
+    let q = serde_json::json!({"text":"ignored", "ftsQuery":"keyword", "limit":5,
+        "filter":{"requireTags":["keep"],"minStrength":0.5}});
+    for mode in [current(), history()] {
+        let result = engine
+            .search_with_semantics(query(q.clone()), mode)
+            .await
+            .unwrap();
+        assert_eq!(
+            result_ids(&result.response),
+            (301..=305).map(mid).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.diagnostics.fts.availability,
+            FtsAvailability::Available
+        );
+        let coverage = result.diagnostics.fts.coverage.unwrap();
+        assert_eq!(
+            (
+                coverage.examined,
+                coverage.eligible,
+                coverage.admitted,
+                coverage.pages
+            ),
+            (305, 5, 5, 4)
+        );
+        assert!(coverage.exhausted);
+        assert!(!coverage.candidate_limited);
+        assert!(!coverage.budget_exhausted);
+    }
+    let legacy = engine
+        .search_with_semantics(query(q), RetrievalSemantics::V1)
+        .await
+        .unwrap();
+    assert!(legacy.response.results.is_empty());
+    assert_eq!(
+        legacy.diagnostics.fts.availability,
+        FtsAvailability::Available
+    );
+    assert!(legacy.diagnostics.fts.coverage.is_none()); // Top-B cannot prove exhaustion.
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fts_sqlite_failure_propagates_in_v2_and_labels_legacy_fallback() {
+    use crate::search::{FtsIndex, adapters::SharedFtsIndexRegistry};
+    let dir = tempfile::tempdir().unwrap();
+    let index = FtsIndex::new(dir.path()).unwrap();
+    let connection = rusqlite::Connection::open(dir.path().join("fts.db")).unwrap();
+    connection.execute("DROP TABLE id_map", []).unwrap();
+    let adapter = Arc::new(SharedFtsIndexRegistry::new(Arc::new(
+        tokio::sync::Mutex::new(index),
+    )));
+    assert!(adapter.search(ns(), "keyword", 100).is_err());
+    assert!(
+        adapter
+            .search_eligible(ns(), "keyword", 100, &HashSet::new())
+            .is_err()
+    );
+    for vectors in [vec![], vec![(mid(1), 0.9)]] {
+        let (mut engine, _) = graph_engine(vec![rec(mid(1))], &vectors, &[]);
+        engine.fts_index = adapter.clone();
+        let q = serde_json::json!({"text":"keyword"});
+        for mode in [current(), history()] {
+            let error = engine
+                .search_with_semantics(query(q.clone()), mode)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("FTS search failed"));
+        }
+        let legacy = engine
+            .search_with_semantics(query(q), RetrievalSemantics::V1)
+            .await
+            .unwrap();
+        assert_eq!(legacy.response.results.len(), vectors.len());
+        assert_eq!(
+            legacy.diagnostics.fts.availability,
+            FtsAvailability::Unavailable
+        );
+        assert!(legacy.diagnostics.fts.coverage.is_none());
+        let metadata = engine
+            .search_with_semantics(
+                query(serde_json::json!({
+                    "queryMode":"metadata_only", "filter":{"minStrength":0.0}
+                })),
+                current(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.diagnostics.fts.availability,
+            FtsAvailability::NotRequested
+        );
+        assert!(metadata.diagnostics.fts.coverage.is_none());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fts_engine_reports_work_underfill_and_candidate_cap_separately() {
+    use crate::search::{FtsIndex, MAX_FTS_EXAMINED, adapters::SharedFtsIndexRegistry};
+    let dir = tempfile::tempdir().unwrap();
+    let index = FtsIndex::new(dir.path()).unwrap();
+    // All index hits before the last one lack canonical records.
+    for n in 1..=MAX_FTS_EXAMINED + 1 {
+        index
+            .add(ns(), mid(n as u128), "keyword", None, &[])
+            .unwrap();
+    }
+    let adapter = Arc::new(SharedFtsIndexRegistry::new(Arc::new(
+        tokio::sync::Mutex::new(index),
+    )));
+    let (mut engine, _) = graph_engine(vec![rec(mid(MAX_FTS_EXAMINED as u128 + 1))], &[], &[]);
+    engine.fts_index = adapter.clone();
+    let q = serde_json::json!({"text":"keyword", "limit":1});
+    let underfill = engine
+        .search_with_semantics(query(q.clone()), current())
+        .await
+        .unwrap();
+    assert!(underfill.response.results.is_empty());
+    let coverage = underfill.diagnostics.fts.coverage.unwrap();
+    assert_eq!(coverage.examined, MAX_FTS_EXAMINED);
+    assert_eq!(coverage.admitted, 0);
+    assert!(coverage.budget_exhausted);
+    assert!(!coverage.exhausted);
+    assert!(coverage.candidate_limited);
+    assert!(!underfill.diagnostics.result_limit_applied);
+
+    let (mut engine, _) = graph_engine((1..=200).map(|n| rec(mid(n))).collect(), &[], &[]);
+    engine.fts_index = adapter;
+    let capped = engine
+        .search_with_semantics(query(q), current())
+        .await
+        .unwrap();
+    let coverage = capped.diagnostics.fts.coverage.unwrap();
+    assert_eq!(
+        (coverage.examined, coverage.eligible, coverage.admitted),
+        (101, 101, 100)
+    );
+    assert!(!coverage.budget_exhausted);
+    assert!(!coverage.exhausted);
+    assert!(coverage.candidate_limited);
+    assert!(capped.diagnostics.result_limit_applied);
+    assert_eq!(capped.response.total_matches, 100);
+    assert_eq!(result_ids(&capped.response), vec![mid(1)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rebuilt_reciprocal_edges_each_contribute_and_survive_engine_recall() {
     use crate::graph::{SpreadingActivationConfig, query::expand, rebuild_from_storage};
     use crate::storage::PersistedEdge;

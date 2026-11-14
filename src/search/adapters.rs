@@ -166,19 +166,33 @@ impl FtsIndexRegistry for SharedFtsIndexRegistry {
         let index = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.index.lock())
         });
-        match index.search(namespace_id, query, k) {
-            Ok(results) => Ok(results
-                .into_iter()
-                .map(|(id, score)| FtsResult {
-                    memory_id: id,
-                    score,
-                })
-                .collect()),
-            Err(e) => {
-                tracing::warn!(%e, "FTS search failed, returning empty results");
-                Ok(Vec::new())
-            }
-        }
+        index
+            .search(namespace_id, query, k)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|(id, score)| FtsResult {
+                        memory_id: id,
+                        score,
+                    })
+                    .collect()
+            })
+            .map_err(|e| SearchError::Internal(format!("FTS search failed: {e}")))
+    }
+
+    fn search_eligible(
+        &self,
+        namespace_id: NamespaceId,
+        query: &str,
+        k: usize,
+        eligible_ids: &HashSet<MemoryId>,
+    ) -> Result<super::EligibleFtsResults> {
+        let index = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.index.lock())
+        });
+        index
+            .search_eligible(namespace_id, query, k, eligible_ids)
+            .map_err(|e| SearchError::Internal(format!("eligible FTS search failed: {e}")))
     }
 }
 
