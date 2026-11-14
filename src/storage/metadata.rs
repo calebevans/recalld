@@ -7,8 +7,11 @@
 //!
 //! See CS-07 for the full specification.
 
+pub(crate) mod effects;
 mod lifecycle_updates;
 mod observation;
+pub(crate) mod removal_ledger;
+pub(crate) mod text_generation;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -71,6 +74,12 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 pub struct MetadataStore {
     db: Database,
     unavailable: std::sync::atomic::AtomicBool,
+    pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
+    derived_dirty: std::sync::atomic::AtomicBool,
+    effects_epoch: std::sync::atomic::AtomicU64,
+    pub(crate) derived_publication: std::sync::Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    pub(crate) fail_effect_application: std::sync::atomic::AtomicBool,
     // Lock order: engine gate -> publication -> redb -> phase_index.
     // Hold across commit and bitmap publication, including direct callers.
     publication: std::sync::RwLock<()>,
@@ -88,33 +97,55 @@ impl MetadataStore {
     /// - Creates all tables on first open.
     /// - Loads or rebuilds the phase index from persisted bitmaps.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        // redb's writable open changes bookkeeping. Refuse an offline v2 store
+        // using a disposable inspection copy, including direct metadata callers.
+        if path.try_exists()? && std::fs::metadata(path)?.len() > 0 {
+            let (_copy, inspection) = super::validation::inspect_database_copy(path, true)?;
+            if control::validate_existing(&inspection.begin_read()?)?
+                .is_some_and(|state| state.control_schema_version == 2)
+            {
+                return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
+            }
+        }
         let db = redb::Builder::new()
             .set_cache_size(16 * 1024 * 1024)
             .create(path)?;
 
         // Inspect additive canonical state before any create/adoption transaction.
         // Partial or future layouts must never be repaired into a new lineage.
+        let pristine;
         {
             let read = db.begin_read()?;
-            if control::validate_existing(&read)?.is_some() {
+            text_generation::read_selection(&read)?;
+            pristine = read.list_tables()?.next().is_none()
+                && read.list_multimap_tables()?.next().is_none();
+            let control = control::validate_existing(&read)?;
+            removal_ledger::read_export(&read, control.as_ref())?;
+            if let Some(state) = control {
+                if state.control_schema_version == 2 {
+                    return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
+                }
                 // An adopted store must retain its canonical tables. Do not
                 // recreate records, namespaces or the never-reused ID counter.
                 read.open_table(META_TABLE)?;
                 read.open_table(NAMESPACE_TABLE)?;
                 read.open_table(NAMESPACE_COUNTER)?;
             }
+            effects::validate_existing(&read)?;
         }
 
         // Force-create all tables by opening them in a write transaction.
         {
             let write_txn = db.begin_write()?;
             control::initialize(&write_txn)?;
+            effects::initialize(&write_txn)?;
             let _ = write_txn.open_table(META_TABLE)?;
             let _ = write_txn.open_table(NAMESPACE_TABLE)?;
             let _ = write_txn.open_table(NAMESPACE_COUNTER)?;
             let _ = write_txn.open_table(INDEX_TABLE)?;
             let _ = write_txn.open_multimap_table(TAG_INDEX)?;
             let _ = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+            removal_ledger::initialize(&write_txn, pristine)?;
             write_txn.commit()?;
         }
 
@@ -123,10 +154,24 @@ impl MetadataStore {
         let store = Self {
             db,
             unavailable: std::sync::atomic::AtomicBool::new(false),
+            canonical_pending: std::sync::atomic::AtomicBool::new(false),
+            derived_dirty: std::sync::atomic::AtomicBool::new(false),
+            effects_epoch: std::sync::atomic::AtomicU64::new(0),
+            derived_publication: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            fail_effect_application: std::sync::atomic::AtomicBool::new(false),
             publication: std::sync::RwLock::new(()),
             phase_index: std::sync::RwLock::new(PhaseIndex::new()),
         };
         store.rebuild_phase_index()?;
+        let pending = store.pending_effects()?;
+        store.canonical_pending.store(
+            pending.iter().any(|e| !e.canonical_applied),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        store
+            .derived_dirty
+            .store(!pending.is_empty(), std::sync::atomic::Ordering::SeqCst);
         Ok(store)
     }
 }
@@ -140,7 +185,11 @@ impl MetadataStore {
     }
 
     pub(crate) fn ensure_available(&self) -> Result<(), StorageError> {
-        if self.unavailable.load(std::sync::atomic::Ordering::Acquire) {
+        if self.unavailable.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .canonical_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(StorageError::RecoveryRequired(
                 "store handle unavailable; reopen for recovery".into(),
             ));
@@ -155,7 +204,9 @@ impl MetadataStore {
         })
     }
 
-    fn mutation_guard(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
+    pub(crate) fn mutation_guard(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
         let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
         // Recheck after waiting: the preceding writer may have failed.
         self.ensure_available()?;
@@ -181,6 +232,7 @@ impl MetadataStore {
     {
         let _publication = self.mutation_guard()?;
         let old_phase;
+        let before;
         let key = id.as_bytes().as_slice();
 
         let write_txn = self.db.begin_write()?;
@@ -194,12 +246,20 @@ impl MetadataStore {
             };
 
             old_phase = record.phase;
+            before = record.clone();
             f(&mut record)?;
 
-            table.insert(key, record.to_bytes().as_slice())?;
+            table.insert(key, record.encode()?.as_slice())?;
             record
         };
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        removal_ledger::record_change(
+            &write_txn,
+            state.generation_ref(),
+            &before,
+            &record,
+            uuid::Uuid::new_v4(),
+        )?;
         self.commit(write_txn)?;
 
         if old_phase != record.phase {
@@ -230,10 +290,16 @@ impl MetadataStore {
                 "record ID disagrees with key".into(),
             ));
         }
+        if record.version != 1 || record.schema.is_some() {
+            return Err(StorageError::RecoveryRequired(
+                "schema-v2 records require offline migration and participating writers".into(),
+            ));
+        }
         let key = id.as_bytes().as_slice();
-        let value = record.to_bytes();
+        let value = record.encode()?;
 
         let write_txn = self.db.begin_write()?;
+        removal_ledger::ensure_insertable(&write_txn, id)?;
         {
             // 1. Insert into primary table (reject duplicates).
             let mut meta = write_txn.open_table(META_TABLE)?;
@@ -475,7 +541,7 @@ impl MetadataStore {
                 record.access_history.remove(0);
             }
             record.access_history.push(AccessEvent { timestamp, kind });
-            table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
+            table.insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
         }
         let receipt = control::record_receipt(
             &tx,
@@ -526,7 +592,16 @@ impl MetadataStore {
             let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             ns_idx.remove(deleted_record.namespace_id, key)?;
         }
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        removal_ledger::record_removal(
+            &write_txn,
+            state.generation_ref(),
+            deleted_record.namespace_id,
+            id,
+            Some(removal_ledger::TerminalKind::HardDelete),
+            removal_ledger::ALL,
+            uuid::Uuid::new_v4(),
+        )?;
         self.commit(write_txn)?;
 
         // 4. Remove from in-memory phase bitmap.
@@ -586,7 +661,7 @@ impl MetadataStore {
             record.strength = 0.0;
             record.decay_strength = 0.0;
 
-            meta.insert(key, record.to_bytes().as_slice())?;
+            meta.insert(key, record.encode()?.as_slice())?;
 
             // Remove from tag index.
             let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
@@ -598,7 +673,16 @@ impl MetadataStore {
             let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             ns_idx.remove(record.namespace_id, key)?;
         }
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        removal_ledger::record_removal(
+            &write_txn,
+            state.generation_ref(),
+            old_namespace_id,
+            id,
+            Some(removal_ledger::TerminalKind::Tombstone),
+            removal_ledger::ALL,
+            uuid::Uuid::new_v4(),
+        )?;
         self.commit(write_txn)?;
 
         // Update phase bitmap: remove from old phase.
@@ -837,6 +921,34 @@ impl MetadataStore {
         Ok(ids)
     }
 
+    /// Load namespace members and canonical records from one redb read snapshot.
+    /// This is metadata-only coherence, not a snapshot of graph/vector/FTS views.
+    pub fn records_in_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<DiskRecord>, StorageError> {
+        let read = self.db.begin_read()?;
+        let namespaces = read.open_multimap_table(NAMESPACE_INDEX)?;
+        let records = read.open_table(META_TABLE)?;
+        let mut result = Vec::new();
+        for entry in namespaces.get(namespace_id.get())? {
+            let key = entry?;
+            let bytes: [u8; 16] = key.value().try_into().map_err(|_| {
+                StorageError::CorruptIndex("invalid UUID length in namespace index".into())
+            })?;
+            if let Some(value) = records.get(bytes.as_slice())? {
+                let record = DiskRecord::from_bytes(value.value())?;
+                if record.id != bytes || record.namespace_id != namespace_id.get() {
+                    return Err(StorageError::CorruptIndex(
+                        "namespace index disagrees with record identity".into(),
+                    ));
+                }
+                result.push(record);
+            }
+        }
+        Ok(result)
+    }
+
     /// Number of live (non-tombstoned) memories in `namespace_id`.
     ///
     /// Applies the same predicate as [`list_memories_filtered`] with no
@@ -1017,6 +1129,8 @@ impl MetadataStore {
         }
         let write_txn = self.db.begin_write()?;
         let mut transitions = Vec::new();
+        let state = control::advance_generation(&write_txn)?;
+        let operation_id = uuid::Uuid::new_v4();
         {
             let mut table = write_txn.open_table(META_TABLE)?;
             let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
@@ -1049,7 +1163,14 @@ impl MetadataStore {
                 if record.phase == DecayPhase::Tombstone {
                     namespaces.remove(record.namespace_id, key)?;
                 }
-                table.insert(key, record.to_bytes().as_slice())?;
+                removal_ledger::record_change(
+                    &write_txn,
+                    state.generation_ref(),
+                    &old,
+                    record,
+                    operation_id,
+                )?;
+                table.insert(key, record.encode()?.as_slice())?;
                 transitions.push((
                     record.namespace_id,
                     record.vector_slot,
@@ -1058,7 +1179,6 @@ impl MetadataStore {
                 ));
             }
         }
-        control::advance_generation(&write_txn)?;
         self.commit(write_txn)?;
         let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
         for (ns, slot, from, to) in transitions {
@@ -1194,6 +1314,12 @@ impl MetadataStore {
     /// List all namespace configurations.
     pub fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError> {
         self.ensure_available()?;
+        self.list_namespaces_for_recovery()
+    }
+
+    pub(crate) fn list_namespaces_for_recovery(
+        &self,
+    ) -> Result<Vec<NamespaceConfig>, StorageError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(NAMESPACE_TABLE)?;
         let mut configs = Vec::new();
@@ -1456,7 +1582,19 @@ impl MetadataStore {
                 ns_idx.remove(ns, key)?;
             }
         }
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        let operation_id = uuid::Uuid::new_v4();
+        for (id, record) in chunk {
+            removal_ledger::record_removal(
+                &write_txn,
+                state.generation_ref(),
+                record.namespace_id,
+                *id,
+                Some(removal_ledger::TerminalKind::HardDelete),
+                removal_ledger::ALL,
+                operation_id,
+            )?;
+        }
         self.commit(write_txn)?;
         Ok(())
     }
@@ -1571,7 +1709,7 @@ impl MetadataStore {
                 stripped.strength = 0.0;
                 stripped.decay_strength = 0.0;
 
-                meta.insert(key, stripped.to_bytes().as_slice())?;
+                meta.insert(key, stripped.encode()?.as_slice())?;
 
                 for tag in &existing.tags {
                     tags.remove(tag.as_str(), key)?;
@@ -1581,7 +1719,21 @@ impl MetadataStore {
                 outcomes.push(TombstoneOutcome::Tombstoned(existing));
             }
         }
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        let operation_id = uuid::Uuid::new_v4();
+        for outcome in &outcomes {
+            if let TombstoneOutcome::Tombstoned(record) = outcome {
+                removal_ledger::record_removal(
+                    &write_txn,
+                    state.generation_ref(),
+                    record.namespace_id,
+                    MemoryId::from_bytes(record.id),
+                    Some(removal_ledger::TerminalKind::Tombstone),
+                    removal_ledger::ALL,
+                    operation_id,
+                )?;
+            }
+        }
         self.commit(write_txn)?;
 
         // Phase bitmaps only after the commit: a bitmap update rolled
@@ -1606,6 +1758,12 @@ impl MetadataStore {
     /// Iterate all records in creation order (UUID v7 byte order).
     pub fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
         self.ensure_available()?;
+        self.scan_all_for_recovery()
+    }
+
+    pub(crate) fn scan_all_for_recovery(
+        &self,
+    ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         let mut records = Vec::new();
@@ -1664,6 +1822,46 @@ impl MetadataStore {
 mod tests {
     use super::*;
     use crate::model::Tag;
+
+    #[test]
+    fn effects_schema_partial_future_or_malformed_layout_never_adopts() {
+        for mode in 0..4 {
+            let (dir, store) = open_store();
+            let path = dir.path().join("meta.db");
+            let tx = store.db.begin_write().unwrap();
+            match mode {
+                0 => {
+                    tx.delete_table(effects::SCHEMA).unwrap();
+                }
+                1 => {
+                    tx.delete_table(effects::EFFECTS).unwrap();
+                }
+                2 => {
+                    tx.open_table(effects::SCHEMA)
+                        .unwrap()
+                        .insert("version", 99)
+                        .unwrap();
+                }
+                _ => {
+                    tx.open_table(effects::EFFECTS)
+                        .unwrap()
+                        .insert(&[0u8; 16][..], &b"{}"[..])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            drop(store);
+            assert!(MetadataStore::open(&path).is_err(), "schema case {mode}");
+            let db = redb::Database::open(&path).unwrap();
+            let read = db.begin_read().unwrap();
+            if mode == 0 {
+                assert!(read.open_table(effects::SCHEMA).is_err());
+            }
+            if mode == 1 {
+                assert!(read.open_table(effects::EFFECTS).is_err());
+            }
+        }
+    }
 
     #[test]
     fn containment_publication_blocks_second_writer_and_phase_reader_after_commit() {
@@ -1755,6 +1953,7 @@ mod tests {
     /// A live, Full-phase record in `namespace_id` occupying `slot`.
     fn record_in(namespace_id: u32, slot: u32, tags: &[&str]) -> DiskRecord {
         DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: [0u8; 16],
             namespace_id,

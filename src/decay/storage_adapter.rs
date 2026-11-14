@@ -21,12 +21,27 @@ pub async fn reinforce(
     quality: u8,
     global_multiplier: f64,
     now_millis: i64,
+    expected_namespace: Option<String>,
 ) -> Result<super::lifecycle::FeedbackPlan, super::lifecycle::LifecycleError> {
     use super::lifecycle::{LifecycleError, plan_feedback, resolve_policy};
     tokio::task::spawn_blocking(move || {
         let storage = storage
             .write()
             .map_err(|e| LifecycleError::Storage(e.to_string()))?;
+        if let Some(namespace) = expected_namespace.as_deref() {
+            storage
+                .assert_memory_namespace(id, namespace)
+                .map_err(|error| match error {
+                    crate::storage::StorageError::NamespaceMismatch { .. } => {
+                        LifecycleError::NamespaceMismatch(error.to_string())
+                    }
+                    crate::storage::StorageError::NotFound(_) => LifecycleError::NotFound,
+                    crate::storage::StorageError::InvalidNamespaceName { .. } => {
+                        LifecycleError::InvalidInput("invalid namespace assertion")
+                    }
+                    _ => LifecycleError::Storage(error.to_string()),
+                })?;
+        }
         let record = storage
             .get_record(id)
             .map_err(|e| LifecycleError::Storage(e.to_string()))?

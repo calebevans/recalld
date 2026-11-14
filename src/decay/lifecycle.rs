@@ -10,6 +10,10 @@ use crate::model::{DecayPhase, DiskRecord, NamespaceConfig};
 pub enum LifecycleError {
     #[error(transparent)]
     Observation(#[from] super::observation::ObservationError),
+    /// An explicit namespace assertion failed before feedback effects.
+    #[error("{0}")]
+    NamespaceMismatch(String),
+
     #[error("invalid lifecycle input: {0}")]
     InvalidInput(&'static str),
     #[error("memory content is unavailable for feedback")]
@@ -229,6 +233,7 @@ mod tests {
 
     fn record() -> DiskRecord {
         DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: [0; 16],
             namespace_id: 1,
@@ -418,8 +423,8 @@ mod tests {
             3,
         )
         .unwrap();
-        let ma = mcp.reinforce_memory(a, 3).await.unwrap();
-        let hb = http.reinforce(b, 3).await.unwrap();
+        let ma = mcp.reinforce_memory(a, 3, None).await.unwrap();
+        let hb = http.reinforce(b, 3, None).await.unwrap();
         assert_eq!(
             clock.calls.load(Ordering::SeqCst),
             2,
@@ -437,7 +442,7 @@ mod tests {
         .unwrap();
         let expected = plan_feedback(&f.record(inherited).unwrap(), &policy, 8 * DAY, 3).unwrap();
         assert_eq!(
-            http.reinforce(inherited, 3).await.unwrap().stability,
+            http.reinforce(inherited, 3, None).await.unwrap().stability,
             expected.stability
         );
         for id in [a, b] {
@@ -448,15 +453,15 @@ mod tests {
             assert_eq!(r.text_length, 0);
             assert_eq!(r.is_permastore, 1);
             let before = r.to_bytes();
-            assert!(mcp.reinforce_memory(id, 0).await.is_err());
-            assert!(http.reinforce(id, 5).await.is_err());
+            assert!(mcp.reinforce_memory(id, 0, None).await.is_err());
+            assert!(http.reinforce(id, 5, None).await.is_err());
             assert_eq!(before, f.record(id).unwrap().to_bytes());
         }
         // A backward production clock cannot move the existing anchor backward.
         let regressed = f
             .storage_adapter()
             .with_clock(Arc::new(ManualClock::new(DAY)));
-        regressed.reinforce_memory(a, 1).await.unwrap();
+        regressed.reinforce_memory(a, 1, None).await.unwrap();
         assert_eq!(f.record(a).unwrap().last_accessed_at, 8 * DAY);
         let ghost = f
             .insert_memory_with(MemorySpec {
@@ -465,17 +470,21 @@ mod tests {
                 ..MemorySpec::new(namespace)
             })
             .await;
-        assert!(mcp.reinforce_memory(ghost, 3).await.is_err());
-        assert!(http.reinforce(ghost, 3).await.is_err());
+        assert!(mcp.reinforce_memory(ghost, 3, None).await.is_err());
+        assert!(http.reinforce(ghost, 3, None).await.is_err());
         assert!(f.record(ghost).unwrap().access_history.is_empty());
-        mcp.delete_memory(a).await.unwrap();
+        mcp.delete_memory(a, None).await.unwrap();
         let tombstone = f.record(a).unwrap().to_bytes();
-        assert!(mcp.reinforce_memory(a, 3).await.is_err());
-        assert!(http.reinforce(a, 3).await.is_err());
+        assert!(mcp.reinforce_memory(a, 3, None).await.is_err());
+        assert!(http.reinforce(a, 3, None).await.is_err());
         assert_eq!(tombstone, f.record(a).unwrap().to_bytes());
         f.storage.write().unwrap().delete_memory(b).unwrap();
-        assert!(http.reinforce(b, 3).await.is_err());
+        assert!(http.reinforce(b, 3, None).await.is_err());
         assert!(f.record(b).is_none());
-        assert!(mcp.reinforce_memory(MemoryId::new(), 3).await.is_err());
+        assert!(
+            mcp.reinforce_memory(MemoryId::new(), 3, None)
+                .await
+                .is_err()
+        );
     }
 }

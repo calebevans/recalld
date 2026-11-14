@@ -8,6 +8,9 @@ use thiserror::Error;
 pub enum SearchError {
     #[error(transparent)]
     Observation(#[from] crate::decay::observation::ObservationError),
+    /// Canonical effects or their derived publication are not ready.
+    #[error("search unavailable: {0}")]
+    Unavailable(String),
     /// The specified namespace does not exist.
     #[error("namespace not found: {0}")]
     NamespaceNotFound(String),
@@ -44,6 +47,10 @@ pub enum SearchError {
     /// is impossible and DROPPING it would widen the query.
     #[error("{0}")]
     InvalidFilter(String),
+
+    /// A supplied query vector cannot be searched safely.
+    #[error("invalid query embedding: {0}")]
+    InvalidEmbedding(String),
 
     /// An unexpected internal error occurred.
     #[error("internal error: {0}")]

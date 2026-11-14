@@ -227,11 +227,12 @@ pub struct SearchRequest {
     )]
     pub record_access: bool,
     /// Natural-language query text. The server generates an
-    /// embedding from this for similarity search.
+    /// embedding from this for similarity search unless `embedding` is supplied.
     #[serde(default)]
     pub query: Option<String>,
 
-    /// Pre-computed query embedding. Mutually exclusive with `query`.
+    /// Pre-computed semantic query embedding. When present, `query` is used
+    /// only for FTS; the embedding provider is not invoked.
     #[serde(default)]
     pub embedding: Option<Vec<f32>>,
 
@@ -362,6 +363,7 @@ mod tests {
     /// A `MemoryResponse` as every read endpoint produces it.
     fn response() -> MemoryResponse {
         let record = CachedRecord {
+            lifecycle: None,
             id: MemoryId::new(),
             namespace_id: crate::model::NamespaceId::new(1),
             created_at: 0,

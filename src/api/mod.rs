@@ -142,3 +142,6 @@ async fn shutdown_signal() {
         .expect("failed to install Ctrl-C handler");
     info!("shutdown signal received");
 }
+
+#[cfg(test)]
+mod vector_query_tests;

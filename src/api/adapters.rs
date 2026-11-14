@@ -125,9 +125,10 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         query: state::SearchQuery,
     ) -> Result<Vec<state::ResolvedSearchResult>, crate::search::SearchError> {
         // Convert API-layer SearchQuery to the pipeline's SearchQuery.
-        let text = match query.query {
-            state::QueryInput::Text(t) => Some(t),
-            state::QueryInput::Vector(_) => None,
+        let (text, query_embedding) = match query.query {
+            state::QueryInput::Text(t) => (Some(t), None),
+            state::QueryInput::Vector(vector) => (None, Some(vector)),
+            state::QueryInput::TextAndVector { text, embedding } => (Some(text), Some(embedding)),
         };
 
         // A label that cannot become a tag is an error, not a dropped
@@ -168,6 +169,7 @@ impl state::SearchPipeline for SearchPipelineAdapter {
 
         let pipeline_query = crate::search::SearchQuery {
             record_access: query.record_access,
+            query_embedding,
             text,
             fts_query: None,
             namespace: query.namespace_name.clone(), // Issue 1: pass actual namespace name
@@ -201,6 +203,7 @@ impl state::SearchPipeline for SearchPipelineAdapter {
                         AccessKind::DirectRetrieval
                     },
                     memory: CachedRecord {
+                        lifecycle: None,
                         id: r.memory_id,
                         namespace_id: query.namespace_id, // Issue 6: use actual namespace_id
                         created_at: r.created_at,
@@ -223,15 +226,44 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             .collect())
     }
 
+    async fn find_similar(
+        &self,
+        id: MemoryId,
+        limit: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, crate::search::SearchError> {
+        self.query_engine
+            .similar_filtered_with_access(id, limit, min_score, record_access)
+            .await
+    }
+
+    async fn record_similar_accesses(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<(), crate::search::SearchError> {
+        self.query_engine.record_similar_accesses(ids).await
+    }
+
     async fn near_duplicates(
         &self,
         embedding: &[f32],
         namespace_id: NamespaceId,
         threshold: f32,
         limit: usize,
-    ) -> Vec<(MemoryId, f32)> {
+    ) -> Result<Vec<(MemoryId, f32)>, super::errors::AppError> {
+        let stamp = self.query_engine.effects_stamp().await?;
         let index = self.vector_index.read().await;
-        crate::search::find_near_duplicates(&index, embedding, namespace_id, threshold, limit)
+        let result =
+            crate::search::find_near_duplicates(&index, embedding, namespace_id, threshold, limit);
+        drop(index);
+        if self.query_engine.effects_stamp().await? != stamp {
+            return Err(crate::storage::StorageError::RecoveryRequired(
+                "effects changed during advisory".into(),
+            )
+            .into());
+        }
+        Ok(result)
     }
 
     async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId) {
@@ -367,6 +399,7 @@ impl StorageEngineAdapter {
         entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
         graph: crate::graph::SharedGraph,
     ) -> Self {
+        cache.bind_storage(&storage);
         Self {
             clock: Arc::new(crate::time::SystemClock),
             storage,
@@ -386,6 +419,30 @@ impl StorageEngineAdapter {
 
 #[async_trait]
 impl state::StorageEngine for StorageEngineAdapter {
+    async fn publication_lease(
+        &self,
+    ) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, crate::storage::StorageError> {
+        Ok(Some(
+            crate::derived_completion::publication_gate(&self.storage)
+                .await?
+                .read_owned()
+                .await,
+        ))
+    }
+
+    async fn effects_stamp(&self) -> Result<u64, crate::storage::StorageError> {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            storage
+                .read()
+                .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
+                .meta_store()
+                .effects_stamp()
+        })
+        .await
+        .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
+    }
+
     async fn create_memory(
         &self,
         namespace_id: NamespaceId,
@@ -410,6 +467,7 @@ impl state::StorageEngine for StorageEngineAdapter {
         let parsed_tags: Vec<Tag> = crate::model::parse_tags_lossy("create_memory.tags", tags);
 
         let mut record = DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: namespace_id.get(),
@@ -474,7 +532,29 @@ impl state::StorageEngine for StorageEngineAdapter {
         .flatten()
     }
 
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, crate::storage::StorageError> {
+    async fn assert_memory_namespace(
+        &self,
+        id: MemoryId,
+        namespace: &str,
+    ) -> Result<(), crate::storage::StorageError> {
+        let storage = self.storage.clone();
+        let namespace = namespace.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let storage = storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::other(e.to_string()))
+            })?;
+            storage.assert_memory_namespace(id, &namespace)
+        })
+        .await
+        .map_err(|e| crate::storage::StorageError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, crate::storage::StorageError> {
+        let namespace = namespace.map(str::to_owned);
         let storage = self.storage.clone();
 
         // Perform read, tombstone check, tombstone, and free_vector_slot
@@ -495,6 +575,9 @@ impl state::StorageEngine for StorageEngineAdapter {
                 ))
             })?;
 
+            if let Some(namespace) = namespace.as_deref() {
+                storage_w.assert_memory_namespace(id, namespace)?;
+            }
             // Check if the record exists and is not already tombstoned.
             let existing_record = match storage_w.get_record(id)? {
                 Some(r) => r,
@@ -1124,6 +1207,7 @@ impl state::RelationshipGraph for RelationshipGraphAdapter {
 /// Adapts the decay subsystem to the API `FsrsEngine` trait.
 pub struct FsrsEngineAdapter {
     clock: Arc<dyn crate::time::Clock>,
+    completion: Option<crate::derived_completion::DerivedCompletion>,
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: Arc<CacheManager>,
     graph: crate::graph::SharedGraph,
@@ -1140,6 +1224,7 @@ impl FsrsEngineAdapter {
         config: Arc<RecalldConfig>,
         has_sweep: bool,
     ) -> Self {
+        cache.bind_storage(&storage);
         Self {
             clock: Arc::new(crate::time::SystemClock),
             storage,
@@ -1147,11 +1232,29 @@ impl FsrsEngineAdapter {
             graph,
             config,
             sweep_alive: has_sweep,
+            completion: None,
         }
     }
     /// Use the system instance's clock (or an isolated manual clock).
     pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+    /// Attach the live derived views so manual sweeps complete committed effects.
+    pub fn with_indexes(
+        mut self,
+        vectors: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
+        fts: Arc<tokio::sync::Mutex<FtsIndex>>,
+        entities: Arc<tokio::sync::RwLock<EntityIndex>>,
+    ) -> Self {
+        self.completion = Some(crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors,
+            fts,
+            entities,
+        });
         self
     }
 }
@@ -1176,6 +1279,7 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<state::ReinforceResult, Box<dyn std::error::Error + Send + Sync>> {
         let outcome = crate::decay::storage_adapter::reinforce(
             self.storage.clone(),
@@ -1184,6 +1288,7 @@ impl state::FsrsEngine for FsrsEngineAdapter {
             quality,
             self.config.decay.decay_rate_multiplier,
             self.clock.now_millis(),
+            namespace.map(str::to_owned),
         )
         .await;
         let plan = outcome?;
@@ -1227,6 +1332,17 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         )
         .await;
 
+        if let Some(completion) = &self.completion {
+            completion.complete().await?;
+        } else if self
+            .storage
+            .read()
+            .map_err(|e| e.to_string())?
+            .meta_store()
+            .needs_effects_rebuild()
+        {
+            return Err("derived completion handles missing; reopen required".into());
+        }
         Ok(result)
     }
 }
@@ -1344,6 +1460,7 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
             });
 
             let ns_config = NamespaceConfig {
+                schema: None,
                 id: NamespaceId::UNSET,
                 name: name_owned,
                 embedding_dim: dim,
@@ -1370,6 +1487,7 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
             })?;
             let assigned_id = storage_w.create_namespace(&ns_config)?;
             Ok(NamespaceConfig {
+                schema: None,
                 id: assigned_id,
                 ..ns_config
             })
@@ -1476,7 +1594,7 @@ mod tests {
         let fx = Fixture::new();
         let id = indexed_memory(&fx).await;
 
-        assert!(adapter(&fx).delete_memory(id).await.expect("delete"));
+        assert!(adapter(&fx).delete_memory(id, None).await.expect("delete"));
 
         assert!(
             fx.fts_index.lock().await.is_empty().expect("fts"),
@@ -1510,7 +1628,7 @@ mod tests {
         let id = indexed_memory(&fx).await;
         let adapter = adapter(&fx);
 
-        assert!(adapter.delete_memory(id).await.expect("first delete"));
+        assert!(adapter.delete_memory(id, None).await.expect("first delete"));
 
         // Re-index it, so a second pass through the cleanup would be
         // visible rather than idempotent by accident.
@@ -1521,7 +1639,10 @@ mod tests {
             .expect("fts add");
 
         assert!(
-            !adapter.delete_memory(id).await.expect("second delete"),
+            !adapter
+                .delete_memory(id, None)
+                .await
+                .expect("second delete"),
             "an already-tombstoned memory must report false"
         );
         assert!(

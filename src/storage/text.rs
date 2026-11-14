@@ -4,6 +4,8 @@
 //! is length-prefixed with a CRC32 checksum for corruption detection.
 //! See CS-08 for the full specification.
 
+pub(crate) mod generation;
+
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -186,6 +188,7 @@ pub struct TextStore {
     path: PathBuf,
     /// Current write position (byte offset of the next append).
     write_pos: u64,
+    header_size: u64,
 }
 
 impl TextStore {
@@ -214,6 +217,7 @@ impl TextStore {
                 file,
                 path: path.to_path_buf(),
                 write_pos,
+                header_size: 16,
             })
         } else {
             // --- Create new ---
@@ -232,6 +236,7 @@ impl TextStore {
                 file,
                 path: path.to_path_buf(),
                 write_pos: TextLogHeader::SIZE as u64,
+                header_size: 16,
             })
         }
     }
@@ -282,6 +287,7 @@ impl TextStore {
             file,
             path: path.to_path_buf(),
             write_pos,
+            header_size: 16,
         };
         store.validate_header()?;
         Ok(store)
@@ -298,7 +304,7 @@ impl TextStore {
     pub fn read(&self, text_ref: TextRef) -> Result<String, StorageError> {
         if !text_ref.is_some()
             || text_ref.length > MAX_ENTRY_SIZE
-            || text_ref.file_offset < TextLogHeader::SIZE as u64
+            || text_ref.file_offset < self.header_size
             || text_ref
                 .file_offset
                 .checked_add(ENTRY_HEADER_SIZE)
@@ -349,6 +355,9 @@ impl TextStore {
 
     /// Validate the file header. Called during startup validation.
     pub fn validate_header(&mut self) -> Result<(), StorageError> {
+        if self.header_size == 48 {
+            return Ok(());
+        } // Full identity checked by open_generation.
         self.file.seek(SeekFrom::Start(0))?;
         let mut header_buf = [0u8; TextLogHeader::SIZE];
         self.file.read_exact(&mut header_buf)?;

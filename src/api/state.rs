@@ -66,15 +66,14 @@ pub trait SearchPipeline: Send + Sync {
     /// checking a new memory for duplicates does not age every
     /// neighbour's decay schedule.
     ///
-    /// Never errors — the caller is an advisory field that must not fail a
-    /// create.
+    /// Fails closed when derived views are unavailable.
     async fn near_duplicates(
         &self,
         embedding: &[f32],
         namespace_id: NamespaceId,
         threshold: f32,
         limit: usize,
-    ) -> Vec<(MemoryId, f32)>;
+    ) -> Result<Vec<(MemoryId, f32)>, super::errors::AppError>;
 
     /// Index a memory's embedding in the vector index.
     async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId);
@@ -119,6 +118,17 @@ pub trait SearchPipeline: Send + Sync {
 /// Persistent storage engine (meta.db, fulltext.dat, vectors.dat, edges.db).
 #[async_trait::async_trait]
 pub trait StorageEngine: Send + Sync {
+    /// Drain in-flight create/index publication before online derived repair.
+    async fn publication_lease(
+        &self,
+    ) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, crate::storage::StorageError> {
+        Ok(None)
+    }
+    /// Internal graph-effects admission, not public canonical generation/CAS.
+    async fn effects_stamp(&self) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
     /// Create a new memory record and persist it.
     async fn create_memory(
         &self,
@@ -132,7 +142,18 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<CachedRecord, StorageError>;
 
     /// Delete a memory by ID. Returns `true` if it existed.
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, StorageError>;
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, StorageError>;
+
+    /// Verify a by-ID namespace assertion against canonical metadata before effects.
+    async fn assert_memory_namespace(
+        &self,
+        id: MemoryId,
+        namespace: &str,
+    ) -> Result<(), StorageError>;
 
     /// Retrieve a single memory's DiskRecord by ID.
     ///
@@ -309,6 +330,7 @@ pub trait FsrsEngine: Send + Sync {
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<ReinforceResult, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Whether the decay sweep thread is still alive.
@@ -372,7 +394,7 @@ pub trait MetricsCollector: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     pub record_access: bool,
-    /// The query input (text or pre-computed vector).
+    /// The query input (text, precomputed vector, or both).
     pub query: QueryInput,
     /// Target namespace for the search.
     pub namespace_id: NamespaceId,
@@ -400,14 +422,15 @@ pub struct SearchQuery {
     pub entities: Vec<String>,
 }
 
-/// Search query input: either natural-language text or a pre-computed
-/// embedding vector.
+/// Search query input: natural-language text, a precomputed vector, or both.
 #[derive(Debug, Clone)]
 pub enum QueryInput {
     /// Natural-language text to be embedded by the server.
     Text(String),
     /// Pre-computed embedding vector.
     Vector(Vec<f32>),
+    /// Precomputed semantic vector plus text for the FTS channel only.
+    TextAndVector { text: String, embedding: Vec<f32> },
 }
 
 /// A single resolved search result with its similarity score.

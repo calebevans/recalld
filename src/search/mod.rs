@@ -37,7 +37,7 @@ pub use simd::{dot_product_simd, is_normalized, normalize_l2};
 pub use duplicates::find_near_duplicates;
 
 // --- CS-26 re-exports ---
-pub use fts::FtsIndex;
+pub use fts::{EligibleFtsResults, FtsCoverage, FtsIndex, MAX_FTS_EXAMINED};
 
 // --- CS-29 re-exports ---
 pub use entity_index::EntityIndex;
@@ -46,9 +46,12 @@ pub use entity_normalize::canonicalize_entity;
 // --- CS-16 re-exports ---
 pub use error::SearchError;
 pub use pipeline::{
-    AccessRecorder, EmbeddingProviderRegistry, EntityIndexReader, EntityRecallResult,
-    FtsIndexRegistry, FtsResult, GraphReader, MetadataStore, NamespaceResolver, QueryEngine,
-    RecordCache, RifProcessor, RifSuppression, ScoredResult, VectorIndexRegistry,
+    AccessRecorder, ChannelDiagnostics, ChannelParticipation, EmbeddingProviderRegistry,
+    EntityIndexReader, EntityRecallResult, FtsAvailability, FtsDiagnostics, FtsIndexRegistry,
+    FtsResult, GraphReader, MetadataStore, NamespaceResolver, QueryEngine, RecordCache,
+    ResultProvenance, RetrievalChannel, RetrievalSemantics, RifProcessor, RifSuppression,
+    ScoredResult, SemanticsDiagnostics, SemanticsResponse, StrengthDiagnostics, UnresolvedReason,
+    VectorIndexRegistry, VersionMode, VersionStatus,
 };
 pub use query::SearchFilter as PipelineSearchFilter;
 pub use query::{QueryMode, SearchQuery};

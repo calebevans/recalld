@@ -1273,6 +1273,7 @@ pub(super) async fn store_single_memory(
     let memory_id = MemoryId::new();
 
     let mut record = DiskRecord {
+        schema: None,
         version: DiskRecord::CURRENT_VERSION,
         id: *memory_id.as_bytes(),
         namespace_id: ns_config.id.get(),
@@ -1638,6 +1639,7 @@ pub(super) async fn search_memories(
         };
         let query = SearchQuery {
             record_access: true,
+            query_embedding: None,
             text: Some(bq.query.clone()),
             fts_query: bq.fts_query.clone(),
             namespace: "default".to_string(),
@@ -1726,6 +1728,7 @@ pub(super) async fn search_memories(
                         };
                         let query = SearchQuery {
                             record_access: true,
+                            query_embedding: None,
                             text: Some(bq.query.clone()),
                             fts_query: bq.fts_query.clone(),
                             namespace: "default".to_string(),

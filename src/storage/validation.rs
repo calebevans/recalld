@@ -25,13 +25,24 @@ pub(crate) fn require_file(path: &Path) -> Result<(), StorageError> {
 
 // redb 2.x writes bookkeeping even on open. Inspect disposable copies and
 // abort repair; source files remain byte-for-byte unchanged.
-fn inspect_database(path: &Path) -> Result<(tempfile::TempDir, redb::Database), StorageError> {
+pub(crate) fn inspect_database(
+    path: &Path,
+) -> Result<(tempfile::TempDir, redb::Database), StorageError> {
+    inspect_database_copy(path, false)
+}
+
+pub(crate) fn inspect_database_copy(
+    path: &Path,
+    recover_copy: bool,
+) -> Result<(tempfile::TempDir, redb::Database), StorageError> {
     require_file(path)?;
     let temp = tempfile::tempdir()?;
     let copy = temp.path().join("inspect.db");
     std::fs::copy(path, &copy)?;
     let mut builder = redb::Builder::new();
-    builder.set_repair_callback(|session| session.abort());
+    if !recover_copy {
+        builder.set_repair_callback(|session| session.abort());
+    }
     let mut db = builder.open(copy)?;
     if !db.check_integrity()? {
         return Err(StorageError::RecoveryRequired(format!(
@@ -40,6 +51,53 @@ fn inspect_database(path: &Path) -> Result<(tempfile::TempDir, redb::Database), 
         )));
     }
     Ok((temp, db))
+}
+
+/// Canonical text preflight on a disposable metadata copy. This precedes any
+/// writable canonical open; pending plans are checked without applying effects.
+pub(crate) fn preflight_text(path: &Path) -> Result<(), StorageError> {
+    // An unclean process exit may require redb free-list recovery. Perform it
+    // only on the disposable copy before touching the original database.
+    let (_copy, metadata) = inspect_database_copy(&path.join("meta.db"), true)?;
+    let read = metadata.begin_read()?;
+    let control = super::control::validate_existing(&read)?;
+    super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
+    // Valid pending effects are recoverable at startup; only malformed evidence fails here.
+    let effects = super::metadata::effects::validate_existing(&read)?;
+    if control
+        .as_ref()
+        .is_some_and(|c| c.control_schema_version == 2)
+    {
+        return Err(StorageError::RecoveryRequired("schema v2 remains offline until participating writers are enabled; use schema inspect/export".into()));
+    }
+    let text = selected_text(path, &read)?;
+    let records = read.open_table(META_TABLE)?;
+    let mut decoded = Vec::new();
+    for row in records.iter()? {
+        let (_, bytes) = row?;
+        let record = DiskRecord::from_bytes(bytes.value())?;
+        decoded.push((MemoryId::from_bytes(record.id), record.clone()));
+        if record.text_offset != 0 || record.text_length != 0 {
+            text.read(TextRef {
+                file_offset: record.text_offset,
+                length: record.text_length,
+            })?;
+        }
+    }
+    for effect in effects.iter().filter(|effect| !effect.canonical_applied) {
+        super::metadata::effects::validate_plan(effect, &decoded)?;
+    }
+    Ok(())
+}
+
+fn selected_text(path: &Path, read: &redb::ReadTransaction) -> Result<TextStore, StorageError> {
+    match super::metadata::text_generation::read_selection(read)? {
+        Some(descriptor) => {
+            super::text::generation::validate_rejection_gate(path, descriptor.store_id)?;
+            TextStore::open_generation(path, &descriptor, false)
+        }
+        None => TextStore::open_read_only(&path.join("fulltext.dat")),
+    }
 }
 
 /// Caller owns/quiesces the store, or supplies an inaccessible staging copy.
@@ -51,8 +109,23 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
     }
     let (_meta_copy, meta) = inspect_database(&path.join("meta.db"))?;
     let read = meta.begin_read()?;
-    if super::control::validate_existing(&read)?.is_some() {
+    let control = super::control::validate_existing(&read)?;
+    super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
+    let schema_state = control
+        .as_ref()
+        .map(|c| super::canonical_schema::read_state(&read, c))
+        .transpose()?
+        .flatten();
+    if control.is_some() {
         read.open_table(super::metadata::NAMESPACE_COUNTER)?;
+    }
+    if super::metadata::effects::validate_existing(&read)?
+        .iter()
+        .any(|e| !e.canonical_applied)
+    {
+        return Err(StorageError::RecoveryRequired(
+            "pending canonical effects; reopen before backup".into(),
+        ));
     }
     let namespaces = read.open_table(NAMESPACE_TABLE)?;
     let mut inventory: HashSet<String> = ["meta.db", "edges.db", "fulltext.dat"]
@@ -60,11 +133,11 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
         .map(str::to_owned)
         .collect();
     let mut vectors = HashMap::new();
+    let mut configs = HashMap::new();
     let mut names = HashSet::new();
     for item in namespaces.iter()? {
         let (key, value) = item?;
-        let config: NamespaceConfig = serde_json::from_slice(value.value())
-            .map_err(|e| StorageError::Deserialize(e.to_string()))?;
+        let config = NamespaceConfig::decode(value.value())?;
         validate_namespace_name(&config.name).map_err(|reason| {
             StorageError::InvalidNamespaceName {
                 name: config.name.clone(),
@@ -79,6 +152,12 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
                 "invalid namespace identity/dimension".into(),
             ));
         }
+        if schema_state.is_some() != config.schema.is_some() {
+            return Err(StorageError::InvalidControl(
+                "mixed namespace schema".into(),
+            ));
+        }
+        configs.insert(config.id.get(), config.clone());
         let dir = path.join(&config.name);
         if !std::fs::symlink_metadata(&dir)?.is_dir() {
             return Err(StorageError::InvalidPath);
@@ -91,7 +170,10 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
             VectorStore::open(&dir, config.embedding_dim as usize)?,
         );
     }
-    let text = TextStore::open_read_only(&path.join("fulltext.dat"))?;
+    if let Some(descriptor) = super::metadata::text_generation::read_selection(&read)? {
+        inventory.insert(descriptor.filename);
+    }
+    let text = selected_text(path, &read)?;
     let records = read.open_table(META_TABLE)?;
     let mut ids = HashSet::new();
     let mut owners = HashSet::new();
@@ -105,6 +187,14 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
         }
         let id = MemoryId::from_bytes(record.id);
         ids.insert(id);
+        let namespace = configs
+            .get(&record.namespace_id)
+            .ok_or(StorageError::NamespaceNotFound(record.namespace_id))?;
+        super::canonical_schema::validate_record_namespace(
+            &record,
+            namespace,
+            schema_state.as_ref(),
+        )?;
         let store = vectors
             .get(&record.namespace_id)
             .ok_or(StorageError::NamespaceNotFound(record.namespace_id))?;
@@ -118,6 +208,31 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
             return Err(StorageError::OwnershipMismatch(format!(
                 "invalid vector owner {id}"
             )));
+        }
+        if let Some(reference) = record
+            .schema
+            .as_ref()
+            .and_then(|schema| schema.vector.as_ref())
+        {
+            use sha2::{Digest, Sha256};
+            let vector = store
+                .get_vector(record.vector_slot)
+                .ok_or_else(|| StorageError::OwnershipMismatch("missing v2 vector".into()))?;
+            let mut hash = Sha256::new();
+            for value in vector {
+                hash.update(value.to_le_bytes());
+            }
+            if <[u8; 32]>::from(hash.finalize()) != reference.sha256 {
+                return Err(StorageError::OwnershipMismatch(
+                    "v2 vector hash mismatch".into(),
+                ));
+            }
+            if matches!(
+                &namespace.schema.as_ref().unwrap().embedding_binding,
+                crate::model::schema::EmbeddingBinding::Bound { .. }
+            ) {
+                super::canonical_schema::validate_bound_vector(vector)?;
+            }
         }
         if record.text_offset != 0 || record.text_length != 0 {
             text.read(TextRef {

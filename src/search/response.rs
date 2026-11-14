@@ -147,6 +147,10 @@ pub struct StageTimings {
     pub parse_us: u64,
     /// Stage 2: Text-to-embedding.
     pub embed_us: u64,
+    /// Stage 2b: Namespace enumeration, canonical loading and hard eligibility.
+    /// Defaults to zero when reading a response produced before this field existed.
+    #[serde(default)]
+    pub eligibility_us: u64,
     /// Stage 3: Flat SIMD vector search.
     pub vector_search_us: u64,
     /// Stage 3b: FTS5 keyword search.
@@ -171,4 +175,32 @@ pub struct StageTimings {
     pub build_response_us: u64,
     /// Total pipeline wall-clock time.
     pub total_us: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eligibility_timing_serializes_additively_and_accepts_older_responses() {
+        let mut value = serde_json::to_value(StageTimings {
+            eligibility_us: 42,
+            ..StageTimings::default()
+        })
+        .unwrap();
+        assert_eq!(value["eligibilityUs"], 42);
+        assert_eq!(
+            serde_json::from_value::<StageTimings>(value.clone())
+                .unwrap()
+                .eligibility_us,
+            42
+        );
+        value.as_object_mut().unwrap().remove("eligibilityUs");
+        assert_eq!(
+            serde_json::from_value::<StageTimings>(value)
+                .unwrap()
+                .eligibility_us,
+            0
+        );
+    }
 }
