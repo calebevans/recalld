@@ -60,8 +60,7 @@ pub(crate) fn read_state(
     if control.control_schema_version != 2
         || state.canonical_schema_version != 2
         || state.migration_id.is_nil()
-        || state.source.store_id != control.store_id
-        || state.source.generation > control.committed_generation
+        || !super::control::permits_generation_origin(read, control, state.source)?
         || chrono::DateTime::from_timestamp_millis(state.migration_now).is_none()
     {
         return Err(StorageError::InvalidControl(
@@ -70,7 +69,7 @@ pub(crate) fn read_state(
     }
     if let Some(operation_id) = state.receipt_operation_id {
         let key = super::control::scoped_key(
-            control.store_id,
+            state.source.store_id,
             super::control::MutationScope::Catalog,
             operation_id.as_bytes(),
         );
@@ -80,15 +79,32 @@ pub(crate) fn read_state(
         })?;
         let receipt = super::control::validate_receipt(receipt.value())?.receipt;
         if receipt.operation_id != operation_id
-            || receipt.store_id != control.store_id
-            || receipt.committed_generation <= state.source.generation
-            || receipt.committed_generation > control.committed_generation
-            || !matches!(receipt.outcome, super::control::MutationOutcome::SchemaMigrated { migration_id, .. } if migration_id == state.migration_id)
+            || receipt.store_id != state.source.store_id
+            || receipt.committed_generation != state.source.generation.next()?
+            || !super::control::permits_generation_origin(
+                read,
+                control,
+                GenerationRef {
+                    store_id: receipt.store_id,
+                    generation: receipt.committed_generation,
+                },
+            )?
+            || (state.source.store_id == control.store_id
+                && receipt.committed_generation != control.committed_generation)
+            || !matches!(receipt.outcome, super::control::MutationOutcome::SchemaMigrated { migration_id, attested_namespaces, .. } if migration_id == state.migration_id && attested_namespaces > 0)
         {
             return Err(StorageError::InvalidControl(
                 "schema migration receipt mismatch".into(),
             ));
         }
+    } else if state.source.store_id == control.store_id
+        && state.source.generation != control.committed_generation
+    {
+        // There are no ordinary offline-v2 writers. A format-only migration
+        // cannot explain an increment; an attestation must retain its evidence.
+        return Err(StorageError::InvalidControl(
+            "format-only migration changed generation without an attestation receipt".into(),
+        ));
     }
     Ok(Some(state))
 }
