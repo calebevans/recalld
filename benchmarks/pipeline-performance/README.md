@@ -48,9 +48,9 @@ Enabled/disabled functional smokes agree on logical canonical state and result
 hashes; each query interval preserves canonical file bytes. Raw build/test and
 probe smoke failures remain in the worktree's private `.validation` directory.
 
-The smoke probe is functional validation only. No overhead ratio has been
-measured or promoted yet. Timed pairs wait for final source/binary freeze and a
-coordinated quiet interval; otherwise results are characterization only. Sink
-flushing is included in each measured request. No serialization/send/provider
-queue, write-fsync detail, compaction, RIF pair-count or transitive readiness
-barrier completion is claimed by this bounded slice.
+The smoke probe is functional validation only. The completed frozen study is in
+[REPORT.md](REPORT.md), [RESULTS.json](RESULTS.json), and the
+[raw archive manifest](archives/MANIFEST.json). Enabled emission did not pass the
+5% overhead gate; shared-host limitations and later integration gaps remain
+explicit. No serialization/send/provider queue, write-fsync detail, compaction,
+RIF pair-count or transitive readiness completion is claimed by this slice.
