@@ -1,7 +1,7 @@
-//! Pure legacy lifecycle planning against the current record layout.
+//! Pure lifecycle planning against explicit canonical anchors when present.
 //!
-//! `last_accessed_at` remains the v1 anchor. No inferred feedback dates,
-//! lifecycle v2 policy, durable receipts, or schema changes are introduced here.
+//! Legacy records retain their v1 anchor. This planner does not enable any
+//! ordinary schema-v2 writer or synthesize observed/retrieved/feedback times.
 
 use super::{DecayConfig, FsrsEngine};
 use crate::model::{DecayPhase, DiskRecord, NamespaceConfig};
@@ -164,17 +164,26 @@ pub fn plan_feedback(
             "invalid record stability or difficulty",
         ));
     }
-    // Until A1 persists lifecycle_updated_at, these are the known v1 times.
-    let timestamp = now_millis
-        .max(record.last_accessed_at)
-        .max(record.created_at);
+    let (anchor, updated_at) = record.schema.as_ref().map_or(
+        (
+            record.last_accessed_at,
+            record.last_accessed_at.max(record.created_at),
+        ),
+        |schema| {
+            (
+                schema.lifecycle.decay_anchor_at,
+                schema.lifecycle.lifecycle_updated_at,
+            )
+        },
+    );
+    let timestamp = now_millis.max(updated_at);
     let config = DecayConfig {
         difficulty: record.difficulty,
         ..policy.config.clone()
     };
     let stability = FsrsEngine::new(&config).review_stability(
         record.stability,
-        crate::time::elapsed_days(timestamp, record.last_accessed_at),
+        crate::time::elapsed_days(timestamp, anchor),
         quality,
         policy.decay_rate_multiplier,
     );

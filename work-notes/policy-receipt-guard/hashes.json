@@ -1,0 +1,19 @@
+{
+  "sources": {
+    "baseline": {
+      "commit": "7bc409957ab0c7d12fc549de0dc5836ac1da5a5f",
+      "path": "src/storage/control.rs",
+      "sha256": "b5fb2a08dbeda7f64f68bdc53eddd7662121dcf13a4d5dded685521e0c7fdddb"
+    },
+    "fixed": {
+      "commit": "65edaa36a446789e7918e756c624025b1a91b6a7",
+      "path": "src/storage/control.rs",
+      "sha256": "2f2652753ad1ae1f100645ce18ee27917477a03303825b8dac257a1a8d04203d"
+    }
+  },
+  "logs": {
+    "after.log": "4838025d36737b786d01d04e96cb83e76ad5d41d89bd9fe2f3ba20b34f2f611b",
+    "before.log": "d0a36c54d212fddee3de13026f1b92f27e1bf37085873f1844f78f5029d97809",
+    "full-suite.log": "288ad84da754216711ea548c598aa6ba3ec12d8e0c49baf65218960666169cb1"
+  }
+}

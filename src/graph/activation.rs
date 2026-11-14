@@ -194,6 +194,26 @@ pub fn connection_bonus(
     graph: &RelationshipGraph,
     config: &ActivationConfig,
 ) -> f32 {
+    connection_bonus_resolved(memory_id, graph, config, None)
+}
+
+/// Query-local donors must already be canonical, same-scope and live. Missing
+/// donors cannot relay a two-hop bonus. Legacy callers retain their old path.
+pub fn connection_bonus_with_strengths(
+    memory_id: MemoryId,
+    graph: &RelationshipGraph,
+    config: &ActivationConfig,
+    strengths: &HashMap<MemoryId, f32>,
+) -> f32 {
+    connection_bonus_resolved(memory_id, graph, config, Some(strengths))
+}
+
+fn connection_bonus_resolved(
+    memory_id: MemoryId,
+    graph: &RelationshipGraph,
+    config: &ActivationConfig,
+    strengths: Option<&HashMap<MemoryId, f32>>,
+) -> f32 {
     let Some(&node_key) = graph.id_index.get(&memory_id) else {
         return 0.0;
     };
@@ -205,7 +225,7 @@ pub fn connection_bonus(
 
     // 1-hop neighbors
     let hop1: Vec<(NodeKey, f32)> =
-        collect_neighbor_contributions(graph, node_key, node, config.s_max);
+        collect_neighbor_contributions(graph, node_key, node, config.s_max, strengths);
 
     for (_, contribution) in &hop1 {
         bonus += contribution * config.scale;
@@ -225,6 +245,7 @@ pub fn connection_bonus(
                     *neighbor_key,
                     neighbor_node,
                     config.s_max,
+                    strengths,
                 );
                 for (hop2_key, contribution) in hop2 {
                     // Skip if hop-2 is the original node (would double-count)
@@ -242,7 +263,11 @@ pub fn connection_bonus(
             }
         }
 
-        for (_, contribution) in &hop2_best {
+        let mut hop2: Vec<_> = hop2_best.into_iter().collect();
+        if strengths.is_some() {
+            hop2.sort_by_key(|(key, _)| graph.nodes[*key].memory_id);
+        }
+        for (_, contribution) in &hop2 {
             bonus += contribution * config.scale * HOP_2_DECAY;
         }
     }
@@ -270,6 +295,7 @@ fn collect_neighbor_contributions(
     node_key: NodeKey,
     node: &GraphNode,
     s_max: f32,
+    strengths: Option<&HashMap<MemoryId, f32>>,
 ) -> Vec<(NodeKey, f32)> {
     let mut results = Vec::new();
 
@@ -296,19 +322,35 @@ fn collect_neighbor_contributions(
             continue;
         };
 
+        let strength = match strengths {
+            Some(values) => match values.get(&neighbor.memory_id) {
+                Some(value) => *value,
+                None => continue,
+            },
+            None => neighbor.strength,
+        };
+
         // Fan = total degree of the NEIGHBOR (not the source node)
         let fan_j = (neighbor.outgoing.len() + neighbor.incoming.len()) as f32;
         let s_ji = (s_max - (fan_j + 1.0).ln()).max(0.0);
 
         if s_ji > 0.0 {
             let contribution = s_ji
-                * neighbor.strength // R_j: neighbor's retrievability
+                * strength // R_j: canonical projected strength when supplied
                 * edge.weight // edge associative strength
                 * edge_factor; // edge type modifier
             results.push((neighbor_key, contribution));
         }
     }
 
+    if strengths.is_some() {
+        results.sort_by(|(a, x), (b, y)| {
+            graph.nodes[*a]
+                .memory_id
+                .cmp(&graph.nodes[*b].memory_id)
+                .then(x.total_cmp(y))
+        });
+    }
     results
 }
 

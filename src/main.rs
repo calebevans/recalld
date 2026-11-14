@@ -103,6 +103,25 @@ enum Command {
         historical: bool,
     },
 
+    /// Preview or explicitly migrate an offline namespace lifecycle policy
+    Lifecycle {
+        #[arg(long)]
+        source: std::path::PathBuf,
+        /// JSON LifecycleMigrationOptions, including expected source and policy revision
+        #[arg(long)]
+        request: std::path::PathBuf,
+        /// Fresh cutover destination, or the exact destination to reconcile a retry
+        #[arg(
+            long,
+            conflicts_with = "preview_at",
+            required_unless_present = "preview_at"
+        )]
+        destination: Option<std::path::PathBuf>,
+        /// Read-only preview at this Unix timestamp in milliseconds
+        #[arg(long, allow_hyphen_values = true)]
+        preview_at: Option<i64>,
+    },
+
     /// Run external benchmarks (LoCoMo, etc.)
     #[cfg(feature = "bench")]
     Bench {
@@ -254,7 +273,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        Command::Backup { .. } | Command::Restore { .. } => {
+        Command::Backup { .. } | Command::Restore { .. } | Command::Lifecycle { .. } => {
             if let Err(e) = init_tracing("info", false, false) {
                 eprintln!("fatal: failed to initialize tracing: {e}");
                 return ExitCode::FAILURE;
@@ -302,6 +321,49 @@ async fn async_main(cli: Cli) -> ExitCode {
             no_stop_daemon,
             historical,
         } => run_restore_command(loaded.config, from, force, no_stop_daemon, historical).await,
+        Command::Lifecycle {
+            source,
+            request,
+            destination,
+            preview_at,
+        } => {
+            let result = (|| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                use recalld::storage::lifecycle_migration::{
+                    LifecycleMigrationOptions, migrate_lifecycle, preview_lifecycle,
+                };
+                let options: LifecycleMigrationOptions =
+                    serde_json::from_slice(&std::fs::read(request)?)?;
+                if let Some(destination) = destination {
+                    Ok(serde_json::to_value(migrate_lifecycle(
+                        &source,
+                        &destination,
+                        &options,
+                    )?)?)
+                } else {
+                    let clock = recalld::time::ManualClock::new(
+                        preview_at.expect("clap requires preview or destination"),
+                    );
+                    Ok(serde_json::to_value(preview_lifecycle(
+                        &source,
+                        &options,
+                        &clock,
+                        &recalld::decay::DecayConfig::default(),
+                        loaded.config.decay.decay_rate_multiplier,
+                        !loaded.config.decay.disable_sweep,
+                    )?)?)
+                }
+            })();
+            match result {
+                Ok(result) => {
+                    println!("{}", result);
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("lifecycle operation failed: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         #[cfg(feature = "bench")]
         Command::Bench { target, format } => run_bench(loaded.config, target, &format).await,
     }

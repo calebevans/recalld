@@ -306,7 +306,11 @@ impl RecordSchemaV2 {
             (Some(v), phase) if phase != DecayPhase::Tombstone && v.slot == record.vector_slot => {}
             _ => return Err("record vector ownership mismatch".into()),
         }
+        // A rollback preserves distinct native anchors/retrieval times. Revision
+        // zero keeps the legacy invariant; canonical inspection additionally
+        // requires receipt-backed namespace history for every later revision.
         if self.lifecycle.lifecycle_version == LifecycleVersion::LegacyAccessV1
+            && self.lifecycle.policy_revision == Generation::default()
             && self.lifecycle.decay_anchor_at != record.last_accessed_at
         {
             return Err("legacy lifecycle anchor mismatch".into());
