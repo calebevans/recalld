@@ -1973,6 +1973,16 @@ mod tests {
         (dir, store)
     }
 
+    fn open_store_with_namespaces() -> (tempfile::TempDir, MetadataStore) {
+        let (dir, store) = open_store();
+        for name in ["default", "other"] {
+            let mut config = NamespaceConfig::default_namespace(0);
+            config.name = name.into();
+            store.create_namespace(&config).unwrap();
+        }
+        (dir, store)
+    }
+
     /// A live, Full-phase record in `namespace_id` occupying `slot`.
     fn record_in(namespace_id: u32, slot: u32, tags: &[&str]) -> DiskRecord {
         DiskRecord {
@@ -2013,7 +2023,7 @@ mod tests {
     fn integration_access_receipt_cannot_be_overwritten_by_a_paused_sweep() {
         use std::sync::{Arc, mpsc};
         use std::time::Duration;
-        let (_dir, store) = open_store();
+        let (_dir, store) = open_store_with_namespaces();
         let id = insert(&store, 1, 0, &[]);
         let ctx = MutationContext::unkeyed(NamespaceId::new(1));
         let store = Arc::new(store);
@@ -2145,7 +2155,7 @@ mod tests {
             "missing_receipt",
             "foreign_scope",
         ] {
-            let (dir, store) = open_store();
+            let (dir, store) = open_store_with_namespaces();
             let id = insert(&store, 1, 0, &[]);
             let ctx = keyed_context(&store, 1, "original");
             let receipt = store
@@ -2241,10 +2251,18 @@ mod tests {
 
     #[test]
     fn access_receipt_aborted_transaction_and_overflow_leave_no_mutation() {
-        let (dir, store) = open_store();
+        let (dir, store) = open_store_with_namespaces();
         let id = insert(&store, 1, 0, &[]);
         let ctx = keyed_context(&store, 1, "abort");
         let before = store.control_state().unwrap();
+        let receipts_before = store
+            .db
+            .begin_read()
+            .unwrap()
+            .open_table(control::RECEIPTS)
+            .unwrap()
+            .len()
+            .unwrap();
         // All three writes have been staged in the real redb transaction.
         let publication = store.publication.write().unwrap();
         let (tx, abandoned) = store
@@ -2296,13 +2314,13 @@ mod tests {
                 .unwrap()
                 .len()
                 .unwrap(),
-            1
+            receipts_before + 1
         );
     }
 
     #[test]
     fn access_receipt_replay_precedes_cas_but_never_lineage_check() {
-        let (_dir, store) = open_store();
+        let (_dir, store) = open_store_with_namespaces();
         let id = insert(&store, 1, 0, &[]);
         let ctx = keyed_context(&store, 1, "access");
         let original = store
@@ -2356,7 +2374,7 @@ mod tests {
 
     #[test]
     fn access_receipts_serialize_concurrent_retries_and_scope_keys_by_namespace() {
-        let (_dir, store) = open_store();
+        let (_dir, store) = open_store_with_namespaces();
         let store = std::sync::Arc::new(store);
         let id = insert(&store, 1, 0, &[]);
         let other = insert(&store, 2, 0, &[]);

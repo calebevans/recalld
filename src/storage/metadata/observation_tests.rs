@@ -317,6 +317,7 @@ fn namespace_keys_are_independent_and_shared_across_operation_kinds() {
     r.id = *c.as_bytes();
     r.namespace_id = other.get();
     store.insert(c, &r).unwrap();
+    let before = counts(&store);
     let first = context(&store, ns, "shared");
     store
         .update_access_with_receipt(&first, a, 100, AccessKind::DirectRetrieval)
@@ -333,7 +334,7 @@ fn namespace_keys_are_independent_and_shared_across_operation_kinds() {
     store
         .record_legacy_feedback(&second, c, 3, 100, 1.0)
         .unwrap();
-    assert_eq!(counts(&store), (2, 2));
+    assert_eq!(counts(&store), (before.0 + 2, before.1 + 2));
 }
 
 #[test]

@@ -82,8 +82,8 @@ impl MetadataStore {
             return Ok(receipt);
         }
         {
-            let mut table = tx.open_table(NAMESPACE_TABLE)?;
             let mut config = namespace_state::require_namespace_active(&tx, id)?;
+            let mut table = tx.open_table(NAMESPACE_TABLE)?;
             if config.schema.is_some() {
                 return Err(StorageError::InvalidMutation(
                     "v2 policy and profile changes require a separate migration".into(),

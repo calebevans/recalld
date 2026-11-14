@@ -445,9 +445,18 @@ mod tests {
         root: &Path,
         embedding: &[f32],
     ) -> (PathBuf, BackupManifest) {
+        fixture_with_namespace(root, embedding, "default")
+    }
+
+    fn fixture_with_namespace(
+        root: &Path,
+        embedding: &[f32],
+        name: &str,
+    ) -> (PathBuf, BackupManifest) {
         let source = root.join("source");
         let mut engine = RedbStorageEngine::open(&source).unwrap();
         let mut ns = NamespaceConfig::default_namespace(0);
+        ns.name = name.into();
         ns.embedding_dim = 4;
         let ns = engine.create_namespace(&ns).unwrap();
         let id = MemoryId::new();
@@ -1227,54 +1236,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_restore_terminal_ledger_survives_tombstone_and_namespace_purge() {
-        for purge in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let (target, manifest) = fixture(root.path());
-            let backup = archive(root.path(), &target, &manifest);
-            let mut engine = RedbStorageEngine::open(&target).unwrap();
-            let (id, original) = engine.scan_all().unwrap().remove(0);
-            let ns = crate::model::NamespaceId::new(original.namespace_id);
-            engine.tombstone_memory(id).unwrap();
-            if purge {
-                engine.purge_namespace(ns).unwrap();
+    async fn retained_restore_terminal_ledger_survives_tombstone() {
+        let root = tempfile::tempdir().unwrap();
+        let (target, manifest) = fixture(root.path());
+        let backup = archive(root.path(), &target, &manifest);
+        let mut engine = RedbStorageEngine::open(&target).unwrap();
+        let (id, original) = engine.scan_all().unwrap().remove(0);
+        let ns = crate::model::NamespaceId::new(original.namespace_id);
+        engine.tombstone_memory(id).unwrap();
+        engine.sync().unwrap();
+        drop(engine);
+        restore_from_backup(retained_options(&backup, &target))
+            .await
+            .unwrap();
+        let mut engine = RedbStorageEngine::open(&target).unwrap();
+        let record = engine.get_record(id).unwrap().unwrap();
+        assert_eq!(record.phase, DecayPhase::Tombstone);
+        assert!(record.summary.is_empty() && record.tags.is_empty());
+        assert_eq!((record.text_offset, record.text_length), (0, 0));
+        assert!(
+            engine
+                .vector_manager()
+                .get(ns)
+                .unwrap()
+                .is_free(original.vector_slot)
+        );
+        let fts = crate::search::FtsIndex::new(&target).unwrap();
+        assert!(fts.search(ns, "backup fixture", 10).unwrap().is_empty());
+        let mut reused = original;
+        assert!(
+            engine
+                .insert_memory(id, ns, &mut reused, &[1.; 4], Some("resurrect"))
+                .is_err()
+        );
+        let snapshot = engine.meta_store().control_state().unwrap();
+        assert_eq!(
+            snapshot.committed_generation.get(),
+            1,
+            "rejected UUID reuse cannot write"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_restore_completed_purge_requires_offline_progress_consumer() {
+        fn files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            fn visit(
+                root: &Path,
+                path: &Path,
+                out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+            ) {
+                for entry in fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        visit(root, &path, out);
+                    } else {
+                        out.insert(
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            fs::read(path).unwrap(),
+                        );
+                    }
+                }
             }
-            engine.sync().unwrap();
-            drop(engine);
-            restore_from_backup(retained_options(&backup, &target))
-                .await
-                .unwrap();
-            let mut engine = RedbStorageEngine::open(&target).unwrap();
-            if purge {
-                assert!(engine.get_record(id).unwrap().is_none());
-            } else {
-                let record = engine.get_record(id).unwrap().unwrap();
-                assert_eq!(record.phase, DecayPhase::Tombstone);
-                assert!(record.summary.is_empty() && record.tags.is_empty());
-                assert_eq!((record.text_offset, record.text_length), (0, 0));
-            }
-            assert!(
-                engine
-                    .vector_manager()
-                    .get(ns)
-                    .unwrap()
-                    .is_free(original.vector_slot)
-            );
-            let fts = crate::search::FtsIndex::new(&target).unwrap();
-            assert!(fts.search(ns, "backup fixture", 10).unwrap().is_empty());
-            let mut reused = original;
-            assert!(
-                engine
-                    .insert_memory(id, ns, &mut reused, &[1.; 4], Some("resurrect"))
-                    .is_err()
-            );
-            let snapshot = engine.meta_store().control_state().unwrap();
-            assert_eq!(
-                snapshot.committed_generation.get(),
-                1,
-                "rejected UUID reuse cannot write"
-            );
+            let mut result = std::collections::BTreeMap::new();
+            visit(root, root, &mut result);
+            result
         }
+        let root = tempfile::tempdir().unwrap();
+        let (target, manifest) = fixture_with_namespace(root.path(), &[1., 2., 3., 4.], "retired");
+        let backup = archive(root.path(), &target, &manifest);
+        let mut engine = RedbStorageEngine::open(&target).unwrap();
+        let (id, record) = engine.scan_all().unwrap().remove(0);
+        let namespace = crate::model::NamespaceId::new(record.namespace_id);
+        engine.purge_namespace(namespace).unwrap();
+        assert!(engine.get_record(id).unwrap().is_none());
+        assert_eq!(
+            engine.meta_store().purge_progress().unwrap()[0].stage,
+            crate::storage::purge::PurgeStage::Complete
+        );
+        engine.sync().unwrap();
+        drop(engine);
+        let before = files(&target);
+        let archive_before = fs::read(&backup).unwrap();
+        // This guard slice deliberately rejects durable purge history until the
+        // offline consumer can merge complete progress with target receipts and
+        // preserve origin identities. The dependent child restores the positive
+        // no-resurrection case; allowlisting or dropping progress is not enough.
+        let error = restore_from_backup(retained_options(&backup, &target))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported canonical restore tables"),
+            "{error}"
+        );
+        assert_eq!(files(&target), before);
+        assert_eq!(fs::read(&backup).unwrap(), archive_before);
+        assert!(!root.path().join("source.recalld-restore-pending").exists());
     }
 
     #[tokio::test]
