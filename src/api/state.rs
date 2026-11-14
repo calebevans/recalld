@@ -346,6 +346,7 @@ pub trait MetricsCollector: Send + Sync {
 /// Internal search query representation for the API layer.
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
+    pub record_access: bool,
     /// The query input (text or pre-computed vector).
     pub query: QueryInput,
     /// Target namespace for the search.

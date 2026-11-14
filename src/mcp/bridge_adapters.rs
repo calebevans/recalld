@@ -128,6 +128,7 @@ impl bridge::SearchPipeline for McpSearchAdapter {
         };
 
         let pipeline_query = crate::search::SearchQuery {
+            record_access: query.record_access,
             text: Some(query.query),
             fts_query: None,
             namespace: query.namespace.clone(),
@@ -343,10 +344,11 @@ impl bridge::SearchPipeline for McpSearchAdapter {
         limit: usize,
         min_score: Option<f32>,
         _same_namespace: bool,
+        record_access: bool,
     ) -> Result<Vec<bridge::SearchHit>, bridge::BridgeError> {
         let results = self
             .query_engine
-            .similar(id, limit)
+            .similar_with_access(id, limit, record_access)
             .await
             .map_err(|e| bridge::BridgeError::Search(e.to_string()))?;
 
@@ -1097,6 +1099,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
     async fn get_memory(
         &self,
         id: MemoryId,
+        _record_access: bool,
     ) -> Result<Option<bridge::MemoryRecord>, bridge::BridgeError> {
         let storage = self.storage.clone();
         let tz = self.timezone;
