@@ -865,6 +865,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             crate::model::parse_tags_lossy("store_memory.tags", &merged_tags);
 
         let mut record = DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *memory_id.as_bytes(),
             namespace_id: ns_config.id.get(),
@@ -1747,6 +1748,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             });
 
             let ns_config = NamespaceConfig {
+                schema: None,
                 id: NamespaceId::UNSET,
                 name: input_name.clone(),
                 embedding_dim: dim,

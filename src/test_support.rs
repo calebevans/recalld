@@ -220,6 +220,7 @@ impl Fixture {
     pub(crate) async fn insert_memory_with(&self, spec: MemorySpec<'_>) -> MemoryId {
         let id = MemoryId::new();
         let mut record = crate::model::DiskRecord {
+            schema: None,
             version: crate::model::DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: spec.namespace.get(),

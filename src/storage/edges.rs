@@ -21,12 +21,13 @@ use crate::storage::error::StorageError;
 /// Forward edge index.
 /// Key:   (source_uuid, edge_type, target_uuid) = 33 bytes
 /// Value: EdgeMetadata (weight, auto_created, created_at) = 13 bytes
-const FORWARD_EDGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("edges_forward");
+pub(crate) const FORWARD_EDGES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("edges_forward");
 
 /// Reverse edge index for efficient incoming-edge lookups.
 /// Key:   (target_uuid, edge_type, source_uuid) = 33 bytes
 /// Value: () -- metadata lives only in the forward index.
-const REVERSE_EDGES: TableDefinition<&[u8], ()> = TableDefinition::new("edges_reverse");
+pub(crate) const REVERSE_EDGES: TableDefinition<&[u8], ()> = TableDefinition::new("edges_reverse");
 
 // ═══════════════════════════════════════════════════════════════════════
 // Constants
@@ -147,7 +148,7 @@ pub struct PersistedEdge {
 
 impl PersistedEdge {
     /// Construct from a decoded forward key and value.
-    fn from_forward(key: &[u8], value: &[u8]) -> Result<Self, StorageError> {
+    pub(crate) fn from_forward(key: &[u8], value: &[u8]) -> Result<Self, StorageError> {
         let (source, edge_type, target) = decode_forward_key(key)?;
         let (weight, auto_created, created_at) = decode_edge_value(value)?;
         Ok(PersistedEdge {

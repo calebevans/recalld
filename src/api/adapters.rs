@@ -379,6 +379,7 @@ impl state::StorageEngine for StorageEngineAdapter {
         let parsed_tags: Vec<Tag> = crate::model::parse_tags_lossy("create_memory.tags", tags);
 
         let mut record = DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: namespace_id.get(),
@@ -1316,6 +1317,7 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
             });
 
             let ns_config = NamespaceConfig {
+                schema: None,
                 id: NamespaceId::UNSET,
                 name: name_owned,
                 embedding_dim: dim,
@@ -1342,6 +1344,7 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
             })?;
             let assigned_id = storage_w.create_namespace(&ns_config)?;
             Ok(NamespaceConfig {
+                schema: None,
                 id: assigned_id,
                 ..ns_config
             })

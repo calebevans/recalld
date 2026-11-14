@@ -79,7 +79,7 @@ enum Command {
         #[arg(short = 'D', long)]
         source_data_dir: Option<std::path::PathBuf>,
 
-        /// Continue even if some files cannot be locked (DANGEROUS)
+        /// Legacy compatibility flag; exclusive access to the source is always required
         #[arg(long)]
         force: bool,
     },
@@ -94,7 +94,7 @@ enum Command {
         #[arg(long)]
         force: bool,
 
-        /// Don't attempt to stop the daemon
+        /// Legacy compatibility flag; restore requires an already stopped target
         #[arg(long)]
         no_stop_daemon: bool,
     },
@@ -746,7 +746,7 @@ async fn run_backup_command(
                 eprintln!("  2. Run the backup");
                 eprintln!("  3. Restart the daemon: recalld daemon start");
                 eprintln!();
-                eprintln!("Or, use --force to attempt backup anyway (not recommended).");
+                eprintln!("Exclusive access is required, including with --force.");
             }
 
             ExitCode::FAILURE

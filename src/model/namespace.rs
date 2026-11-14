@@ -63,8 +63,10 @@ impl Default for PhaseThresholds {
 /// dimensionality, decay parameters, and vector file. The `id` and
 /// `embedding_dim` are immutable after creation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NamespaceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<crate::model::schema::NamespaceSchemaV2>,
     /// Sequential integer ID, starting at 1. Immutable.
     pub id: NamespaceId,
 
@@ -104,9 +106,21 @@ pub struct NamespaceConfig {
 }
 
 impl NamespaceConfig {
+    pub fn decode(bytes: &[u8]) -> Result<Self, crate::model::DecodeError> {
+        let config: Self = serde_json::from_slice(bytes)
+            .map_err(|e| crate::model::DecodeError::InvalidSchema(e.to_string()))?;
+        if let Some(schema) = &config.schema {
+            schema
+                .validate(&config)
+                .map_err(crate::model::DecodeError::InvalidSchema)?;
+        }
+        Ok(config)
+    }
+
     /// Create the default namespace (ID 1, "default", 1536 dims).
     pub fn default_namespace(now_millis: i64) -> Self {
         Self {
+            schema: None,
             id: NamespaceId::new(1),
             name: "default".to_string(),
             embedding_dim: DEFAULT_EMBEDDING_DIM,

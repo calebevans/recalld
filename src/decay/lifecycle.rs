@@ -227,6 +227,7 @@ mod tests {
 
     fn record() -> DiskRecord {
         DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: [0; 16],
             namespace_id: 1,

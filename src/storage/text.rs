@@ -4,7 +4,9 @@
 //! is length-prefixed with a CRC32 checksum for corruption detection.
 //! See CS-08 for the full specification.
 
-use std::fs::{self, File, OpenOptions};
+pub(crate) mod generation;
+
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -15,7 +17,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::model::MemoryId;
 use crate::storage::error::StorageError;
-use crate::storage::fsync::{fsync_dir, fsync_file};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Constants
@@ -27,11 +28,6 @@ pub const MAX_ENTRY_SIZE: u32 = 1_048_576;
 
 /// Entry header size: 4 bytes length + 4 bytes CRC32.
 const ENTRY_HEADER_SIZE: u64 = 8;
-
-/// Minimum fragmentation ratio (dead bytes / total bytes) before
-/// compaction is considered worthwhile. Below this threshold,
-/// `compact()` returns a no-op result to avoid unnecessary I/O.
-const COMPACTION_FRAGMENTATION_THRESHOLD: f64 = 0.20;
 
 /// Magic bytes identifying a fulltext.dat file.
 const TEXT_LOG_MAGIC: [u8; 4] = *b"MEMT";
@@ -192,6 +188,7 @@ pub struct TextStore {
     path: PathBuf,
     /// Current write position (byte offset of the next append).
     write_pos: u64,
+    header_size: u64,
 }
 
 impl TextStore {
@@ -220,6 +217,7 @@ impl TextStore {
                 file,
                 path: path.to_path_buf(),
                 write_pos,
+                header_size: 16,
             })
         } else {
             // --- Create new ---
@@ -238,6 +236,7 @@ impl TextStore {
                 file,
                 path: path.to_path_buf(),
                 write_pos: TextLogHeader::SIZE as u64,
+                header_size: 16,
             })
         }
     }
@@ -281,6 +280,19 @@ impl TextStore {
         })
     }
 
+    pub(crate) fn open_read_only(path: &Path) -> Result<Self, StorageError> {
+        let file = File::open(path)?;
+        let write_pos = file.metadata()?.len();
+        let mut store = Self {
+            file,
+            path: path.to_path_buf(),
+            write_pos,
+            header_size: 16,
+        };
+        store.validate_header()?;
+        Ok(store)
+    }
+
     /// Read the text entry at the given `TextRef`.
     ///
     /// Validates length match and CRC32 integrity.
@@ -290,7 +302,15 @@ impl TextStore {
     /// write lock for read-only operations, enabling concurrent
     /// readers via `RwLock`.
     pub fn read(&self, text_ref: TextRef) -> Result<String, StorageError> {
-        if !text_ref.is_some() {
+        if !text_ref.is_some()
+            || text_ref.length > MAX_ENTRY_SIZE
+            || text_ref.file_offset < self.header_size
+            || text_ref
+                .file_offset
+                .checked_add(ENTRY_HEADER_SIZE)
+                .and_then(|offset| offset.checked_add(u64::from(text_ref.length)))
+                .is_none_or(|end| end > self.write_pos)
+        {
             return Err(StorageError::InvalidTextRef);
         }
 
@@ -335,6 +355,9 @@ impl TextStore {
 
     /// Validate the file header. Called during startup validation.
     pub fn validate_header(&mut self) -> Result<(), StorageError> {
+        if self.header_size == 48 {
+            return Ok(());
+        } // Full identity checked by open_generation.
         self.file.seek(SeekFrom::Start(0))?;
         let mut header_buf = [0u8; TextLogHeader::SIZE];
         self.file.read_exact(&mut header_buf)?;
@@ -361,185 +384,21 @@ impl TextStore {
         &self.path
     }
 
-    /// Phase 1 of fulltext.dat compaction: write a new file containing
-    /// only live entries, but do NOT rename or remove the marker.
-    ///
-    /// The caller must update meta.db with the new offsets from the
-    /// returned `CompactionResult`, then call [`compact_finalize`] to
-    /// atomically swap the files. This two-phase approach ensures that
-    /// meta.db offsets are always consistent with the active fulltext.dat.
-    ///
-    /// Returns `(result, compacted)` where `compacted` is `true` if a
-    /// new file was written (fragmentation above threshold) and
-    /// `compact_finalize()` must be called afterwards.
+    /// Legacy compaction is disabled until metadata selects text generations.
     pub fn compact_write_new_file(
         &mut self,
-        live_refs: &[(MemoryId, TextRef)],
+        _live_refs: &[(MemoryId, TextRef)],
     ) -> Result<(CompactionResult, bool), StorageError> {
-        let parent_dir = self
-            .path
-            .parent()
-            .ok_or(StorageError::InvalidPath)?
-            .to_path_buf();
-        let marker_path = parent_dir.join(".compacting");
-        let new_path = parent_dir.join("fulltext.dat.new");
-
-        let old_size = self.write_pos;
-        let total_possible = self.count_entries_approx();
-
-        // Estimate live data size to check if compaction is worthwhile.
-        let live_data_size: u64 = live_refs
-            .iter()
-            .map(|(_, r)| ENTRY_HEADER_SIZE + r.length as u64)
-            .sum::<u64>()
-            + TextLogHeader::SIZE as u64;
-        let dead_bytes = old_size.saturating_sub(live_data_size);
-        let fragmentation = if old_size > 0 {
-            dead_bytes as f64 / old_size as f64
-        } else {
-            0.0
-        };
-
-        if fragmentation < COMPACTION_FRAGMENTATION_THRESHOLD {
-            tracing::debug!(
-                fragmentation = format!("{:.1}%", fragmentation * 100.0),
-                threshold = format!("{:.0}%", COMPACTION_FRAGMENTATION_THRESHOLD * 100.0),
-                "Skipping fulltext.dat compaction: fragmentation below threshold"
-            );
-            return Ok((
-                CompactionResult {
-                    old_size,
-                    new_size: old_size,
-                    entries_removed: 0,
-                    entries_kept: live_refs.len(),
-                    new_refs: live_refs
-                        .iter()
-                        .map(|&(id, text_ref)| (id, text_ref))
-                        .collect(),
-                },
-                false,
-            ));
-        }
-
-        // Step 1: Write marker.
-        fs::write(&marker_path, b"fulltext.dat compaction in progress\n")?;
-        fsync_file(&marker_path)?;
-        fsync_dir(&parent_dir)?;
-
-        tracing::info!(
-            live = live_refs.len(),
-            old_size,
-            "Starting fulltext.dat compaction"
-        );
-
-        // Step 2: Create new file with header.
-        let mut new_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&new_path)?;
-
-        let header = TextLogHeader::new();
-        new_file.write_all(zerocopy::IntoBytes::as_bytes(&header))?;
-
-        let mut new_write_pos = TextLogHeader::SIZE as u64;
-        let mut new_refs: RefMapping = Vec::with_capacity(live_refs.len());
-
-        // Step 3: Copy live entries.
-        for &(memory_id, old_ref) in live_refs {
-            // Read from old file (includes CRC verification).
-            let text = self.read(old_ref)?;
-            let data = text.as_bytes();
-            let crc = compute_crc32(data);
-            let length_u32 = data.len() as u32;
-
-            // Write to new file.
-            let new_offset = new_write_pos;
-            new_file.write_all(&length_u32.to_le_bytes())?;
-            new_file.write_all(&crc.to_le_bytes())?;
-            new_file.write_all(data)?;
-            new_write_pos += ENTRY_HEADER_SIZE + data.len() as u64;
-
-            let new_ref = TextRef {
-                file_offset: new_offset,
-                length: length_u32,
-            };
-            new_refs.push((memory_id, new_ref));
-        }
-
-        // Step 4: Fsync new file.
-        new_file.sync_all()?;
-        drop(new_file);
-
-        let entries_removed = total_possible.saturating_sub(live_refs.len());
-
-        let result = CompactionResult {
-            old_size,
-            new_size: new_write_pos,
-            entries_removed,
-            entries_kept: live_refs.len(),
-            new_refs,
-        };
-
-        Ok((result, true))
+        Err(StorageError::RecoveryRequired(
+            "legacy text compaction is disabled".into(),
+        ))
     }
 
-    /// Phase 2 of fulltext.dat compaction: atomically rename the new
-    /// file over the old one, remove markers, and reopen the file handle.
-    ///
-    /// Must only be called after `compact_write_new_file` returned
-    /// `compacted = true` AND the caller has persisted updated offsets
-    /// to meta.db.
+    /// Never finalize a marker-driven swap: the committed file is ambiguous.
     pub fn compact_finalize(&mut self) -> Result<(), StorageError> {
-        let parent_dir = self
-            .path
-            .parent()
-            .ok_or(StorageError::InvalidPath)?
-            .to_path_buf();
-        let marker_path = parent_dir.join(".compacting");
-        let committed_marker_path = parent_dir.join(".compaction-meta-committed");
-        let new_path = parent_dir.join("fulltext.dat.new");
-
-        // Step 1: Atomic rename fulltext.dat.new -> fulltext.dat.
-        fs::rename(&new_path, &self.path)?;
-
-        // Step 2: Fsync directory to persist the rename.
-        fsync_dir(&parent_dir)?;
-
-        // Step 3: Remove markers.
-        let _ = fs::remove_file(&committed_marker_path);
-        let _ = fs::remove_file(&marker_path);
-        fsync_dir(&parent_dir)?;
-
-        // Step 4: Reopen file handle with updated contents.
-        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        // Determine new write position from file size.
-        self.write_pos = self.file.seek(SeekFrom::End(0))?;
-
-        tracing::info!(new_size = self.write_pos, "Text.log compaction finalized");
-
-        Ok(())
-    }
-
-    /// Approximate entry count by scanning forward from header.
-    /// Used only for compaction stats; not authoritative.
-    fn count_entries_approx(&mut self) -> usize {
-        let mut count = 0usize;
-        let mut pos = TextLogHeader::SIZE as u64;
-
-        while pos < self.write_pos {
-            if self.file.seek(SeekFrom::Start(pos)).is_err() {
-                break;
-            }
-            let mut len_buf = [0u8; 4];
-            if self.file.read_exact(&mut len_buf).is_err() {
-                break;
-            }
-            let entry_len = u32::from_le_bytes(len_buf) as u64;
-            pos += ENTRY_HEADER_SIZE + entry_len;
-            count += 1;
-        }
-        count
+        Err(StorageError::RecoveryRequired(
+            "legacy text compaction is disabled".into(),
+        ))
     }
 }
 
@@ -547,66 +406,19 @@ impl TextStore {
 // Crash Recovery
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Recover from an interrupted fulltext.dat compaction.
-///
-/// Called once during startup validation, BEFORE opening the TextStore.
-///
-/// Handles two compaction states using marker files:
-///
-/// - `.compacting` alone (no `.compaction-meta-committed`):
-///   meta.db has NOT been updated with new offsets yet. Delete the
-///   incomplete `fulltext.dat.new` and revert to the original file.
-///
-/// - `.compacting` AND `.compaction-meta-committed`:
-///   meta.db HAS been updated with new offsets. Complete the rename
-///   of `fulltext.dat.new` -> `fulltext.dat` so the file matches
-///   the committed offsets. If the rename already happened (no .new
-///   file), just clean up the markers.
+/// Reject interrupted legacy compaction without modifying any evidence.
+/// Filesystem markers cannot prove which offsets the redb transaction committed.
 pub fn recover_text_compaction(db_dir: &Path) -> Result<(), StorageError> {
-    let marker_path = db_dir.join(".compacting");
-    let committed_marker_path = db_dir.join(".compaction-meta-committed");
-    let new_file_path = db_dir.join("fulltext.dat.new");
-    let fulltext_path = db_dir.join("fulltext.dat");
-
-    if !marker_path.exists() {
-        // No compaction was in progress.
-        return Ok(());
-    }
-
-    tracing::warn!(
-        "Compaction marker found at {} -- recovering",
-        marker_path.display()
-    );
-
-    if committed_marker_path.exists() {
-        // meta.db has already been updated with new offsets.
-        // We must complete the rename so fulltext.dat matches.
-        if new_file_path.exists() {
-            tracing::warn!(
-                "meta.db offsets committed; completing rename of fulltext.dat.new -> fulltext.dat"
-            );
-            fs::rename(&new_file_path, &fulltext_path)?;
-            fsync_dir(db_dir)?;
-        } else {
-            // Rename already happened before crash; just clean up markers.
-            tracing::info!(
-                "meta.db offsets committed and rename already complete; cleaning up markers"
-            );
-        }
-    } else {
-        // meta.db has NOT been updated. Safe to delete .new and revert
-        // to the original fulltext.dat with its original offsets.
-        if new_file_path.exists() {
-            tracing::warn!("Deleting incomplete fulltext.dat.new");
-            fs::remove_file(&new_file_path)?;
+    for name in [
+        ".compacting",
+        ".compaction-meta-committed",
+        "fulltext.dat.new",
+    ] {
+        if db_dir.join(name).try_exists()? {
+            return Err(StorageError::RecoveryRequired(format!(
+                "legacy compaction artifact {name}; preserve all text files and recover from independent evidence or an intact backup"
+            )));
         }
     }
-
-    // Remove all markers.
-    let _ = fs::remove_file(&committed_marker_path);
-    let _ = fs::remove_file(&marker_path);
-    fsync_dir(db_dir)?;
-
-    tracing::info!("Compaction recovery complete");
     Ok(())
 }
