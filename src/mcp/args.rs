@@ -838,6 +838,7 @@ pub fn parse_recall_input(obj: &Value, default_namespace: &str) -> Result<Recall
 
     Ok(RecallArgs {
         input: SearchInput {
+            include_neighbors: !compact,
             record_access: record_access(obj)?,
             query,
             namespace,

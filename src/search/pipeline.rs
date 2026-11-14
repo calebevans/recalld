@@ -547,7 +547,7 @@ impl QueryEngine {
         let query_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
 
         if query.record_access {
-            self.record_accesses_async(&candidates);
+            self.record_accesses(&candidates).await?;
         }
 
         let response = SearchResponse {
@@ -894,18 +894,9 @@ impl QueryEngine {
             },
         };
 
-        // Preserve legacy fire-and-forget only when access is permitted.
-        if record_access {
-            let recorder = Arc::clone(&self.access_recorder);
-            let access_id = id;
-            tokio::spawn(async move {
-                if let Err(e) = recorder
-                    .record_access(access_id, AccessKind::DirectRetrieval)
-                    .await
-                {
-                    warn!("failed to record access for {access_id:?}: {e}");
-                }
-            });
+        if record_access && record.phase != DecayPhase::Tombstone {
+            self.record_exposures(&[(id, AccessKind::DirectRetrieval)])
+                .await?;
         }
         Ok(Some(MemoryResponse {
             id: record.id,
@@ -941,17 +932,32 @@ impl QueryEngine {
         k: usize,
         record_access: bool,
     ) -> Result<Vec<SearchResult>> {
+        self.similar_filtered_with_access(id, k, None, record_access)
+            .await
+    }
+
+    pub async fn similar_filtered_with_access(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<SearchResult>> {
+        if min_score.is_some_and(|score| !score.is_finite()) {
+            return Err(SearchError::InvalidFilter(
+                "min_score must be finite".into(),
+            ));
+        }
         let k = k.clamp(1, SearchQuery::MAX_USER_LIMIT);
 
-        let record = match record_access.then(|| self.cache.get(&id)).flatten() {
-            Some(r) => r,
-            None => self
-                .meta_store
-                .get(&id)
-                .await?
-                .ok_or(SearchError::MemoryNotFound(id))?,
-        };
-
+        let record = self
+            .meta_store
+            .get(&id)
+            .await?
+            .ok_or(SearchError::MemoryNotFound(id))?;
+        if matches!(record.phase, DecayPhase::Ghost | DecayPhase::Tombstone) {
+            return Err(SearchError::MemoryNotFound(id));
+        }
         // Load the source memory's embedding from the vector index.
         let source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
             SearchError::Internal(format!("no embedding found for memory {id:?}"))
@@ -965,12 +971,12 @@ impl QueryEngine {
         // Remove the source memory from results.
         let filtered: Vec<ScoredResult> = scored
             .into_iter()
-            .filter(|s| s.memory_id != id)
+            .filter(|s| s.memory_id != id && min_score.is_none_or(|min| s.score >= min))
             .take(k)
             .collect();
 
         let result_ids: Vec<MemoryId> = filtered.iter().map(|s| s.memory_id).collect();
-        let records = self.load_records(&result_ids, record_access).await?;
+        let records = self.load_records(&result_ids, false).await?;
 
         // Build a lookup map so we can iterate `filtered` (which preserves
         // descending similarity order from the vector search) instead of
@@ -982,6 +988,11 @@ impl QueryEngine {
             .iter()
             .filter_map(|scored| {
                 let rec = record_map.get(&scored.memory_id)?;
+                if rec.namespace_id != record.namespace_id
+                    || matches!(rec.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
+                {
+                    return None;
+                }
                 let score = Some(scored.score);
                 Some(SearchResult {
                     memory_id: rec.id,
@@ -1015,13 +1026,8 @@ impl QueryEngine {
             .iter()
             .map(|r| (r.memory_id, AccessKind::AssociativeRetrieval))
             .collect();
-        if record_access && !accesses.is_empty() {
-            let recorder = Arc::clone(&self.access_recorder);
-            tokio::spawn(async move {
-                if let Err(e) = recorder.record_access_batch(&accesses).await {
-                    warn!("failed to record associative access: {e}");
-                }
-            });
+        if record_access {
+            self.record_exposures(&accesses).await?;
         }
 
         Ok(results)
@@ -1238,8 +1244,7 @@ impl QueryEngine {
             .collect()
     }
 
-    /// Fire-and-forget access recording.
-    fn record_accesses_async(&self, candidates: &[Candidate]) {
+    async fn record_accesses(&self, candidates: &[Candidate]) -> Result<()> {
         let accesses: Vec<(MemoryId, AccessKind)> = candidates
             .iter()
             .map(|c| {
@@ -1252,16 +1257,24 @@ impl QueryEngine {
             })
             .collect();
 
-        if accesses.is_empty() {
-            return;
-        }
+        self.record_exposures(&accesses).await
+    }
 
-        let recorder = Arc::clone(&self.access_recorder);
-        tokio::spawn(async move {
-            if let Err(e) = recorder.record_access_batch(&accesses).await {
-                warn!("failed to record access events: {e}");
-            }
-        });
+    pub async fn record_similar_accesses(&self, ids: &[MemoryId]) -> Result<()> {
+        let accesses: Vec<_> = ids
+            .iter()
+            .map(|id| (*id, AccessKind::AssociativeRetrieval))
+            .collect();
+        self.record_exposures(&accesses).await
+    }
+
+    /// Record the final caller-visible set after any outer hydration/filtering.
+    /// Outer callers must disable core recording to avoid duplicate events.
+    pub async fn record_exposures(&self, accesses: &[(MemoryId, AccessKind)]) -> Result<()> {
+        if accesses.is_empty() {
+            return Ok(());
+        }
+        self.access_recorder.record_access_batch(accesses).await
     }
 }
 

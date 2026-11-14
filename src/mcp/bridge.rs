@@ -138,6 +138,10 @@ pub trait HealthChecker: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchInput {
+    /// Internal response shaping: compact tools do not expose graph neighbors.
+    /// Defaults true for existing direct/daemon search clients.
+    #[serde(default = "crate::search::default_record_access")]
+    pub include_neighbors: bool,
     /// False forbids retrieval-attributable writes; omission preserves v1 behavior.
     #[serde(
         rename = "recordAccess",

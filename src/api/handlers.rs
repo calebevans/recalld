@@ -19,6 +19,7 @@ use super::errors::AppError;
 use super::models::*;
 use super::state::{AppState, QueryInput, SearchQuery};
 use crate::health::report as health_report_compute;
+use crate::model::DecayPhase;
 use crate::model::constants::{
     EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, MAX_BATCH_MEMORIES, TOPIC_TAG_PREFIX,
 };
@@ -373,21 +374,21 @@ pub async fn get_memory(
         id: id.clone(),
     })?;
 
-    // Record access for decay tracking
-    if options.record_access {
-        state
-            .decay
-            .record_access(memory_id, AccessKind::DirectRetrieval)
-            .await;
-    }
-
     let ns_name = state
         .namespaces
         .name_for(record.namespace_id)
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut response = MemoryResponse::from_cached(&record, ns_name);
-    response.full_text = state.storage.get_full_text(memory_id).await.unwrap_or(None);
+    response.full_text = state.storage.get_full_text(memory_id).await?;
+    // Record access for decay tracking
+    if options.record_access && record.phase != DecayPhase::Tombstone {
+        state
+            .decay
+            .record_access(memory_id, AccessKind::DirectRetrieval)
+            .await?;
+    }
+
     let took = start.elapsed().as_micros() as u64;
 
     Ok(Json(ApiResponse {
@@ -502,6 +503,7 @@ pub async fn reinforce_memory(
 fn feedback_error(error: Box<dyn std::error::Error + Send + Sync>, id: &str) -> AppError {
     use crate::decay::lifecycle::LifecycleError;
     match error.downcast_ref::<LifecycleError>() {
+        Some(LifecycleError::Observation(error)) => AppError::Observation(error.clone()),
         Some(LifecycleError::ContentUnavailable) => AppError::Conflict {
             message: error.to_string(),
         },
@@ -821,7 +823,7 @@ pub async fn search_memories(
     };
 
     let search_query = SearchQuery {
-        record_access: req.record_access,
+        record_access: false,
         query: query_input.unwrap_or(QueryInput::Text(String::new())),
         namespace_id: ns.id,
         namespace_name: ns.name.clone(),
@@ -849,17 +851,15 @@ pub async fn search_memories(
 
     // Convert to API response, loading full_text from storage
     let mut hits: Vec<SearchHit> = Vec::with_capacity(results.len());
+    let mut exposures = Vec::with_capacity(results.len());
     for r in results {
+        exposures.push((r.memory.id, r.access_kind));
         let ns_name = state
             .namespaces
             .name_for(r.memory.namespace_id)
             .unwrap_or_else(|| "unknown".to_string());
         let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
-        mem.full_text = state
-            .storage
-            .get_full_text(r.memory.id)
-            .await
-            .unwrap_or(None);
+        mem.full_text = state.storage.get_full_text(r.memory.id).await?;
         if req.include_embeddings {
             mem.embedding = embeddings.get(&r.memory.id).cloned();
         }
@@ -867,6 +867,10 @@ pub async fn search_memories(
             memory: mem,
             score: r.score,
         });
+    }
+
+    if req.record_access {
+        state.search.record_exposures(&exposures).await?;
     }
 
     let total = hits.len() as u64;
@@ -896,93 +900,44 @@ pub async fn find_similar(
 
     let memory_id = parse_memory_id(&id)?;
 
-    // Load source memory to get namespace
-    let source = if req.record_access {
-        state
-            .cache
-            .get_or_load(memory_id, state.storage.as_ref())
-            .await
-    } else {
-        state
-            .storage
-            .get_record(memory_id)
-            .await
-            .map(|r| std::sync::Arc::new(crate::model::CachedRecord::from(&r)))
-    }
-    .ok_or_else(|| AppError::NotFound {
-        resource: "memory",
-        id: id.clone(),
-    })?;
-
-    let source_embedding =
-        state
-            .search
-            .get_embedding(memory_id)
-            .ok_or_else(|| AppError::Internal {
-                source: "source memory has no indexed embedding".into(),
-            })?;
-
-    let limit = req.limit.min(100) as usize;
-
-    let ns_name = state
-        .namespaces
-        .name_for(source.namespace_id)
-        .unwrap_or_else(|| "default".to_string());
-
-    // Search using source embedding, requesting limit+1 to account
-    // for the source memory appearing in its own results.
-    let search_query = SearchQuery {
-        record_access: req.record_access,
-        query: QueryInput::Vector(source_embedding),
-        namespace_id: source.namespace_id,
-        namespace_name: ns_name,
-        k: limit + 1,
-        include_tags: vec![],
-        exclude_tags: vec![],
-        decay_phases: None,
-        min_score: req.min_score,
-        graph_depth: 0,
-        apply_rif: false,
-        time_range_start: None,
-        time_range_end: None,
-        entities: vec![],
-    };
-
-    let results = state.search.search(search_query).await?;
-
-    // Batch-load embeddings with a single lock acquisition if requested.
+    // Selection and hydration are read-only. Record the final exposed set only
+    // after all fallible hydration, never the source or filtered-out matches.
+    let results = state
+        .search
+        .find_similar(memory_id, req.limit.min(100) as usize, req.min_score, false)
+        .await?;
+    let ids: Vec<_> = results.iter().map(|r| r.memory_id).collect();
     let embeddings = if req.include_embeddings {
-        let ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id).collect();
         state.search.get_embeddings_batch(&ids)
     } else {
         std::collections::HashMap::new()
     };
-
-    // Exclude source memory from results, loading full_text from storage
-    let filtered: Vec<_> = results
-        .into_iter()
-        .filter(|r| r.memory.id != memory_id)
-        .take(limit)
-        .collect();
-    let mut hits: Vec<SearchHit> = Vec::with_capacity(filtered.len());
-    for r in filtered {
+    let mut hits = Vec::with_capacity(results.len());
+    for result in results {
+        let Some(record) = state.storage.get_record(result.memory_id).await else {
+            continue;
+        };
+        if matches!(record.phase, DecayPhase::Ghost | DecayPhase::Tombstone) {
+            continue;
+        }
         let ns_name = state
             .namespaces
-            .name_for(r.memory.namespace_id)
-            .unwrap_or_else(|| "unknown".to_string());
-        let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
-        mem.full_text = state
-            .storage
-            .get_full_text(r.memory.id)
-            .await
-            .unwrap_or(None);
+            .name_for(NamespaceId::new(record.namespace_id))
+            .unwrap_or_else(|| "unknown".into());
+        let cached = crate::model::CachedRecord::from(&record);
+        let mut memory = MemoryResponse::from_cached(&cached, ns_name);
+        memory.full_text = state.storage.get_full_text(result.memory_id).await?;
         if req.include_embeddings {
-            mem.embedding = embeddings.get(&r.memory.id).cloned();
+            memory.embedding = embeddings.get(&result.memory_id).cloned();
         }
         hits.push(SearchHit {
-            memory: mem,
-            score: r.score,
+            memory,
+            score: result.score.unwrap_or_default(),
         });
+    }
+    if req.record_access {
+        let ids: Vec<_> = hits.iter().map(|hit| hit.memory.id).collect();
+        state.search.record_similar_accesses(&ids).await?;
     }
 
     let total = hits.len() as u64;

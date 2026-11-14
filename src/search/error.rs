@@ -6,6 +6,8 @@ use thiserror::Error;
 /// Errors that can occur during search operations.
 #[derive(Debug, Error)]
 pub enum SearchError {
+    #[error(transparent)]
+    Observation(#[from] crate::decay::observation::ObservationError),
     /// The specified namespace does not exist.
     #[error("namespace not found: {0}")]
     NamespaceNotFound(String),

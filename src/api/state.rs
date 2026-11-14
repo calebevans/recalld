@@ -43,6 +43,21 @@ pub trait SearchPipeline: Send + Sync {
     /// Execute a search query, returning scored results.
     async fn search(&self, query: SearchQuery) -> Result<Vec<ResolvedSearchResult>, SearchError>;
 
+    async fn find_similar(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, SearchError>;
+
+    async fn record_similar_accesses(&self, ids: &[MemoryId]) -> Result<(), SearchError>;
+
+    async fn record_exposures(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+    ) -> Result<(), SearchError>;
+
     /// Find existing memories at or above `threshold` similarity to a
     /// pre-computed embedding, closest first, at most `limit` of them.
     ///
@@ -277,7 +292,17 @@ pub trait RelationshipGraph: Send + Sync {
 #[async_trait::async_trait]
 pub trait FsrsEngine: Send + Sync {
     /// Record an access event for decay tracking.
-    async fn record_access(&self, id: MemoryId, kind: AccessKind);
+    async fn record_access(
+        &self,
+        id: MemoryId,
+        kind: AccessKind,
+    ) -> Result<(), crate::decay::observation::ObservationError> {
+        self.record_access_batch(&[(id, kind)]).await
+    }
+    async fn record_access_batch(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+    ) -> Result<(), crate::decay::observation::ObservationError>;
 
     /// Apply manual reinforcement with the given FSRS quality rating.
     async fn reinforce(
@@ -388,6 +413,7 @@ pub enum QueryInput {
 /// A single resolved search result with its similarity score.
 #[derive(Debug, Clone)]
 pub struct ResolvedSearchResult {
+    pub access_kind: AccessKind,
     /// The cached memory record.
     pub memory: CachedRecord,
     /// Cosine similarity score.

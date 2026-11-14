@@ -5,6 +5,7 @@ use crate::mcp::bridge::{self, McpBridge};
 use crate::model::{AccessKind, CachedRecord, NamespaceId};
 use crate::search::adapters::*;
 use crate::search::{AccessRecorder, QueryEngine, SearchQuery, VectorIndex as _, VectorMetadata};
+use crate::storage::StorageEngine as _;
 use crate::test_support::{DIM, Fixture, MemorySpec, StubBridge};
 use serde_json::{Value, json};
 use std::sync::atomic::AtomicUsize;
@@ -62,7 +63,7 @@ impl Harness {
     async fn new() -> Self {
         let f = Fixture::new();
         let access = Arc::new(ObservedAccess {
-            inner: StorageAccessRecorder::new(f.storage.clone())
+            inner: StorageAccessRecorder::new(f.storage.clone(), f.cache.clone())
                 .with_clock(Arc::new(crate::time::ManualClock::new(NOW))),
             completed: AtomicUsize::new(0),
             notify: tokio::sync::Notify::new(),
@@ -216,7 +217,10 @@ impl Harness {
             .unwrap();
         format!(
             "{records:?}{nodes:?}{vectors:?}{fts:?}{:?}{}",
-            self.f.persisted_edges(),
+            (
+                self.f.persisted_edges(),
+                self.f.storage.read().unwrap().control_state().unwrap()
+            ),
             self.f.entity_index.read().await.len()
         )
     }
@@ -296,7 +300,7 @@ async fn read_only_pipeline_bypasses_stale_cache_and_preserves_state() {
         "false mode must not fill record cache"
     );
     h.assert_quiet(&before).await;
-    // Explicit true and old wrappers retain async exposure without FSRS feedback.
+    // True/default exposures complete before return, without FSRS feedback.
     for mode in 0..3 {
         match mode {
             0 => {
@@ -332,11 +336,6 @@ async fn read_only_mcp_tools_and_legacy_get_contract() {
             "find_similar_memories",
             json!({"id":h.ids[0].to_string(), "recordAccess":false}),
         ),
-        ("get_memory", json!({"id":h.ids[0].to_string()})),
-        (
-            "get_memory",
-            json!({"id":h.ids[0].to_string(), "recordAccess":true}),
-        ),
     ] {
         let response = crate::mcp::tools::dispatch_tool(&bridge, name, args).await;
         assert_ne!(response.is_error, Some(true), "{response:?}");
@@ -351,6 +350,23 @@ async fn read_only_mcp_tools_and_legacy_get_contract() {
         assert_eq!(response.is_error, Some(true));
     }
     h.assert_quiet(&before).await;
+    let before_count = h.f.record(h.ids[0]).unwrap().access_history.len();
+    for flag in [None, Some(true)] {
+        let mut args = json!({"id":h.ids[0].to_string()});
+        if let Some(flag) = flag {
+            args["recordAccess"] = json!(flag);
+        }
+        assert_ne!(
+            crate::mcp::tools::dispatch_tool(&bridge, "get_memory", args)
+                .await
+                .is_error,
+            Some(true)
+        );
+    }
+    assert_eq!(
+        h.f.record(h.ids[0]).unwrap().access_history.len(),
+        before_count + 2
+    );
     for name in ["recall_memories", "find_similar_memories"] {
         for flag in [None, Some(true)] {
             let mut args = json!({"id":h.ids[0].to_string(), "query":"fixture"});
@@ -396,7 +412,7 @@ async fn http_call(
     )
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_only_http_get_search_and_existing_similarity_error() {
+async fn read_only_http_get_search_and_similarity() {
     let h = Harness::new().await;
     let before = h.snapshot().await;
     let get = format!("/memories/{}", h.ids[0]);
@@ -418,8 +434,7 @@ async fn read_only_http_get_search_and_existing_similarity_error() {
     .await;
     assert!(status.is_success(), "{body}");
     assert_eq!(body["hits"].as_array().unwrap().len(), 3);
-    // Existing HTTP vector-only adapter rejects EmptyQuery. Verify false mode
-    // also bypasses the source cache before this failure; do not claim success.
+    // Similarity now selects and hydrates read-only before optional recording.
     let (status, _) = http_call(
         h.http(),
         "POST",
@@ -427,7 +442,7 @@ async fn read_only_http_get_search_and_existing_similarity_error() {
         json!({"recordAccess":false}),
     )
     .await;
-    assert!(status.is_client_error());
+    assert!(status.is_success());
     assert!(h.f.cache.get(h.ids[0]).await.is_none());
     h.assert_quiet(&before).await;
     for suffix in ["", "?recordAccess=true"] {
@@ -524,13 +539,18 @@ async fn read_only_daemon_aliases_force_false_and_legacy_methods_keep_defaults()
         )
         .await
         .unwrap();
-    // Legacy daemon get was always nonobserving, with or without the new flag.
+    h.assert_quiet(&before).await;
+    let before_count = h.f.record(h.ids[0]).unwrap().access_history.len();
+    // Default/true daemon get now completes one durable exposure per call.
     storage.get_memory(h.ids[0], true).await.unwrap();
     client
         .call("get_memory", json!({"id":h.ids[0].to_string()}))
         .await
         .unwrap();
-    h.assert_quiet(&before).await;
+    assert_eq!(
+        h.f.record(h.ids[0]).unwrap().access_history.len(),
+        before_count + 2
+    );
     search.search(input(Some(true))).await.unwrap();
     h.observed().await;
     let mut omitted = serde_json::to_value(input(None)).unwrap();
@@ -686,4 +706,202 @@ async fn read_only_graph_expansion_and_supersedes_hydrate_canonical_records() {
         h.f.cache.get(replacement).await.unwrap().summary,
         "stale replacement"
     );
+}
+
+fn event_counts(h: &Harness, ids: &[MemoryId]) -> Vec<usize> {
+    ids.iter()
+        .map(|id| h.f.record(*id).unwrap().access_history.len())
+        .collect()
+}
+fn control_generation(h: &Harness) -> u64 {
+    h.f.storage
+        .read()
+        .unwrap()
+        .control_state()
+        .unwrap()
+        .committed_generation
+        .get()
+}
+fn tool_json(result: &crate::mcp::protocol::ToolCallResult) -> Value {
+    let crate::mcp::protocol::ContentBlock::Text { text } = &result.content[0];
+    serde_json::from_str(text).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn awaited_mcp_final_union_records_neighbors_only_when_exposed() {
+    let h = Harness::new().await;
+    let bridge = h.bridge();
+    let read = crate::mcp::tools::dispatch_tool(
+        &bridge,
+        "recall_memories",
+        json!({"query":"fixture", "limit":1, "depth":0, "recordAccess":false}),
+    )
+    .await;
+    assert_ne!(read.is_error, Some(true));
+    let first = tool_json(&read)["memories"][0]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<uuid::Uuid>()
+        .unwrap()
+        .into();
+    let neighbor = h.f.insert_memory().await; // Not indexed; only outer MCP hydration exposes it.
+    let foreign_ns = h.f.create_namespace("foreign");
+    let foreign = h.f.insert_memory_in(foreign_ns, &[]).await;
+    let ghost =
+        h.f.insert_memory_with(MemorySpec {
+            phase: crate::model::DecayPhase::Ghost,
+            ..MemorySpec::new(NamespaceId::new(1))
+        })
+        .await;
+    for id in [neighbor, foreign, ghost] {
+        h.f.graph
+            .write()
+            .await
+            .add_edge(first, id, crate::model::EdgeType::Associative, 1.0, false)
+            .unwrap();
+    }
+    let ids = [h.ids.clone(), vec![neighbor, foreign, ghost]].concat();
+    for compact in [true, false] {
+        let before = event_counts(&h, &ids);
+        let generation = control_generation(&h);
+        let result = crate::mcp::tools::dispatch_tool(&bridge, "recall_memories", json!({"query":"fixture", "limit":1, "depth":0, "compact":compact, "recordAccess":true})).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let body = tool_json(&result);
+        let mut exposed = std::collections::HashSet::new();
+        for hit in body["memories"].as_array().unwrap() {
+            exposed.insert(hit["id"].as_str().unwrap().to_owned());
+        }
+        if !compact {
+            for n in body["graphContext"]["neighbors"].as_array().unwrap() {
+                exposed.insert(n["id"].as_str().unwrap().to_owned());
+            }
+            assert!(exposed.contains(&neighbor.to_string()));
+        } else {
+            assert!(!exposed.contains(&neighbor.to_string()));
+        }
+        assert!(!exposed.contains(&foreign.to_string()));
+        assert!(!exposed.contains(&ghost.to_string()));
+        assert_eq!(control_generation(&h), generation + 1);
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(
+                h.f.record(*id).unwrap().access_history.len(),
+                before[index] + usize::from(exposed.contains(&id.to_string())),
+                "{id}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn awaited_similarity_filters_before_single_exposure_and_false_skips_all_writes() {
+    let h = Harness::new().await;
+    let source = h.ids[0];
+    let bridge = h.bridge();
+    let before = event_counts(&h, &h.ids);
+    let generation = control_generation(&h);
+    // No returned matches means no receipt, including true mode.
+    for record_access in [false, true] {
+        let hits = bridge
+            .search
+            .find_similar(source, 10, Some(1.1), true, record_access)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+        let (status, body) = http_call(
+            h.http(),
+            "POST",
+            &format!("/similar/{source}"),
+            json!({"minScore":1.1,"recordAccess":record_access}),
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+        assert_eq!(body["hits"].as_array().unwrap().len(), 0);
+    }
+    assert_eq!(event_counts(&h, &h.ids), before);
+    assert_eq!(control_generation(&h), generation);
+    for record_access in [false, true] {
+        let before = event_counts(&h, &h.ids);
+        let generation = control_generation(&h);
+        let (status, body) = http_call(
+            h.http(),
+            "POST",
+            &format!("/similar/{source}"),
+            json!({"limit":1,"minScore":0.5,"recordAccess":record_access}),
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+        let hits = body["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        let returned = hits[0]["memory"]["id"].as_str().unwrap();
+        assert_ne!(returned, source.to_string());
+        assert_eq!(
+            control_generation(&h),
+            generation + u64::from(record_access)
+        );
+        for (index, id) in h.ids.iter().enumerate() {
+            assert_eq!(
+                h.f.record(*id).unwrap().access_history.len(),
+                before[index] + usize::from(record_access && returned == id.to_string())
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_transports_propagate_observation_failure_without_success_payload() {
+    let h = Harness::new().await;
+    let id = h.ids[0];
+    h.f.storage
+        .write()
+        .unwrap()
+        .update_access(id, i64::MAX, AccessKind::DirectRetrieval)
+        .unwrap();
+    let before = event_counts(&h, &h.ids);
+    let generation = control_generation(&h);
+    let (status, body) = http_call(
+        h.http(),
+        "GET",
+        &format!("/memories/{id}?recordAccess=true"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["observation"]["commitState"], "notCommitted");
+    assert!(body.get("data").is_none());
+    let response = crate::mcp::tools::dispatch_tool(
+        &h.bridge(),
+        "get_memory",
+        json!({"id":id.to_string(), "recordAccess":true}),
+    )
+    .await;
+    assert_eq!(response.is_error, Some(true));
+    let serialized = serde_json::to_string(&response).unwrap();
+    assert!(serialized.contains("notCommitted"));
+    assert!(!serialized.contains("fixture"));
+    assert_eq!(event_counts(&h, &h.ids), before);
+    assert_eq!(control_generation(&h), generation);
+    // Original user false bypasses the transaction, rather than merely muting its error.
+    assert!(
+        http_call(
+            h.http(),
+            "GET",
+            &format!("/memories/{id}?recordAccess=false"),
+            Value::Null
+        )
+        .await
+        .0
+        .is_success()
+    );
+    assert_ne!(
+        crate::mcp::tools::dispatch_tool(
+            &h.bridge(),
+            "get_memory",
+            json!({"id":id.to_string(), "recordAccess":false})
+        )
+        .await
+        .is_error,
+        Some(true)
+    );
+    assert_eq!(event_counts(&h, &h.ids), before);
+    assert_eq!(control_generation(&h), generation);
 }

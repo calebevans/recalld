@@ -94,6 +94,32 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         self.embedding.embed(text).await
     }
 
+    async fn find_similar(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, crate::search::SearchError> {
+        self.query_engine
+            .similar_filtered_with_access(id, k, min_score, record_access)
+            .await
+    }
+
+    async fn record_similar_accesses(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<(), crate::search::SearchError> {
+        self.query_engine.record_similar_accesses(ids).await
+    }
+
+    async fn record_exposures(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+    ) -> Result<(), crate::search::SearchError> {
+        self.query_engine.record_exposures(accesses).await
+    }
+
     async fn search(
         &self,
         query: state::SearchQuery,
@@ -169,6 +195,11 @@ impl state::SearchPipeline for SearchPipelineAdapter {
                 // Issue 5: Parse entities from tags
                 let metadata = parse_structured_tags(&r.tags);
                 state::ResolvedSearchResult {
+                    access_kind: if r.activation_score.is_some() {
+                        AccessKind::AssociativeRetrieval
+                    } else {
+                        AccessKind::DirectRetrieval
+                    },
                     memory: CachedRecord {
                         id: r.memory_id,
                         namespace_id: query.namespace_id, // Issue 6: use actual namespace_id
@@ -1127,20 +1158,18 @@ impl FsrsEngineAdapter {
 
 #[async_trait]
 impl state::FsrsEngine for FsrsEngineAdapter {
-    async fn record_access(&self, id: MemoryId, kind: AccessKind) {
-        let now = self.clock.now_millis();
-        let storage = self.storage.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(storage_w) = storage.write() {
-                if let Ok(Some(record)) = storage_w.get_record(id) {
-                    if record.phase != DecayPhase::Tombstone {
-                        let timestamp = now.max(record.created_at).max(record.last_accessed_at);
-                        let _ = storage_w.update_access(id, timestamp, kind);
-                    }
-                }
-            }
-        })
-        .await;
+    async fn record_access_batch(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+    ) -> Result<(), crate::decay::observation::ObservationError> {
+        crate::decay::observation::record_exposures(
+            self.storage.clone(),
+            self.cache.clone(),
+            accesses.to_vec(),
+            self.clock.now_millis(),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn reinforce(
@@ -1150,14 +1179,13 @@ impl state::FsrsEngine for FsrsEngineAdapter {
     ) -> Result<state::ReinforceResult, Box<dyn std::error::Error + Send + Sync>> {
         let outcome = crate::decay::storage_adapter::reinforce(
             self.storage.clone(),
+            self.cache.clone(),
             id,
             quality,
             self.config.decay.decay_rate_multiplier,
             self.clock.now_millis(),
         )
         .await;
-        // The first storage write may have committed even if the second failed.
-        self.cache.invalidate(id).await;
         let plan = outcome?;
         Ok(state::ReinforceResult {
             strength: plan.strength,

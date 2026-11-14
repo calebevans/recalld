@@ -472,7 +472,7 @@ fn recall_memories_def() -> ToolInfo {
             "properties": {
                 "recordAccess": {
                     "type": "boolean", "default": true,
-                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true preserves legacy path behavior; get_memory remains nonobserving."
+                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true synchronously records legacy exposure before success."
                 },
                 "query": {
                     "type": "string",
@@ -646,7 +646,7 @@ fn get_memory_def() -> ToolInfo {
             "properties": {
                 "recordAccess": {
                     "type": "boolean", "default": true,
-                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true preserves legacy path behavior; get_memory remains nonobserving."
+                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true synchronously records legacy exposure before success."
                 },
                 "id": {
                     "type": "string",
@@ -656,9 +656,9 @@ fn get_memory_def() -> ToolInfo {
             "required": ["id"]
         }),
         annotations: Some(ToolAnnotations {
-            read_only_hint: Some(true),
+            read_only_hint: Some(false),
             destructive_hint: Some(false),
-            idempotent_hint: Some(true),
+            idempotent_hint: Some(false),
             open_world_hint: Some(false),
         }),
     }
@@ -1012,7 +1012,7 @@ fn find_similar_memories_def() -> ToolInfo {
             "properties": {
                 "recordAccess": {
                     "type": "boolean", "default": true,
-                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true preserves legacy path behavior; get_memory remains nonobserving."
+                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true synchronously records legacy exposure before success."
                 },
                 "mode": {
                     "type": "string",
@@ -2268,9 +2268,8 @@ mod tests {
     #[test]
     fn t38_read_only_tools_declare_the_read_only_hint() {
         // Hints describe the omitted/default mode. Recall/similarity observe
-        // asynchronously by default; only explicit false opts out.
-        const READ_ONLY: [&str; 5] = [
-            "get_memory",
+        // synchronously by default; only explicit false opts out.
+        const READ_ONLY: [&str; 4] = [
             "namespace_stats",
             "list_memories",
             "list_namespaces",
