@@ -14,13 +14,16 @@
 //! - `error` — Unified `StorageError` type
 //! - `fsync` — Filesystem sync helpers for crash safety
 
+pub mod control;
 pub mod edges;
 pub mod engine;
 pub mod error;
 pub mod fsync;
 pub mod indexes;
 pub mod metadata;
+pub(crate) mod ownership;
 pub mod text;
+pub(crate) mod validation;
 pub mod vectors;
 
 // ── Re-exports ──────────────────────────────────────────────────────

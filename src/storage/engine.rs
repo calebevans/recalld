@@ -15,9 +15,9 @@ use crate::model::validation::validate_namespace_name;
 use crate::model::{
     AccessKind, DecayPhase, DiskRecord, EdgeType, MemoryId, NamespaceConfig, NamespaceId,
 };
+use crate::storage::control::{ControlState, MutationContext, MutationScope, WriteReceipt};
 use crate::storage::edges::{EdgeStore, PersistedEdge, cleanup_orphaned_edges};
 use crate::storage::error::StorageError;
-use crate::storage::fsync::{fsync_dir, fsync_file};
 use crate::storage::metadata::MetadataStore;
 use crate::storage::text::{CompactionResult, TextRef, TextStore, recover_text_compaction};
 use crate::storage::vectors::VectorManager;
@@ -279,9 +279,49 @@ pub struct RedbStorageEngine {
     edge_store: EdgeStore,
     /// Exclusive file lock preventing multi-process access.
     _lock_file: std::fs::File,
+    _ownership: crate::storage::ownership::StoreOwnership,
 }
 
 impl RedbStorageEngine {
+    /// Fail closed after an uncertain commit or failed derived publication.
+    /// Lock order for graph writers: graph -> storage -> metadata -> redb.
+    pub(crate) fn ensure_available(&self) -> Result<(), StorageError> {
+        self.meta_store.ensure_available()
+    }
+
+    pub(crate) fn mark_unavailable(&self) {
+        self.meta_store.mark_unavailable();
+    }
+
+    /// Metadata lineage/generation foundation; not a whole-store read snapshot.
+    pub fn control_state(&self) -> Result<ControlState, StorageError> {
+        self.meta_store.control_state()
+    }
+
+    /// Commit an access event and its receipt in one metadata transaction.
+    /// This acknowledges canonical commit only. Derived readiness is untracked;
+    /// adapters must not advertise v2 ready-write semantics from this receipt.
+    pub fn update_access_with_receipt(
+        &self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        timestamp: i64,
+        kind: AccessKind,
+    ) -> Result<WriteReceipt, StorageError> {
+        self.meta_store
+            .update_access_with_receipt(ctx, id, timestamp, kind)
+    }
+
+    pub fn lookup_operation(
+        &self,
+        store_id: uuid::Uuid,
+        scope: MutationScope,
+        operation_id: uuid::Uuid,
+    ) -> Result<Option<WriteReceipt>, StorageError> {
+        self.meta_store
+            .lookup_operation(store_id, scope, operation_id)
+    }
+
     /// Open or create a storage engine at the given directory path.
     ///
     /// Performs the full initialization sequence:
@@ -293,21 +333,23 @@ impl RedbStorageEngine {
     /// 6. Opens vector files for all existing namespaces.
     /// 7. Runs startup validation (rebuilds phase index, cleans orphans).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let db_path = path.as_ref().to_path_buf();
+        let ownership = crate::storage::ownership::StoreOwnership::acquire(path.as_ref())?;
+        let db_path = ownership.path.clone();
         std::fs::create_dir_all(&db_path)?;
+        let lock_file = crate::storage::ownership::lock_directory(&db_path)?;
 
-        // Step 1: Acquire exclusive file lock.
-        let lock_path = db_path.join("recalld.lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
-
-        use fs2::FileExt;
-        lock_file
-            .try_lock_exclusive()
-            .map_err(|_| StorageError::DatabaseLocked)?;
+        // Existing stores must not silently initialize absent canonical files.
+        recover_text_compaction(&db_path)?;
+        let existing = std::fs::read_dir(&db_path)?.any(|entry| {
+            entry
+                .map(|e| e.file_name() != "recalld.lock")
+                .unwrap_or(true)
+        });
+        if existing {
+            for name in ["meta.db", "edges.db", "fulltext.dat"] {
+                crate::storage::validation::require_file(&db_path.join(name))?;
+            }
+        }
 
         // Step 2: Open meta.db.
         let meta_store = MetadataStore::open(&db_path.join("meta.db"))?;
@@ -315,9 +357,7 @@ impl RedbStorageEngine {
         // Step 3: Open edges.db.
         let edge_store = EdgeStore::open(&db_path.join("edges.db"))?;
 
-        // Step 4: Recover any interrupted fulltext.dat compaction.
-        recover_text_compaction(&db_path)?;
-
+        // Legacy compaction was checked before opening any canonical file.
         // Step 5: Open fulltext.dat.
         let text_store = TextStore::open(&db_path.join("fulltext.dat"))?;
 
@@ -325,6 +365,16 @@ impl RedbStorageEngine {
         let mut vector_manager = VectorManager::new(db_path.clone());
         let namespaces = meta_store.list_namespaces()?;
         for ns in &namespaces {
+            validate_namespace_name(&ns.name).map_err(|reason| {
+                StorageError::InvalidNamespaceName {
+                    name: ns.name.clone(),
+                    reason: reason.to_string(),
+                }
+            })?;
+            if !std::fs::symlink_metadata(db_path.join(&ns.name))?.is_dir() {
+                return Err(StorageError::InvalidPath);
+            }
+            crate::storage::validation::require_file(&db_path.join(&ns.name).join("vectors.dat"))?;
             vector_manager.open_or_create(ns.id, &ns.name, ns.embedding_dim as usize)?;
         }
 
@@ -335,6 +385,7 @@ impl RedbStorageEngine {
             text_store,
             edge_store,
             _lock_file: lock_file,
+            _ownership: ownership,
         };
 
         // Step 7: Startup validation.
@@ -352,14 +403,40 @@ impl RedbStorageEngine {
     fn startup_validation(&mut self) -> Result<(), StorageError> {
         tracing::info!("Running storage startup validation...");
 
-        // 1. Rebuild the phase index from meta.db ground truth.
-        self.meta_store.rebuild_phase_index()?;
+        // MetadataStore::open already rebuilt the phase index from records.
 
         // 2. Validate fulltext.dat header.
         self.text_store.validate_header()?;
 
         // 3. Clean up orphaned edges.
         let all_records = self.meta_store.scan_all()?;
+        let mut owners = HashSet::new();
+        for (id, record) in &all_records {
+            if record.id != *id.as_bytes() {
+                return Err(StorageError::InvalidMutation(
+                    "stored record ID disagrees with key".into(),
+                ));
+            }
+            let vectors = self
+                .vector_manager
+                .get(NamespaceId::new(record.namespace_id))
+                .ok_or(StorageError::NamespaceNotFound(record.namespace_id))?;
+            if record.phase != DecayPhase::Tombstone
+                && (!owners.insert((record.namespace_id, record.vector_slot))
+                    || vectors.is_free(record.vector_slot)
+                    || vectors.get_vector(record.vector_slot).is_none())
+            {
+                return Err(StorageError::OwnershipMismatch(format!(
+                    "invalid or duplicate vector owner {id}"
+                )));
+            }
+            if record.text_offset != 0 || record.text_length != 0 {
+                self.text_store.read(TextRef {
+                    file_offset: record.text_offset,
+                    length: record.text_length,
+                })?;
+            }
+        }
         let known_ids: HashSet<MemoryId> = all_records.iter().map(|(id, _)| *id).collect();
         let orphans_removed = cleanup_orphaned_edges(&self.edge_store, &known_ids)?;
         if orphans_removed > 0 {
@@ -410,12 +487,9 @@ impl RedbStorageEngine {
     ///
     /// # Why this cannot delete a live namespace
     ///
-    /// [`open`](Self::open) step 6 calls `VectorManager::open_or_create`
-    /// for **every** namespace in `NAMESPACE_TABLE`, and
-    /// `open_or_create` creates the directory. That runs before step 7,
-    /// which is this. So at sweep time every live namespace provably
-    /// has a directory on disk and a name in `live`; there is no window
-    /// in which a live-but-not-yet-opened namespace could be swept.
+    /// [`open`](Self::open) requires a real directory and existing vector
+    /// file for every namespace before this sweep runs. A missing payload
+    /// fails startup; it is never initialized or swept as an orphan.
     ///
     /// # Guards, and why each one is here
     ///
@@ -1094,6 +1168,24 @@ impl StorageEngine for RedbStorageEngine {
         embedding: &[f32],
         full_text: Option<&str>,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
+        // Reject identity conflicts before allocating or appending payloads.
+        if record.id != *id.as_bytes() || record.namespace_id != namespace_id.get() {
+            return Err(StorageError::InvalidMutation(
+                "record ID/namespace disagrees with insert arguments".into(),
+            ));
+        }
+        if record.phase == DecayPhase::Tombstone {
+            return Err(StorageError::InvalidMutation(
+                "cannot allocate a vector for a tombstone".into(),
+            ));
+        }
+        if self.meta_store.exists(id)? {
+            return Err(StorageError::DuplicateId(id.into_inner()));
+        }
+        self.meta_store
+            .get_namespace(namespace_id)?
+            .ok_or(StorageError::NamespaceNotFound(namespace_id.get()))?;
         // 1. Allocate vector slot and write embedding.
         let vector_store = self
             .vector_manager
@@ -1125,38 +1217,15 @@ impl StorageEngine for RedbStorageEngine {
             self.text_store.sync_data()?;
         }
 
-        // 3. Insert the completed record into meta.db.
-        if let Err(e) = self.meta_store.insert(id, record) {
-            // Best-effort rollback: free the vector slot so it can be
-            // reused. The fulltext.dat entry (if written) becomes orphaned
-            // dead space that compaction will eventually reclaim.
-            if let Some(vs) = self.vector_manager.get_mut(namespace_id) {
-                if let Err(rollback_err) = vs.free_slot(vector_slot) {
-                    tracing::warn!(
-                        memory_id = %id,
-                        vector_slot,
-                        error = %rollback_err,
-                        "Failed to roll back vector slot after meta.db insert failure; \
-                         slot is leaked until next compaction or restart"
-                    );
-                }
-            }
-            if full_text.is_some() {
-                tracing::warn!(
-                    memory_id = %id,
-                    text_offset = record.text_offset,
-                    text_length = record.text_length,
-                    "Orphaned fulltext.dat entry after meta.db insert failure; \
-                     dead space will be reclaimed by next compaction"
-                );
-            }
-            return Err(e);
-        }
+        // A commit I/O error can have an uncertain outcome. Never reclaim
+        // bytes that metadata may already own; recovery must decide.
+        self.meta_store.insert(id, record)?;
 
         Ok(())
     }
 
     fn get_record(&self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.get(id)
     }
 
@@ -1165,6 +1234,7 @@ impl StorageEngine for RedbStorageEngine {
         namespace_id: NamespaceId,
         slot: u32,
     ) -> Result<Option<Vec<f32>>, StorageError> {
+        self.ensure_available()?;
         let vector_store = self
             .vector_manager
             .get(namespace_id)
@@ -1173,6 +1243,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn get_text(&self, text_ref: TextRef) -> Result<Option<String>, StorageError> {
+        self.ensure_available()?;
         if !text_ref.is_some() {
             return Ok(None);
         }
@@ -1180,19 +1251,16 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn delete_memory(&mut self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
+        self.ensure_available()?;
         // 1. Delete from meta.db (also removes secondary indexes).
         let record = match self.meta_store.delete(id)? {
             Some(r) => r,
             None => return Ok(None),
         };
 
-        // 2. Free the vector slot.
-        let namespace_id = NamespaceId::new(record.namespace_id);
-        if let Some(vector_store) = self.vector_manager.get_mut(namespace_id) {
-            // Ignore errors from freeing slots -- the slot may
-            // reference a namespace whose vector file was already
-            // removed (e.g., during namespace deletion).
-            let _ = vector_store.free_slot(record.vector_slot);
+        // Tombstones retain legacy slot numbers, but no longer own them.
+        if record.phase != DecayPhase::Tombstone {
+            self.free_vector_slot(NamespaceId::new(record.namespace_id), record.vector_slot)?;
         }
 
         // 3. Remove all edges involving this memory, repairing the
@@ -1205,6 +1273,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn tombstone_memory(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.tombstone(id)
     }
 
@@ -1219,6 +1288,7 @@ impl StorageEngine for RedbStorageEngine {
         stability: f32,
         is_permastore: bool,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.update_decay_state(
             id,
             phase,
@@ -1230,14 +1300,17 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.strip_full_text(id)
     }
 
     fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.strip_summary(id)
     }
 
     fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.ids_in_phase(phase)
     }
 
@@ -1245,6 +1318,7 @@ impl StorageEngine for RedbStorageEngine {
         &self,
         phase: DecayPhase,
     ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.scan_phase_records(phase)
     }
 
@@ -1252,6 +1326,7 @@ impl StorageEngine for RedbStorageEngine {
         &self,
         compute_new_state: &dyn Fn(&DiskRecord) -> Option<DiskRecord>,
     ) -> Result<usize, StorageError> {
+        self.ensure_available()?;
         self.meta_store.decay_sweep(compute_new_state)
     }
 
@@ -1263,6 +1338,7 @@ impl StorageEngine for RedbStorageEngine {
         timestamp: i64,
         kind: AccessKind,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.update_access(id, timestamp, kind)
     }
 
@@ -1277,11 +1353,13 @@ impl StorageEngine for RedbStorageEngine {
         auto_created: bool,
         created_at: u64,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.edge_store
             .add_edge(source, target, edge_type, weight, auto_created, created_at)
     }
 
     fn batch_add_edges(&self, edges: &[PersistedEdge]) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.edge_store.batch_add_edges(edges)
     }
 
@@ -1289,6 +1367,7 @@ impl StorageEngine for RedbStorageEngine {
         &self,
         source: MemoryId,
     ) -> Result<Vec<(MemoryId, EdgeType)>, StorageError> {
+        self.ensure_available()?;
         self.edge_store.get_outgoing(source)
     }
 
@@ -1296,14 +1375,17 @@ impl StorageEngine for RedbStorageEngine {
         &self,
         target: MemoryId,
     ) -> Result<Vec<(MemoryId, EdgeType)>, StorageError> {
+        self.ensure_available()?;
         self.edge_store.get_incoming(target)
     }
 
     fn remove_all_edges(&self, memory_id: MemoryId) -> Result<usize, StorageError> {
+        self.ensure_available()?;
         self.edge_store.remove_all_edges(memory_id)
     }
 
     fn load_all_edges(&self) -> Result<Vec<PersistedEdge>, StorageError> {
+        self.ensure_available()?;
         self.edge_store.load_all_edges()
     }
 
@@ -1324,6 +1406,7 @@ impl StorageEngine for RedbStorageEngine {
     /// by another store or a full disk, and both wedge the boot in
     /// exactly the same way.
     fn create_namespace(&mut self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
+        self.ensure_available()?;
         validate_namespace_name(&config.name).map_err(|e| StorageError::InvalidNamespaceName {
             name: config.name.clone(),
             reason: e.to_string(),
@@ -1353,126 +1436,69 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.list_namespaces()
     }
 
     fn get_namespace(&self, id: NamespaceId) -> Result<Option<NamespaceConfig>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.get_namespace(id)
     }
 
     fn get_namespace_by_name(&self, name: &str) -> Result<Option<NamespaceConfig>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.get_namespace_by_name(name)
     }
 
     // ── Text Compaction ─────────────────────────────────────────────
 
     fn compact_text_log(&mut self) -> Result<CompactionResult, StorageError> {
-        // Collect all live text references from meta.db.
-        let all_records = self.meta_store.scan_all()?;
-        let mut live_refs: Vec<(MemoryId, TextRef)> = Vec::new();
-
-        for (id, record) in &all_records {
-            if record.text_offset > 0 && record.text_length > 0 {
-                live_refs.push((
-                    *id,
-                    TextRef {
-                        file_offset: record.text_offset,
-                        length: record.text_length,
-                    },
-                ));
-            }
-        }
-
-        // Phase 1: Write new file with only live entries.
-        // This creates fulltext.dat.new and the .compacting marker,
-        // but does NOT rename or remove the marker.
-        let (result, compacted) = self.text_store.compact_write_new_file(&live_refs)?;
-
-        if compacted {
-            // Phase 2: Update meta.db with new text offsets BEFORE
-            // renaming the file. This ensures that if we crash after
-            // the meta.db commit but before the rename, recovery can
-            // detect the .compaction-meta-committed marker and complete
-            // the rename. Without this ordering, a crash after the
-            // rename but before the meta.db update would leave stale
-            // offsets pointing into a compacted file, corrupting all
-            // text reads.
-            let updates: Vec<(MemoryId, DiskRecord)> = result
-                .new_refs
-                .iter()
-                .map(|(id, new_ref)| {
-                    // Find the original record and update its text pointer.
-                    let original = all_records
-                        .iter()
-                        .find(|(rid, _)| rid == id)
-                        .map(|(_, r)| r)
-                        .expect("compaction ref must match a record");
-                    let mut updated = original.clone();
-                    updated.text_offset = new_ref.file_offset;
-                    updated.text_length = new_ref.length;
-                    (*id, updated)
-                })
-                .collect();
-
-            if !updates.is_empty() {
-                self.meta_store.batch_update_records(&updates)?;
-            }
-
-            // Write a committed marker so recovery knows meta.db has
-            // already been updated with new offsets. If we crash after
-            // this but before the rename, recovery will complete the
-            // rename instead of rolling back.
-            let committed_marker = self.db_path.join(".compaction-meta-committed");
-            std::fs::write(&committed_marker, b"meta.db offsets committed\n")?;
-            fsync_file(&committed_marker)?;
-            fsync_dir(&self.db_path)?;
-
-            // Phase 3: Atomically swap the files and clean up markers.
-            self.text_store.compact_finalize()?;
-
-            tracing::info!(
-                old_size = result.old_size,
-                new_size = result.new_size,
-                removed = result.entries_removed,
-                kept = result.entries_kept,
-                "Text.log compaction complete"
-            );
-        }
-
-        Ok(result)
+        self.ensure_available()?;
+        // ponytail: keep the append-only log until metadata can atomically
+        // select a durable text generation. Marker ordering cannot do this.
+        Err(StorageError::RecoveryRequired(
+            "text compaction is disabled until generation-selected recovery is implemented".into(),
+        ))
     }
 
     // ── Tags ────────────────────────────────────────────────────────
 
     fn memories_with_tag(&self, tag: &str) -> Result<Vec<MemoryId>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.memories_with_tag(tag)
     }
 
     fn list_tags(&self) -> Result<Vec<(String, u64)>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.list_tags()
     }
 
     // ── Edge Count ──────────────────────────────────────────────────
 
     fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.update_edge_count(id, edge_count)
     }
 
     // ── Bulk / Diagnostic ───────────────────────────────────────────
 
     fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.scan_all()
     }
 
     fn count(&self) -> Result<u64, StorageError> {
+        self.ensure_available()?;
         self.meta_store.count()
     }
 
     fn count_active(&self) -> Result<u64, StorageError> {
+        self.ensure_available()?;
         self.meta_store.count_active()
     }
 
     fn exists(&self, id: MemoryId) -> Result<bool, StorageError> {
+        self.ensure_available()?;
         self.meta_store.exists(id)
     }
 
@@ -1481,6 +1507,20 @@ impl StorageEngine for RedbStorageEngine {
         namespace_id: NamespaceId,
         slot: u32,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
+        // Legacy callers carry no allocation epoch. Reject any release of a
+        // currently owned slot, including delayed releases after slot reuse.
+        // ponytail: O(n) guard until canonical vector_owners replaces the scan.
+        if self.meta_store.scan_all()?.iter().any(|(_, record)| {
+            record.namespace_id == namespace_id.get()
+                && record.vector_slot == slot
+                && record.phase != DecayPhase::Tombstone
+        }) {
+            return Err(StorageError::OwnershipMismatch(format!(
+                "namespace {} slot {slot} is live",
+                namespace_id.get()
+            )));
+        }
         if let Some(vector_store) = self.vector_manager.get_mut(namespace_id) {
             vector_store.free_slot(slot)?;
         }
@@ -1488,6 +1528,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn sync(&mut self) -> Result<(), StorageError> {
+        self.ensure_available()?;
         // Sync fulltext.dat.
         self.text_store.sync_data()?;
 
@@ -1500,6 +1541,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn persist_phase_index(&self) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.persist_phase_index()
     }
 }
@@ -1512,6 +1554,210 @@ impl StorageEngine for RedbStorageEngine {
 mod tests {
     use super::*;
     use crate::model::EdgeType;
+
+    #[test]
+    fn unavailable_handle_blocks_payloads_metadata_and_writes_until_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "gate");
+        let id = add_memory(&mut engine, ns);
+        let record = engine.get_record(id).unwrap().unwrap();
+        engine.mark_unavailable();
+        assert!(engine.get_record(id).is_err());
+        assert!(engine.meta_store().get(id).is_err());
+        assert!(
+            engine
+                .get_text(TextRef {
+                    file_offset: record.text_offset,
+                    length: record.text_length
+                })
+                .is_err()
+        );
+        assert!(engine.get_vector(ns, record.vector_slot).is_err());
+        assert!(engine.load_all_edges().is_err());
+        assert!(engine.delete_memory(id).is_err());
+        assert!(engine.meta_store().update_edge_count(id, 9).is_err());
+        assert!(engine.sync().is_err());
+        drop(engine);
+        let engine = open_engine(dir.path());
+        assert_eq!(
+            engine.get_record(id).unwrap().unwrap().to_bytes(),
+            record.to_bytes()
+        );
+    }
+
+    #[test]
+    fn containment_rejects_insert_identity_conflicts_before_payload_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "one");
+        let other = make_namespace(&mut engine, "two");
+        let id = add_memory(&mut engine, ns);
+        let original = engine.get_record(id).unwrap().unwrap();
+        let vector_size = std::fs::metadata(dir.path().join("two/vectors.dat"))
+            .unwrap()
+            .len();
+        let text_size = std::fs::metadata(dir.path().join("fulltext.dat"))
+            .unwrap()
+            .len();
+        let mut wrong = original.clone();
+        assert!(
+            engine
+                .insert_memory(id, other, &mut wrong, &[1.0; DIM], Some("rejected"))
+                .is_err()
+        );
+        assert!(
+            engine
+                .insert_memory(
+                    MemoryId::new(),
+                    ns,
+                    &mut wrong,
+                    &[1.0; DIM],
+                    Some("rejected")
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            engine.insert_memory(id, ns, &mut wrong, &[1.0; DIM], Some("duplicate")),
+            Err(StorageError::DuplicateId(_))
+        ));
+        let fresh = MemoryId::new();
+        wrong.id = *fresh.as_bytes();
+        assert!(
+            engine
+                .insert_memory(fresh, ns, &mut wrong, &[1.0], Some("bad dimension"))
+                .is_err()
+        );
+        assert_eq!(engine.count().unwrap(), 1);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("two/vectors.dat"))
+                .unwrap()
+                .len(),
+            vector_size
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("fulltext.dat"))
+                .unwrap()
+                .len(),
+            text_size
+        );
+        assert_eq!(
+            engine.get_record(id).unwrap().unwrap().to_bytes(),
+            original.to_bytes()
+        );
+    }
+
+    #[test]
+    fn containment_tombstone_reuse_delete_and_stale_release_preserve_new_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "default");
+        let a = add_memory(&mut engine, ns);
+        let slot = engine.get_record(a).unwrap().unwrap().vector_slot;
+        engine.tombstone_memory(a).unwrap();
+        engine.free_vector_slot(ns, slot).unwrap();
+        engine.free_vector_slot(ns, slot).unwrap(); // idempotent, no free-list cycle
+        let b = MemoryId::new();
+        let mut record = engine.get_record(a).unwrap().unwrap();
+        record.id = *b.as_bytes();
+        record.phase = DecayPhase::Summary;
+        engine
+            .insert_memory(b, ns, &mut record, &[1., 2., 3., 4.], None)
+            .unwrap();
+        assert_eq!(record.vector_slot, slot);
+        assert_eq!(engine.ids_in_phase(DecayPhase::Summary).unwrap(), vec![b]);
+        assert_eq!(engine.ids_in_phase(DecayPhase::Tombstone).unwrap(), vec![a]);
+        assert!(matches!(
+            engine.free_vector_slot(ns, slot),
+            Err(StorageError::OwnershipMismatch(_))
+        ));
+        engine.delete_memory(a).unwrap();
+        assert!(engine.delete_memory(a).unwrap().is_none());
+        let c = add_memory(&mut engine, ns);
+        assert_ne!(engine.get_record(c).unwrap().unwrap().vector_slot, slot);
+        engine.sync().unwrap();
+        drop(engine);
+        let engine = open_engine(dir.path());
+        assert_eq!(
+            engine.get_vector(ns, slot).unwrap().unwrap(),
+            vec![1., 2., 3., 4.]
+        );
+        assert_eq!(engine.ids_in_phase(DecayPhase::Summary).unwrap(), vec![b]);
+    }
+
+    #[test]
+    fn containment_disables_compaction_and_preserves_ambiguous_legacy_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let text = std::fs::read(dir.path().join("fulltext.dat")).unwrap();
+        assert!(engine.compact_text_log().is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("fulltext.dat")).unwrap(),
+            text
+        );
+        drop(engine);
+        for artifact in [
+            ".compacting",
+            ".compaction-meta-committed",
+            "fulltext.dat.new",
+        ] {
+            std::fs::write(dir.path().join(artifact), b"independent evidence").unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    RedbStorageEngine::open(dir.path()),
+                    Err(StorageError::RecoveryRequired(_))
+                ));
+                assert_eq!(
+                    std::fs::read(dir.path().join(artifact)).unwrap(),
+                    b"independent evidence"
+                );
+            }
+            std::fs::remove_file(dir.path().join(artifact)).unwrap();
+        }
+    }
+
+    #[test]
+    fn containment_existing_store_never_initializes_missing_payloads() {
+        for missing in ["meta.db", "edges.db", "fulltext.dat", "default/vectors.dat"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut engine = open_engine(dir.path());
+            make_namespace(&mut engine, "default");
+            drop(engine);
+            let path = dir.path().join(missing);
+            std::fs::remove_file(&path).unwrap();
+            assert!(RedbStorageEngine::open(dir.path()).is_err(), "{missing}");
+            assert!(!path.exists(), "{missing} was recreated");
+        }
+    }
+
+    #[test]
+    fn containment_reopen_rejects_duplicate_owners_and_owned_free_slots() {
+        for duplicate in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut engine = open_engine(dir.path());
+            let ns = make_namespace(&mut engine, "default");
+            let a = add_memory(&mut engine, ns);
+            let mut record = engine.get_record(a).unwrap().unwrap();
+            if duplicate {
+                let b = MemoryId::new();
+                record.id = *b.as_bytes();
+                engine.meta_store.insert(b, &record).unwrap();
+            } else {
+                engine
+                    .vector_manager
+                    .get_mut(ns)
+                    .unwrap()
+                    .free_slot(record.vector_slot)
+                    .unwrap();
+            }
+            engine.sync().unwrap();
+            drop(engine);
+            assert!(matches!(
+                RedbStorageEngine::open(dir.path()),
+                Err(StorageError::OwnershipMismatch(_))
+            ));
+        }
+    }
 
     const DIM: usize = 4;
 
@@ -1552,6 +1798,74 @@ mod tests {
             .insert_memory(id, namespace_id, &mut record, &[0.0; DIM], None)
             .expect("insert memory");
         id
+    }
+
+    #[test]
+    fn canonical_access_receipt_restarts_and_survives_namespace_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let namespace = make_namespace(&mut engine, "receipts");
+        let id = add_memory(&mut engine, namespace);
+        let state = engine.control_state().unwrap();
+        let ctx = MutationContext {
+            store_id: Some(state.store_id),
+            scope: MutationScope::Namespace(namespace),
+            idempotency_key: Some("request-1".into()),
+            expected_generation: Some(state.committed_generation),
+            contract_version: 1,
+        };
+        let receipt = engine
+            .update_access_with_receipt(&ctx, id, 123, AccessKind::DirectRetrieval)
+            .unwrap();
+        // Lost-response boundary: close immediately after the real commit,
+        // without an explicit sync/checkpoint acknowledgement to the caller.
+        drop(engine);
+        let mut engine = open_engine(dir.path());
+        assert_eq!(engine.control_state().unwrap().store_id, state.store_id);
+        assert_eq!(
+            engine
+                .lookup_operation(state.store_id, ctx.scope, receipt.operation_id)
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        let replay = engine
+            .update_access_with_receipt(&ctx, id, 999, AccessKind::DirectRetrieval)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation_id, receipt.operation_id);
+        assert_eq!(replay.outcome, receipt.outcome);
+        assert_eq!(
+            engine.get_record(id).unwrap().unwrap().access_history.len(),
+            1
+        );
+        engine.purge_namespace(namespace).unwrap();
+        let replacement = make_namespace(&mut engine, "receipts");
+        assert_ne!(replacement, namespace);
+        drop(engine);
+        let engine = open_engine(dir.path());
+        let before = engine.control_state().unwrap();
+        let replay = engine
+            .update_access_with_receipt(&ctx, id, 1000, AccessKind::DirectRetrieval)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation_id, receipt.operation_id);
+        assert_eq!(engine.control_state().unwrap(), before);
+        assert!(engine.get_record(id).unwrap().is_none());
+        assert!(
+            engine
+                .lookup_operation(
+                    state.store_id,
+                    MutationScope::Namespace(replacement),
+                    receipt.operation_id
+                )
+                .unwrap()
+                .is_none()
+        );
+        let encoded = serde_json::to_value(&replay).unwrap();
+        assert!(encoded["committedGeneration"].is_string());
+        assert_eq!(encoded["receiptVersion"], 1);
+        assert!(encoded.get("ready").is_none()); // Receipt is not a readiness claim.
+        assert!(!encoded.to_string().contains("fixture"));
     }
 
     /// The directory shape the boot sweep recognizes, planted by hand.
@@ -1675,7 +1989,7 @@ mod tests {
     }
 
     /// The sweep's safety argument — "no NAMESPACE_TABLE row means dead"
-    /// — has no lower bound: an absent or restored-from-backup meta.db
+    /// — has no lower bound: a restored-from-backup empty meta.db
     /// makes `live` empty and EVERY namespace directory a candidate.
     /// Every guard passes, because they really are namespace
     /// directories. Quarantine is what makes that survivable.
@@ -1692,9 +2006,11 @@ mod tests {
             .expect("write vectors.dat");
         }
 
-        // The restored-backup shape: the namespace rows are gone, the
-        // directories are not.
-        std::fs::remove_file(dir.path().join("meta.db")).expect("remove meta.db");
+        // A complete older catalog can omit the namespace. An absent meta.db
+        // now fails closed instead (covered by the missing-payload regression).
+        let older = tempfile::tempdir().unwrap();
+        drop(open_engine(older.path()));
+        std::fs::copy(older.path().join("meta.db"), dir.path().join("meta.db")).unwrap();
 
         {
             let _engine = open_engine(dir.path());
@@ -1986,6 +2302,27 @@ mod tests {
         assert!(db_is_intact(dir.path()), "the database was destroyed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn parent_path_aliases_share_store_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real_parent, &alias).unwrap();
+        let engine = open_engine(&alias.join("store"));
+        assert!(matches!(
+            RedbStorageEngine::open(real_parent.join("store")),
+            Err(StorageError::DatabaseLocked)
+        ));
+        assert_eq!(
+            engine.namespace_dir("scratch").unwrap(),
+            real_parent.canonicalize().unwrap().join("store/scratch")
+        );
+        drop(engine);
+        drop(open_engine(&real_parent.join("store")));
+    }
+
     #[test]
     fn w47_only_a_single_ordinary_path_component_is_accepted() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2009,7 +2346,7 @@ mod tests {
 
         assert_eq!(
             engine.namespace_dir("scratch").expect("a plain name"),
-            dir.path().join("scratch")
+            dir.path().canonicalize().unwrap().join("scratch")
         );
     }
 

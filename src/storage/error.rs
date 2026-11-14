@@ -8,6 +8,36 @@ use crate::model::error::DecodeError;
 /// Errors from storage operations (metadata, vectors, text, edges).
 #[derive(Debug, Error)]
 pub enum StorageError {
+    /// Invalid lineage, key, version, or generation encoding.
+    #[error("invalid mutation context: {0}")]
+    InvalidMutationContext(String),
+
+    #[error("STORE_LINEAGE_MISMATCH")]
+    StoreLineageMismatch,
+
+    #[error("GENERATION_CONFLICT: expected {expected}, actual {actual}")]
+    GenerationConflict { expected: String, actual: String },
+
+    #[error("IDEMPOTENCY_CONFLICT")]
+    IdempotencyConflict,
+
+    #[error("NAMESPACE_MISMATCH")]
+    MutationNamespaceMismatch,
+
+    #[error("canonical generation exhausted")]
+    GenerationExhausted,
+
+    #[error("unsupported or corrupt canonical control: {0}")]
+    InvalidControl(String),
+
+    /// The database may have committed; reconcile by operation ID after reopen.
+    #[error("commit outcome unknown for operation {operation_id}: {source}")]
+    CommitOutcomeUnknown {
+        operation_id: Uuid,
+        #[source]
+        source: redb::CommitError,
+    },
+
     // ── redb errors (from metadata.rs and edges.rs) ──────────────────
     /// A generic redb error.
     #[error("redb error: {0}")]
@@ -32,6 +62,15 @@ pub enum StorageError {
     /// A redb commit error.
     #[error("redb commit error: {0}")]
     RedbCommit(#[from] redb::CommitError),
+
+    #[error("invalid storage mutation: {0}")]
+    InvalidMutation(String),
+
+    #[error("storage recovery required: {0}")]
+    RecoveryRequired(String),
+
+    #[error("vector ownership mismatch: {0}")]
+    OwnershipMismatch(String),
 
     // ── Metadata errors ──────────────────────────────────────────────
     /// A record with this ID already exists.
