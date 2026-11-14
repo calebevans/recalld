@@ -11,6 +11,8 @@ mod catalog;
 pub(crate) mod effects;
 mod insertion;
 mod lifecycle_updates;
+pub(crate) mod namespace_state;
+pub(crate) mod purge;
 pub(crate) mod removal_ledger;
 pub(crate) mod text_generation;
 mod tombstone;
@@ -76,12 +78,15 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 pub struct MetadataStore {
     db: Database,
     unavailable: std::sync::atomic::AtomicBool,
+    purge_pending: std::sync::atomic::AtomicBool,
     pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
     derived_dirty: std::sync::atomic::AtomicBool,
     effects_epoch: std::sync::atomic::AtomicU64,
     pub(crate) derived_publication: std::sync::Arc<tokio::sync::RwLock<()>>,
     #[cfg(test)]
     pub(crate) fail_effect_application: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_purge_child_commit: std::sync::atomic::AtomicBool,
     // Lock order: engine gate -> publication -> redb -> phase_index.
     // Hold across commit and bitmap publication, including direct callers.
     publication: std::sync::RwLock<()>,
@@ -156,16 +161,32 @@ impl MetadataStore {
         let store = Self {
             db,
             unavailable: std::sync::atomic::AtomicBool::new(false),
+            purge_pending: std::sync::atomic::AtomicBool::new(false),
             canonical_pending: std::sync::atomic::AtomicBool::new(false),
             derived_dirty: std::sync::atomic::AtomicBool::new(false),
             effects_epoch: std::sync::atomic::AtomicU64::new(0),
             derived_publication: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             fail_effect_application: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_purge_child_commit: std::sync::atomic::AtomicBool::new(false),
             publication: std::sync::RwLock::new(()),
             phase_index: std::sync::RwLock::new(PhaseIndex::new()),
         };
-        store.rebuild_phase_index()?;
+        store.purge_pending.store(
+            store
+                .purge_progress()?
+                .iter()
+                .any(|p| p.stage != crate::storage::purge::PurgeStage::Complete),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let records = store.scan_all_for_recovery()?;
+        let phases: Vec<_> = records
+            .iter()
+            .map(|(_, r)| (r.namespace_id, r.vector_slot, r.phase))
+            .collect();
+        *store.phase_index.write().unwrap_or_else(|e| e.into_inner()) =
+            PhaseIndex::rebuild_from_records(&phases);
         let pending = store.pending_effects()?;
         store.canonical_pending.store(
             pending.iter().any(|e| !e.canonical_applied),
@@ -187,6 +208,11 @@ impl MetadataStore {
     }
 
     pub(crate) fn ensure_available(&self) -> Result<(), StorageError> {
+        self.ensure_handle_available()?;
+        self.require_no_active_purge()
+    }
+
+    pub(crate) fn ensure_handle_available(&self) -> Result<(), StorageError> {
         if self.unavailable.load(std::sync::atomic::Ordering::Acquire)
             || self
                 .canonical_pending
@@ -471,7 +497,7 @@ impl MetadataStore {
         scope: MutationScope,
         operation_id: uuid::Uuid,
     ) -> Result<Option<WriteReceipt>, StorageError> {
-        self.ensure_available()?;
+        self.ensure_handle_available()?;
         let tx = self.db.begin_read()?;
         let table = tx.open_table(control::CONTROL)?;
         let value = table

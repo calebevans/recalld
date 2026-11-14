@@ -193,6 +193,20 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    NamespacePurgeStarted {
+        namespace_id: NamespaceId,
+        name_hash: [u8; 32],
+    },
+    NamespacePurgeAdvanced {
+        parent_operation_id: Uuid,
+        namespace_id: NamespaceId,
+        sequence: u64,
+        stage: super::purge::PurgeStage,
+        removed: u64,
+        tombstones_removed: u64,
+        edges_removed: u64,
+        last_id: Option<MemoryId>,
+    },
     MemoryTombstoned {
         #[serde(rename = "memoryId")]
         memory_id: MemoryId,
@@ -305,6 +319,7 @@ pub(crate) fn validate_existing(
                 "schema without control lineage".into(),
             ));
         }
+        super::metadata::purge::validate_existing(tx, None)?;
         return Ok(None);
     }
     if !present.iter().all(|p| *p) {
@@ -333,7 +348,9 @@ pub(crate) fn validate_existing(
         let stored = validate_receipt(value.value())?;
         let scope_matches = match &stored.receipt.outcome {
             MutationOutcome::NamespaceCreated { .. } => scope == MutationScope::Catalog,
-            MutationOutcome::NamespacePolicyUpdated { namespace_id } => {
+            MutationOutcome::NamespacePolicyUpdated { namespace_id }
+            | MutationOutcome::NamespacePurgeStarted { namespace_id, .. }
+            | MutationOutcome::NamespacePurgeAdvanced { namespace_id, .. } => {
                 scope == MutationScope::Namespace(*namespace_id)
             }
             MutationOutcome::MemoryInserted { .. } | MutationOutcome::MemoryTombstoned { .. } => {
@@ -382,6 +399,7 @@ pub(crate) fn validate_existing(
             ));
         }
     }
+    super::metadata::purge::validate_existing(tx, Some(&state))?;
     Ok(Some(state))
 }
 
@@ -610,10 +628,33 @@ pub(crate) fn record_receipt(
     hash: [u8; 32],
     outcome: MutationOutcome,
 ) -> Result<WriteReceipt, StorageError> {
+    record_reserved_receipt(tx, ctx, hash, outcome, Uuid::new_v4())
+}
+
+/// Internal transaction primitive. Purge callers must first prove a durable
+/// reservation; external requests cannot choose an operation identity.
+pub(super) fn record_reserved_receipt(
+    tx: &WriteTransaction,
+    ctx: &MutationContext,
+    hash: [u8; 32],
+    outcome: MutationOutcome,
+    operation_id: Uuid,
+) -> Result<WriteReceipt, StorageError> {
+    let before = read_control(tx)?;
+    if operation_id.is_nil()
+        || tx
+            .open_table(RECEIPTS)?
+            .get(scoped_key(before.store_id, ctx.scope, operation_id.as_bytes()).as_slice())?
+            .is_some()
+    {
+        return Err(StorageError::InvalidControl(
+            "receipt operation ID already used or nil".into(),
+        ));
+    }
     let state = advance_generation(tx)?;
     let receipt = WriteReceipt {
         store_id: state.store_id,
-        operation_id: Uuid::new_v4(),
+        operation_id,
         committed_generation: state.committed_generation,
         receipt_version: 1,
         outcome,

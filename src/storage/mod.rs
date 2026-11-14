@@ -26,6 +26,9 @@ pub mod insertion;
 pub mod metadata;
 pub mod offline_snapshot;
 pub(crate) mod ownership;
+pub mod purge;
+#[cfg(test)]
+mod purge_tests;
 pub mod schema_migration;
 pub mod text;
 pub mod text_migration;

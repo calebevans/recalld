@@ -1937,23 +1937,15 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                     }
                 }
 
-                storage_w.purge_namespace(config.id).map_err(|e| {
-                    let error = if e.is_partial() {
-                        bridge::BridgeError::PartiallyApplied(format!(
-                            "Namespace '{name}' was PARTIALLY destroyed: {} memories are \
-                             permanently gone, and the namespace still exists holding the \
-                             rest. Re-run delete_namespace to finish it. Cause: {}",
-                            e.destroyed.len(),
-                            e.source
-                        ))
-                    } else {
-                        bridge::BridgeError::Storage(e.source.to_string())
-                    };
-                    DeleteFailure {
-                        destroyed: e.destroyed,
-                        error,
-                    }
-                })
+                storage_w
+                    .purge_namespace_checked(config.id, force)
+                    .map_err(|e| {
+                        let error = map_mutation_error(e.source);
+                        DeleteFailure {
+                            destroyed: e.destroyed,
+                            error,
+                        }
+                    })
             })
             .await
             .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
@@ -1980,7 +1972,7 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                     .await;
                 }
                 // Even a partial purge may have durable effects to publish.
-                self.complete_effects().await?;
+                let _ = self.complete_effects().await;
                 return Err(failure.error);
             }
         };
@@ -2005,7 +1997,14 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         )
         .await;
 
-        self.complete_effects().await?;
+        self.complete_effects().await.map_err(|source| {
+            map_mutation_error(crate::storage::StorageError::CommittedMutation {
+                receipt: Box::new(purged.receipt.clone()),
+                source: Box::new(crate::storage::StorageError::RecoveryRequired(
+                    source.to_string(),
+                )),
+            })
+        })?;
         Ok(bridge::DeleteNamespaceResult {
             name: purged.config.name.clone(),
             id: purged.config.id.get(),

@@ -46,12 +46,7 @@ impl MetadataStore {
         // Reserve a generation before writing external bytes (without advancing
         // it yet). Exhaustion must leave payload files untouched.
         control::read_control(&tx)?.committed_generation.next()?;
-        let config = NamespaceConfig::decode(
-            tx.open_table(NAMESPACE_TABLE)?
-                .get(namespace.get())?
-                .ok_or(StorageError::NamespaceNotFound(namespace.get()))?
-                .value(),
-        )?;
+        let config = super::namespace_state::require_namespace_active(&tx, namespace)?;
         if config.id != namespace {
             return Err(StorageError::MutationNamespaceMismatch);
         }
