@@ -1,0 +1,35 @@
+   Compiling recalld v1.0.0 (/tmp/review)
+    Finished `test` profile [unoptimized] target(s) in 7.23s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-95c53b6a0cf39984)
+
+running 3 tests
+
+thread 'decay::sweep::independent_review_regressions::review_access_must_not_move_feedback_anchor_backward' (278) panicked at src/decay/sweep.rs:1647:9:
+assertion `left == right` failed
+  left: 86400000
+ right: 691200000
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test decay::sweep::independent_review_regressions::review_access_must_not_move_feedback_anchor_backward ... FAILED
+
+thread 'decay::sweep::independent_review_regressions::review_stale_sweep_must_not_overwrite_committed_feedback' (279) panicked at src/decay/sweep.rs:1623:9:
+assertion `left == right` failed
+  left: (1.0, 0, Summary)
+ right: (17.70828, 1, Full)
+test decay::sweep::independent_review_regressions::review_stale_sweep_must_not_overwrite_committed_feedback ... FAILED
+
+thread 'decay::sweep::independent_review_regressions::review_successful_sweep_must_publish_final_graph_phase' (282) panicked at src/decay/sweep.rs:1637:9:
+assertion `left == right` failed
+  left: Summary
+ right: Ghost
+test decay::sweep::independent_review_regressions::review_successful_sweep_must_publish_final_graph_phase ... FAILED
+
+failures:
+
+failures:
+    decay::sweep::independent_review_regressions::review_access_must_not_move_feedback_anchor_backward
+    decay::sweep::independent_review_regressions::review_stale_sweep_must_not_overwrite_committed_feedback
+    decay::sweep::independent_review_regressions::review_successful_sweep_must_publish_final_graph_phase
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 505 filtered out; finished in 0.20s
+
+error: test failed, to rerun pass `--lib`
