@@ -5,7 +5,10 @@
 //! Until all writers/effects participate, this counter must not be advertised
 //! as a public cursor/barrier generation. Existing metadata writes advance it.
 
-use redb::{ReadableTable, TableDefinition, TableHandle, WriteTransaction};
+use redb::{
+    MultimapTableHandle, ReadTransaction, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableHandle, WriteTransaction,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -212,6 +215,98 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, 
     serde_json::from_slice(bytes).map_err(|e| StorageError::InvalidControl(e.to_string()))
 }
 
+/// Read-only validation shared by metadata startup and staged backup/restore.
+/// Absence of the entire additive schema is a legacy store; partial presence,
+/// conflicting table types and unknown versions are never legacy adoption.
+pub(crate) fn validate_existing(
+    tx: &ReadTransaction,
+) -> Result<Option<ControlState>, StorageError> {
+    let reserved = [CONTROL.name(), RECEIPTS.name(), KEYS.name()];
+    if tx
+        .list_multimap_tables()?
+        .any(|table| reserved.contains(&table.name()))
+    {
+        return Err(StorageError::InvalidControl(
+            "control table is a multimap".into(),
+        ));
+    }
+    let names: Vec<_> = tx
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect();
+    let present = reserved.map(|name| names.iter().any(|n| n == name));
+    if !present.iter().any(|p| *p) {
+        return Ok(None);
+    }
+    if !present.iter().all(|p| *p) {
+        return Err(StorageError::InvalidControl(
+            "incomplete control tables".into(),
+        ));
+    }
+    let control = tx.open_table(CONTROL)?;
+    let receipts = tx.open_table(RECEIPTS)?;
+    let keys = tx.open_table(KEYS)?;
+    if control.len()? != 1 {
+        return Err(StorageError::InvalidControl(
+            "control must contain exactly one state row".into(),
+        ));
+    }
+    let state = ControlState::decode(
+        control
+            .get("state")?
+            .ok_or_else(|| StorageError::InvalidControl("missing control state".into()))?
+            .value(),
+    )?;
+    for entry in receipts.iter()? {
+        let (key, value) = entry?;
+        let (lineage, _, operation) = decode_scope(key.value())?;
+        let stored = validate_receipt(value.value())?;
+        if lineage != state.store_id
+            || stored.receipt.store_id != lineage
+            || operation != stored.receipt.operation_id.as_bytes()
+            || stored.receipt.committed_generation > state.committed_generation
+        {
+            return Err(StorageError::InvalidControl(
+                "receipt identity/generation disagrees with control".into(),
+            ));
+        }
+    }
+    for entry in keys.iter()? {
+        let (key, value) = entry?;
+        let (lineage, scope, client_key) = decode_scope(key.value())?;
+        let (receipt_lineage, receipt_scope, _) = decode_scope(value.value())?;
+        if lineage != state.store_id
+            || lineage != receipt_lineage
+            || scope != receipt_scope
+            || client_key.is_empty()
+            || client_key.len() > 128
+            || !client_key.iter().all(|b| (0x20..=0x7e).contains(b))
+            || receipts.get(value.value())?.is_none()
+        {
+            return Err(StorageError::InvalidControl(
+                "invalid retry key or receipt reference".into(),
+            ));
+        }
+    }
+    Ok(Some(state))
+}
+
+fn decode_scope(key: &[u8]) -> Result<(Uuid, MutationScope, &[u8]), StorageError> {
+    let invalid = || StorageError::InvalidControl("invalid receipt/key scope encoding".into());
+    let lineage = Uuid::from_slice(key.get(..16).ok_or_else(invalid)?).map_err(|_| invalid())?;
+    match key.get(16) {
+        Some(0) => Ok((lineage, MutationScope::Catalog, &key[17..])),
+        Some(1) if key.len() >= 21 => {
+            let ns = NamespaceId::new(u32::from_be_bytes(key[17..21].try_into().unwrap()));
+            if ns.is_unset() {
+                return Err(invalid());
+            }
+            Ok((lineage, MutationScope::Namespace(ns), &key[21..]))
+        }
+        _ => Err(invalid()),
+    }
+}
+
 /// One-time adoption at generation zero; a present but incomplete control schema
 /// is corruption, not permission to mint a new retry lineage.
 pub(crate) fn initialize(tx: &WriteTransaction) -> Result<(), StorageError> {
@@ -288,9 +383,15 @@ pub(crate) fn scoped_key(store_id: Uuid, scope: MutationScope, suffix: &[u8]) ->
 
 pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageError> {
     let stored: StoredReceipt = decode(bytes)?;
-    if stored.request_hash_version != 1 || stored.receipt.receipt_version != 1 {
+    if stored.request_hash_version != 1
+        || stored.receipt.receipt_version != 1
+        || stored.receipt.store_id.is_nil()
+        || stored.receipt.operation_id.is_nil()
+        || stored.receipt.committed_generation == Generation::default()
+        || stored.receipt.replayed
+    {
         return Err(StorageError::InvalidControl(
-            "unsupported receipt/hash version".into(),
+            "unsupported receipt/hash version or invalid persisted receipt".into(),
         ));
     }
     Ok(stored)

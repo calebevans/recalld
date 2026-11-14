@@ -41,7 +41,8 @@ pub(crate) const NAMESPACE_TABLE: TableDefinition<u32, &[u8]> = TableDefinition:
 
 /// Monotonic counter for namespace ID assignment.
 /// Single row: key = "max_id", value = highest assigned u32.
-const NAMESPACE_COUNTER: TableDefinition<&str, u32> = TableDefinition::new("namespace_counter");
+pub(crate) const NAMESPACE_COUNTER: TableDefinition<&str, u32> =
+    TableDefinition::new("namespace_counter");
 
 /// Serialized secondary index blobs (phase bitmaps).
 /// Key: index name string. Value: serialized bytes.
@@ -86,6 +87,19 @@ impl MetadataStore {
         let db = redb::Builder::new()
             .set_cache_size(16 * 1024 * 1024)
             .create(path)?;
+
+        // Inspect additive canonical state before any create/adoption transaction.
+        // Partial or future layouts must never be repaired into a new lineage.
+        {
+            let read = db.begin_read()?;
+            if control::validate_existing(&read)?.is_some() {
+                // An adopted store must retain its canonical tables. Do not
+                // recreate records, namespaces or the never-reused ID counter.
+                read.open_table(META_TABLE)?;
+                read.open_table(NAMESPACE_TABLE)?;
+                read.open_table(NAMESPACE_COUNTER)?;
+            }
+        }
 
         // Force-create all tables by opening them in a write transaction.
         {
@@ -374,7 +388,8 @@ impl MetadataStore {
         timestamp: i64,
         kind: AccessKind,
     ) -> Result<WriteReceipt, StorageError> {
-        let (tx, receipt) = self.prepare_access(ctx, id, timestamp, kind)?;
+        let publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        let (tx, receipt) = self.prepare_access(&publication, ctx, id, timestamp, kind)?;
         if !receipt.replayed {
             tx.commit()
                 .map_err(|source| StorageError::CommitOutcomeUnknown {
@@ -389,6 +404,7 @@ impl MetadataStore {
     // transaction at the last pre-commit boundary, without a fake backend.
     fn prepare_access(
         &self,
+        _publication: &std::sync::RwLockWriteGuard<'_, ()>,
         ctx: &MutationContext,
         id: MemoryId,
         timestamp: i64,
@@ -1702,6 +1718,225 @@ mod tests {
         id
     }
 
+    #[test]
+    fn integration_access_receipt_cannot_be_overwritten_by_a_paused_sweep() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let (_dir, store) = open_store();
+        let id = insert(&store, 1, 0, &[]);
+        let ctx = MutationContext::unkeyed(NamespaceId::new(1));
+        let store = Arc::new(store);
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let sweeping = store.clone();
+        let sweep = std::thread::spawn(move || {
+            sweeping
+                .decay_sweep(|record| {
+                    snapshot_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                    let mut updated = record.clone();
+                    updated.phase = DecayPhase::Summary;
+                    Some(updated)
+                })
+                .unwrap()
+        });
+        snapshot_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let accessing = store.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let access = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let receipt = accessing
+                .update_access_with_receipt(&ctx, id, 123, AccessKind::DirectRetrieval)
+                .unwrap();
+            done_tx.send(()).unwrap();
+            receipt
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let blocked = done_rx.recv_timeout(Duration::from_millis(100)).is_err();
+        resume_tx.send(()).unwrap();
+        assert_eq!(sweep.join().unwrap(), 1);
+        let receipt = access.join().unwrap();
+        assert!(
+            blocked,
+            "access committed while sweep could still overwrite its record"
+        );
+        let record = store.get(id).unwrap().unwrap();
+        assert_eq!(record.phase, DecayPhase::Summary);
+        assert_eq!(record.last_accessed_at, 123);
+        assert_eq!(record.access_history.len(), 1);
+        assert_eq!(store.ids_in_phase(DecayPhase::Summary).unwrap(), vec![id]);
+        assert_eq!(
+            receipt.committed_generation,
+            store.control_state().unwrap().committed_generation
+        );
+    }
+
+    #[test]
+    fn integration_control_partial_table_sets_never_initialize_missing_tables() {
+        use redb::TableHandle;
+        for mask in 1..7 {
+            let (dir, store) = open_store();
+            let tx = store.db.begin_write().unwrap();
+            if mask & 1 == 0 {
+                tx.delete_table(control::CONTROL).unwrap();
+            }
+            if mask & 2 == 0 {
+                tx.delete_table(control::RECEIPTS).unwrap();
+            }
+            if mask & 4 == 0 {
+                tx.delete_table(control::KEYS).unwrap();
+            }
+            tx.commit().unwrap();
+            let before: Vec<_> = store
+                .db
+                .begin_read()
+                .unwrap()
+                .list_tables()
+                .unwrap()
+                .map(|t| t.name().to_owned())
+                .collect();
+            drop(store);
+            assert!(
+                MetadataStore::open(&dir.path().join("meta.db")).is_err(),
+                "mask {mask}"
+            );
+            let db = Database::open(dir.path().join("meta.db")).unwrap();
+            let after: Vec<_> = db
+                .begin_read()
+                .unwrap()
+                .list_tables()
+                .unwrap()
+                .map(|t| t.name().to_owned())
+                .collect();
+            assert_eq!(after, before);
+        }
+    }
+
+    #[test]
+    fn integration_adopted_control_never_recreates_missing_canonical_tables() {
+        for missing in ["memories", "namespaces", "namespace_counter"] {
+            let (dir, store) = open_store();
+            let tx = store.db.begin_write().unwrap();
+            match missing {
+                "memories" => {
+                    tx.delete_table(META_TABLE).unwrap();
+                }
+                "namespaces" => {
+                    tx.delete_table(NAMESPACE_TABLE).unwrap();
+                }
+                "namespace_counter" => {
+                    tx.delete_table(NAMESPACE_COUNTER).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            tx.commit().unwrap();
+            drop(store);
+            assert!(
+                MetadataStore::open(&dir.path().join("meta.db")).is_err(),
+                "{missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_control_versions_types_and_receipt_references_fail_before_open() {
+        for mode in [
+            "receipt_type",
+            "key_type",
+            "multimap",
+            "extra_state",
+            "receipt_version",
+            "hash_version",
+            "future_generation",
+            "wrong_lineage",
+            "wrong_operation",
+            "missing_receipt",
+            "foreign_scope",
+        ] {
+            let (dir, store) = open_store();
+            let id = insert(&store, 1, 0, &[]);
+            let ctx = keyed_context(&store, 1, "original");
+            let receipt = store
+                .update_access_with_receipt(&ctx, id, 123, AccessKind::DirectRetrieval)
+                .unwrap();
+            let key =
+                control::scoped_key(receipt.store_id, ctx.scope, receipt.operation_id.as_bytes());
+            let tx = store.db.begin_write().unwrap();
+            match mode {
+                "receipt_type" => {
+                    tx.delete_table(control::RECEIPTS).unwrap();
+                    tx.open_table(redb::TableDefinition::<u64, u64>::new("mutation_receipts"))
+                        .unwrap();
+                }
+                "key_type" => {
+                    tx.delete_table(control::KEYS).unwrap();
+                    tx.open_table(redb::TableDefinition::<u64, u64>::new("mutation_keys"))
+                        .unwrap();
+                }
+                "multimap" => {
+                    tx.delete_table(control::CONTROL).unwrap();
+                    tx.open_multimap_table(redb::MultimapTableDefinition::<u64, u64>::new(
+                        "canonical_control",
+                    ))
+                    .unwrap();
+                }
+                "extra_state" => {
+                    tx.open_table(control::CONTROL)
+                        .unwrap()
+                        .insert("unexpected", b"{}".as_slice())
+                        .unwrap();
+                }
+                "missing_receipt" => {
+                    tx.open_table(control::RECEIPTS)
+                        .unwrap()
+                        .remove(key.as_slice())
+                        .unwrap();
+                }
+                "foreign_scope" => {
+                    let wrong = control::scoped_key(
+                        receipt.store_id,
+                        MutationScope::Namespace(NamespaceId::new(2)),
+                        b"foreign",
+                    );
+                    tx.open_table(control::KEYS)
+                        .unwrap()
+                        .insert(wrong.as_slice(), key.as_slice())
+                        .unwrap();
+                }
+                _ => {
+                    let mut table = tx.open_table(control::RECEIPTS).unwrap();
+                    let mut stored: control::StoredReceipt =
+                        control::decode(table.get(key.as_slice()).unwrap().unwrap().value())
+                            .unwrap();
+                    match mode {
+                        "receipt_version" => stored.receipt.receipt_version = 2,
+                        "hash_version" => stored.request_hash_version = 2,
+                        "future_generation" => {
+                            stored.receipt.committed_generation = control::Generation::MAX
+                        }
+                        "wrong_lineage" => stored.receipt.store_id = uuid::Uuid::new_v4(),
+                        "wrong_operation" => stored.receipt.operation_id = uuid::Uuid::new_v4(),
+                        _ => unreachable!(),
+                    }
+                    table
+                        .insert(key.as_slice(), control::encode(&stored).unwrap().as_slice())
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            assert!(
+                control::validate_existing(&store.db.begin_read().unwrap()).is_err(),
+                "{mode}"
+            );
+            drop(store);
+            assert!(
+                MetadataStore::open(&dir.path().join("meta.db")).is_err(),
+                "{mode}"
+            );
+        }
+    }
+
     fn keyed_context(store: &MetadataStore, namespace_id: u32, key: &str) -> MutationContext {
         let state = store.control_state().unwrap();
         MutationContext {
@@ -1720,10 +1955,12 @@ mod tests {
         let ctx = keyed_context(&store, 1, "abort");
         let before = store.control_state().unwrap();
         // All three writes have been staged in the real redb transaction.
+        let publication = store.publication.write().unwrap();
         let (tx, abandoned) = store
-            .prepare_access(&ctx, id, 123, AccessKind::DirectRetrieval)
+            .prepare_access(&publication, &ctx, id, 123, AccessKind::DirectRetrieval)
             .unwrap();
         drop(tx);
+        drop(publication);
         drop(store);
         let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
         assert_eq!(store.control_state().unwrap(), before);
