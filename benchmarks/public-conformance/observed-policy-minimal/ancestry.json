@@ -1,0 +1,24 @@
+{
+  "branch": "impl/observed-consumer-join",
+  "excluded": {
+    "098a182": "098a182a88d9b9bafd3ba685b41a9d05fd6656ee",
+    "159f987": "159f987233080b78c28e3d29a0c77646a1da5c11",
+    "75882c3": "75882c3d8e2f00a632ad5c76c6261b4cf1a5b023",
+    "7fb2769": "7fb27693dca69866eb616ba2ae27e41293d44cca",
+    "c425a5d": "c425a5d4df158e2659ecfa674ea9b422e5e9dc2b",
+    "e64930d": "e64930df6c7a944a144c930fc68fc50497d4c9cd",
+    "faf0f81": "faf0f810ecbe8d2a2d324057d64d32c24d6d0f94"
+  },
+  "fixtureOrigin": "62dbd44df2c097681613900e23fccdbd0dbf14b3",
+  "note": "#57 includes its actual restore/provenance ancestry; no broad/catalog/export/evaluation/entity-rebuild parent.",
+  "overlayOnlyFile": "src/search/strength_tests.rs",
+  "overlayOrigin": "3deecca70beaa8b63cee836419f77e6c9abeb11d",
+  "required": {
+    "129b701": "129b701e590cfef39ba51cc6ac467725510e4cd9",
+    "3b590fb": "3b590fb28c84bb2aa2d8afaac66e34556d7da6a6",
+    "74c9bfb": "74c9bfbff86a29635ecfafa7914c51f9527dad68",
+    "9ebe082": "9ebe08242290f811ad98d250b055ec96d49dee0f",
+    "e7fd455": "e7fd45573b7ba2de4fd216a208f7981a0a8c8c2d"
+  },
+  "sourceCommit": "424ea7a3baf94c765f03ed751eef78dc0c029203"
+}
