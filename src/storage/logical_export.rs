@@ -21,6 +21,45 @@ use crate::model::{DecayPhase, DiskRecord, NamespaceConfig};
 const MAX_LINE: u64 = 16 * 1024 * 1024;
 const CATALOG: &str = "text_generations_v1";
 
+#[cfg(test)]
+thread_local! {
+    static TEST_AVAILABLE_SPACE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn check_staging_space(
+    parent: &Path,
+    input: &Path,
+    chunks: u64,
+    vector_slack: u64,
+) -> Result<(), StorageError> {
+    // Conservative headroom, not a reservation or an exact redb growth promise.
+    // Retained input/source/old stores already consume space and are never deleted.
+    let required = std::fs::metadata(input)?
+        .len()
+        .checked_mul(2)
+        .and_then(|n| {
+            chunks
+                .checked_mul(8192)
+                .and_then(|rows| n.checked_add(rows))
+        })
+        .and_then(|n| n.checked_add(vector_slack))
+        .and_then(|n| n.checked_add(64 * 1024 * 1024))
+        .ok_or_else(|| invalid("staging space estimate overflow"))?;
+    #[cfg(test)]
+    let available = TEST_AVAILABLE_SPACE
+        .with(|v| v.take())
+        .map(Ok)
+        .unwrap_or_else(|| fs2::available_space(parent))?;
+    #[cfg(not(test))]
+    let available = fs2::available_space(parent)?;
+    if available < required {
+        return Err(invalid(&format!(
+            "insufficient staging space: estimated {required} bytes, available {available}"
+        )));
+    }
+    Ok(())
+}
+
 fn checkpoint(_point: &str) {
     #[cfg(test)]
     if std::env::var("RECALLD_IMPORT_TEST_STOP").as_deref() == Ok(_point) {
@@ -854,7 +893,17 @@ fn validate_logical_snapshot(
 /// Resume only a checksummed import belonging to this export ID. No existing
 /// destination is overwritten; an already-complete matching import is verified.
 pub fn import_store(input: &Path, destination: &Path) -> Result<ExportSummary, StorageError> {
-    let (header, summary, final_chain) = scan_stream(input, |_, _, _| Ok(()))?;
+    let mut vector_slack = 0u64;
+    let (header, summary, final_chain) = scan_stream(input, |_, chunk, _| {
+        if let Item::Namespace(ns) = &chunk.item {
+            vector_slack = vector_slack
+                .checked_add(
+                    u64::from(ns.embedding_dim) * 4 * u64::from(super::vectors::GROWTH_CHUNK),
+                )
+                .ok_or_else(|| invalid("vector staging size overflow"))?;
+        }
+        Ok(())
+    })?;
     let absolute = std::path::absolute(destination)?;
     let parent = absolute
         .parent()
@@ -873,6 +922,7 @@ pub fn import_store(input: &Path, destination: &Path) -> Result<ExportSummary, S
         validate_logical_snapshot(&snapshot, &summary)?;
         return Ok(summary);
     }
+    check_staging_space(&parent, input, summary.chunks, vector_slack)?;
     let identity: String = Sha256::digest(target.as_os_str().as_encoded_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
