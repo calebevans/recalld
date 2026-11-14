@@ -84,7 +84,7 @@ pub enum ProviderType {
 ///
 /// # Wrapping order
 ///
-/// `PrefixedProvider(CachedProvider(inner))` -- the cache layer wraps
+/// `PrefixedProvider(CachedProvider(CheckedProvider(inner)))` -- the cache layer wraps
 /// the raw provider. The outer prefix layer prepends prefixes before
 /// delegating, so cache keys contain the exact prefixed text and embedding
 /// task. Query/document tasks remain distinct even with identical prefixes.
@@ -93,6 +93,11 @@ pub async fn build_provider(
     document_prefix: &str,
     query_prefix: &str,
 ) -> Result<Box<dyn EmbeddingProvider>, EmbeddingError> {
+    if !(1..=8192).contains(&config.dimensions) {
+        return Err(EmbeddingError::Unavailable(
+            "provider dimensions must be 1..8192".into(),
+        ));
+    }
     let inner: Box<dyn EmbeddingProvider> = match config.provider {
         ProviderType::OpenAI => {
             let api_key = config
@@ -172,6 +177,11 @@ pub async fn build_provider(
             Box::new(provider)
         }
     };
+
+    if let Some(profile) = inner.profile() {
+        profile.validate().map_err(EmbeddingError::Unavailable)?;
+    }
+    let inner: Box<dyn EmbeddingProvider> = Box::new(super::runtime::CheckedProvider(inner));
 
     // Layer 1: Provider-local cache; the outer prefix layer supplies prefixed text.
     let cached: Box<dyn EmbeddingProvider> = if config.cache_embeddings {

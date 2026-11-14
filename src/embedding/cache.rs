@@ -119,6 +119,10 @@ impl EmbeddingProvider for CachedProvider {
     fn dimensions(&self) -> usize {
         self.inner.dimensions()
     }
+    fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+        self.inner.profile()
+    }
+
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }

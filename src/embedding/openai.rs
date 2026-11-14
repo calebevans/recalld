@@ -229,20 +229,7 @@ impl OpenAIProvider {
 impl EmbeddingProvider for OpenAIProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         let response = self.request_with_retry(&[text]).await?;
-        let data = response
-            .data
-            .into_iter()
-            .next()
-            .ok_or_else(|| EmbeddingError::InvalidResponse("empty response".into()))?;
-
-        if data.embedding.len() != self.dim {
-            return Err(EmbeddingError::DimensionMismatch {
-                expected: self.dim,
-                got: data.embedding.len(),
-            });
-        }
-
-        Ok(data.embedding)
+        Ok(ordered_embeddings(response.data, 1, self.dim)?.remove(0))
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
@@ -256,29 +243,7 @@ impl EmbeddingProvider for OpenAIProvider {
         for chunk in texts.chunks(2048) {
             let response = self.request_with_retry(chunk).await?;
 
-            // Response `data` items have an `index` field -- sort to
-            // guarantee output order matches input order.
-            let mut data = response.data;
-            data.sort_by_key(|d| d.index);
-
-            // Validate the number of returned embeddings matches the chunk size.
-            if data.len() != chunk.len() {
-                return Err(EmbeddingError::InvalidResponse(format!(
-                    "expected {} embeddings, got {}",
-                    chunk.len(),
-                    data.len()
-                )));
-            }
-
-            for item in data {
-                if item.embedding.len() != self.dim {
-                    return Err(EmbeddingError::DimensionMismatch {
-                        expected: self.dim,
-                        got: item.embedding.len(),
-                    });
-                }
-                all_results.push(item.embedding);
-            }
+            all_results.extend(ordered_embeddings(response.data, chunk.len(), self.dim)?);
         }
 
         Ok(all_results)
@@ -288,12 +253,49 @@ impl EmbeddingProvider for OpenAIProvider {
         self.dim
     }
 
+    fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+        Some(super::runtime::native_profile(
+            crate::model::schema::ProviderKind::Openai,
+            self.model_name(),
+            self.dimensions(),
+        ))
+    }
+
     fn model_name(&self) -> &str {
         &self.model
     }
 }
 
 // ── Request/Response types (private) ────────────────────────────────
+
+fn ordered_embeddings(
+    mut data: Vec<EmbeddingData>,
+    count: usize,
+    dimension: usize,
+) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    data.sort_by_key(|item| item.index);
+    if data.len() != count
+        || data
+            .iter()
+            .enumerate()
+            .any(|(index, item)| item.index != index)
+    {
+        return Err(EmbeddingError::InvalidResponse(
+            "embedding response indices must uniquely cover the input batch".into(),
+        ));
+    }
+    data.into_iter()
+        .map(|item| {
+            if item.embedding.len() != dimension {
+                return Err(EmbeddingError::DimensionMismatch {
+                    expected: dimension,
+                    got: item.embedding.len(),
+                });
+            }
+            Ok(item.embedding)
+        })
+        .collect()
+}
 
 #[derive(Serialize)]
 struct EmbeddingRequest<'a> {
@@ -335,4 +337,53 @@ struct ErrorDetail {
     error_type: String,
     #[allow(dead_code)]
     code: Option<String>,
+}
+
+#[cfg(test)]
+mod response_shape_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_profile_openai_real_response_fixtures_require_exact_index_cover() {
+        // Only an isolated loopback server inside the network-none test container.
+        // Exercise actual native HTTP decoding and both single/batch consumers.
+        for (indices, count, valid) in [
+            (&[1, 0][..], 2, true),
+            (&[0, 0], 2, false),
+            (&[1, 2], 2, false),
+            (&[0], 2, false),
+            (&[0, 1, 2], 2, false),
+            (&[0, 1], 1, false),
+            (&[1], 1, false),
+        ] {
+            let body = serde_json::json!({
+                "data": indices.iter().map(|&index| serde_json::json!({"index":index, "embedding":[index as f32, 1.]})).collect::<Vec<_>>(),
+                "usage": {"prompt_tokens": 1, "total_tokens": 1}
+            });
+            let app = axum::Router::new().route(
+                "/v1/embeddings",
+                axum::routing::post(move || async move { axum::Json(body) }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let provider =
+                OpenAIProvider::new("isolated-dummy-key".into(), "fixture-model".into(), Some(2))
+                    .with_base_url(format!("http://{address}"));
+            let result = if count == 1 {
+                provider.embed("one").await.map(|v| vec![v])
+            } else {
+                provider.embed_batch(&["one", "two"]).await
+            };
+            server.abort();
+            if valid {
+                assert_eq!(result.unwrap(), vec![vec![0., 1.], vec![1., 1.]]);
+            } else {
+                assert!(
+                    matches!(result, Err(EmbeddingError::InvalidResponse(_))),
+                    "{result:?}"
+                );
+            }
+        }
+    }
 }

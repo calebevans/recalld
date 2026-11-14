@@ -7,6 +7,8 @@ use crate::model::{NamespaceConfig, NamespaceId};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProfileError {
+    #[error("schema-v2 semantic serving requires participating writers; serving remains disabled")]
+    ServingDisabled,
     #[error("namespace assertion differs from the canonical namespace identity")]
     NamespaceMismatch,
     #[error("migrate the canonical namespace schema before preparing an attestation")]

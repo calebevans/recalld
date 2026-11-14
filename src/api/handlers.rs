@@ -230,7 +230,7 @@ pub async fn create_memory(
                     field: Some("embedding".into()),
                 });
             }
-            vec.clone()
+            vec.clone().into()
         }
         None => {
             // Build embedding text from summary + full_text + tags (matches MCP)
@@ -241,11 +241,13 @@ pub async fn create_memory(
             if !merged_tags.is_empty() {
                 embed_text = format!("{} {}", embed_text, merged_tags.join(" "));
             }
-            state.search.embed_text(&embed_text, ns.id).await?
+            state.search.embed_text(&embed_text, &ns).await?
         }
     };
 
-    let mut embedding = raw_embedding.clone();
+    crate::embedding::runtime::check_namespace(&ns, raw_embedding.profile.as_ref())
+        .map_err(|e| crate::embedding::EmbeddingError::Unavailable(e.to_string()))?;
+    let mut embedding = raw_embedding.values.clone();
     crate::storage::insertion::normalize_embedding(
         &mut embedding,
         ns.embedding_dim,
@@ -1522,7 +1524,7 @@ pub async fn batch_store(
                     });
                     continue;
                 }
-                vec.clone()
+                vec.clone().into()
             }
             None => {
                 let mut embed_text = match &mem_req.full_text {
@@ -1532,7 +1534,7 @@ pub async fn batch_store(
                 if !merged_tags.is_empty() {
                     embed_text = format!("{} {}", embed_text, merged_tags.join(" "));
                 }
-                match state.search.embed_text(&embed_text, ns.id).await {
+                match state.search.embed_text(&embed_text, &ns).await {
                     Ok(emb) => emb,
                     Err(e) => {
                         failed.push(BatchStoreFailure {
@@ -1546,7 +1548,17 @@ pub async fn batch_store(
             }
         };
 
-        let mut embedding = raw_embedding.clone();
+        if let Err(error) =
+            crate::embedding::runtime::check_namespace(&ns, raw_embedding.profile.as_ref())
+        {
+            failed.push(BatchStoreFailure {
+                index,
+                error: error.to_string(),
+                field: None,
+            });
+            continue;
+        }
+        let mut embedding = raw_embedding.values.clone();
         if let Err(error) = crate::storage::insertion::normalize_embedding(
             &mut embedding,
             ns.embedding_dim,
