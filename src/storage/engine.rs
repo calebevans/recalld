@@ -2129,6 +2129,27 @@ mod tests {
         assert!(db_is_intact(dir.path()), "the database was destroyed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn parent_path_aliases_share_store_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real_parent, &alias).unwrap();
+        let engine = open_engine(&alias.join("store"));
+        assert!(matches!(
+            RedbStorageEngine::open(real_parent.join("store")),
+            Err(StorageError::DatabaseLocked)
+        ));
+        assert_eq!(
+            engine.namespace_dir("scratch").unwrap(),
+            real_parent.canonicalize().unwrap().join("store/scratch")
+        );
+        drop(engine);
+        drop(open_engine(&real_parent.join("store")));
+    }
+
     #[test]
     fn w47_only_a_single_ordinary_path_component_is_accepted() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2152,7 +2173,7 @@ mod tests {
 
         assert_eq!(
             engine.namespace_dir("scratch").expect("a plain name"),
-            dir.path().join("scratch")
+            dir.path().canonicalize().unwrap().join("scratch")
         );
     }
 
