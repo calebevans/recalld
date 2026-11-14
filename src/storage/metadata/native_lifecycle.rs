@@ -62,6 +62,34 @@ fn normalize(
     Ok(result)
 }
 impl MetadataStore {
+    /// Only for this already-validated, owned handle, under publication. Opening
+    /// the handle proves the complete receipt/schema suffix. Participating writes
+    /// preserve it atomically; an uncertain commit poisons the handle until a
+    /// strict reopen. Do not run that lifetime-history proof on each observation.
+    fn native_control_at(
+        &self,
+        read: &redb::ReadTransaction,
+    ) -> Result<ControlState, StorageError> {
+        self.ensure_available()?;
+        if !self.native_lifecycle_only {
+            return Err(StorageError::RecoveryRequired(
+                "explicit native lifecycle entry required".into(),
+            ));
+        }
+        let table = read.open_table(control::CONTROL)?;
+        if table.len()? != 1 {
+            return Err(invalid("invalid native control singleton"));
+        }
+        let value = table
+            .get("state")?
+            .ok_or_else(|| invalid("missing native control"))?;
+        let state = ControlState::decode(value.value())?;
+        if state.control_schema_version != 2 {
+            return Err(invalid("native control schema required"));
+        }
+        crate::storage::lineage::ensure_serving(read, &state)?;
+        Ok(state)
+    }
     fn native_guard(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
         if !self.native_lifecycle_only {
             return Err(StorageError::RecoveryRequired(
@@ -71,12 +99,7 @@ impl MetadataStore {
         let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
         self.ensure_available()?;
         let read = self.db.begin_read()?;
-        let state =
-            control::validate_existing(&read)?.ok_or_else(|| invalid("missing native control"))?;
-        if state.control_schema_version != 2 {
-            return Err(invalid("native control schema required"));
-        }
-        crate::storage::lineage::ensure_serving(&read, &state)?;
+        self.native_control_at(&read)?;
         Ok(guard)
     }
     pub fn capture_exposure(
@@ -172,11 +195,7 @@ impl MetadataStore {
         ids: &[MemoryId],
         policy: &NativePolicyInputs,
     ) -> Result<CapturedLifecycle, StorageError> {
-        let state =
-            control::validate_existing(read)?.ok_or_else(|| invalid("missing native control"))?;
-        if state.control_schema_version != 2 {
-            return Err(invalid("native capture requires schema 2"));
-        }
+        let state = self.native_control_at(read)?;
         let ns = {
             let table = read.open_table(NAMESPACE_TABLE)?;
             let value = table

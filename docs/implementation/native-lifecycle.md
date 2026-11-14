@@ -91,6 +91,23 @@ This entry provides no live cache/search/graph readiness assertion. Future
 online integration must publish/invalidate affected derived state and satisfy
 its admission barrier before reporting queryable success.
 
+The owned native handle runs full receipt/schema proof at open and reopen.
+Healthy capture and write admission read the current control singleton and
+serving lineage, without walking lifetime receipts. The final transaction still
+checks captured policy and record tokens; keyed replay validates the selected
+receipt. Availability is rechecked under publication. An uncertain commit
+requires strict reopen, and offline restore/migration cannot replace schema or
+lineage while this handle owns the store. No proof cache is shared across handles.
+
+This bounds receipt validation work per exposure/feedback independently of
+receipt count; B-tree lookup cost and restore-ancestry validation remain. It is
+not a latency or ordinary-serving guarantee. A test-only per-thread counter
+checks actual capture, commit and replay at growing receipt counts, then checks
+that reopen still examines history and rejects a missing old receipt without
+changing source bytes. The separate native-record integration will replace the
+raw publication guard with Halley's ticket-bearing `MutationGuard` before that
+child freezes; no second admission mechanism is introduced here.
+
 ## Typed proof and recovery
 
 Only `LifecycleExposureRecorded` and `LifecycleFeedbackApplied` extend the
