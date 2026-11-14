@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-e423ca3d07310388)
+
+running 1 test
+test storage::metadata::native_lifecycle::tests::capture_rechecks_poison_after_waiting_for_publication ... FAILED
+
+failures:
+
+---- storage::metadata::native_lifecycle::tests::capture_rechecks_poison_after_waiting_for_publication stdout ----
+
+thread 'storage::metadata::native_lifecycle::tests::capture_rechecks_poison_after_waiting_for_publication' (283) panicked at src/storage/metadata/native_lifecycle/tests.rs:1080:13:
+assertion failed: matches!(pending.join().unwrap(),Err(StorageError::RecoveryRequired(_)))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    storage::metadata::native_lifecycle::tests::capture_rechecks_poison_after_waiting_for_publication
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 667 filtered out; finished in 2.10s
+
+error: test failed, to rerun pass `--lib`

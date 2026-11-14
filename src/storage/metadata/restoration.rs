@@ -24,11 +24,10 @@ pub(crate) struct CapturedSnapshot {
     pub keys: Rows,
 }
 
-/// Read-only inspection copies metadata; caller holds stable ownership/legacy lock.
-pub(crate) fn capture(path: &Path) -> Result<CapturedSnapshot, StorageError> {
-    crate::storage::validation::validate_existing(path)?;
-    let (_copy, db) = crate::storage::validation::inspect_database(&path.join("meta.db"))?;
-    let read = db.begin_read()?;
+/// Layouts whose canonical tables have explicit consumers. Native owned open
+/// and private restore staging share this boundary; unknown tables are not
+/// silently treated as derived state.
+pub(crate) fn validate_inventory(read: &redb::ReadTransaction) -> Result<(), StorageError> {
     // Only layouts with an explicit staging consumer are supported.
     let known = [
         "memories",
@@ -55,6 +54,15 @@ pub(crate) fn capture(path: &Path) -> Result<CapturedSnapshot, StorageError> {
             "unsupported canonical restore tables; integrate their recovery consumer first".into(),
         ));
     }
+    Ok(())
+}
+
+/// Read-only inspection copies metadata; caller holds stable ownership/legacy lock.
+pub(crate) fn capture(path: &Path) -> Result<CapturedSnapshot, StorageError> {
+    crate::storage::validation::validate_existing(path)?;
+    let (_copy, db) = crate::storage::validation::inspect_database(&path.join("meta.db"))?;
+    let read = db.begin_read()?;
+    validate_inventory(&read)?;
     let control = control::validate_existing(&read)?.ok_or_else(|| {
         StorageError::RecoveryRequired(
             "restore requires explicit offline migration of legacy control/ledger".into(),

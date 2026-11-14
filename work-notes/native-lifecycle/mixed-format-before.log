@@ -1,0 +1,22 @@
+   Compiling recalld v1.0.0 (/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.02s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-e423ca3d07310388)
+
+running 1 test
+test storage::metadata::native_lifecycle::tests::mixed_format_rejected_before_either_writable_entry ... FAILED
+
+failures:
+
+---- storage::metadata::native_lifecycle::tests::mixed_format_rejected_before_either_writable_entry stdout ----
+
+thread 'storage::metadata::native_lifecycle::tests::mixed_format_rejected_before_either_writable_entry' (276) panicked at src/storage/metadata/native_lifecycle/tests.rs:583:9:
+generic writable entry accepted mixed format case 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    storage::metadata::native_lifecycle::tests::mixed_format_rejected_before_either_writable_entry
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 662 filtered out; finished in 1.07s
+
+error: test failed, to rerun pass `--lib`

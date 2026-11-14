@@ -1,0 +1,22 @@
+   Compiling recalld v1.0.0 (/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.88s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-e423ca3d07310388)
+
+running 14 tests
+test storage::metadata::native_lifecycle::tests::capture_rechecks_poison_after_waiting_for_publication ... ok
+test storage::metadata::native_lifecycle::tests::abandoned_real_transaction_and_invalid_inputs_leave_records_receipts_and_history_unchanged ... ok
+test storage::metadata::native_lifecycle::tests::concurrent_identical_key_commits_once_and_other_key_gets_record_conflict ... ok
+test storage::metadata::native_lifecycle::tests::malformed_native_proof_and_missing_suffix_fail_read_only_inspection ... ok
+test storage::metadata::native_lifecycle::tests::mixed_native_policy_history_survives_rollback_copy_and_stale_policy_retry ... ok
+test storage::metadata::native_lifecycle::tests::mixed_format_rejected_before_either_writable_entry ... ok
+test storage::metadata::native_lifecycle::tests::native_contract_one_rejects_feedback_and_exposure_without_bytes_or_time_change ... ok
+test storage::metadata::native_lifecycle::tests::native_entry_excludes_other_owners_legacy_stores_and_unparticipating_writers ... ok
+test storage::metadata::native_lifecycle::tests::native_backup_fork_preserves_receipts_applies_later_deletion_and_blocks_historical_writes ... ok
+test storage::metadata::native_lifecycle::tests::real_native_exposure_and_feedback_obey_both_policies_and_one_clock ... ok
+test storage::metadata::native_lifecycle::tests::replay_precedes_stale_tokens_policy_and_clock_but_not_lineage_or_payload ... ok
+test storage::metadata::native_lifecycle::tests::source_tokens_and_bad_clock_reject_before_batch_mutation ... ok
+test storage::metadata::native_lifecycle::tests::summary_feedback_stays_stripped_and_permastore_sticky_under_clock_regression ... ok
+test storage::metadata::native_lifecycle::tests::uncertain_real_commit_poisoning_requires_reopen_then_reconciles_without_reapplying ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 654 filtered out; finished in 25.38s
+

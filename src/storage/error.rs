@@ -8,6 +8,11 @@ use crate::model::error::DecodeError;
 /// Errors from storage operations (metadata, vectors, text, edges).
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("LIFECYCLE_CONFLICT: {0}")]
+    LifecycleConflict(String),
+    #[error("CONTENT_UNAVAILABLE")]
+    LifecycleContentUnavailable,
+
     /// Invalid lineage, key, version, or generation encoding.
     #[error("invalid mutation context: {0}")]
     InvalidMutationContext(String),

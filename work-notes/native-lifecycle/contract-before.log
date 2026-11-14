@@ -1,0 +1,22 @@
+   Compiling recalld v1.0.0 (/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.36s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-e423ca3d07310388)
+
+running 1 test
+test storage::metadata::native_lifecycle::tests::native_contract_one_rejects_feedback_and_exposure_without_bytes_or_time_change ... FAILED
+
+failures:
+
+---- storage::metadata::native_lifecycle::tests::native_contract_one_rejects_feedback_and_exposure_without_bytes_or_time_change stdout ----
+
+thread 'storage::metadata::native_lifecycle::tests::native_contract_one_rejects_feedback_and_exposure_without_bytes_or_time_change' (277) panicked at src/storage/metadata/native_lifecycle/tests.rs:1055:5:
+assertion failed: matches!(session.apply_feedback(&context,&feedback),Err(StorageError::InvalidMutationContext(_)))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    storage::metadata::native_lifecycle::tests::native_contract_one_rejects_feedback_and_exposure_without_bytes_or_time_change
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 667 filtered out; finished in 1.76s
+
+error: test failed, to rerun pass `--lib`

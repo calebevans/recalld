@@ -8,6 +8,47 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub(crate) const SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("canonical_schema");
+
+/// Format-only startup check on the disposable metadata copy. Private migration
+/// and restore transactions may stage a new format before publishing its marker;
+/// ordinary writable open must never adopt those intermediate rows as legacy.
+pub(crate) fn validate_metadata_format(
+    read: &redb::ReadTransaction,
+    control: Option<&ControlState>,
+) -> Result<(), StorageError> {
+    use super::metadata::{META_TABLE, NAMESPACE_TABLE};
+    use redb::ReadableTable;
+    let canonical = control.is_some_and(|c| c.control_schema_version == 2);
+    let names = read
+        .list_tables()?
+        .map(|t| t.name().to_owned())
+        .collect::<Vec<_>>();
+    if names.iter().any(|n| n == NAMESPACE_TABLE.name()) {
+        for row in read.open_table(NAMESPACE_TABLE)?.iter()? {
+            let (_, value) = row?;
+            let ns = crate::model::NamespaceConfig::decode(value.value())?;
+            if ns.schema.is_some() != canonical {
+                return Err(StorageError::InvalidControl(
+                    "mixed namespace/control schema".into(),
+                ));
+            }
+        }
+    }
+    if names.iter().any(|n| n == META_TABLE.name()) {
+        for row in read.open_table(META_TABLE)?.iter()? {
+            let (_, value) = row?;
+            let record = crate::model::DiskRecord::from_bytes(value.value())?;
+            if record.schema.is_some() != canonical
+                || record.version != if canonical { 2 } else { 1 }
+            {
+                return Err(StorageError::InvalidControl(
+                    "mixed record/control schema".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServingMode {

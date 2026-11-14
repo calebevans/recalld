@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-e423ca3d07310388)
+
+running 1 test
+
+thread 'storage::metadata::native_lifecycle::tests::native_open_rejects_unknown_canonical_tables_before_writable_open' (10) panicked at src/storage/metadata/native_lifecycle/tests.rs:1227:9:
+assertion failed: MetadataStore::open_native_lifecycle(&d.path.join("meta.db")).is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test storage::metadata::native_lifecycle::tests::native_open_rejects_unknown_canonical_tables_before_writable_open ... FAILED
+
+failures:
+
+failures:
+    storage::metadata::native_lifecycle::tests::native_open_rejects_unknown_canonical_tables_before_writable_open
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 669 filtered out; finished in 1.59s
+
+error: test failed, to rerun pass `--lib`
