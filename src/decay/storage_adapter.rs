@@ -10,12 +10,13 @@ use crate::model::{DecayPhase, MemoryId, NamespaceId};
 use crate::storage::StorageEngine;
 
 /// Serialize current-layout feedback with other users of the storage lock.
-/// State and history commit together; public receipts and retry safety remain
-/// outside this legacy compatibility adapter.
+/// State, history and an unkeyed receipt commit together; cache invalidation
+/// finishes before this adapter acknowledges success.
 /// Lock order: storage only here. Do not acquire/await graph while holding this
 /// guard: sweep publication holds graph first, then acquires storage.
 pub async fn reinforce(
     storage: std::sync::Arc<std::sync::RwLock<crate::storage::RedbStorageEngine>>,
+    cache: std::sync::Arc<crate::cache::CacheManager>,
     id: MemoryId,
     quality: u8,
     global_multiplier: f64,
@@ -39,19 +40,43 @@ pub async fn reinforce(
             &super::DecayConfig::default(),
             global_multiplier,
         )?;
-        let plan = plan_feedback(&record, &policy, now_millis, quality)?;
-        if !storage
-            .apply_legacy_feedback(id, &record, &namespace, &plan)
-            .map_err(|e| LifecycleError::Storage(e.to_string()))?
-        {
-            return Err(LifecycleError::Storage(
-                "lifecycle snapshot changed before feedback commit".into(),
-            ));
-        }
-        Ok(plan)
+        plan_feedback(&record, &policy, now_millis, quality)?;
+        let receipt = storage
+            .record_legacy_feedback(
+                &crate::storage::control::MutationContext::unkeyed(namespace.id),
+                id,
+                quality,
+                now_millis,
+                global_multiplier,
+            )
+            .map_err(|e| super::observation::ObservationError::storage(e, vec![]))?;
+        super::observation::publish(&storage, std::slice::from_ref(&receipt), || {
+            tokio::runtime::Handle::current().block_on(cache.invalidate(id));
+        })?;
+        // Return canonical values, not the preflight plan: the metadata
+        // transaction is the authority even if an internal writer bypassed
+        // the outer storage lock. No historical response payload is retained.
+        let current = storage
+            .get_record(id)
+            .map_err(|e| super::observation::ObservationError::storage(e, vec![receipt.clone()]))?
+            .ok_or_else(|| {
+                super::observation::ObservationError::storage(
+                    crate::storage::StorageError::NotFound(id.into_inner()),
+                    vec![receipt.clone()],
+                )
+            })?;
+        Ok(super::lifecycle::FeedbackPlan {
+            timestamp: current.last_accessed_at,
+            stability: current.stability,
+            strength: current.strength,
+            phase: current.phase,
+            is_permastore: current.is_permastore != 0,
+        })
     })
     .await
-    .map_err(|e| LifecycleError::Storage(e.to_string()))?
+    .map_err(|e| {
+        LifecycleError::Observation(super::observation::ObservationError::worker_failed(e))
+    })?
 }
 
 /// Extract decay-relevant metadata from a `DiskRecord`, including the

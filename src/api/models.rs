@@ -151,6 +151,12 @@ pub struct ReinforceResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FindSimilarRequest {
+    /// False forbids retrieval-attributable writes; omission preserves v1 behavior.
+    #[serde(
+        rename = "recordAccess",
+        default = "crate::search::default_record_access"
+    )]
+    pub record_access: bool,
     /// Maximum number of similar memories to return. Default: 10, max: 100.
     #[serde(default = "default_similar_limit")]
     pub limit: u32,
@@ -689,4 +695,12 @@ pub struct TriggerSweepResponse {
     pub deletions: u64,
     pub saved_by_connection_bonus: u64,
     pub duration_ms: u64,
+}
+
+/// GET /memories/:id?recordAccess=false. Query strings accept true/false only.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMemoryQuery {
+    #[serde(default = "crate::search::default_record_access")]
+    pub record_access: bool,
 }

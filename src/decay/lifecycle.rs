@@ -8,6 +8,8 @@ use crate::model::{DecayPhase, DiskRecord, NamespaceConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
+    #[error(transparent)]
+    Observation(#[from] super::observation::ObservationError),
     #[error("invalid lifecycle input: {0}")]
     InvalidInput(&'static str),
     #[error("memory content is unavailable for feedback")]

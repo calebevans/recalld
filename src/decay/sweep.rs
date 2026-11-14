@@ -1731,7 +1731,8 @@ mod independent_review_regressions {
         assert_eq!(f.record(id).unwrap().last_accessed_at, 8 * DAY);
         adapter(&f, DAY)
             .record_access(id, AccessKind::DirectRetrieval)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(f.record(id).unwrap().last_accessed_at, 8 * DAY);
     }
     #[tokio::test]

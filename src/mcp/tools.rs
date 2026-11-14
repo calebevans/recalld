@@ -470,6 +470,10 @@ fn recall_memories_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "recordAccess": {
+                    "type": "boolean", "default": true,
+                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true synchronously records legacy exposure before success."
+                },
                 "query": {
                     "type": "string",
                     "description": "Natural language search query"
@@ -542,9 +546,9 @@ fn recall_memories_def() -> ToolInfo {
             "required": ["query"]
         }),
         annotations: Some(ToolAnnotations {
-            read_only_hint: Some(true),
+            read_only_hint: Some(false),
             destructive_hint: Some(false),
-            idempotent_hint: Some(true),
+            idempotent_hint: Some(false),
             open_world_hint: Some(false),
         }),
     }
@@ -640,6 +644,10 @@ fn get_memory_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "recordAccess": {
+                    "type": "boolean", "default": true,
+                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true synchronously records legacy exposure before success."
+                },
                 "id": {
                     "type": "string",
                     "description": "Memory UUID"
@@ -648,9 +656,9 @@ fn get_memory_def() -> ToolInfo {
             "required": ["id"]
         }),
         annotations: Some(ToolAnnotations {
-            read_only_hint: Some(true),
+            read_only_hint: Some(false),
             destructive_hint: Some(false),
-            idempotent_hint: Some(true),
+            idempotent_hint: Some(false),
             open_world_hint: Some(false),
         }),
     }
@@ -668,7 +676,11 @@ async fn handle_get_memory(bridge: &McpBridge, arguments: serde_json::Value) -> 
     };
     let id = crate::model::MemoryId::from_uuid(uuid);
 
-    match bridge.storage.get_memory(id).await {
+    let record_access = match args::record_access(&arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+    match bridge.storage.get_memory(id, record_access).await {
         Ok(Some(record)) => match ToolCallResult::json(&record) {
             Ok(r) => r,
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
@@ -998,6 +1010,10 @@ fn find_similar_memories_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "recordAccess": {
+                    "type": "boolean", "default": true,
+                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true synchronously records legacy exposure before success."
+                },
                 "mode": {
                     "type": "string",
                     "enum": ["single", "scan"],
@@ -1040,9 +1056,9 @@ fn find_similar_memories_def() -> ToolInfo {
             }
         }),
         annotations: Some(ToolAnnotations {
-            read_only_hint: Some(true),
+            read_only_hint: Some(false),
             destructive_hint: Some(false),
-            idempotent_hint: Some(true),
+            idempotent_hint: Some(false),
             open_world_hint: Some(false),
         }),
     }
@@ -1084,6 +1100,7 @@ async fn handle_find_similar_single(
     arguments: &serde_json::Value,
 ) -> ToolCallResult {
     let args::FindSimilarArgs {
+        record_access,
         id,
         limit,
         min_score,
@@ -1103,7 +1120,7 @@ async fn handle_find_similar_single(
 
     match bridge
         .search
-        .find_similar(id, limit, min_score, same_namespace)
+        .find_similar(id, limit, min_score, same_namespace, record_access)
         .await
     {
         Ok(hits) => {
@@ -2065,6 +2082,7 @@ mod tests {
             _: usize,
             _: Option<f32>,
             _: bool,
+            _: bool,
         ) -> Result<Vec<crate::mcp::bridge::SearchHit>, crate::mcp::bridge::BridgeError> {
             refuse!()
         }
@@ -2090,6 +2108,7 @@ mod tests {
         async fn get_memory(
             &self,
             _: crate::model::MemoryId,
+            _: bool,
         ) -> Result<Option<crate::mcp::bridge::MemoryRecord>, crate::mcp::bridge::BridgeError>
         {
             refuse!()
@@ -2248,10 +2267,9 @@ mod tests {
 
     #[test]
     fn t38_read_only_tools_declare_the_read_only_hint() {
-        const READ_ONLY: [&str; 7] = [
-            "recall_memories",
-            "get_memory",
-            "find_similar_memories",
+        // Hints describe the omitted/default mode. Recall/similarity observe
+        // synchronously by default; only explicit false opts out.
+        const READ_ONLY: [&str; 4] = [
             "namespace_stats",
             "list_memories",
             "list_namespaces",

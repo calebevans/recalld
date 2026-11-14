@@ -368,48 +368,41 @@ impl RifProcessor for RifProcessorAdapter {
 /// Adapts `RedbStorageEngine` to `AccessRecorder`.
 pub struct StorageAccessRecorder {
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: Arc<CacheManager>,
+    clock: Arc<dyn crate::time::Clock>,
 }
 
 impl StorageAccessRecorder {
-    pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
-        Self { storage }
+    pub fn new(
+        storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+        cache: Arc<CacheManager>,
+    ) -> Self {
+        Self {
+            storage,
+            cache,
+            clock: Arc::new(crate::time::SystemClock),
+        }
+    }
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
 #[async_trait]
 impl AccessRecorder for StorageAccessRecorder {
     async fn record_access(&self, id: MemoryId, kind: AccessKind) -> Result<()> {
-        let now = chrono::Utc::now().timestamp_millis();
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || {
-            let storage_r = storage
-                .read()
-                .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
-            storage_r
-                .update_access(id, now, kind)
-                .map_err(|e| SearchError::Internal(e.to_string()))
-        })
-        .await
-        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
+        self.record_access_batch(&[(id, kind)]).await
     }
-
     async fn record_access_batch(&self, accesses: &[(MemoryId, AccessKind)]) -> Result<()> {
-        let now = chrono::Utc::now().timestamp_millis();
-        let storage = self.storage.clone();
-        let accesses = accesses.to_vec();
-        tokio::task::spawn_blocking(move || {
-            let storage_r = storage
-                .read()
-                .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
-            for (id, kind) in &accesses {
-                storage_r
-                    .update_access(*id, now, *kind)
-                    .map_err(|e| SearchError::Internal(e.to_string()))?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
+        crate::decay::observation::record_exposures(
+            self.storage.clone(),
+            self.cache.clone(),
+            accesses.to_vec(),
+            self.clock.now_millis(),
+        )
+        .await?;
+        Ok(())
     }
 }
 

@@ -64,6 +64,9 @@ pub struct SearchFilter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchQuery {
+    /// Permit legacy exposure recording. False also bypasses behavioral record caches.
+    #[serde(default = "default_record_access")]
+    pub record_access: bool,
     /// Free-text query, embedded via the namespace's provider.
     #[serde(default)]
     pub text: Option<String>,
@@ -114,6 +117,11 @@ pub struct SearchQuery {
     /// Named entities provided by the caller for entity overlap scoring.
     #[serde(default)]
     pub entities: Vec<String>,
+}
+
+/// Omitted access control preserves each v1 path's existing behavior.
+pub fn default_record_access() -> bool {
+    true
 }
 
 fn default_namespace() -> String {
