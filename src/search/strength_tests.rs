@@ -882,6 +882,34 @@ impl NamespaceResolver for ByIdNamespace {
     }
 }
 
+// Pure consumer probe over a real migrated snapshot. No native exposure is
+// persisted: independently advanced retrieval timestamps require that writer.
+struct RetrievalTimestampOverlay(Arc<OfflineSnapshot>);
+impl RetrievalTimestampOverlay {
+    fn apply(record: &mut CachedRecord) {
+        record.last_accessed_at = 10 * DAY;
+        record.lifecycle.as_mut().unwrap().retrieved_at = Some(10 * DAY);
+    }
+}
+#[async_trait::async_trait]
+impl MetadataStore for RetrievalTimestampOverlay {
+    async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
+        let mut record = MetadataStore::get(self.0.as_ref(), id).await?;
+        if let Some(record) = &mut record {
+            Self::apply(record);
+        }
+        Ok(record)
+    }
+    async fn get_batch(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>> {
+        let mut records = MetadataStore::get_batch(self.0.as_ref(), ids).await?;
+        records.iter_mut().for_each(Self::apply);
+        Ok(records)
+    }
+    async fn list_namespace_memories(&self, namespace: NamespaceId) -> Result<Vec<MemoryId>> {
+        self.0.list_namespace_memories(namespace).await
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn by_id_get_projects_once_and_retains_canonical_scope_phase_and_bytes() {
     let f = offline(2, LifecycleVersion::ExplicitFeedbackV2, |_, r| {
@@ -889,13 +917,18 @@ async fn by_id_get_projects_once_and_retains_canonical_scope_phase_and_bytes() {
         r.is_permastore = 1;
         r.strength = 0.13;
         r.decay_strength = 0.23;
-        r.last_accessed_at = 10 * DAY;
-        r.schema.as_mut().unwrap().lifecycle.retrieved_at = Some(10 * DAY);
     })
     .await;
     let bytes = file_bytes(&f.files);
     let clock = CountingClock::new(DAY);
     let mut engine = engine(&f, clock.clone(), &[(0, 1, EdgeType::Associative)]);
+    let canonical = f.view.record(f.ids[0]).unwrap().unwrap().record;
+    assert_eq!(canonical.last_accessed_at, 0);
+    assert_eq!(
+        canonical.schema.as_ref().unwrap().lifecycle.retrieved_at,
+        None
+    );
+    engine.meta_store = Arc::new(RetrievalTimestampOverlay(f.view.clone()));
     let namespaces = Arc::new(ByIdNamespace {
         view: f.view.clone(),
         calls: AtomicUsize::new(0),
