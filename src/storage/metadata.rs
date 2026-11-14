@@ -87,6 +87,13 @@ impl MetadataStore {
     /// - Creates all tables on first open.
     /// - Loads or rebuilds the phase index from persisted bitmaps.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        if let Some(parent) = path.parent() {
+            if std::fs::symlink_metadata(parent.join(".recalld-importing")).is_ok() {
+                return Err(StorageError::RecoveryRequired(
+                    "incomplete logical import; resume using its original export".into(),
+                ));
+            }
+        }
         // redb's writable open changes bookkeeping. Refuse an offline v2 store
         // using a disposable inspection copy, including direct metadata callers.
         if path.try_exists()? && std::fs::metadata(path)?.len() > 0 {
