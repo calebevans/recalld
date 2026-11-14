@@ -1,0 +1,50 @@
+warning: `recalld` (lib) generated 7 warnings (run `cargo fix --lib -p recalld` to apply 2 suggestions)
+warning: `recalld` (lib test) generated 5 warnings (5 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 01s
+thread 'daemon::server::tests::actual_batch_rpc_resume_only_loads_existing_parent_and_rejects_changed_identity_without_write' (933) panicked at src/daemon/server.rs:593:9:
+assertion failed: outcome.all_ready()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'daemon::server::tests::actual_batch_rpc_keeps_reservation_and_current_unknown_child_separate' (932) panicked at src/daemon/server.rs:679:9:
+thread 'daemon::server::tests::actual_batch_rpc_keeps_reservation_and_current_unknown_child_separate' (932) panicked at src/daemon/server.rs:679:9:
+assertion `left == right` failed
+  left: NotAttempted
+ right: Unknown
+test daemon::server::tests::actual_batch_rpc_resume_only_loads_existing_parent_and_rejects_changed_identity_without_write ... FAILED
+thread 'mcp::batches::tests::caller_hash_preserves_supplied_float_bits_and_expands_fixed_defaults' (940) panicked at src/mcp/batches.rs:259:13:
+assertion `left != right` failed
+  left: [94, 161, 183, 254, 172, 211, 134, 202, 243, 164, 111, 124, 224, 153, 91, 177, 14, 251, 247, 56, 73, 167, 167, 178, 145, 61, 109, 221, 85, 241, 120, 181]
+ right: [94, 161, 183, 254, 172, 211, 134, 202, 243, 164, 111, 124, 224, 153, 91, 177, 14, 251, 247, 56, 73, 167, 167, 178, 145, 61, 109, 221, 85, 241, 120, 181]
+test mcp::batches::tests::caller_identity_includes_effective_default_scope_but_never_rebinds_explicit_scope ... ok
+thread 'mcp::bridge_adapters::batch_adapters::tests::actual_batch_mixed_results_and_changed_default_or_original_bits_conflict' (943) panicked at src/mcp/batch_adapters.rs:401:9:
+assertion `left == right` failed
+  left: (4, 0, 1, 3)
+ right: (4, 2, 2, 0)
+test mcp::bridge_adapters::batch_adapters::tests::actual_batch_mixed_results_and_changed_default_or_original_bits_conflict ... FAILED
+thread 'mcp::bridge_adapters::batch_adapters::tests::actual_mcp_retains_every_index_and_sets_error_on_committed_not_ready' (946) panicked at src/mcp/batch_adapters.rs:615:9:
+assertion `left == right` failed
+  left: (3, 0, 1, 2)
+ right: (3, 1, 1, 1)
+test mcp::bridge_adapters::batch_adapters::tests::actual_mcp_retains_every_index_and_sets_error_on_committed_not_ready ... FAILED
+thread 'mcp::bridge_adapters::batch_adapters::tests::committed_unready_child_keeps_current_receipt_and_replays_after_online_repair' (948) panicked at src/mcp/batch_adapters.rs:453:9:
+assertion `left == right` failed
+  left: (0, 0, 2)
+ right: (1, 0, 1)
+test mcp::bridge_adapters::batch_adapters::tests::committed_unready_child_keeps_current_receipt_and_replays_after_online_repair ... FAILED
+thread 'mcp::bridge_adapters::batch_adapters::tests::actual_adapter_distinguishes_unknown_reservation_child_and_error_bookkeeping' (942) panicked at src/mcp/batch_adapters.rs:500:13:
+assertion `left == right` failed
+  left: NotAttempted
+ right: Unknown
+test mcp::bridge_adapters::batch_adapters::tests::actual_adapter_distinguishes_unknown_reservation_child_and_error_bookkeeping ... FAILED
+thread 'storage::metadata::batch::tests::child_outcome_commits_with_record_and_lost_ack_reopens_without_reallocation' (956) panicked at src/storage/metadata/batch_tests.rs:104:5:
+assertion failed: matches!(error,StorageError::CommitOutcomeUnknown{operation_id,..} if
+    operation_id==p.items[0].operation_id)
+test storage::metadata::batch::tests::child_outcome_commits_with_record_and_lost_ack_reopens_without_reallocation ... FAILED
+test mcp::bridge_adapters::tests::w28_a_duplicate_id_in_one_batch_frees_its_vector_slot_once ... ok
+thread 'storage::tombstone_tests::actual_batch_tool_marks_committed_failure_as_error_and_stops_later_items' (966) panicked at src/storage/tombstone_tests.rs:539:5:
+assertion failed: encoded.contains("commitState=committed") && encoded.contains("receipt=")
+test storage::tombstone_tests::actual_batch_tool_marks_committed_failure_as_error_and_stops_later_items ... FAILED
+test storage::tombstone_tests::legacy_batch_forget_keeps_order_and_uses_receipted_namespace_children ... ok
+
+test result: FAILED. 19 passed; 9 failed; 0 ignored; 0 measured; 683 filtered out; finished in 3.21s
+error: test failed, to rerun pass `--lib`

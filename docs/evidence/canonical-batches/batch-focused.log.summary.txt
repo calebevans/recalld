@@ -1,0 +1,13 @@
+     Removed 1889 files, 5.3GiB total
+error: variant field name `kind` conflicts with internal tag
+error[E0277]: the trait bound `storage::control::MutationOutcome: serde::Serialize` is not satisfied
+error[E0277]: the trait bound `storage::control::MutationOutcome: serde::Deserialize<'de>` is not satisfied
+error[E0277]: the trait bound `storage::control::MutationOutcome: serde::Deserialize<'de>` is not satisfied
+error[E0277]: the trait bound `storage::control::MutationOutcome: serde::Deserialize<'de>` is not satisfied
+error[E0277]: the trait bound `storage::control::MutationOutcome: serde::Deserialize<'de>` is not satisfied
+error[E0277]: the trait bound `storage::control::MutationOutcome: serde::Deserialize<'de>` is not satisfied
+error[E0277]: the trait bound `storage::control::MutationOutcome: serde::Deserialize<'de>` is not satisfied
+warning: `recalld` (lib) generated 3 warnings
+error: could not compile `recalld` (lib) due to 5 previous errors; 3 warnings emitted
+warning: `recalld` (lib test) generated 3 warnings (3 duplicates)
+error: could not compile `recalld` (lib test) due to 5 previous errors; 3 warnings emitted

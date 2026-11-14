@@ -1,0 +1,10 @@
+warning: `recalld` (lib) generated 7 warnings (run `cargo fix --lib -p recalld` to apply 2 suggestions)
+warning: `recalld` (lib test) generated 5 warnings (5 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.90s
+thread 'storage::metadata::batch::tests::corrupt_batch_manifest_is_rejected_before_writable_startup_without_source_changes' (980) panicked at src/storage/metadata/batch_tests.rs:409:9:
+assertion failed: crate::storage::RedbStorageEngine::open(dir.path()).is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test storage::metadata::batch::tests::corrupt_batch_manifest_is_rejected_before_writable_startup_without_source_changes ... FAILED
+test storage::metadata::batch::tests::pending_batch_scope_never_rebinds_a_recreated_namespace_name ... ok
+test result: FAILED. 33 passed; 1 failed; 0 ignored; 0 measured; 683 filtered out; finished in 9.68s
+error: test failed, to rerun pass `--lib`
