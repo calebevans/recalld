@@ -3,6 +3,120 @@ use crate::model::EdgeType;
 use crate::storage::edges::PersistedEdge;
 use crate::storage::insertion::InsertMemory;
 
+#[cfg(test)]
+mod profile_boundary_tests {
+    use super::*;
+    use crate::embedding::runtime::tests::{bound, profile};
+    use crate::storage::StorageEngine as _;
+
+    #[test]
+    fn native_profile_legacy_insertion_remains_unverified_and_replay_precedes_profile() {
+        let fixture = crate::test_support::Fixture::new();
+        let mut engine = fixture.storage.write().unwrap();
+        let input = InsertMemory {
+            id: None,
+            summary: "legacy generated".into(),
+            full_text: None,
+            tags: vec![],
+            initial_stability: None,
+            created_at: None,
+            embedding: None,
+            parent_id: None,
+            supersedes: None,
+        };
+        let ctx = MutationContext {
+            store_id: Some(engine.control_state().unwrap().store_id),
+            idempotency_key: Some("profile-replay".into()),
+            ..MutationContext::unkeyed(NamespaceId::new(1))
+        };
+        let generation = engine.control_state().unwrap().committed_generation;
+        let mut wrong = profile();
+        wrong.dimension = 8;
+        assert!(matches!(
+            engine.insert_memory_with_profile(&ctx, &input, &[1., 0., 0., 0.], Some(&wrong), 123),
+            Err(StorageError::ProviderVectorUnavailable(_))
+        ));
+        assert_eq!(
+            engine.control_state().unwrap().committed_generation,
+            generation
+        );
+        let receipt = engine
+            .insert_memory_with_profile(&ctx, &input, &[1., 0., 0., 0.], Some(&profile()), 123)
+            .unwrap();
+        let id = crate::storage::insertion::inserted_id(&receipt).unwrap();
+        assert!(engine.get_record(id).unwrap().unwrap().schema.is_none());
+        assert!(
+            engine
+                .get_namespace_by_name("default")
+                .unwrap()
+                .unwrap()
+                .schema
+                .is_none()
+        );
+        wrong.identity_version = 99;
+        let replay = engine
+            .insert_memory_with_profile(&ctx, &input, &[f32::NAN], Some(&wrong), i64::MAX)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation_id, receipt.operation_id);
+        assert_eq!(engine.scan_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_profile_final_transaction_rechecks_canonical_binding_before_allocation() {
+        let fixture = crate::test_support::Fixture::new();
+        let mut engine = fixture.storage.write().unwrap();
+        let input = InsertMemory {
+            id: None,
+            summary: "profile boundary".into(),
+            full_text: Some("must not allocate".into()),
+            tags: vec![],
+            initial_stability: None,
+            created_at: None,
+            embedding: None,
+            parent_id: None,
+            supersedes: None,
+        };
+        let ctx = MutationContext::unkeyed(NamespaceId::new(1));
+        // Isolated fixture replaces the canonical row after an adapter could
+        // have resolved it. This is deliberately not an ordinary v2 writer API.
+        let tx = engine.meta_store().db.begin_write().unwrap();
+        tx.open_table(NAMESPACE_TABLE)
+            .unwrap()
+            .insert(1, serde_json::to_vec(&bound()).unwrap().as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+        let snapshot = || {
+            ["meta.db", "fulltext.dat", "default/vectors.dat"]
+                .map(|p| std::fs::read(fixture.path().join(p)).unwrap())
+        };
+        let before = snapshot();
+        let generation = engine.control_state().unwrap().committed_generation;
+        let mut wrong = profile();
+        wrong.query_preprocessing.prefix = "same dimension, different space".into();
+        for (descriptor, message) in [
+            (Some(&wrong), "profile differs"),
+            (Some(&profile()), "serving remains disabled"),
+            (None, "provenance is unknown"),
+        ] {
+            let error = engine
+                .insert_memory_with_profile(&ctx, &input, &[1., 0., 0., 0.], descriptor, 123)
+                .unwrap_err();
+            assert!(
+                matches!(error, StorageError::RecoveryRequired(_)),
+                "{error}"
+            );
+            assert!(error.to_string().contains(message), "{error}");
+            assert_eq!(
+                engine.control_state().unwrap().committed_generation,
+                generation
+            );
+            assert!(engine.scan_all().unwrap().is_empty());
+            assert_eq!(snapshot(), before);
+        }
+    }
+}
+
 impl MetadataStore {
     pub(crate) fn lookup_insert_replay(
         &self,
@@ -24,6 +138,7 @@ impl MetadataStore {
         input: &InsertMemory,
         sampled_at: i64,
         embedding: &[f32],
+        profile: Option<&crate::model::schema::EmbeddingProfile>,
         existing_edges: &[PersistedEdge],
         stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord, &[f32]) -> Result<(), StorageError>,
     ) -> Result<WriteReceipt, StorageError> {
@@ -55,6 +170,14 @@ impl MetadataStore {
         if config.id != namespace {
             return Err(StorageError::MutationNamespaceMismatch);
         }
+        crate::embedding::runtime::check_namespace(&config, profile).map_err(|e| {
+            if config.schema.is_some() {
+                // Preserve the existing schema writer-gate error classification.
+                StorageError::RecoveryRequired(e.to_string())
+            } else {
+                StorageError::ProviderVectorUnavailable(e.to_string())
+            }
+        })?;
         if config.schema.is_some() || control::read_control(&tx)?.control_schema_version != 1 {
             return Err(StorageError::RecoveryRequired(
                 "schema-v2 insertion requires participating writers; serving remains disabled"

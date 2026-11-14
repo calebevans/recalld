@@ -89,9 +89,10 @@ impl state::SearchPipeline for SearchPipelineAdapter {
     async fn embed_text(
         &self,
         text: &str,
-        _namespace_id: NamespaceId,
-    ) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
-        self.embedding.embed(text).await
+        namespace: &NamespaceConfig,
+    ) -> Result<crate::embedding::runtime::GeneratedEmbedding, crate::embedding::EmbeddingError>
+    {
+        crate::embedding::runtime::generate(self.embedding.as_ref(), namespace, text).await
     }
 
     async fn search(
@@ -393,7 +394,7 @@ impl state::StorageEngine for StorageEngineAdapter {
         &self,
         namespace_id: NamespaceId,
         input: crate::storage::insertion::InsertMemory,
-        generated_embedding: Vec<f32>,
+        generated_embedding: crate::embedding::runtime::GeneratedEmbedding,
     ) -> Result<crate::storage::insertion::InsertResult, crate::storage::StorageError> {
         crate::derived_completion::DerivedCompletion {
             storage: self.storage.clone(),
@@ -456,7 +457,7 @@ impl state::StorageEngine for StorageEngineAdapter {
                     parent_id: None,
                     supersedes: None,
                 },
-                vec![],
+                vec![].into(),
             )
             .await?;
         result.record.ok_or_else(|| {
@@ -1400,7 +1401,7 @@ mod tests {
                 .unwrap()
                 .committed_generation;
             let error = match adapter(&fx)
-                .insert_memory(NamespaceId::new(1), input, vec![0.; DIM])
+                .insert_memory(NamespaceId::new(1), input, vec![0.; DIM].into())
                 .await
             {
                 Ok(_) => panic!("zero vector accepted"),
@@ -1447,7 +1448,7 @@ mod tests {
                     parent_id: None,
                     supersedes: None,
                 },
-                vec![],
+                vec![].into(),
             )
             .await
         {
