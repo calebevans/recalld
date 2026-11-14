@@ -2632,6 +2632,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a4_optional_tool_arguments_preserve_no_arg_calls() {
+        use crate::mcp::protocol::LEGACY_PROTOCOL_VERSION;
+        use crate::mcp::server::{
+            McpServer,
+            tests::{initialize_request, modern_request, plain_request},
+        };
+
+        let fixture = crate::test_support::Fixture::new();
+        let mut bridge = crate::test_support::StubBridge::default().into_bridge();
+        bridge.namespaces = std::sync::Arc::new(fixture.namespace_adapter());
+        let bridge = std::sync::Arc::new(bridge);
+        for modern in [false, true] {
+            let mut server = McpServer::new(bridge.clone());
+            if !modern {
+                let response = server
+                    .handle_message(initialize_request(1, LEGACY_PROTOCOL_VERSION))
+                    .await
+                    .unwrap();
+                assert!(response.error.is_none());
+            }
+            for arguments in [None, Some(json!({})), Some(json!(null)), Some(json!([]))] {
+                let reject = arguments.as_ref().is_some_and(|value| !value.is_object());
+                let mut params = json!({"name": "list_namespaces"});
+                if let Some(arguments) = arguments {
+                    params["arguments"] = arguments;
+                }
+                let request = if modern {
+                    modern_request(2, "tools/call", params)
+                } else {
+                    plain_request(2, "tools/call", Some(params))
+                };
+                let response = server.handle_message(request).await.unwrap();
+                assert!(response.error.is_none(), "{response:?}");
+                let result = response.result.unwrap();
+                assert_eq!(
+                    result["isError"].as_bool().unwrap_or(false),
+                    reject,
+                    "modern={modern}: {result}"
+                );
+                let text = result["content"][0]["text"].as_str().unwrap();
+                if reject {
+                    assert!(text.contains("Arguments must be an object"), "{text}");
+                } else {
+                    let namespaces: serde_json::Value = serde_json::from_str(text).unwrap();
+                    assert!(
+                        namespaces
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|ns| ns["name"] == "default"),
+                        "{namespaces}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a4_object_boundary_rejects_before_any_bridge_call() {
         let bridge = crate::test_support::StubBridge::default().into_bridge();
         for name in DISPATCHED {
