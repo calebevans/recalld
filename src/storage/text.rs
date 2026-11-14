@@ -195,7 +195,7 @@ impl TextStore {
     /// Open an existing fulltext.dat, or create a new one if the file
     /// does not exist. Validates the header and sets the write
     /// position to end-of-file.
-    pub(super) fn open(path: &Path) -> Result<TextStore, StorageError> {
+    pub(crate) fn open(path: &Path) -> Result<TextStore, StorageError> {
         if path.exists() {
             // --- Open existing ---
             let mut file = OpenOptions::new().read(true).write(true).open(path)?;

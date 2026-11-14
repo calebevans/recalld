@@ -1288,7 +1288,12 @@ pub(super) async fn store_single_memory(
         embedding.clone().into(), timestamp_ms,
     ).await?;
     if result.record.is_none() {
-        return Err("committed benchmark insertion lacks its record".into());
+        return Err(crate::storage::StorageError::CommittedMutation {
+            receipt: Box::new(result.receipt),
+            source: Box::new(crate::storage::StorageError::InvalidMutation(
+                "committed benchmark insertion lacks its record".into(),
+            )),
+        }.into());
     }
 
     let entities = llm_entities.to_vec();
@@ -1587,6 +1592,8 @@ pub(super) async fn search_memories(
             ..PipelineSearchFilter::default()
         };
         let query = SearchQuery {
+            record_access: true,
+            query_embedding: None,
             text: Some(bq.query.clone()),
             fts_query: bq.fts_query.clone(),
             namespace: "default".to_string(),
@@ -1674,6 +1681,8 @@ pub(super) async fn search_memories(
                             ..PipelineSearchFilter::default()
                         };
                         let query = SearchQuery {
+                            record_access: true,
+                            query_embedding: None,
                             text: Some(bq.query.clone()),
                             fts_query: bq.fts_query.clone(),
                             namespace: "default".to_string(),

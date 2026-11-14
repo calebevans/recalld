@@ -17,6 +17,17 @@ use crate::model::{DecayPhase, MemoryId, NamespaceId};
 // Memory Endpoints
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Optional by-ID namespace assertion for GET/DELETE query parameters.
+#[derive(Debug, Default, Deserialize)]
+pub struct MemoryScopeQuery {
+    /// Omission leaves the operation scoped by its UUID.
+    #[serde(
+        default,
+        deserialize_with = "crate::mcp::args::deserialize_namespace_assertion"
+    )]
+    pub namespace: Option<String>,
+}
+
 /// POST /memories -- extended request type.
 ///
 /// Wraps CS-02's `CreateMemoryRequest` with the optional `parent_id`
@@ -135,6 +146,18 @@ pub struct ReinforceResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FindSimilarRequest {
+    /// False forbids retrieval-attributable writes; omission preserves v1 behavior.
+    #[serde(
+        rename = "recordAccess",
+        default = "crate::search::default_record_access"
+    )]
+    pub record_access: bool,
+    /// Assert the source memory's canonical namespace; omission uses record scope.
+    #[serde(
+        default,
+        deserialize_with = "crate::mcp::args::deserialize_namespace_assertion"
+    )]
+    pub namespace: Option<String>,
     /// Maximum number of similar memories to return. Default: 10, max: 100.
     #[serde(default = "default_similar_limit")]
     pub limit: u32,
@@ -695,4 +718,18 @@ pub struct TriggerSweepResponse {
     pub deletions: u64,
     pub saved_by_connection_bonus: u64,
     pub duration_ms: u64,
+}
+
+/// GET /memories/:id?recordAccess=false. Query strings accept true/false only.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMemoryQuery {
+    /// Optional assertion of canonical record scope.
+    #[serde(
+        default,
+        deserialize_with = "crate::mcp::args::deserialize_namespace_assertion"
+    )]
+    pub namespace: Option<String>,
+    #[serde(default = "crate::search::default_record_access")]
+    pub record_access: bool,
 }

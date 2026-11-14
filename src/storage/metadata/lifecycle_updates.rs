@@ -24,7 +24,8 @@ enum LegacyPatch<'a> {
 impl MetadataStore {
     /// Patch feedback state and append its legacy event in one transaction.
     /// False means the record/policy snapshot changed; nothing was committed.
-    pub fn apply_legacy_feedback(
+    #[cfg(test)]
+    pub(crate) fn apply_legacy_feedback(
         &self,
         id: MemoryId,
         expected: &DiskRecord,
@@ -37,7 +38,7 @@ impl MetadataStore {
     /// Materialize strength, optionally losing exactly one retained phase.
     /// V1 Summary->Ghost clears summary only; tags and other fields are retained.
     #[cfg(test)]
-    pub(super) fn apply_legacy_decay(
+    pub(crate) fn apply_legacy_decay(
         &self,
         id: MemoryId,
         expected: &DiskRecord,
@@ -58,6 +59,7 @@ impl MetadataStore {
         )
     }
 
+    #[cfg(test)]
     fn apply_legacy_patch(
         &self,
         id: MemoryId,
@@ -88,6 +90,7 @@ impl MetadataStore {
 
     /// Actual write preparation, shared with boundary tests that abandon the
     /// redb transaction after all fields and generation have been staged.
+    #[cfg(test)]
     fn prepare_legacy_patch(
         &self,
         _publication: &std::sync::RwLockWriteGuard<'_, ()>,
@@ -162,34 +165,9 @@ impl MetadataStore {
         let before = record.clone();
         match patch {
             LegacyPatch::Feedback(plan) => {
-                if !matches!(record.phase, DecayPhase::Full | DecayPhase::Summary)
-                    || (record.phase == DecayPhase::Summary && record.summary.is_empty())
-                {
+                if !patch_legacy_feedback(&mut record, plan)? {
                     return Ok(StagedPatch::Skipped(DecaySkip::Stale));
                 }
-                if plan.phase != record.phase
-                    || plan.timestamp < record.created_at.max(record.last_accessed_at)
-                    || !plan.stability.is_finite()
-                    || plan.stability <= 0.0
-                    || !valid_strength(plan.strength)
-                    || (record.is_permastore != 0 && !plan.is_permastore)
-                {
-                    return Err(StorageError::InvalidMutation(
-                        "invalid legacy feedback patch".into(),
-                    ));
-                }
-                record.strength = plan.strength;
-                record.decay_strength = plan.strength;
-                record.stability = plan.stability;
-                record.is_permastore = u8::from(plan.is_permastore);
-                record.last_accessed_at = plan.timestamp;
-                if record.access_history.len() >= ACCESS_HISTORY_MAX {
-                    record.access_history.remove(0);
-                }
-                record.access_history.push(AccessEvent {
-                    timestamp: plan.timestamp,
-                    kind: AccessKind::ManualReinforcement,
-                });
             }
             LegacyPatch::Decay {
                 phase,
@@ -306,6 +284,42 @@ impl MetadataStore {
         )
         .map(|result| DecayMutationResult::Committed(result.receipt))
     }
+}
+
+/// Shared patch semantics for planned legacy feedback and receipt-bearing feedback.
+pub(super) fn patch_legacy_feedback(
+    record: &mut DiskRecord,
+    plan: &FeedbackPlan,
+) -> Result<bool, StorageError> {
+    if !matches!(record.phase, DecayPhase::Full | DecayPhase::Summary)
+        || (record.phase == DecayPhase::Summary && record.summary.is_empty())
+    {
+        return Ok(false);
+    }
+    if plan.phase != record.phase
+        || plan.timestamp < record.created_at.max(record.last_accessed_at)
+        || !plan.stability.is_finite()
+        || plan.stability <= 0.0
+        || !valid_strength(plan.strength)
+        || (record.is_permastore != 0 && !plan.is_permastore)
+    {
+        return Err(StorageError::InvalidMutation(
+            "invalid legacy feedback patch".into(),
+        ));
+    }
+    record.strength = plan.strength;
+    record.decay_strength = plan.strength;
+    record.stability = plan.stability;
+    record.is_permastore = u8::from(plan.is_permastore);
+    record.last_accessed_at = plan.timestamp;
+    if record.access_history.len() >= ACCESS_HISTORY_MAX {
+        record.access_history.remove(0);
+    }
+    record.access_history.push(AccessEvent {
+        timestamp: plan.timestamp,
+        kind: AccessKind::ManualReinforcement,
+    });
+    Ok(true)
 }
 
 fn valid_strength(value: f32) -> bool {

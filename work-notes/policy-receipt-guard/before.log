@@ -1,0 +1,22 @@
+   Compiling recalld v1.0.0 (/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.78s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-e423ca3d07310388)
+
+running 1 test
+test storage::control::tests::policy_receipt_requires_canonical_schema_before_writable_startup ... FAILED
+
+failures:
+
+---- storage::control::tests::policy_receipt_requires_canonical_schema_before_writable_startup stdout ----
+
+thread 'storage::control::tests::policy_receipt_requires_canonical_schema_before_writable_startup' (284) panicked at src/storage/control.rs:641:9:
+legacy control without a canonical schema must reject policy receipts
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    storage::control::tests::policy_receipt_requires_canonical_schema_before_writable_startup
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 653 filtered out; finished in 0.15s
+
+error: test failed, to rerun pass `--lib`

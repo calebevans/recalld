@@ -43,7 +43,7 @@ async fn legacy_mcp_forget_retains_same_commit_receipt_and_ledger() {
     let fixture = Fixture::new();
     let id = fixture.insert_memory().await;
     let adapter = fixture.storage_adapter();
-    assert!(adapter.delete_memory(id).await.unwrap());
+    assert!(adapter.delete_memory(id, None).await.unwrap());
     assert_eq!(fixture.record(id).unwrap().phase, DecayPhase::Tombstone);
     drop(adapter);
     let source = fixture.close();
@@ -63,7 +63,7 @@ async fn legacy_http_forget_retains_same_commit_receipt_and_ledger() {
         fixture.entity_index.clone(),
         fixture.graph.clone(),
     );
-    assert!(adapter.delete_memory(id).await.unwrap());
+    assert!(adapter.delete_memory(id, None).await.unwrap());
     drop(adapter);
     let source = fixture.close();
     assert_tombstone_receipt(source.path(), id);
@@ -98,7 +98,7 @@ async fn forget_reports_committed_not_ready_when_derived_publication_fails() {
     *fixture.vector_index.write().await = crate::search::FlatVectorIndex::new(DIM + 1);
     let adapter = fixture.storage_adapter();
     assert!(
-        adapter.delete_memory(forgotten).await.is_err(),
+        adapter.delete_memory(forgotten, None).await.is_err(),
         "canonical commit must not return ready success when derived publication cannot complete"
     );
     let pending = fixture
@@ -458,7 +458,7 @@ async fn forget_retains_structural_edges_but_removes_live_search_payload() {
             .unwrap();
     }
     let adapter = fixture.storage_adapter();
-    assert!(adapter.delete_memory(id).await.unwrap());
+    assert!(adapter.delete_memory(id, None).await.unwrap());
     let engine = fixture.storage.read().unwrap();
     assert_eq!(engine.load_all_edges().unwrap(), vec![edge]);
     let record = engine.get_record(id).unwrap().unwrap();
@@ -491,7 +491,7 @@ async fn http_forget_error_carries_committed_receipt_and_503() {
         fixture.graph.clone(),
     );
     let response =
-        crate::api::AppError::from(adapter.delete_memory(id).await.unwrap_err()).into_response();
+        crate::api::AppError::from(adapter.delete_memory(id, None).await.unwrap_err()).into_response();
     assert_eq!(
         response.status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
@@ -507,7 +507,7 @@ async fn http_forget_error_carries_committed_receipt_and_503() {
     assert_eq!(fixture.record(id).unwrap().phase, DecayPhase::Tombstone);
     // Retrying the legacy operation completes the existing work before false.
     *fixture.vector_index.write().await = crate::search::FlatVectorIndex::new(DIM);
-    assert!(!adapter.delete_memory(id).await.unwrap());
+    assert!(!adapter.delete_memory(id, None).await.unwrap());
     assert!(
         fixture
             .storage

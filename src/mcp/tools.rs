@@ -471,6 +471,10 @@ fn recall_memories_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "recordAccess": {
+                    "type": "boolean", "default": true,
+                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true synchronously records legacy exposure before success."
+                },
                 "query": {
                     "type": "string",
                     "description": "Natural language search query"
@@ -641,6 +645,11 @@ fn get_memory_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "recordAccess": {
+                    "type": "boolean", "default": true,
+                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true synchronously records legacy exposure before success."
+                },
+                "namespace": {"type": "string", "description": "Optional assertion of the record's namespace. Mismatch fails before effects; omitted uses the record scope, regardless of session default. Null is invalid."},
                 "id": {
                     "type": "string",
                     "description": "Memory UUID"
@@ -649,15 +658,20 @@ fn get_memory_def() -> ToolInfo {
             "required": ["id"]
         }),
         annotations: Some(ToolAnnotations {
-            read_only_hint: Some(true),
+            read_only_hint: Some(false),
             destructive_hint: Some(false),
-            idempotent_hint: Some(true),
+            idempotent_hint: Some(false),
             open_world_hint: Some(false),
         }),
     }
 }
 
 async fn handle_get_memory(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
+    let namespace = match args::parse_namespace_assertion(&arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+
     let id_str = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return ToolCallResult::error("Missing required parameter: id"),
@@ -669,7 +683,15 @@ async fn handle_get_memory(bridge: &McpBridge, arguments: serde_json::Value) -> 
     };
     let id = crate::model::MemoryId::from_uuid(uuid);
 
-    match bridge.storage.get_memory(id).await {
+    let record_access = match args::record_access(&arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+    match bridge
+        .storage
+        .get_memory(id, record_access, namespace)
+        .await
+    {
         Ok(Some(record)) => match ToolCallResult::json(&record) {
             Ok(r) => r,
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
@@ -695,6 +717,7 @@ fn reinforce_memory_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "namespace": {"type": "string", "description": "Optional assertion of the record's namespace. Mismatch fails before effects; omitted uses the record scope, regardless of session default. Null is invalid."},
                 "id": {
                     "type": "string",
                     "description": "Memory UUID to reinforce"
@@ -722,6 +745,11 @@ async fn handle_reinforce_memory(
     bridge: &McpBridge,
     arguments: serde_json::Value,
 ) -> ToolCallResult {
+    let namespace = match args::parse_namespace_assertion(&arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+
     let id_str = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return ToolCallResult::error("Missing required parameter: id"),
@@ -738,7 +766,11 @@ async fn handle_reinforce_memory(
         Err(e) => return ToolCallResult::error(e.to_string()),
     };
 
-    match bridge.storage.reinforce_memory(id, quality).await {
+    match bridge
+        .storage
+        .reinforce_memory(id, quality, namespace)
+        .await
+    {
         Ok(result) => match ToolCallResult::json(&result) {
             Ok(r) => r,
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
@@ -771,6 +803,7 @@ fn forget_memory_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "namespace": {"type": "string", "description": "Optional assertion of the record's namespace. Mismatch fails before effects; omitted uses the record scope, regardless of session default. Null is invalid."},
                 "id": {
                     "type": "string",
                     "description": "Memory UUID to forget. The memory moves to the \
@@ -790,6 +823,11 @@ fn forget_memory_def() -> ToolInfo {
 }
 
 async fn handle_forget_memory(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
+    let namespace = match args::parse_namespace_assertion(&arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+
     let id_str = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return ToolCallResult::error("Missing required parameter: id"),
@@ -801,7 +839,7 @@ async fn handle_forget_memory(bridge: &McpBridge, arguments: serde_json::Value) 
     };
     let id = crate::model::MemoryId::from_uuid(uuid);
 
-    match bridge.storage.delete_memory(id).await {
+    match bridge.storage.delete_memory(id, namespace).await {
         Ok(deleted) => {
             let response = json!({
                 "id": id_str,
@@ -999,6 +1037,10 @@ fn find_similar_memories_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "recordAccess": {
+                    "type": "boolean", "default": true,
+                    "description": "False disables retrieval access writes and behavioral record caches. Omitted/true synchronously records legacy exposure before success."
+                },
                 "mode": {
                     "type": "string",
                     "enum": ["single", "scan"],
@@ -1011,7 +1053,7 @@ fn find_similar_memories_def() -> ToolInfo {
                 },
                 "namespace": {
                     "type": ["string", "null"],
-                    "description": "Namespace for \"scan\" mode; omitted or null uses the configured session default, then \"default\". Ignored in \"single\" mode, which uses the source record namespace."
+                    "description": "Scan scope (omitted/null uses session default); in single mode an optional assertion against the source record namespace, checked before effects. Omit for record scope; null is invalid in single mode."
                 },
                 "limit": {
                     "type": "integer",
@@ -1041,9 +1083,9 @@ fn find_similar_memories_def() -> ToolInfo {
             }
         }),
         annotations: Some(ToolAnnotations {
-            read_only_hint: Some(true),
+            read_only_hint: Some(false),
             destructive_hint: Some(false),
-            idempotent_hint: Some(true),
+            idempotent_hint: Some(false),
             open_world_hint: Some(false),
         }),
     }
@@ -1084,7 +1126,13 @@ async fn handle_find_similar_single(
     bridge: &McpBridge,
     arguments: &serde_json::Value,
 ) -> ToolCallResult {
+    let namespace = match args::parse_namespace_assertion(arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+
     let args::FindSimilarArgs {
+        record_access,
         id,
         limit,
         min_score,
@@ -1104,7 +1152,14 @@ async fn handle_find_similar_single(
 
     match bridge
         .search
-        .find_similar(id, limit, min_score, same_namespace)
+        .find_similar(
+            id,
+            limit,
+            min_score,
+            same_namespace,
+            record_access,
+            namespace,
+        )
         .await
     {
         Ok(hits) => {
@@ -2052,6 +2107,8 @@ mod tests {
             _: usize,
             _: Option<f32>,
             _: bool,
+            _: bool,
+            _namespace: Option<&str>,
         ) -> Result<Vec<crate::mcp::bridge::SearchHit>, crate::mcp::bridge::BridgeError> {
             refuse!()
         }
@@ -2077,6 +2134,8 @@ mod tests {
         async fn get_memory(
             &self,
             _: crate::model::MemoryId,
+            _: bool,
+            _namespace: Option<&str>,
         ) -> Result<Option<crate::mcp::bridge::MemoryRecord>, crate::mcp::bridge::BridgeError>
         {
             refuse!()
@@ -2084,6 +2143,7 @@ mod tests {
         async fn delete_memory(
             &self,
             _: crate::model::MemoryId,
+            _namespace: Option<&str>,
         ) -> Result<bool, crate::mcp::bridge::BridgeError> {
             refuse!()
         }
@@ -2097,6 +2157,7 @@ mod tests {
             &self,
             _: crate::model::MemoryId,
             _: u8,
+            _namespace: Option<&str>,
         ) -> Result<crate::mcp::bridge::ReinforceResult, crate::mcp::bridge::BridgeError> {
             refuse!()
         }
@@ -2235,9 +2296,9 @@ mod tests {
 
     #[test]
     fn t38_read_only_tools_declare_the_read_only_hint() {
-        const READ_ONLY: [&str; 6] = [
-            "get_memory",
-            "find_similar_memories",
+        // Hints describe the omitted/default mode. Recall/similarity observe
+        // synchronously by default; only explicit false opts out.
+        const READ_ONLY: [&str; 4] = [
             "namespace_stats",
             "list_memories",
             "list_namespaces",
@@ -2708,17 +2769,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a4_mcp_get_does_not_change_the_record() {
+    async fn a4_mcp_get_false_is_unchanged_and_default_observes_once() {
         let fixture = crate::test_support::Fixture::new();
         let id = fixture.insert_memory().await;
         let mut bridge = crate::test_support::StubBridge::default().into_bridge();
         bridge.storage = std::sync::Arc::new(fixture.storage_adapter());
         let before = format!("{:?}", fixture.record(id).unwrap());
         for _ in 0..2 {
-            let result = dispatch_tool(&bridge, "get_memory", json!({"id": id.to_string()})).await;
+            let result = dispatch_tool(
+                &bridge,
+                "get_memory",
+                json!({"id": id.to_string(), "recordAccess": false}),
+            )
+            .await;
             assert_ne!(result.is_error, Some(true));
             assert_eq!(before, format!("{:?}", fixture.record(id).unwrap()));
         }
+        let count = fixture.record(id).unwrap().access_history.len();
+        let result = dispatch_tool(&bridge, "get_memory", json!({"id": id.to_string()})).await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(fixture.record(id).unwrap().access_history.len(), count + 1);
     }
 
     #[test]
@@ -2748,7 +2818,14 @@ mod tests {
             };
             if let Some(namespace) = properties.get("namespace") {
                 assert!(namespace.get("default").is_none(), "{}", def.name);
-                assert_eq!(namespace["type"], json!(["string", "null"]));
+                let expected_type = if ["get_memory", "reinforce_memory", "forget_memory"]
+                    .contains(&def.name.as_str())
+                {
+                    json!("string")
+                } else {
+                    json!(["string", "null"])
+                };
+                assert_eq!(namespace["type"], expected_type, "{}", def.name);
             }
         }
         let schema = create_namespace_def().input_schema;

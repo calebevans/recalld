@@ -97,6 +97,29 @@ enum Command {
         /// Legacy compatibility flag; restore requires an already stopped target
         #[arg(long)]
         no_stop_daemon: bool,
+
+        /// Restore into a fresh historical/read-only destination, excluded from serving
+        #[arg(long)]
+        historical: bool,
+    },
+
+    /// Preview or explicitly migrate an offline namespace lifecycle policy
+    Lifecycle {
+        #[arg(long)]
+        source: std::path::PathBuf,
+        /// JSON LifecycleMigrationOptions, including expected source and policy revision
+        #[arg(long)]
+        request: std::path::PathBuf,
+        /// Fresh cutover destination, or the exact destination to reconcile a retry
+        #[arg(
+            long,
+            conflicts_with = "preview_at",
+            required_unless_present = "preview_at"
+        )]
+        destination: Option<std::path::PathBuf>,
+        /// Read-only preview at this Unix timestamp in milliseconds
+        #[arg(long, allow_hyphen_values = true)]
+        preview_at: Option<i64>,
     },
 
     /// Run external benchmarks (LoCoMo, etc.)
@@ -250,7 +273,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        Command::Backup { .. } | Command::Restore { .. } => {
+        Command::Backup { .. } | Command::Restore { .. } | Command::Lifecycle { .. } => {
             if let Err(e) = init_tracing("info", false, false) {
                 eprintln!("fatal: failed to initialize tracing: {e}");
                 return ExitCode::FAILURE;
@@ -296,7 +319,51 @@ async fn async_main(cli: Cli) -> ExitCode {
             from,
             force,
             no_stop_daemon,
-        } => run_restore_command(loaded.config, from, force, no_stop_daemon).await,
+            historical,
+        } => run_restore_command(loaded.config, from, force, no_stop_daemon, historical).await,
+        Command::Lifecycle {
+            source,
+            request,
+            destination,
+            preview_at,
+        } => {
+            let result = (|| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                use recalld::storage::lifecycle_migration::{
+                    LifecycleMigrationOptions, migrate_lifecycle, preview_lifecycle,
+                };
+                let options: LifecycleMigrationOptions =
+                    serde_json::from_slice(&std::fs::read(request)?)?;
+                if let Some(destination) = destination {
+                    Ok(serde_json::to_value(migrate_lifecycle(
+                        &source,
+                        &destination,
+                        &options,
+                    )?)?)
+                } else {
+                    let clock = recalld::time::ManualClock::new(
+                        preview_at.expect("clap requires preview or destination"),
+                    );
+                    Ok(serde_json::to_value(preview_lifecycle(
+                        &source,
+                        &options,
+                        &clock,
+                        &recalld::decay::DecayConfig::default(),
+                        loaded.config.decay.decay_rate_multiplier,
+                        !loaded.config.decay.disable_sweep,
+                    )?)?)
+                }
+            })();
+            match result {
+                Ok(result) => {
+                    println!("{}", result);
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("lifecycle operation failed: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         #[cfg(feature = "bench")]
         Command::Bench { target, format } => run_bench(loaded.config, target, &format).await,
     }
@@ -462,12 +529,12 @@ async fn run_serve(
                 Arc::new(system.config().clone()),
                 true,
             )
+            .with_clock(system.clock().clone())
             .with_indexes(
                 system.vector_index().clone(),
                 system.fts_index().clone(),
                 system.entity_index().clone(),
-            )
-            .with_clock(system.clock().clone()),
+            ),
         );
         let namespaces: Arc<dyn recalld::api::NamespaceRegistry> =
             Arc::new(NamespaceRegistryAdapter::new(system.storage().clone()));
@@ -764,6 +831,7 @@ async fn run_restore_command(
     backup_path: std::path::PathBuf,
     force: bool,
     no_stop_daemon: bool,
+    historical: bool,
 ) -> ExitCode {
     use recalld::backup::{RestoreOptions, restore_from_backup};
 
@@ -774,6 +842,7 @@ async fn run_restore_command(
         data_dir,
         force,
         no_stop_daemon,
+        historical,
     };
 
     match restore_from_backup(opts).await {
@@ -781,9 +850,15 @@ async fn run_restore_command(
             eprintln!();
             eprintln!("Restore completed successfully");
             eprintln!();
-            eprintln!("Next steps:");
-            eprintln!("  1. Start the daemon: recalld daemon start");
-            eprintln!("  2. Verify data: recalld daemon status");
+            if historical {
+                eprintln!("Historical/read-only destination; ordinary serving is blocked.");
+                eprintln!(
+                    "Deletion coverage is through the available snapshot; later coverage is unknown."
+                );
+            } else {
+                eprintln!("Retained removal evidence applied; restored store has a new lineage.");
+                eprintln!("Start the daemon when ready: recalld daemon start");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

@@ -32,6 +32,9 @@ pub(crate) mod ownership;
 pub mod purge;
 #[cfg(test)]
 mod purge_tests;
+pub mod lifecycle_migration;
+pub(crate) mod lineage;
+pub(crate) mod restore_journal;
 pub mod schema_migration;
 pub mod text;
 pub mod text_migration;

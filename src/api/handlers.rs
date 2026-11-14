@@ -5,6 +5,7 @@
 //! the same pattern: extract, validate, delegate to subsystem, convert
 //! result, respond.
 
+use crate::decay::observation::Observed;
 use std::time::Instant;
 
 use axum::{
@@ -19,6 +20,7 @@ use super::errors::AppError;
 use super::models::*;
 use super::state::{AppState, QueryInput, SearchQuery};
 use crate::health::report as health_report_compute;
+use crate::model::DecayPhase;
 use crate::model::constants::{
     EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, MAX_BATCH_MEMORIES, TOPIC_TAG_PREFIX,
 };
@@ -340,39 +342,45 @@ pub async fn create_memory(
 pub async fn get_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(options): Query<GetMemoryQuery>,
 ) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
     let stamp = state.storage.effects_stamp().await?;
-    let result = get_memory_admitted(State(state.clone()), Path(id)).await;
-    if state.storage.effects_stamp().await? != stamp {
-        return Err(AppError::ServiceUnavailable {
-            message: "graph effects changed during query; retry".into(),
-        });
-    }
-    result
+    let observed = get_memory_admitted(State(state.clone()), Path(id), Query(options), stamp).await;
+    observed?.finish(check_read_admission(&state, stamp).await)
 }
 
 async fn get_memory_admitted(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
+    Query(options): Query<GetMemoryQuery>,
+    admitted_stamp: u64,
+) -> Result<Observed<Json<ApiResponse<MemoryResponse>>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
+    if let Some(namespace) = options.namespace.as_deref() {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
 
-    let record = state
-        .cache
-        .get_or_load(memory_id, state.storage.as_ref())
-        .await
-        .ok_or_else(|| AppError::NotFound {
-            resource: "memory",
-            id: id.clone(),
-        })?;
-
-    // Record access for decay tracking
-    state
-        .decay
-        .record_access(memory_id, AccessKind::DirectRetrieval)
-        .await;
+    let record = if options.record_access {
+        state
+            .cache
+            .get_or_load(memory_id, state.storage.as_ref())
+            .await
+    } else {
+        state
+            .storage
+            .get_record(memory_id)
+            .await
+            .map(|r| std::sync::Arc::new(crate::model::CachedRecord::from(&r)))
+    }
+    .ok_or_else(|| AppError::NotFound {
+        resource: "memory",
+        id: id.clone(),
+    })?;
 
     let ns_name = state
         .namespaces
@@ -380,13 +388,31 @@ async fn get_memory_admitted(
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut response = MemoryResponse::from_cached(&record, ns_name);
-    response.full_text = state.storage.get_full_text(memory_id).await.unwrap_or(None);
+    response.full_text = state.storage.get_full_text(memory_id).await?;
+    check_read_admission(&state, admitted_stamp).await?;
+    let receipts = if options.record_access && record.phase != DecayPhase::Tombstone {
+        state
+            .search
+            .record_exposures(
+                &[(memory_id, AccessKind::DirectRetrieval)],
+                crate::storage::control::ExposureScope {
+                    namespace: response.namespace.clone(),
+                    source: Some(memory_id),
+                },
+            )
+            .await?
+    } else {
+        Vec::new()
+    };
     let took = start.elapsed().as_micros() as u64;
 
-    Ok(Json(ApiResponse {
-        data: response,
-        took_us: Some(took),
-    }))
+    Ok(Observed {
+        receipts,
+        value: Json(ApiResponse {
+            data: response,
+            took_us: Some(took),
+        }),
+    })
 }
 
 /// DELETE /memories/:id -- delete a memory.
@@ -400,15 +426,25 @@ async fn get_memory_admitted(
 pub async fn delete_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(scope): Query<MemoryScopeQuery>,
 ) -> Result<Json<ApiResponse<DeleteResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
+    if let Some(namespace) = scope.namespace.as_deref() {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
 
     // Read record first for entity index cleanup (Issue 14)
     let existing_record = state.storage.get_record(memory_id).await;
 
-    let existed = state.storage.delete_memory(memory_id).await?;
+    let existed = state
+        .storage
+        .delete_memory(memory_id, scope.namespace.as_deref())
+        .await?;
     if existed {
         state.cache.remove(memory_id).await;
         state.search.remove_from_index(memory_id).await;
@@ -463,11 +499,18 @@ pub async fn reinforce_memory(
 
     let memory_id = parse_memory_id(&id)?;
 
+    let namespace = crate::mcp::args::parse_namespace_assertion(&req).map_err(argument_error)?;
+    if let Some(namespace) = namespace {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
     let quality = crate::mcp::args::parse_quality(&req).map_err(argument_error)?;
 
     let updated = state
         .decay
-        .reinforce(memory_id, quality)
+        .reinforce(memory_id, quality, namespace)
         .await
         .map_err(|e| feedback_error(e, &id))?;
 
@@ -489,6 +532,10 @@ pub async fn reinforce_memory(
 fn feedback_error(error: Box<dyn std::error::Error + Send + Sync>, id: &str) -> AppError {
     use crate::decay::lifecycle::LifecycleError;
     match error.downcast_ref::<LifecycleError>() {
+        Some(LifecycleError::Observation(error)) => AppError::Observation(error.clone()),
+        Some(LifecycleError::NamespaceMismatch(_)) => AppError::NamespaceMismatch {
+            message: error.to_string(),
+        },
         Some(LifecycleError::ContentUnavailable) => AppError::Conflict {
             message: error.to_string(),
         },
@@ -750,19 +797,15 @@ pub async fn search_memories(
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
     let stamp = state.storage.effects_stamp().await?;
-    let result = search_memories_admitted(State(state.clone()), Json(req)).await;
-    if state.storage.effects_stamp().await? != stamp {
-        return Err(AppError::ServiceUnavailable {
-            message: "graph effects changed during query; retry".into(),
-        });
-    }
-    result
+    let observed = search_memories_admitted(State(state.clone()), Json(req), stamp).await;
+    observed?.finish(check_read_admission(&state, stamp).await)
 }
 
 async fn search_memories_admitted(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
-) -> Result<Json<SearchResponse>, AppError> {
+    admitted_stamp: u64,
+) -> Result<Observed<Json<SearchResponse>>, AppError> {
     let start = Instant::now();
 
     // Validate: need at least one search signal
@@ -770,14 +813,6 @@ async fn search_memories_admitted(
         return Err(AppError::BadRequest {
             message: "at least one of 'query', 'embedding', or 'tags' must be provided".into(),
             field: None,
-        });
-    }
-
-    // Validate: query and embedding are mutually exclusive
-    if req.query.is_some() && req.embedding.is_some() {
-        return Err(AppError::UnprocessableEntity {
-            message: "'query' and 'embedding' are mutually exclusive".into(),
-            field: Some("embedding".into()),
         });
     }
 
@@ -823,16 +858,16 @@ async fn search_memories_admitted(
         }
     }
 
-    let query_input = if let Some(ref text) = req.query {
-        Some(QueryInput::Text(text.clone()))
-    } else {
-        req.embedding
-            .as_ref()
-            .map(|vec| QueryInput::Vector(vec.clone()))
+    let query_input = match (req.query, req.embedding) {
+        (Some(text), Some(embedding)) => QueryInput::TextAndVector { text, embedding },
+        (Some(text), None) => QueryInput::Text(text),
+        (None, Some(embedding)) => QueryInput::Vector(embedding),
+        (None, None) => QueryInput::Text(String::new()),
     };
 
     let search_query = SearchQuery {
-        query: query_input.unwrap_or(QueryInput::Text(String::new())),
+        record_access: req.record_access,
+        query: query_input,
         namespace_id: ns.id,
         namespace_name: ns.name.clone(),
         k: limit,
@@ -847,7 +882,7 @@ async fn search_memories_admitted(
         entities: req.entities.clone(),
     };
 
-    let results = state.search.search(search_query).await?;
+    let results = state.search.prepare_search(search_query).await?;
 
     // Batch-load embeddings with a single lock acquisition if requested.
     let embeddings = if req.include_embeddings {
@@ -859,17 +894,37 @@ async fn search_memories_admitted(
 
     // Convert to API response, loading full_text from storage
     let mut hits: Vec<SearchHit> = Vec::with_capacity(results.len());
+    let mut exposures = Vec::new();
     for r in results {
-        let ns_name = state
-            .namespaces
-            .name_for(r.memory.namespace_id)
-            .unwrap_or_else(|| "unknown".to_string());
-        let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
-        mem.full_text = state
-            .storage
-            .get_full_text(r.memory.id)
-            .await
-            .unwrap_or(None);
+        exposures.push((r.memory.id, r.access_kind));
+        let canonical =
+            state
+                .storage
+                .get_record(r.memory.id)
+                .await
+                .ok_or_else(|| AppError::NotFound {
+                    resource: "memory",
+                    id: r.memory.id.to_string(),
+                })?;
+        if canonical.namespace_id != ns.id.get()
+            || matches!(canonical.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
+        {
+            return Err(AppError::ServiceUnavailable {
+                message: "search result changed during hydration".into(),
+            });
+        }
+        let mut mem = MemoryResponse::from_cached(
+            &crate::model::CachedRecord::from(&canonical),
+            ns.name.clone(),
+        );
+        if canonical.schema.as_ref().is_some_and(|s| {
+            s.lifecycle.lifecycle_version
+                == crate::model::schema::LifecycleVersion::ExplicitFeedbackV2
+        }) {
+            mem.strength = r.memory.strength;
+            mem.decay_strength = r.memory.decay_strength;
+        }
+        mem.full_text = state.storage.get_full_text(r.memory.id).await?;
         if req.include_embeddings {
             mem.embedding = embeddings.get(&r.memory.id).cloned();
         }
@@ -879,14 +934,32 @@ async fn search_memories_admitted(
         });
     }
 
+    check_read_admission(&state, admitted_stamp).await?;
+    let receipts = if req.record_access {
+        state
+            .search
+            .record_exposures(
+                &exposures,
+                crate::storage::control::ExposureScope {
+                    namespace: ns.name.clone(),
+                    source: None,
+                },
+            )
+            .await?
+    } else {
+        Vec::new()
+    };
     let total = hits.len() as u64;
     let took = start.elapsed().as_micros() as u64;
 
-    Ok(Json(SearchResponse {
-        hits,
-        total,
-        took_us: Some(took),
-    }))
+    Ok(Observed {
+        receipts,
+        value: Json(SearchResponse {
+            hits,
+            total,
+            took_us: Some(took),
+        }),
+    })
 }
 
 /// POST /similar/:id -- find memories similar to an existing memory.
@@ -903,112 +976,118 @@ pub async fn find_similar(
     Json(req): Json<FindSimilarRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
     let stamp = state.storage.effects_stamp().await?;
-    let result = find_similar_admitted(State(state.clone()), Path(id), Json(req)).await;
-    if state.storage.effects_stamp().await? != stamp {
-        return Err(AppError::ServiceUnavailable {
-            message: "graph effects changed during query; retry".into(),
-        });
-    }
-    result
+    let observed = find_similar_admitted(State(state.clone()), Path(id), Json(req), stamp).await;
+    observed?.finish(check_read_admission(&state, stamp).await)
 }
 
 async fn find_similar_admitted(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<FindSimilarRequest>,
-) -> Result<Json<SearchResponse>, AppError> {
+    admitted_stamp: u64,
+) -> Result<Observed<Json<SearchResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
 
-    // Load source memory to get namespace
-    let source = state
-        .cache
-        .get_or_load(memory_id, state.storage.as_ref())
-        .await
-        .ok_or_else(|| AppError::NotFound {
-            resource: "memory",
-            id: id.clone(),
-        })?;
-
-    let source_embedding =
+    if let Some(namespace) = req.namespace.as_deref() {
         state
-            .search
-            .get_embedding(memory_id)
-            .ok_or_else(|| AppError::Internal {
-                source: "source memory has no indexed embedding".into(),
-            })?;
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
 
-    let limit = req.limit.min(100) as usize;
-
-    let ns_name = state
-        .namespaces
-        .name_for(source.namespace_id)
-        .unwrap_or_else(|| "default".to_string());
-
-    // Search using source embedding, requesting limit+1 to account
-    // for the source memory appearing in its own results.
-    let search_query = SearchQuery {
-        query: QueryInput::Vector(source_embedding),
-        namespace_id: source.namespace_id,
-        namespace_name: ns_name,
-        k: limit + 1,
-        include_tags: vec![],
-        exclude_tags: vec![],
-        decay_phases: None,
-        min_score: req.min_score,
-        graph_depth: 0,
-        apply_rif: false,
-        time_range_start: None,
-        time_range_end: None,
-        entities: vec![],
-    };
-
-    let results = state.search.search(search_query).await?;
-
-    // Batch-load embeddings with a single lock acquisition if requested.
+    // The shared path resolves canonical scope, removes the source and applies
+    // similarity minScore before exposure. /search minStrength is independent.
+    let results = state
+        .search
+        .prepare_similar_filtered(
+            memory_id,
+            req.limit.min(100) as usize,
+            req.min_score,
+            req.record_access,
+        )
+        .await?;
     let embeddings = if req.include_embeddings {
-        let ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id).collect();
+        let ids: Vec<_> = results.iter().map(|r| r.memory_id).collect();
         state.search.get_embeddings_batch(&ids)
     } else {
         std::collections::HashMap::new()
     };
-
-    // Exclude source memory from results, loading full_text from storage
-    let filtered: Vec<_> = results
-        .into_iter()
-        .filter(|r| r.memory.id != memory_id)
-        .take(limit)
-        .collect();
-    let mut hits: Vec<SearchHit> = Vec::with_capacity(filtered.len());
-    for r in filtered {
-        let ns_name = state
-            .namespaces
-            .name_for(r.memory.namespace_id)
-            .unwrap_or_else(|| "unknown".to_string());
-        let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
-        mem.full_text = state
-            .storage
-            .get_full_text(r.memory.id)
-            .await
-            .unwrap_or(None);
-        if req.include_embeddings {
-            mem.embedding = embeddings.get(&r.memory.id).cloned();
+    let mut hits = Vec::with_capacity(results.len());
+    for r in results {
+        let record =
+            state
+                .storage
+                .get_record(r.memory_id)
+                .await
+                .ok_or_else(|| AppError::NotFound {
+                    resource: "memory",
+                    id: r.memory_id.to_string(),
+                })?;
+        if matches!(
+            record.phase,
+            crate::model::DecayPhase::Ghost | crate::model::DecayPhase::Tombstone
+        ) {
+            return Err(AppError::ServiceUnavailable {
+                message: "similarity result changed during hydration; retry".into(),
+            });
         }
+        // Hydrate exact canonical metadata. Explicit-policy strengths are the
+        // prepared operation's projection, not persisted compatibility values.
+        let mut memory =
+            MemoryResponse::from_cached(&crate::model::CachedRecord::from(&record), r.namespace);
+        if record.schema.as_ref().is_some_and(|schema| {
+            schema.lifecycle.lifecycle_version
+                == crate::model::schema::LifecycleVersion::ExplicitFeedbackV2
+        }) {
+            memory.strength = r.retrievability;
+            memory.decay_strength = r.effective_r;
+        }
+        memory.full_text = state.storage.get_full_text(r.memory_id).await?;
+        memory.embedding = embeddings.get(&r.memory_id).cloned();
         hits.push(SearchHit {
-            memory: mem,
-            score: r.score,
+            memory,
+            score: r.score.unwrap_or(0.0),
         });
     }
+
+    // Reject read-admission drift and hydration errors before any observation.
+    if state.storage.effects_stamp().await? != admitted_stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    let receipts = if req.record_access {
+        let ids: Vec<_> = hits.iter().map(|hit| hit.memory.id).collect();
+        state
+            .search
+            .record_similar_accesses(
+                &ids,
+                crate::storage::control::ExposureScope {
+                    namespace: hits
+                        .first()
+                        .map(|h| h.memory.namespace.clone())
+                        .unwrap_or_default(),
+                    source: Some(memory_id),
+                },
+            )
+            .await?
+    } else {
+        Vec::new()
+    };
 
     let total = hits.len() as u64;
     let took = start.elapsed().as_micros() as u64;
 
-    Ok(Json(SearchResponse {
-        hits,
-        total,
-        took_us: Some(took),
-    }))
+    Ok(Observed {
+        receipts,
+        value: Json(SearchResponse {
+            hits,
+            total,
+            took_us: Some(took),
+        }),
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1938,7 +2017,7 @@ mod lifecycle_error_tests {
             if phase == DecayPhase::Tombstone {
                 f.tombstone(id);
             }
-            let error = adapter.reinforce(id, 3).await.unwrap_err();
+            let error = adapter.reinforce(id, 3, None).await.unwrap_err();
             let response = feedback_error(error, &id.to_string()).into_response();
             assert_eq!(response.status(), StatusCode::CONFLICT);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1950,7 +2029,7 @@ mod lifecycle_error_tests {
             assert_eq!(f.record(id).unwrap().last_accessed_at, 0);
         }
         let missing = MemoryId::new();
-        let error = adapter.reinforce(missing, 3).await.unwrap_err();
+        let error = adapter.reinforce(missing, 3, None).await.unwrap_err();
         assert_eq!(
             feedback_error(error, &missing.to_string())
                 .into_response()
@@ -1958,7 +2037,7 @@ mod lifecycle_error_tests {
             StatusCode::NOT_FOUND
         );
         let id = f.insert_memory().await;
-        let error = adapter.reinforce(id, 0).await.unwrap_err();
+        let error = adapter.reinforce(id, 0, None).await.unwrap_err();
         assert_eq!(
             feedback_error(error, &id.to_string())
                 .into_response()
@@ -1971,3 +2050,12 @@ mod lifecycle_error_tests {
 #[cfg(test)]
 #[path = "validation_tests.rs"]
 mod validation_tests;
+
+async fn check_read_admission(state: &AppState, stamp: u64) -> Result<(), AppError> {
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query".into(),
+        });
+    }
+    Ok(())
+}

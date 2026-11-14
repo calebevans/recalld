@@ -414,8 +414,8 @@ const MAX_CONNECTION_BONUS: f32 = 0.15;
 /// The runner holds `Arc` references to shared subsystems. It does NOT
 /// own those subsystems -- it borrows them via Arc for the background task.
 pub struct DecaySweepRunner {
-    completion: Option<crate::derived_completion::DerivedCompletion>,
     clock: Arc<dyn crate::time::Clock>,
+    completion: Option<crate::derived_completion::DerivedCompletion>,
     config: SweepConfig,
     decay_config: Arc<DecayConfig>,
     activation_config: ActivationConfig,
@@ -467,16 +467,15 @@ impl DecaySweepRunner {
         })
     }
 
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
     pub(crate) fn with_completion(
         mut self,
         completion: crate::derived_completion::DerivedCompletion,
     ) -> Self {
         self.completion = Some(completion);
-        self
-    }
-
-    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
-        self.clock = clock;
         self
     }
 
@@ -490,8 +489,8 @@ impl DecaySweepRunner {
     /// 2. Enters a loop: sleep for `interval`, then sweep
     /// 3. Exits when `shutdown()` is called
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
-        let completion = self.completion.clone();
         let clock = self.clock.clone();
+        let completion = self.completion.clone();
         let config = self.config.clone();
         let decay_config = Arc::clone(&self.decay_config);
         let activation_config = self.activation_config.clone();
@@ -1741,7 +1740,7 @@ mod independent_review_regressions {
             .unwrap()
             .committed_generation
             .get();
-        let feedback = adapter(&f, 8 * DAY).reinforce(id, 3).await.unwrap();
+        let feedback = adapter(&f, 8 * DAY).reinforce(id, 3, None).await.unwrap();
         assert_eq!(
             f.storage
                 .read()
@@ -1816,7 +1815,7 @@ mod independent_review_regressions {
                     .committed_generation
                     .get(),
                 generation + 1 + u64::from(result.compaction_triggered),
-                "one phase/content commit plus an explicitly reported compaction"
+                "one lifecycle commit plus any separate text-compaction commit"
             );
         }
         assert_eq!(f.record(id).unwrap().phase, DecayPhase::Ghost);
@@ -1906,11 +1905,12 @@ mod independent_review_regressions {
     async fn review_access_must_not_move_feedback_anchor_backward() {
         let f = Fixture::new();
         let id = f.insert_memory().await;
-        adapter(&f, 8 * DAY).reinforce(id, 3).await.unwrap();
+        adapter(&f, 8 * DAY).reinforce(id, 3, None).await.unwrap();
         assert_eq!(f.record(id).unwrap().last_accessed_at, 8 * DAY);
         adapter(&f, DAY)
             .record_access(id, AccessKind::DirectRetrieval)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(f.record(id).unwrap().last_accessed_at, 8 * DAY);
     }
     #[tokio::test]
@@ -2032,10 +2032,13 @@ mod independent_review_regressions {
         })
         .await
         .expect("purge must release storage before awaiting graph");
-        tokio::time::timeout(Duration::from_secs(5), adapter(&f, DAY).reinforce(live, 3))
-            .await
-            .expect("feedback must not wait for graph holding storage")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            adapter(&f, DAY).reinforce(live, 3, None),
+        )
+        .await
+        .expect("feedback must not wait for graph holding storage")
+        .unwrap();
         assert!(
             !purge.is_finished(),
             "purge publication must wait for graph"

@@ -87,6 +87,16 @@ impl EntityIndex {
         entities: &[String],
         exclude_id: MemoryId,
     ) -> Vec<(MemoryId, usize)> {
+        self.find_by_entities_filtered(entities, exclude_id, |_| true)
+    }
+
+    /// Apply canonical namespace/eligibility membership before counting or capping.
+    pub fn find_by_entities_filtered(
+        &self,
+        entities: &[String],
+        exclude_id: MemoryId,
+        eligible: impl Fn(MemoryId) -> bool,
+    ) -> Vec<(MemoryId, usize)> {
         let mut counts: HashMap<MemoryId, usize> = HashMap::new();
         let mut seen_keys: HashSet<String> = HashSet::new();
         for entity in entities {
@@ -97,7 +107,7 @@ impl EntityIndex {
                 }
                 if let Some(set) = self.index.get(&key) {
                     for &mid in set {
-                        if mid != exclude_id {
+                        if mid != exclude_id && eligible(mid) {
                             *counts.entry(mid).or_default() += 1;
                         }
                     }

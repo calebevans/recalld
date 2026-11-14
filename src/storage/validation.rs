@@ -61,6 +61,9 @@ pub(crate) fn preflight_text(path: &Path) -> Result<(), StorageError> {
     let (_copy, metadata) = inspect_database_copy(&path.join("meta.db"), true)?;
     let read = metadata.begin_read()?;
     let control = super::control::validate_existing(&read)?;
+    if let Some(control) = &control {
+        super::lineage::ensure_serving(&read, control)?;
+    }
     super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
     // Valid pending effects are recoverable at startup; only malformed evidence fails here.
     let effects = super::metadata::effects::validate_existing(&read)?;

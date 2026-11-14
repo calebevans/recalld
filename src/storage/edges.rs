@@ -178,7 +178,7 @@ pub struct EdgeStore {
 
 impl EdgeStore {
     /// Open or create the edge store at the given path.
-    pub(super) fn open(path: &Path) -> Result<Self, StorageError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, StorageError> {
         let db = Database::create(path)?;
 
         // Ensure tables exist.
