@@ -309,6 +309,7 @@ impl state::SearchPipeline for SearchPipelineAdapter {
 
 /// Adapts `RedbStorageEngine` to the API `StorageEngine` trait.
 pub struct StorageEngineAdapter {
+    clock: Arc<dyn crate::time::Clock>,
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: Arc<CacheManager>,
     /// Held so `delete_memory` can clean the indexes storage cannot
@@ -335,6 +336,7 @@ impl StorageEngineAdapter {
         graph: crate::graph::SharedGraph,
     ) -> Self {
         Self {
+            clock: Arc::new(crate::time::SystemClock),
             storage,
             cache,
             vector_index,
@@ -342,6 +344,11 @@ impl StorageEngineAdapter {
             entity_index,
             graph,
         }
+    }
+    /// Use the system instance's clock (or an isolated manual clock).
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
@@ -361,7 +368,7 @@ impl state::StorageEngine for StorageEngineAdapter {
         use crate::model::record::DiskRecord;
 
         let id = MemoryId::new();
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = self.clock.now_millis();
         let ts = created_at.unwrap_or(now);
         // Over-long tags cannot reach this point: the shared request
         // validator bounds every tag and reserves the `entity/` /
@@ -1084,6 +1091,7 @@ impl state::RelationshipGraph for RelationshipGraphAdapter {
 
 /// Adapts the decay subsystem to the API `FsrsEngine` trait.
 pub struct FsrsEngineAdapter {
+    clock: Arc<dyn crate::time::Clock>,
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: Arc<CacheManager>,
     graph: crate::graph::SharedGraph,
@@ -1101,6 +1109,7 @@ impl FsrsEngineAdapter {
         has_sweep: bool,
     ) -> Self {
         Self {
+            clock: Arc::new(crate::time::SystemClock),
             storage,
             cache,
             graph,
@@ -1108,12 +1117,17 @@ impl FsrsEngineAdapter {
             sweep_alive: has_sweep,
         }
     }
+    /// Use the system instance's clock (or an isolated manual clock).
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
 }
 
 #[async_trait]
 impl state::FsrsEngine for FsrsEngineAdapter {
     async fn record_access(&self, id: MemoryId, kind: AccessKind) {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = self.clock.now_millis();
         let storage = self.storage.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(storage_r) = storage.read() {
@@ -1128,106 +1142,21 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         id: MemoryId,
         quality: u8,
     ) -> Result<state::ReinforceResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Step 1: Read the current record.
-        let record = {
-            let storage = self.storage.clone();
-            tokio::task::spawn_blocking(move || {
-                let storage_r = storage
-                    .read()
-                    .map_err(|e| format!("storage lock poisoned: {e}"))?;
-                storage_r
-                    .get_record(id)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("memory {id} not found"))
-            })
-            .await
-            .map_err(|e| format!("blocking task join error: {e}"))??
-        };
-
-        // Tombstoned memories cannot be reinforced.
-        if record.phase == DecayPhase::Tombstone {
-            return Err(format!("memory {id} has been deleted (tombstoned)").into());
-        }
-
-        let phase = record.phase;
-
-        // Step 2: Look up the namespace's decay rate multiplier.
-        let ns_decay_multiplier = {
-            let storage = self.storage.clone();
-            let ns_id = record.namespace_id;
-            tokio::task::spawn_blocking(move || {
-                let storage_r = storage
-                    .read()
-                    .map_err(|e| format!("storage lock poisoned: {e}"))?;
-                let multiplier = storage_r
-                    .get_namespace(NamespaceId::new(ns_id))
-                    .ok()
-                    .flatten()
-                    .and_then(|ns| ns.decay_rate_multiplier)
-                    .unwrap_or(1.0);
-                Ok::<f32, String>(multiplier)
-            })
-            .await
-            .map_err(|e| format!("blocking task join error: {e}"))??
-        };
-
-        // Step 3: Compute elapsed days since last access.
-        let now = chrono::Utc::now().timestamp_millis();
-        let elapsed_millis = (now - record.last_accessed_at).max(0) as f64;
-        let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
-
-        // Step 4: Use FSRS to compute new stability based on quality rating.
-        let decay_config = crate::decay::DecayConfig::default();
-        let engine = crate::decay::FsrsEngine::new(&decay_config);
-        let new_stability =
-            engine.review_stability(record.stability, elapsed_days, quality, ns_decay_multiplier);
-
-        // Step 5: Compute new retrievability (just reinforced = 1.0).
-        let new_strength = 1.0_f32;
-        let is_permastore =
-            record.is_permastore != 0 || new_stability >= decay_config.permastore_threshold;
-
-        // Step 6: Persist the updated decay state and access event.
-        {
-            let storage = self.storage.clone();
-            tokio::task::spawn_blocking(move || {
-                let storage_r = storage
-                    .read()
-                    .map_err(|e| format!("storage lock poisoned: {e}"))?;
-                storage_r
-                    .update_decay_state(
-                        id,
-                        phase,
-                        new_strength,
-                        new_strength,
-                        new_stability,
-                        is_permastore,
-                    )
-                    .map_err(|e| e.to_string())?;
-                storage_r
-                    .update_access(id, now, crate::model::AccessKind::ManualReinforcement)
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|e| format!("blocking task join error: {e}"))??;
-        }
-
-        // Step 7: Update cache.
-        if let Some(existing) = self.cache.get(id).await {
-            let mut updated = (*existing).clone();
-            updated.stability = new_stability;
-            updated.strength = new_strength;
-            updated.decay_strength = new_strength;
-            updated.is_permastore = is_permastore;
-            updated.last_accessed_at = now;
-            self.cache.insert(id, updated).await;
-        }
-
+        let plan = crate::decay::storage_adapter::reinforce(
+            self.storage.clone(),
+            id,
+            quality,
+            self.config.decay.decay_rate_multiplier,
+            self.clock.now_millis(),
+        )
+        .await?;
+        // Invalidate instead of copying potentially discarded content from cache.
+        self.cache.invalidate(id).await;
         Ok(state::ReinforceResult {
-            strength: new_strength,
-            stability: new_stability,
-            phase,
-            is_permastore,
+            strength: plan.strength,
+            stability: plan.stability,
+            phase: plan.phase,
+            is_permastore: plan.is_permastore,
         })
     }
 
@@ -1259,7 +1188,7 @@ impl state::FsrsEngine for FsrsEngineAdapter {
             &self.graph,
             &self.cache,
             global_multiplier,
-            as_of_millis,
+            Some(as_of_millis.unwrap_or_else(|| self.clock.now_millis())),
         )
         .await;
 

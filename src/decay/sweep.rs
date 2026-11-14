@@ -48,9 +48,8 @@ pub struct DecayMetadata {
     pub last_accessed_at: i64,
     /// Whether the memory is exempt from decay sweeps.
     pub is_permastore: bool,
-    /// Namespace-specific decay rate multiplier, if set.
-    /// None means inherit from global config.
-    pub decay_rate_multiplier: Option<f32>,
+    /// Namespace policy snapshot; concrete namespace values override global defaults.
+    pub namespace: crate::model::NamespaceConfig,
     /// Whether the record has a non-empty summary.
     /// Used by Full -> Summary transitions to skip the summary check
     /// without re-reading the record from storage.
@@ -299,6 +298,7 @@ const MAX_CONNECTION_BONUS: f32 = 0.15;
 /// The runner holds `Arc` references to shared subsystems. It does NOT
 /// own those subsystems -- it borrows them via Arc for the background task.
 pub struct DecaySweepRunner {
+    clock: Arc<dyn crate::time::Clock>,
     config: SweepConfig,
     decay_config: Arc<DecayConfig>,
     activation_config: ActivationConfig,
@@ -336,6 +336,7 @@ impl DecaySweepRunner {
         config.validate()?;
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
+            clock: Arc::new(crate::time::SystemClock),
             config,
             decay_config,
             activation_config,
@@ -348,6 +349,11 @@ impl DecaySweepRunner {
         })
     }
 
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Spawn the background sweep task on the tokio runtime.
     ///
     /// Returns a `JoinHandle` that resolves when the task exits
@@ -358,6 +364,7 @@ impl DecaySweepRunner {
     /// 2. Enters a loop: sleep for `interval`, then sweep
     /// 3. Exits when `shutdown()` is called
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
+        let clock = self.clock.clone();
         let config = self.config.clone();
         let decay_config = Arc::clone(&self.decay_config);
         let activation_config = self.activation_config.clone();
@@ -372,7 +379,7 @@ impl DecaySweepRunner {
             // Optional startup sweep
             if config.sweep_on_startup {
                 info!("running startup decay sweep");
-                let result = Self::execute_sweep(
+                let result = Self::execute_sweep_at(
                     &config,
                     &decay_config,
                     &activation_config,
@@ -380,6 +387,7 @@ impl DecaySweepRunner {
                     &graph,
                     &cache,
                     global_decay_multiplier,
+                    Some(clock.now_millis()),
                 )
                 .await;
                 Self::log_result(&result);
@@ -418,7 +426,7 @@ impl DecaySweepRunner {
                     return;
                 }
 
-                let result = Self::execute_sweep(
+                let result = Self::execute_sweep_at(
                     &config,
                     &decay_config,
                     &activation_config,
@@ -426,6 +434,7 @@ impl DecaySweepRunner {
                     &graph,
                     &cache,
                     global_decay_multiplier,
+                    Some(clock.now_millis()),
                 )
                 .await;
                 Self::log_result(&result);
@@ -488,29 +497,6 @@ impl DecaySweepRunner {
     ///    in the same sweep.
     /// 2. The cheapest operations (phase 3 records are smallest) run first.
     #[instrument(skip_all)]
-    pub(crate) async fn execute_sweep(
-        config: &SweepConfig,
-        decay_config: &DecayConfig,
-        activation_config: &ActivationConfig,
-        storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
-        graph: &SharedGraph,
-        cache: &Arc<CacheManager>,
-        global_decay_multiplier: f64,
-    ) -> SweepResult {
-        Self::execute_sweep_at(
-            config,
-            decay_config,
-            activation_config,
-            storage,
-            graph,
-            cache,
-            global_decay_multiplier,
-            None,
-        )
-        .await
-    }
-
-    #[instrument(skip_all)]
     pub(crate) async fn execute_sweep_at(
         config: &SweepConfig,
         decay_config: &DecayConfig,
@@ -522,7 +508,8 @@ impl DecaySweepRunner {
         as_of_millis: Option<i64>,
     ) -> SweepResult {
         let start = Instant::now();
-        let now_millis = as_of_millis.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let now_millis = as_of_millis
+            .unwrap_or_else(|| crate::time::Clock::now_millis(&crate::time::SystemClock));
         let engine = FsrsEngine::new(decay_config);
         let mut result = SweepResult::default();
 
@@ -731,13 +718,6 @@ impl DecaySweepRunner {
                 )
                 .await;
 
-                // Flush write batch if full.
-                if pending_transitions.len() >= config.write_batch_size {
-                    Self::flush_transitions(&pending_transitions, storage, graph, cache, result)
-                        .await;
-                    pending_transitions.clear();
-                }
-
                 // Update strength and decay_strength in storage and sync
                 // graph state. Skip if the record was not evaluated
                 // (permastore/decay-disabled).
@@ -746,6 +726,13 @@ impl DecaySweepRunner {
                         *memory_id, phase, raw_r, eff_r, &meta, storage, graph, result,
                     )
                     .await;
+                }
+
+                // Flush write batch if full.
+                if pending_transitions.len() >= config.write_batch_size {
+                    Self::flush_transitions(&pending_transitions, storage, graph, cache, result)
+                        .await;
+                    pending_transitions.clear();
                 }
 
                 let _ = i; // suppress unused warning
@@ -822,12 +809,18 @@ impl DecaySweepRunner {
     ) -> (HashMap<MemoryId, DecayMetadata>, Vec<(MemoryId, String)>) {
         // Pre-load namespace configs to avoid repeated lookups.
         // There are typically very few namespaces (< 10).
-        let ns_cache: HashMap<u32, Option<f32>> = storage
-            .list_namespaces()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|ns| (ns.id.get(), ns.decay_rate_multiplier))
-            .collect();
+        let namespaces = match storage.list_namespaces() {
+            Ok(namespaces) => namespaces,
+            Err(e) => {
+                return (
+                    HashMap::new(),
+                    ids.iter()
+                        .map(|&id| (id, format!("failed to load namespace policy: {e}")))
+                        .collect(),
+                );
+            }
+        };
+        let ns_cache: HashMap<_, _> = namespaces.into_iter().map(|ns| (ns.id.get(), ns)).collect();
 
         let mut results = HashMap::with_capacity(ids.len());
         let mut errors = Vec::new();
@@ -844,8 +837,10 @@ impl DecaySweepRunner {
                         continue;
                     }
 
-                    let decay_rate_multiplier =
-                        ns_cache.get(&record.namespace_id).copied().flatten();
+                    let Some(namespace) = ns_cache.get(&record.namespace_id).cloned() else {
+                        errors.push((id, "namespace policy not found".to_string()));
+                        continue;
+                    };
 
                     results.insert(
                         id,
@@ -853,7 +848,7 @@ impl DecaySweepRunner {
                             stability: record.stability,
                             last_accessed_at: record.last_accessed_at,
                             is_permastore: record.is_permastore != 0,
-                            decay_rate_multiplier,
+                            namespace,
                             has_summary: !record.summary.is_empty(),
                         },
                     );
@@ -898,12 +893,31 @@ impl DecaySweepRunner {
             return None;
         }
 
-        // -- Get effective decay rate multiplier -------------------
-        // Namespace override > global default
-        let multiplier = meta
-            .decay_rate_multiplier
-            .map(|m| m as f64)
-            .unwrap_or(global_decay_multiplier);
+        let policy = match super::lifecycle::resolve_policy(
+            &meta.namespace,
+            engine.config,
+            global_decay_multiplier,
+        ) {
+            Ok(policy) => policy,
+            Err(e) => {
+                result.errors.push(SweepRecordError {
+                    memory_id,
+                    phase,
+                    error: e.to_string(),
+                });
+                return None;
+            }
+        };
+        if !meta.stability.is_finite() || meta.stability <= 0.0 {
+            result.errors.push(SweepRecordError {
+                memory_id,
+                phase,
+                error: "invalid record stability".to_string(),
+            });
+            return None;
+        }
+        let engine = FsrsEngine::new(&policy.config);
+        let multiplier = policy.decay_rate_multiplier;
 
         // -- Decay disabled check ---------------------------------
         if multiplier == 0.0 {
@@ -911,15 +925,27 @@ impl DecaySweepRunner {
             return None;
         }
 
-        // -- Calculate raw retrievability -------------------------
-        let elapsed_millis = (now_millis - meta.last_accessed_at).max(0) as f64;
-        let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
-        let raw_r = engine.retrievability(elapsed_days, meta.stability, multiplier as f32);
-
-        // -- Calculate connection bonus ---------------------------
         let connection_bonus =
             Self::calculate_connection_bonus(memory_id, graph, activation_config).await;
-        let effective_r = engine.effective_retrievability(raw_r, connection_bonus);
+        let projection = match super::lifecycle::project(
+            meta.stability,
+            meta.last_accessed_at,
+            &policy,
+            now_millis,
+            connection_bonus,
+        ) {
+            Ok(projection) => projection,
+            Err(e) => {
+                result.errors.push(SweepRecordError {
+                    memory_id,
+                    phase,
+                    error: e.to_string(),
+                });
+                return None;
+            }
+        };
+        let raw_r = projection.strength;
+        let effective_r = projection.decay_strength;
 
         // -- Determine transition ---------------------------------
         let threshold = match phase {
@@ -931,7 +957,13 @@ impl DecaySweepRunner {
             DecayPhase::Tombstone => return None,
         };
 
-        if effective_r <= threshold {
+        if effective_r <= threshold && phase == DecayPhase::Full && !meta.has_summary {
+            result.errors.push(SweepRecordError {
+                memory_id,
+                phase,
+                error: "missing_summary: retaining full text".to_string(),
+            });
+        } else if effective_r <= threshold {
             pending_transitions.push(PendingTransition {
                 memory_id,
                 from_phase: phase,
@@ -1107,9 +1139,7 @@ impl DecaySweepRunner {
 impl DecaySweepRunner {
     /// Phase 1 -> Phase 2: Full -> Summary.
     ///
-    /// 1. Verify summary exists (it should -- summaries are created at
-    ///    memory creation time). If missing, log a warning; the memory
-    ///    transitions anyway but will have no summary text.
+    /// 1. Require a retained summary before discarding full text.
     /// 2. Delete full_text from fulltext.dat (zero the pointer in meta.db,
     ///    mark the space as dead -- no physical deletion until compaction).
     /// 3. Update decay_phase = Summary in meta.db.
@@ -1127,11 +1157,9 @@ impl DecaySweepRunner {
         storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     ) -> Result<PhaseTransition, SweepError> {
         if !has_summary {
-            warn!(
-                id = %memory_id,
-                "memory has no summary at Full->Summary transition; \
-                 proceeding anyway -- summary was expected at creation time"
-            );
+            return Err(SweepError::Storage(
+                "missing_summary: retaining full text".to_string(),
+            ));
         }
 
         let storage_clone = Arc::clone(storage);
@@ -1368,6 +1396,120 @@ mod tests {
     use crate::model::{DiskRecord, NamespaceConfig};
 
     const DIM: usize = 4;
+
+    #[tokio::test]
+    async fn fixed_time_sweep_obeys_namespace_thresholds_and_preserves_content_phases() {
+        use crate::api::StorageEngine as _;
+        use crate::test_support::{Fixture, MemorySpec};
+        let f = Fixture::new();
+        let mut ns = NamespaceConfig::default_namespace(0);
+        ns.name = "threshold".into();
+        ns.embedding_dim = DIM as u32;
+        ns.phase_thresholds.full_to_summary = 0.95;
+        let namespace = f.storage.write().unwrap().create_namespace(&ns).unwrap();
+        let full = f.insert_memory_in(namespace, &[]).await;
+        let storage = crate::api::adapters::StorageEngineAdapter::new(
+            f.storage.clone(),
+            f.cache.clone(),
+            f.vector_index.clone(),
+            f.fts_index.clone(),
+            f.entity_index.clone(),
+            f.graph.clone(),
+        )
+        .with_clock(Arc::new(crate::time::ManualClock::new(0)));
+        let missing = storage
+            .create_memory(
+                namespace,
+                "",
+                Some("only retained text"),
+                &[],
+                &[0.0; DIM],
+                Some(1.0),
+                None,
+            )
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(f.record(missing).unwrap().created_at, 0);
+        let summary = f
+            .insert_memory_with(MemorySpec {
+                phase: DecayPhase::Summary,
+                ..MemorySpec::new(namespace)
+            })
+            .await;
+        // At day one R=0.9 for S=1: custom threshold degrades Full;
+        // the default 0.7 does not. A batch size of one covers flush ordering.
+        let config = SweepConfig {
+            write_batch_size: 1,
+            ..SweepConfig::default()
+        };
+        let decay = DecayConfig::default();
+        let activation = ActivationConfig::default();
+        let run = |now| {
+            DecaySweepRunner::execute_sweep_at(
+                &config,
+                &decay,
+                &activation,
+                &f.storage,
+                &f.graph,
+                &f.cache,
+                1.0,
+                Some(now),
+            )
+        };
+        let result = run(86_400_000).await;
+        assert_eq!(f.record(full).unwrap().phase, DecayPhase::Summary);
+        assert_eq!(f.record(summary).unwrap().phase, DecayPhase::Summary);
+        assert_eq!(f.record(missing).unwrap().phase, DecayPhase::Full);
+        assert_eq!(
+            storage.get_full_text(missing).await.unwrap().as_deref(),
+            Some("only retained text")
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.memory_id == missing && e.error.contains("missing_summary"))
+        );
+        run(i64::MAX).await;
+        assert_eq!(
+            f.record(full).unwrap().phase,
+            DecayPhase::Ghost,
+            "one destructive phase per sweep"
+        );
+        assert!(f.record(full).unwrap().summary.is_empty());
+        assert_eq!(f.record(missing).unwrap().phase, DecayPhase::Full);
+    }
+
+    #[tokio::test]
+    async fn manual_sweep_uses_injected_clock_and_zero_multiplier_skips_degradation() {
+        use crate::api::FsrsEngine as _;
+        use crate::test_support::Fixture;
+        let f = Fixture::new();
+        let clock = Arc::new(crate::time::ManualClock::new(0));
+        let adapter = crate::api::adapters::FsrsEngineAdapter::new(
+            f.storage.clone(),
+            f.cache.clone(),
+            f.graph.clone(),
+            Arc::new(crate::config::RecalldConfig::default()),
+            false,
+        )
+        .with_clock(clock.clone());
+        let full = f.insert_memory().await;
+        let mut ns = NamespaceConfig::default_namespace(0);
+        ns.name = "disabled".into();
+        ns.embedding_dim = DIM as u32;
+        ns.decay_rate_multiplier = Some(0.0);
+        let namespace = f.storage.write().unwrap().create_namespace(&ns).unwrap();
+        let disabled = f.insert_memory_in(namespace, &[]).await;
+        adapter.trigger_sweep(None).await.unwrap();
+        assert_eq!(f.record(full).unwrap().phase, DecayPhase::Full);
+        clock.advance_to(i64::MAX).unwrap();
+        adapter.trigger_sweep(None).await.unwrap();
+        assert_eq!(f.record(full).unwrap().phase, DecayPhase::Summary);
+        assert_eq!(f.record(disabled).unwrap().phase, DecayPhase::Full);
+        assert_eq!(f.record(disabled).unwrap().last_accessed_at, 0);
+    }
 
     /// An engine holding one live, Full-phase memory.
     fn engine_with_one_memory() -> (tempfile::TempDir, RedbStorageEngine, MemoryId) {
