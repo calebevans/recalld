@@ -345,7 +345,22 @@ impl bridge::SearchPipeline for McpSearchAdapter {
         min_score: Option<f32>,
         _same_namespace: bool,
         record_access: bool,
+        namespace: Option<&str>,
     ) -> Result<Vec<bridge::SearchHit>, bridge::BridgeError> {
+        let namespace = namespace.map(str::to_owned);
+        if let Some(namespace) = namespace {
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || {
+                let storage = storage
+                    .read()
+                    .map_err(|e| bridge::BridgeError::Internal(e.to_string()))?;
+                storage
+                    .assert_memory_namespace(id, &namespace)
+                    .map_err(bridge::BridgeError::from)
+            })
+            .await
+            .map_err(|e| bridge::BridgeError::Internal(e.to_string()))??;
+        }
         let results = self
             .query_engine
             .similar_with_access(id, limit, record_access)
@@ -1100,13 +1115,20 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         id: MemoryId,
         _record_access: bool,
+        namespace: Option<&str>,
     ) -> Result<Option<bridge::MemoryRecord>, bridge::BridgeError> {
+        let namespace = namespace.map(str::to_owned);
         let storage = self.storage.clone();
         let tz = self.timezone;
         tokio::task::spawn_blocking(move || {
             let storage_r = storage.read().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
             })?;
+            if let Some(namespace) = namespace.as_deref() {
+                storage_r
+                    .assert_memory_namespace(id, namespace)
+                    .map_err(bridge::BridgeError::from)?;
+            }
 
             let disk_record = storage_r
                 .get_record(id)
@@ -1177,7 +1199,12 @@ impl bridge::StorageEngine for McpStorageAdapter {
         .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
     }
 
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, bridge::BridgeError> {
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, bridge::BridgeError> {
+        let namespace = namespace.map(str::to_owned);
         // Tombstone-based deletion: strip content from the record but
         // preserve the graph node and edges so relationship chains
         // remain intact for spreading activation traversal.
@@ -1193,6 +1220,11 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 let mut storage_w = storage.write().map_err(|e| {
                     bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
                 })?;
+                if let Some(namespace) = namespace.as_deref() {
+                    storage_w
+                        .assert_memory_namespace(id, namespace)
+                        .map_err(bridge::BridgeError::from)?;
+                }
 
                 let existing = storage_w
                     .get_record(id)
@@ -1329,6 +1361,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<bridge::ReinforceResult, bridge::BridgeError> {
         let outcome = crate::decay::storage_adapter::reinforce(
             self.storage.clone(),
@@ -1336,10 +1369,18 @@ impl bridge::StorageEngine for McpStorageAdapter {
             quality,
             self.config.decay.decay_rate_multiplier,
             self.clock.now_millis(),
+            namespace.map(str::to_owned),
         )
         .await;
         // The first storage write may have committed even if the second failed.
-        self.cache.invalidate(id).await;
+        if !matches!(
+            &outcome,
+            Err(crate::decay::lifecycle::LifecycleError::NamespaceMismatch(
+                _
+            ))
+        ) {
+            self.cache.invalidate(id).await;
+        }
         let plan = outcome.map_err(|e| {
             use crate::decay::lifecycle::LifecycleError;
             match e {
@@ -1348,6 +1389,9 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 }
                 LifecycleError::InvalidInput(_) => bridge::BridgeError::InvalidInput(e.to_string()),
                 LifecycleError::Storage(_) => bridge::BridgeError::Storage(e.to_string()),
+                LifecycleError::NamespaceMismatch(_) => {
+                    bridge::BridgeError::NamespaceMismatch(e.to_string())
+                }
             }
         })?;
         Ok(bridge::ReinforceResult {
@@ -2800,7 +2844,7 @@ mod tests {
         );
         assert_eq!(fx.entity_index.read().await.len(), 1);
 
-        assert!(adapter.delete_memory(id).await.expect("delete"));
+        assert!(adapter.delete_memory(id, None).await.expect("delete"));
 
         assert!(
             fx.fts_index.lock().await.is_empty().expect("fts"),

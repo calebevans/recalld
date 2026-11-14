@@ -24,11 +24,18 @@ use crate::model::constants::{
 };
 use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
-use crate::model::validation::{MemoryInputRef, validate_memory_input, validate_namespace_name};
+use crate::model::validation::{MemoryInputRef, validate_memory_input};
 use crate::serialization::{
-    ApiResponse, MemoryResponse, NamespaceRequest, NamespaceResponse, SearchHit, SearchRequest,
-    SearchResponse,
+    ApiResponse, MemoryResponse, NamespaceResponse, SearchHit, SearchRequest, SearchResponse,
 };
+
+/// Keep shared parser field names in HTTP validation errors.
+fn argument_error(error: crate::mcp::args::ArgError) -> AppError {
+    AppError::BadRequest {
+        message: error.message,
+        field: (!error.field.is_empty()).then_some(error.field),
+    }
+}
 
 /// Duration for which a cached health report is considered fresh.
 const HEALTH_REPORT_CACHE_TTL_SECS: u64 = 60;
@@ -355,6 +362,12 @@ pub async fn get_memory(
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
+    if let Some(namespace) = options.namespace.as_deref() {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
 
     let record = if options.record_access {
         state
@@ -407,15 +420,25 @@ pub async fn get_memory(
 pub async fn delete_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(scope): Query<MemoryScopeQuery>,
 ) -> Result<Json<ApiResponse<DeleteResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
+    if let Some(namespace) = scope.namespace.as_deref() {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
 
     // Read record first for entity index cleanup (Issue 14)
     let existing_record = state.storage.get_record(memory_id).await;
 
-    let existed = state.storage.delete_memory(memory_id).await?;
+    let existed = state
+        .storage
+        .delete_memory(memory_id, scope.namespace.as_deref())
+        .await?;
     if existed {
         state.cache.remove(memory_id).await;
         state.search.remove_from_index(memory_id).await;
@@ -464,23 +487,24 @@ pub async fn delete_memory(
 pub async fn reinforce_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<ReinforceRequest>,
+    Json(req): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<ReinforceResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
 
-    // Validate quality rating
-    if !(1..=4).contains(&req.quality) {
-        return Err(AppError::BadRequest {
-            message: "quality must be 1-4 (again/hard/good/easy)".into(),
-            field: Some("quality".into()),
-        });
+    let namespace = crate::mcp::args::parse_namespace_assertion(&req).map_err(argument_error)?;
+    if let Some(namespace) = namespace {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
     }
+    let quality = crate::mcp::args::parse_quality(&req).map_err(argument_error)?;
 
     let updated = state
         .decay
-        .reinforce(memory_id, req.quality)
+        .reinforce(memory_id, quality, namespace)
         .await
         .map_err(|e| feedback_error(e, &id))?;
 
@@ -502,6 +526,9 @@ pub async fn reinforce_memory(
 fn feedback_error(error: Box<dyn std::error::Error + Send + Sync>, id: &str) -> AppError {
     use crate::decay::lifecycle::LifecycleError;
     match error.downcast_ref::<LifecycleError>() {
+        Some(LifecycleError::NamespaceMismatch(_)) => AppError::NamespaceMismatch {
+            message: error.to_string(),
+        },
         Some(LifecycleError::ContentUnavailable) => AppError::Conflict {
             message: error.to_string(),
         },
@@ -896,23 +923,23 @@ pub async fn find_similar(
 
     let memory_id = parse_memory_id(&id)?;
 
-    // Load source memory to get namespace
-    let source = if req.record_access {
-        state
-            .cache
-            .get_or_load(memory_id, state.storage.as_ref())
-            .await
-    } else {
+    if let Some(namespace) = req.namespace.as_deref() {
         state
             .storage
-            .get_record(memory_id)
-            .await
-            .map(|r| std::sync::Arc::new(crate::model::CachedRecord::from(&r)))
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
     }
-    .ok_or_else(|| AppError::NotFound {
-        resource: "memory",
-        id: id.clone(),
-    })?;
+
+    // The source scope is canonical, never a session default or cached namespace.
+    let source = state
+        .storage
+        .get_record(memory_id)
+        .await
+        .ok_or_else(|| AppError::NotFound {
+            resource: "memory",
+            id: id.clone(),
+        })?;
+    let source_namespace = NamespaceId::new(source.namespace_id);
 
     let source_embedding =
         state
@@ -926,7 +953,7 @@ pub async fn find_similar(
 
     let ns_name = state
         .namespaces
-        .name_for(source.namespace_id)
+        .name_for(source_namespace)
         .unwrap_or_else(|| "default".to_string());
 
     // Search using source embedding, requesting limit+1 to account
@@ -934,7 +961,7 @@ pub async fn find_similar(
     let search_query = SearchQuery {
         record_access: req.record_access,
         query: QueryInput::Vector(source_embedding),
-        namespace_id: source.namespace_id,
+        namespace_id: source_namespace,
         namespace_name: ns_name,
         k: limit + 1,
         include_tags: vec![],
@@ -1036,31 +1063,22 @@ pub async fn list_namespaces(
 /// 4. Return 201 with namespace details.
 pub async fn create_namespace(
     State(state): State<AppState>,
-    Json(req): Json<NamespaceRequest>,
+    Json(req): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<ApiResponse<NamespaceResponse>>), AppError> {
     let start = Instant::now();
 
-    // Validate name format
-    validate_namespace_name(&req.name)?;
-
-    // Validate embedding dimensions if provided
-    if let Some(dim) = req.embedding_dim {
-        if dim == 0 || dim > 8192 {
-            return Err(AppError::BadRequest {
-                message: "embedding_dim must be between 1 and 8192".into(),
-                field: Some("embeddingDim".into()),
-            });
-        }
-    }
+    let req = crate::mcp::args::parse_create_namespace(&req).map_err(argument_error)?;
 
     // Create namespace (registry checks for duplicates)
     let ns = state
         .namespaces
         .create(
             &req.name,
-            req.embedding_dim,
-            req.initial_stability,
-            req.desired_retention,
+            req.embedding_dim.map(u32::from),
+            req.initial_stability
+                .unwrap_or(crate::model::constants::DEFAULT_INITIAL_STABILITY),
+            req.desired_retention
+                .unwrap_or(crate::model::constants::DEFAULT_DESIRED_RETENTION),
             req.decay_rate_multiplier,
         )
         .await
@@ -1636,8 +1654,20 @@ pub async fn scan_duplicates(
             id: name.clone(),
         })?;
 
-    let threshold = req.threshold.clamp(0.0, 1.0);
-    let max_memories = req.max_memories.min(10_000);
+    if !req.threshold.is_finite() || !(0.0..=1.0).contains(&req.threshold) {
+        return Err(AppError::BadRequest {
+            message: "threshold must be finite and between 0 and 1".into(),
+            field: Some("threshold".into()),
+        });
+    }
+    if !(1..=10_000).contains(&req.max_memories) {
+        return Err(AppError::BadRequest {
+            message: "maxMemories must be between 1 and 10000".into(),
+            field: Some("maxMemories".into()),
+        });
+    }
+    let threshold = req.threshold;
+    let max_memories = req.max_memories;
 
     // Get memory IDs in this namespace
     let filter = ListFilter {
@@ -1650,34 +1680,25 @@ pub async fn scan_duplicates(
     let records = state.storage.list_memories(&filter).await?;
     let memory_ids: Vec<MemoryId> = records.iter().take(max_memories).map(|r| r.id).collect();
 
-    if memory_ids.len() < 2 {
-        let took = start.elapsed().as_micros() as u64;
-        return Ok(Json(ApiResponse {
-            data: ScanDuplicatesResponse {
-                clusters: vec![],
-                total: 0,
-            },
-            took_us: Some(took),
-        }));
-    }
-
     // Load embeddings
     let embeddings = state.search.get_embeddings_batch(&memory_ids);
+    let sampled_count = memory_ids.len();
     let id_embeddings: Vec<(MemoryId, Vec<f32>)> = memory_ids
         .into_iter()
         .filter_map(|mid| embeddings.get(&mid).map(|emb| (mid, emb.clone())))
         .collect();
 
-    if id_embeddings.len() < 2 {
-        let took = start.elapsed().as_micros() as u64;
-        return Ok(Json(ApiResponse {
-            data: ScanDuplicatesResponse {
-                clusters: vec![],
-                total: 0,
-            },
-            took_us: Some(took),
-        }));
-    }
+    let coverage = DuplicateScanCoverage {
+        algorithm: "sampledPairs",
+        eligible_count: records.len(),
+        sampled_count,
+        skipped_vector_count: sampled_count - id_embeddings.len(),
+        sample_cap: max_memories,
+        neighbor_cap: None,
+        truncated: sampled_count < records.len(),
+        // This legacy scan has no generation-consistent read view.
+        complete: false,
+    };
 
     // Union-Find based clustering
     let n = id_embeddings.len();
@@ -1768,7 +1789,11 @@ pub async fn scan_duplicates(
     let took = start.elapsed().as_micros() as u64;
 
     Ok(Json(ApiResponse {
-        data: ScanDuplicatesResponse { clusters, total },
+        data: ScanDuplicatesResponse {
+            clusters,
+            total,
+            coverage,
+        },
         took_us: Some(took),
     }))
 }
@@ -1868,7 +1893,7 @@ mod lifecycle_error_tests {
             if phase == DecayPhase::Tombstone {
                 f.tombstone(id);
             }
-            let error = adapter.reinforce(id, 3).await.unwrap_err();
+            let error = adapter.reinforce(id, 3, None).await.unwrap_err();
             let response = feedback_error(error, &id.to_string()).into_response();
             assert_eq!(response.status(), StatusCode::CONFLICT);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1880,7 +1905,7 @@ mod lifecycle_error_tests {
             assert_eq!(f.record(id).unwrap().last_accessed_at, 0);
         }
         let missing = MemoryId::new();
-        let error = adapter.reinforce(missing, 3).await.unwrap_err();
+        let error = adapter.reinforce(missing, 3, None).await.unwrap_err();
         assert_eq!(
             feedback_error(error, &missing.to_string())
                 .into_response()
@@ -1888,7 +1913,7 @@ mod lifecycle_error_tests {
             StatusCode::NOT_FOUND
         );
         let id = f.insert_memory().await;
-        let error = adapter.reinforce(id, 0).await.unwrap_err();
+        let error = adapter.reinforce(id, 0, None).await.unwrap_err();
         assert_eq!(
             feedback_error(error, &id.to_string())
                 .into_response()
@@ -1897,3 +1922,7 @@ mod lifecycle_error_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "validation_tests.rs"]
+mod validation_tests;

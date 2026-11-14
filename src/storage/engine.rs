@@ -199,6 +199,27 @@ pub trait StorageEngine: Send + Sync {
     /// Get a namespace by name.
     fn get_namespace_by_name(&self, name: &str) -> Result<Option<NamespaceConfig>, StorageError>;
 
+    /// Check an opt-in by-ID assertion using canonical rows, never a session default
+    /// or cache. Call under the same storage guard as the protected operation.
+    fn assert_memory_namespace(&self, id: MemoryId, namespace: &str) -> Result<(), StorageError> {
+        validate_namespace_name(namespace).map_err(|e| StorageError::InvalidNamespaceName {
+            name: namespace.to_owned(),
+            reason: e.to_string(),
+        })?;
+        let record = self
+            .get_record(id)?
+            .ok_or(StorageError::NotFound(id.into_inner()))?;
+        let asserted = self.get_namespace_by_name(namespace)?;
+        if asserted.is_some_and(|ns| ns.id.get() == record.namespace_id) {
+            Ok(())
+        } else {
+            Err(StorageError::NamespaceMismatch {
+                id: id.into_inner(),
+                namespace: namespace.to_owned(),
+            })
+        }
+    }
+
     // ── Text Compaction ─────────────────────────────────────────────
 
     /// Run fulltext.dat compaction, reclaiming dead space from decayed

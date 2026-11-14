@@ -48,6 +48,9 @@ pub enum AppError {
         message: String,
     },
 
+    /// 409 -- Explicit by-ID namespace assertion failed.
+    NamespaceMismatch { message: String },
+
     /// 422 -- Semantically invalid request (e.g. dimension mismatch,
     /// mutually exclusive fields both provided).
     UnprocessableEntity {
@@ -94,6 +97,12 @@ impl IntoResponse for AppError {
                 "BAD_REQUEST".to_string(),
                 message.clone(),
                 field.clone(),
+            ),
+            AppError::NamespaceMismatch { message } => (
+                StatusCode::CONFLICT,
+                "NAMESPACE_MISMATCH".into(),
+                message.clone(),
+                Some("namespace".into()),
             ),
             AppError::Conflict { message } => (
                 StatusCode::CONFLICT,
@@ -157,6 +166,13 @@ pub use crate::storage::StorageError;
 impl From<StorageError> for AppError {
     fn from(err: StorageError) -> Self {
         match &err {
+            StorageError::NamespaceMismatch { .. } => AppError::NamespaceMismatch {
+                message: err.to_string(),
+            },
+            StorageError::InvalidNamespaceName { .. } => AppError::BadRequest {
+                message: err.to_string(),
+                field: Some("namespace".into()),
+            },
             StorageError::NotFound(uuid) => AppError::NotFound {
                 resource: "memory",
                 id: uuid.to_string(),

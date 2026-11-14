@@ -443,7 +443,29 @@ impl state::StorageEngine for StorageEngineAdapter {
         .flatten()
     }
 
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, crate::storage::StorageError> {
+    async fn assert_memory_namespace(
+        &self,
+        id: MemoryId,
+        namespace: &str,
+    ) -> Result<(), crate::storage::StorageError> {
+        let storage = self.storage.clone();
+        let namespace = namespace.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let storage = storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::other(e.to_string()))
+            })?;
+            storage.assert_memory_namespace(id, &namespace)
+        })
+        .await
+        .map_err(|e| crate::storage::StorageError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, crate::storage::StorageError> {
+        let namespace = namespace.map(str::to_owned);
         let storage = self.storage.clone();
 
         // Perform read, tombstone check, tombstone, and free_vector_slot
@@ -464,6 +486,9 @@ impl state::StorageEngine for StorageEngineAdapter {
                 ))
             })?;
 
+            if let Some(namespace) = namespace.as_deref() {
+                storage_w.assert_memory_namespace(id, namespace)?;
+            }
             // Check if the record exists and is not already tombstoned.
             let existing_record = match storage_w.get_record(id)? {
                 Some(r) => r,
@@ -1147,6 +1172,7 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<state::ReinforceResult, Box<dyn std::error::Error + Send + Sync>> {
         let outcome = crate::decay::storage_adapter::reinforce(
             self.storage.clone(),
@@ -1154,10 +1180,18 @@ impl state::FsrsEngine for FsrsEngineAdapter {
             quality,
             self.config.decay.decay_rate_multiplier,
             self.clock.now_millis(),
+            namespace.map(str::to_owned),
         )
         .await;
         // The first storage write may have committed even if the second failed.
-        self.cache.invalidate(id).await;
+        if !matches!(
+            &outcome,
+            Err(crate::decay::lifecycle::LifecycleError::NamespaceMismatch(
+                _
+            ))
+        ) {
+            self.cache.invalidate(id).await;
+        }
         let plan = outcome?;
         Ok(state::ReinforceResult {
             strength: plan.strength,
@@ -1448,7 +1482,7 @@ mod tests {
         let fx = Fixture::new();
         let id = indexed_memory(&fx).await;
 
-        assert!(adapter(&fx).delete_memory(id).await.expect("delete"));
+        assert!(adapter(&fx).delete_memory(id, None).await.expect("delete"));
 
         assert!(
             fx.fts_index.lock().await.is_empty().expect("fts"),
@@ -1482,7 +1516,7 @@ mod tests {
         let id = indexed_memory(&fx).await;
         let adapter = adapter(&fx);
 
-        assert!(adapter.delete_memory(id).await.expect("first delete"));
+        assert!(adapter.delete_memory(id, None).await.expect("first delete"));
 
         // Re-index it, so a second pass through the cleanup would be
         // visible rather than idempotent by accident.
@@ -1493,7 +1527,10 @@ mod tests {
             .expect("fts add");
 
         assert!(
-            !adapter.delete_memory(id).await.expect("second delete"),
+            !adapter
+                .delete_memory(id, None)
+                .await
+                .expect("second delete"),
             "an already-tombstoned memory must report false"
         );
         assert!(
