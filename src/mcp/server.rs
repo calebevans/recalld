@@ -165,7 +165,7 @@ impl McpDispatcher {
             (Era::Legacy, "ping") => Ok(Outcome::plain(serde_json::json!({}))),
 
             (_, "tools/list") => self.handle_tools_list(),
-            (_, "tools/call") => self.handle_tools_call(msg.params).await,
+            (_, "tools/call") => self.handle_tools_call(ctx, msg.params).await,
             (_, "resources/list") => self.handle_resources_list(),
             (_, "resources/templates/list") => self.handle_resource_templates_list(),
             (_, "resources/read") => self.handle_resources_read(msg.params).await,
@@ -283,6 +283,7 @@ impl McpDispatcher {
 
     async fn handle_tools_call(
         &self,
+        ctx: &RequestContext,
         params: Option<serde_json::Value>,
     ) -> Result<Outcome, DispatchError> {
         let params: ToolCallParams = params
@@ -291,7 +292,12 @@ impl McpDispatcher {
             .map_err(|e| DispatchError::InvalidParams(e.to_string()))?
             .ok_or_else(|| DispatchError::InvalidParams("Missing params".to_string()))?;
 
-        let result = self.handler.call_tool(&params.name, params.arguments).await;
+        let mut result = self.handler.call_tool(&params.name, params.arguments).await;
+        // Legacy sessions include pre-structured-content protocol versions.
+        // Keep their response shape unchanged until version-aware adoption.
+        if ctx.era == Era::Legacy {
+            result.structured_content = None;
+        }
         Ok(Outcome::plain(serde_json::to_value(result)?))
     }
 
@@ -548,6 +554,9 @@ pub(crate) mod tests {
         }
 
         async fn call_tool(&self, name: &str, _arguments: serde_json::Value) -> ToolCallResult {
+            if name == "structured_test" {
+                return ToolCallResult::json(&serde_json::json!({"count": 2})).unwrap();
+            }
             ToolCallResult::text(format!("called {name}"))
         }
 
@@ -738,6 +747,33 @@ pub(crate) mod tests {
         );
         let resp = srv.handle_message(msg).await.unwrap();
         assert_eq!(ok(&resp)["content"][0]["text"], "called store_memory");
+    }
+
+    #[tokio::test]
+    async fn structured_results_are_modern_only_and_keep_legacy_text() {
+        let mut srv = server();
+        let args = serde_json::json!({"name": "structured_test", "arguments": {}});
+        let modern = srv
+            .handle_message(modern_request(1, "tools/call", args.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            ok(&modern)["structuredContent"],
+            serde_json::json!({"count": 2})
+        );
+        for version in SUPPORTED_LEGACY_VERSIONS {
+            let mut legacy_server = server();
+            legacy_server
+                .handle_message(initialize_request(2, version))
+                .await
+                .unwrap();
+            let legacy = legacy_server
+                .handle_message(plain_request(3, "tools/call", Some(args.clone())))
+                .await
+                .unwrap();
+            assert!(ok(&legacy).get("structuredContent").is_none());
+            assert_eq!(ok(&legacy)["content"], ok(&modern)["content"]);
+        }
     }
 
     #[tokio::test]
