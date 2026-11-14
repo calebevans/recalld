@@ -193,6 +193,47 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    NamespacePurgeStarted {
+        namespace_id: NamespaceId,
+        name_hash: [u8; 32],
+    },
+    NamespacePurgeAdvanced {
+        parent_operation_id: Uuid,
+        namespace_id: NamespaceId,
+        sequence: u64,
+        stage: super::purge::PurgeStage,
+        removed: u64,
+        tombstones_removed: u64,
+        edges_removed: u64,
+        last_id: Option<MemoryId>,
+    },
+    MemoryTombstoned {
+        #[serde(rename = "memoryId")]
+        memory_id: MemoryId,
+        status: super::tombstone::TombstoneStatus,
+    },
+    MemoryInserted {
+        #[serde(rename = "memoryId")]
+        memory_id: MemoryId,
+        #[serde(rename = "createdAt")]
+        created_at: i64,
+        #[serde(rename = "initialStabilityBits")]
+        initial_stability_bits: u32,
+        #[serde(rename = "embeddingDim")]
+        embedding_dim: u32,
+        #[serde(rename = "edgesPut")]
+        edges_put: usize,
+    },
+    NamespaceCreated {
+        #[serde(rename = "namespaceId")]
+        namespace_id: NamespaceId,
+        #[serde(rename = "createdAt")]
+        created_at: i64,
+    },
+    NamespacePolicyUpdated {
+        #[serde(rename = "namespaceId")]
+        namespace_id: NamespaceId,
+    },
     GraphChanged {
         edges_put: usize,
         edges_removed: usize,
@@ -278,6 +319,7 @@ pub(crate) fn validate_existing(
                 "schema without control lineage".into(),
             ));
         }
+        super::metadata::purge::validate_existing(tx, None)?;
         return Ok(None);
     }
     if !present.iter().all(|p| *p) {
@@ -303,8 +345,34 @@ pub(crate) fn validate_existing(
     super::canonical_schema::read_state(tx, &state)?;
     for entry in receipts.iter()? {
         let (key, value) = entry?;
-        let (lineage, _, operation) = decode_scope(key.value())?;
+        let (lineage, scope, operation) = decode_scope(key.value())?;
         let stored = validate_receipt(value.value())?;
+        let scope_matches = match &stored.receipt.outcome {
+            MutationOutcome::NamespaceCreated { .. } => scope == MutationScope::Catalog,
+            MutationOutcome::NamespacePolicyUpdated { namespace_id }
+            | MutationOutcome::NamespacePurgeStarted { namespace_id, .. }
+            | MutationOutcome::NamespacePurgeAdvanced { namespace_id, .. } => {
+                scope == MutationScope::Namespace(*namespace_id)
+            }
+            MutationOutcome::MemoryInserted { .. } | MutationOutcome::MemoryTombstoned { .. } => {
+                matches!(scope, MutationScope::Namespace(_))
+            }
+            _ => true,
+        };
+        if !scope_matches {
+            return Err(StorageError::InvalidControl(
+                if matches!(
+                    stored.receipt.outcome,
+                    MutationOutcome::MemoryInserted { .. }
+                        | MutationOutcome::MemoryTombstoned { .. }
+                ) {
+                    "record mutation receipt has catalog scope"
+                } else {
+                    "catalog receipt outcome disagrees with key scope"
+                }
+                .into(),
+            ));
+        }
         let permitted_origin = if lineage == state.store_id {
             stored.receipt.committed_generation <= state.committed_generation
         } else {
@@ -316,6 +384,7 @@ pub(crate) fn validate_existing(
             })
         };
         if !permitted_origin
+
             || stored.receipt.store_id != lineage
             || operation != stored.receipt.operation_id.as_bytes()
         {
@@ -344,6 +413,7 @@ pub(crate) fn validate_existing(
             ));
         }
     }
+    super::metadata::purge::validate_existing(tx, Some(&state))?;
     Ok(Some(state))
 }
 
@@ -452,7 +522,78 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
             "unsupported receipt/hash version or invalid persisted receipt".into(),
         ));
     }
+    if let MutationOutcome::MemoryInserted {
+        memory_id,
+        created_at,
+        edges_put,
+        initial_stability_bits,
+        embedding_dim,
+    } = stored.receipt.outcome
+    {
+        if memory_id == MemoryId::nil()
+            || chrono::DateTime::from_timestamp_millis(created_at).is_none()
+            || edges_put > 2
+            || !(1..=8192).contains(&embedding_dim)
+            || !f32::from_bits(initial_stability_bits).is_finite()
+            || f32::from_bits(initial_stability_bits) <= 0.0
+        {
+            return Err(StorageError::InvalidControl(
+                "invalid insertion receipt".into(),
+            ));
+        }
+    }
+    if matches!(stored.receipt.outcome, MutationOutcome::MemoryTombstoned { memory_id, .. } if memory_id == MemoryId::nil())
+    {
+        return Err(StorageError::InvalidControl(
+            "nil tombstone receipt identity".into(),
+        ));
+    }
+    match &stored.receipt.outcome {
+        MutationOutcome::NamespaceCreated {
+            namespace_id,
+            created_at,
+        } if namespace_id.is_unset()
+            || chrono::DateTime::from_timestamp_millis(*created_at).is_none() =>
+        {
+            return Err(StorageError::InvalidControl(
+                "invalid catalog receipt".into(),
+            ));
+        }
+        MutationOutcome::NamespacePolicyUpdated { namespace_id } if namespace_id.is_unset() => {
+            return Err(StorageError::InvalidControl(
+                "invalid catalog receipt".into(),
+            ));
+        }
+        _ => {}
+    }
     Ok(stored)
+}
+
+/// Lookup before resolving mutable defaults. Operation-specific callers can
+/// reconstruct normalization from a payload-free historical outcome, then use
+/// replay_or_check to verify the complete hash before accepting replay.
+pub(crate) fn keyed_receipt(
+    tx: &WriteTransaction,
+    ctx: &MutationContext,
+) -> Result<Option<StoredReceipt>, StorageError> {
+    ctx.validate()?;
+    let state = read_control(tx)?;
+    if ctx.store_id.is_some_and(|id| id != state.store_id) {
+        return Err(StorageError::StoreLineageMismatch);
+    }
+    let Some(key) = &ctx.idempotency_key else {
+        return Ok(None);
+    };
+    let keys = tx.open_table(KEYS)?;
+    let Some(id) = keys.get(scoped_key(state.store_id, ctx.scope, key.as_bytes()).as_slice())?
+    else {
+        return Ok(None);
+    };
+    let receipts = tx.open_table(RECEIPTS)?;
+    let value = receipts
+        .get(id.value())?
+        .ok_or_else(|| StorageError::InvalidControl("key without receipt".into()))?;
+    validate_receipt(value.value()).map(Some)
 }
 
 /// Lineage precedes replay; matching replay precedes CAS (including after purge).
@@ -502,10 +643,33 @@ pub(crate) fn record_receipt(
     hash: [u8; 32],
     outcome: MutationOutcome,
 ) -> Result<WriteReceipt, StorageError> {
+    record_reserved_receipt(tx, ctx, hash, outcome, Uuid::new_v4())
+}
+
+/// Internal transaction primitive. Purge callers must first prove a durable
+/// reservation; external requests cannot choose an operation identity.
+pub(super) fn record_reserved_receipt(
+    tx: &WriteTransaction,
+    ctx: &MutationContext,
+    hash: [u8; 32],
+    outcome: MutationOutcome,
+    operation_id: Uuid,
+) -> Result<WriteReceipt, StorageError> {
+    let before = read_control(tx)?;
+    if operation_id.is_nil()
+        || tx
+            .open_table(RECEIPTS)?
+            .get(scoped_key(before.store_id, ctx.scope, operation_id.as_bytes()).as_slice())?
+            .is_some()
+    {
+        return Err(StorageError::InvalidControl(
+            "receipt operation ID already used or nil".into(),
+        ));
+    }
     let state = advance_generation(tx)?;
     let receipt = WriteReceipt {
         store_id: state.store_id,
-        operation_id: Uuid::new_v4(),
+        operation_id,
         committed_generation: state.committed_generation,
         receipt_version: 1,
         outcome,

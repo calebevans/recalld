@@ -19,6 +19,101 @@ pub(crate) struct DerivedCompletion {
 }
 
 impl DerivedCompletion {
+    /// Actual insertion consumer: canonical commit under the store lease, then
+    /// drain leases and rebuild every derived view before ready success.
+    pub async fn insert(
+        &self,
+        ctx: crate::storage::control::MutationContext,
+        input: crate::storage::insertion::InsertMemory,
+        generated_embedding: Vec<f32>,
+        sampled_at: i64,
+    ) -> Result<crate::storage::insertion::InsertResult, StorageError> {
+        let gate = publication_gate(&self.storage).await?;
+        let lease = gate.read_owned().await;
+        let storage = self.storage.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            let receipt = storage.insert_memory_with_receipt(
+                &ctx,
+                &input,
+                &generated_embedding,
+                sampled_at,
+            )?;
+            let id = crate::storage::insertion::inserted_id(&receipt)?;
+            let record = storage
+                .get_record(id)
+                .map_err(|source| StorageError::CommittedMutation {
+                    receipt: Box::new(receipt.clone()),
+                    source: Box::new(source),
+                })?
+                .map(|r| crate::model::CachedRecord::from(&r));
+            Ok::<_, StorageError>(crate::storage::insertion::InsertResult { receipt, record })
+        })
+        .await
+        .map_err(|e| {
+            failed(format!(
+                "insertion worker outcome unknown; reconcile before retry: {e}"
+            ))
+        })?;
+        drop(lease); // Complete takes this gate exclusively; never upgrade in place.
+        let result = result?;
+        self.complete()
+            .await
+            .map_err(|source| StorageError::CommittedMutation {
+                receipt: Box::new(result.receipt.clone()),
+                source: Box::new(source),
+            })?;
+        Ok(result)
+    }
+
+    /// Legacy bool adapter. Resolve namespace and commit under one store guard;
+    /// each batch caller invokes this in order, with independent child commits.
+    pub async fn forget(&self, id: crate::model::MemoryId) -> Result<bool, StorageError> {
+        let gate = publication_gate(&self.storage).await?;
+        let lease = gate.read_owned().await;
+        let storage = self.storage.clone();
+        let receipt = tokio::task::spawn_blocking(move || {
+            let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            let Some(record) = storage.get_record(id)? else {
+                return Ok(None);
+            };
+            // Preserve a clean legacy no-op. A pending prior forget must still
+            // produce a receipt and finish publication, never claim ready here.
+            if record.phase == DecayPhase::Tombstone
+                && !storage.meta_store().needs_effects_rebuild()
+            {
+                return Ok(None);
+            }
+            let ctx = crate::storage::control::MutationContext::unkeyed(NamespaceId::new(
+                record.namespace_id,
+            ));
+            storage.tombstone_memory_with_receipt(&ctx, id).map(Some)
+        })
+        .await
+        .map_err(|e| {
+            failed(format!(
+                "forget worker outcome unknown; reconcile before retry: {e}"
+            ))
+        })?;
+        drop(lease);
+        let Some(receipt) = receipt? else {
+            return Ok(false);
+        };
+        self.complete()
+            .await
+            .map_err(|source| StorageError::CommittedMutation {
+                receipt: Box::new(receipt.clone()),
+                source: Box::new(source),
+            })?;
+        Ok(matches!(
+            receipt.outcome,
+            crate::storage::control::MutationOutcome::MemoryTombstoned {
+                status: crate::storage::tombstone::TombstoneStatus::Tombstoned,
+                ..
+            }
+        ))
+    }
+
     /// Retrying is safe: no receipt is acknowledged until every view is ready.
     /// Canonical/uncertain-commit failures still require reopening the engine.
     pub async fn complete(&self) -> Result<(), StorageError> {
@@ -32,14 +127,14 @@ impl DerivedCompletion {
         let storage = self.storage.clone();
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || {
-            let storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            storage.resume_pending_purges()?;
             storage.ensure_available()?;
             if !storage.meta_store().needs_effects_rebuild() {
                 return Ok(());
             }
-            let operation_id = storage
-                .meta_store()
-                .pending_effects()?
+            let pending = storage.meta_store().pending_effects()?;
+            let operation_id = pending
                 .first()
                 .ok_or_else(|| failed("dirty state without durable effects".into()))?
                 .receipt
@@ -108,7 +203,16 @@ impl DerivedCompletion {
                 *graph = next_graph;
                 *vectors = next_vectors;
                 *entities = next_entities;
-                cache.invalidate_all();
+                // Preserve unrelated cached candidates used by legacy temporal
+                // linking. Cache invalidation itself never acquires storage or
+                // graph locks; it is safe to finish its future on this blocking
+                // worker while publication is closed. Bound cache hits still
+                // reject any late stale refill against canonical metadata.
+                let invalidated: Vec<_> = pending
+                    .iter()
+                    .flat_map(|effect| effect.invalidated_ids.iter().copied())
+                    .collect();
+                tokio::runtime::Handle::current().block_on(cache.batch_invalidate(&invalidated));
                 crate::storage::metadata::effects::crash_point("before_online_derived_ack");
                 storage.meta_store().acknowledge_rebuilt_effects()
             })();
@@ -144,6 +248,122 @@ mod tests {
             fts: fx.fts_index.clone(),
             entities: fx.entity_index.clone(),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn insertion_completion_returns_receipt_on_failure_then_retries_all_views() {
+        use crate::storage::control::{MutationContext, MutationOutcome, MutationScope};
+        let fx = Fixture::new();
+        let unrelated = fx.insert_memory().await;
+        fx.cache
+            .insert(
+                unrelated,
+                CachedRecord::from(&fx.record(unrelated).unwrap()),
+            )
+            .await;
+        let input = crate::storage::insertion::InsertMemory {
+            id: None,
+            summary: "durable insertion proof".into(),
+            full_text: Some("text proof".into()),
+            tags: vec![crate::model::Tag::new("entity/proof").unwrap()],
+            initial_stability: None,
+            created_at: None,
+            embedding: Some(vec![1., 0., 0., 0.]),
+            parent_id: None,
+            supersedes: None,
+        };
+        let ctx = MutationContext {
+            store_id: Some(fx.storage.read().unwrap().control_state().unwrap().store_id),
+            idempotency_key: Some("completion".into()),
+            ..MutationContext::unkeyed(NamespaceId::new(1))
+        };
+        let before = fx
+            .storage
+            .read()
+            .unwrap()
+            .control_state()
+            .unwrap()
+            .committed_generation;
+        *fx.vector_index.write().await = FlatVectorIndex::new(DIM + 1);
+        let error = match publisher(&fx)
+            .insert(ctx.clone(), input.clone(), vec![], 123)
+            .await
+        {
+            Ok(_) => panic!("wrong-width derived rebuild succeeded"),
+            Err(error) => error,
+        };
+        let StorageError::CommittedMutation { receipt, .. } = error else {
+            panic!("{error}")
+        };
+        let MutationOutcome::MemoryInserted { memory_id, .. } = receipt.outcome else {
+            panic!()
+        };
+        assert_eq!(receipt.committed_generation, before.next().unwrap());
+        assert!(fx.storage_adapter().get_memory(memory_id).await.is_err());
+        assert_eq!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .pending_effects()
+                .unwrap()[0]
+                .receipt,
+            *receipt
+        );
+        *fx.vector_index.write().await = FlatVectorIndex::new(DIM);
+        let replay = publisher(&fx)
+            .insert(ctx, input, vec![f32::NAN], i64::MAX)
+            .await
+            .unwrap();
+        assert!(replay.receipt.replayed);
+        assert_eq!(replay.receipt.operation_id, receipt.operation_id);
+        assert_eq!(
+            fx.storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation,
+            receipt.committed_generation
+        );
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .pending_effects()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(fx.vector_index.read().await.get_vector(memory_id).is_some());
+        assert!(fx.graph.read().await.contains(&memory_id));
+        assert_eq!(fx.entity_index.read().await.len(), 1);
+        assert_eq!(
+            fx.fts_index
+                .lock()
+                .await
+                .search(NamespaceId::new(1), "durable", 10)
+                .unwrap()[0]
+                .0,
+            memory_id
+        );
+        assert!(
+            fx.cache.get(unrelated).await.is_some(),
+            "insertion must retain unrelated cached temporal candidates"
+        );
+        assert_eq!(
+            fx.storage
+                .read()
+                .unwrap()
+                .lookup_operation(
+                    receipt.store_id,
+                    MutationScope::Namespace(NamespaceId::new(1)),
+                    receipt.operation_id
+                )
+                .unwrap()
+                .unwrap(),
+            *receipt
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
