@@ -16,8 +16,13 @@ use super::response::{MemoryResponse, SearchResponse, SearchResult, StageTimings
 use super::{EligibleFtsResults, FtsCoverage};
 use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConfig, NamespaceId};
 
+#[path = "diagnostics.rs"]
+mod diagnostics;
 #[path = "semantics.rs"]
 mod semantics;
+pub use diagnostics::{
+    ChannelDiagnostics, ChannelParticipation, ResultProvenance, RetrievalChannel,
+};
 #[cfg(test)]
 #[path = "semantics_tests.rs"]
 mod semantics_tests;
@@ -276,6 +281,8 @@ struct Candidate {
     graph_depth: Option<u8>,
     /// V2 graph seed evidence, merged independently of discovery order.
     seed_score: f32,
+    /// Diagnostic evidence only; never read by ranking or source selection.
+    provenance: ResultProvenance,
 }
 
 impl Candidate {
@@ -293,6 +300,7 @@ impl Candidate {
             activation_score: None,
             graph_depth: None,
             seed_score: 0.0,
+            provenance: ResultProvenance::default(),
         }
     }
 }
@@ -527,6 +535,8 @@ impl QueryEngine {
         let entity_recall_start = Instant::now();
         let entity_recall_cap = query.limit * 2;
         let mut entity_only_ids: Vec<(MemoryId, f32)> = Vec::new();
+        let mut entity_hit_ids = HashSet::new();
+        let mut entity_offered = None;
 
         // Union vector and FTS results into the candidate pool.
         let mut all_candidate_ids: Vec<MemoryId> = vector_ids.clone();
@@ -547,6 +557,12 @@ impl QueryEngine {
                 &eligible_ids,
             )?;
 
+            if diagnostics.channels.is_some() {
+                // Observe overlap before the ranking path skips existing IDs
+                // and caps novel entity candidates. This never changes that path.
+                entity_hit_ids.extend(entity_results.iter().map(|r| r.memory_id));
+                entity_offered = Some(entity_hit_ids.len());
+            }
             let query_entity_count = query_entities.len() as f32;
 
             for result in entity_results {
@@ -604,6 +620,29 @@ impl QueryEngine {
             for record in eligible_records.values() {
                 candidates.push(Candidate::new(record.clone()));
             }
+        }
+        if diagnostics.channels.is_some() {
+            for candidate in &mut candidates {
+                let channels = &mut candidate.provenance.own_channels;
+                if candidate.raw_vector_score.is_some() {
+                    channels.insert(RetrievalChannel::Vector);
+                }
+                if candidate.raw_fts_score.is_some() {
+                    channels.insert(RetrievalChannel::Fts);
+                }
+                if entity_hit_ids.contains(&candidate.record.id) {
+                    channels.insert(RetrievalChannel::Entity);
+                }
+                if query.query_mode == QueryMode::MetadataOnly {
+                    channels.insert(RetrievalChannel::Metadata);
+                }
+            }
+            diagnostics.observe_direct_channels(
+                &candidates,
+                query_embedding.as_ref().map(|_| vector_score_map.len()),
+                entity_offered,
+                (query.query_mode == QueryMode::MetadataOnly).then_some(eligible_records.len()),
+            );
         }
         timings.load_metadata_us = stage_start.elapsed().as_micros() as u64;
 
