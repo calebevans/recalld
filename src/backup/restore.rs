@@ -685,6 +685,51 @@ mod tests {
         assert!(extract_backup(&path, &root.path().join("stage"), &manifest).is_err());
     }
 
+    #[tokio::test]
+    async fn integration_restore_rejects_partial_or_future_control_before_replacing_target() {
+        use crate::storage::control;
+        for future in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (source, manifest) = fixture(root.path());
+            let engine = RedbStorageEngine::open(&source).unwrap();
+            let mut state = engine.control_state().unwrap();
+            drop(engine);
+            let db = redb::Database::open(source.join("meta.db")).unwrap();
+            let tx = db.begin_write().unwrap();
+            if future {
+                state.control_schema_version = 2;
+                tx.open_table(control::CONTROL)
+                    .unwrap()
+                    .insert("state", control::encode(&state).unwrap().as_slice())
+                    .unwrap();
+            } else {
+                tx.delete_table(control::KEYS).unwrap();
+            }
+            tx.commit().unwrap();
+            drop(db);
+            let source_before = fs::read(source.join("meta.db")).unwrap();
+            assert!(canonical_files(&source).is_err());
+            assert_eq!(fs::read(source.join("meta.db")).unwrap(), source_before);
+            // Use a checksum-valid archive to isolate semantic validation.
+            let files: Vec<_> = manifest
+                .files
+                .iter()
+                .map(|f| source.join(&f.name))
+                .collect();
+            let manifest = generate_manifest(&source, &files).unwrap();
+            let archive = archive(root.path(), &source, &manifest);
+            let target = root.path().join("target");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("sentinel"), b"original target").unwrap();
+            assert!(restore(archive, &target).await.is_err());
+            assert_eq!(
+                fs::read(target.join("sentinel")).unwrap(),
+                b"original target"
+            );
+            assert!(!target.join("meta.db").exists());
+        }
+    }
+
     #[test]
     fn containment_restore_lock_child() {
         let Some(target) = std::env::var_os("RECALLD_TEST_LOCK_TARGET") else {
