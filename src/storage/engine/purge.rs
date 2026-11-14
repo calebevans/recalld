@@ -36,7 +36,7 @@ impl RedbStorageEngine {
         let p = self
             .lookup_namespace_purge(store_id, namespace, parent)?
             .ok_or_else(|| StorageError::InvalidMutation("unknown purge operation".into()))?;
-        self.purge_step(&p, chunk_limit)?;
+        self.purge_step(&p, chunk_limit, None)?;
         self.lookup_namespace_purge(store_id, namespace, parent)?
             .ok_or_else(|| StorageError::InvalidControl("lost purge progress".into()))
     }
@@ -45,17 +45,23 @@ impl RedbStorageEngine {
         &mut self,
         p: &PurgeProgress,
         limit: usize,
+        parent: Option<&crate::storage::work::WorkTicket>,
     ) -> Result<Option<crate::storage::metadata::effects::EffectResult>, StorageError> {
         self.meta_store.ensure_handle_available()?;
         match p.stage {
             PurgeStage::Complete => Ok(None),
             PurgeStage::Deleting => {
-                let result =
-                    self.meta_store
-                        .advance_purge(p, limit, &self.edge_store.load_all_edges()?)?;
+                let guard = self.meta_store.purge_guard(parent)?;
+                let result = self.meta_store.advance_purge(
+                    &guard,
+                    p,
+                    limit,
+                    &self.edge_store.load_all_edges()?,
+                )?;
                 if let Some(result) = &result {
                     effects::apply_pending(
                         &self.meta_store,
+                        &guard,
                         &self.edge_store,
                         Some(&mut self.vector_manager),
                     )
@@ -67,10 +73,11 @@ impl RedbStorageEngine {
                 Ok(result)
             }
             PurgeStage::Cleanup => {
+                let guard = self.meta_store.purge_guard(parent)?;
                 drop(self.vector_manager.remove(p.namespace_id));
                 let path = self.namespace_dir(&p.name)?;
                 let root = &self.db_path;
-                self.meta_store.finish_purge_cleanup(p, || {
+                self.meta_store.finish_purge_cleanup(&guard, p, || {
                     // Name validity and the durable lease were checked before
                     // mutation. Refuse symlink/non-directory replacement.
                     match std::fs::symlink_metadata(&path) {
@@ -98,6 +105,13 @@ impl RedbStorageEngine {
     /// Each canonical transaction is bounded; there is no forgotten queue that
     /// needs a manual reopen to make an otherwise healthy purge progress.
     pub(crate) fn resume_pending_purges(&mut self) -> Result<(), StorageError> {
+        self.resume_pending_purges_with_work(None)
+    }
+
+    pub(crate) fn resume_pending_purges_with_work(
+        &mut self,
+        parent: Option<&crate::storage::work::WorkTicket>,
+    ) -> Result<(), StorageError> {
         loop {
             let active = self
                 .meta_store
@@ -107,7 +121,7 @@ impl RedbStorageEngine {
             let Some(p) = active else {
                 return Ok(());
             };
-            self.purge_step(&p, CHUNK_LIMIT)?;
+            self.purge_step(&p, CHUNK_LIMIT, parent)?;
         }
     }
 
@@ -145,7 +159,7 @@ impl RedbStorageEngine {
         let mut records = Vec::new();
         let mut peers = std::collections::HashMap::new();
         while p.stage != PurgeStage::Complete {
-            match self.purge_step(&p, CHUNK_LIMIT) {
+            match self.purge_step(&p, CHUNK_LIMIT, None) {
                 Ok(Some(result)) => {
                     records.extend(result.removed);
                     peers.extend(result.peer_counts);

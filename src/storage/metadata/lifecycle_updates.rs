@@ -80,12 +80,13 @@ impl MetadataStore {
     /// redb transaction after all fields and generation have been staged.
     fn prepare_legacy_patch(
         &self,
-        _publication: &std::sync::RwLockWriteGuard<'_, ()>,
+        _publication: &MutationGuard<'_>,
         id: MemoryId,
         expected: &DiskRecord,
         namespace: &NamespaceConfig,
         patch: LegacyPatch<'_>,
     ) -> Result<Option<(redb::WriteTransaction, DiskRecord)>, StorageError> {
+        _publication.check(self)?;
         let tx = self.db.begin_write()?;
         let mut record = {
             let table = tx.open_table(META_TABLE)?;

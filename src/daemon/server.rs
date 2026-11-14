@@ -626,6 +626,29 @@ mod tests {
         assert!(rejected.result.is_none());
         assert!(rejected.error.is_some());
         assert_eq!(fx.storage.read().unwrap().control_state().unwrap(), before);
+        let tracker = fx.storage.read().unwrap().meta_store().work_tracker();
+        let lease = tracker
+            .close_and_drain(std::time::Instant::now() + std::time::Duration::from_secs(10))
+            .unwrap();
+        let request = DaemonRequest {
+            id: 3,
+            params: serde_json::json!({"resultVersion":1,"kind":"insert","items":[{"summary":"closed socket root"}],"defaultNamespace":"default"}),
+            ..request
+        };
+        write_framed_request(&mut client, &request, LEGACY_MAX_MESSAGE_SIZE)
+            .await
+            .unwrap();
+        let rejected = read_framed_response(&mut client, LEGACY_MAX_MESSAGE_SIZE)
+            .await
+            .unwrap();
+        assert!(rejected.result.is_none());
+        assert!(
+            serde_json::to_string(&rejected.error)
+                .unwrap()
+                .contains("admission is closed")
+        );
+        assert_eq!(fx.storage.read().unwrap().control_state().unwrap(), before);
+        drop(lease);
         tx.send(true).unwrap();
         task.await.unwrap();
         assert_eq!(count.load(Ordering::Relaxed), 0);
@@ -754,6 +777,9 @@ mod tests {
             Some(outcome.batch_operation_id)
         );
         assert_eq!(outcome.items[1].status, BatchStatus::NotAttempted);
+        let tracker = fx.storage.read().unwrap().meta_store().work_tracker();
+        assert!(tracker.status().unresolved > 0);
+        assert!(tracker.close_and_drain(std::time::Instant::now()).is_err());
         assert_eq!(
             outcome.total,
             outcome.succeeded + outcome.failed + outcome.unresolved

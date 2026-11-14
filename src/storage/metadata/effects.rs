@@ -252,15 +252,27 @@ impl MetadataStore {
     /// Called after every derived index is rebuilt, either during startup or
     /// under the online coordinator's publication/index/storage guards.
     pub(crate) fn acknowledge_rebuilt_effects(&self) -> Result<(), StorageError> {
-        let ids: Vec<_> = self
-            .pending_effects()?
-            .iter()
-            .map(|e| e.receipt.operation_id)
-            .collect();
-        for id in ids {
-            self.acknowledge_derived_effects(id)?;
-        }
-        Ok(())
+        self.acknowledge_rebuilt_effects_with_work(None)
+    }
+
+    pub(crate) fn acknowledge_rebuilt_effects_with_work(
+        &self,
+        parent: Option<&WorkTicket>,
+    ) -> Result<(), StorageError> {
+        let work = self.work_tracker.admit(parent)?;
+        let result = (|| {
+            let ids: Vec<_> = self
+                .pending_effects()?
+                .iter()
+                .map(|e| e.receipt.operation_id)
+                .collect();
+            for id in ids {
+                self.acknowledge_derived_effects_with_work(id, Some(&work))?;
+            }
+            Ok(())
+        })();
+        self.finish_work(work);
+        result
     }
 
     pub(crate) fn pending_effects(&self) -> Result<Vec<PendingEffects>, StorageError> {
@@ -270,7 +282,7 @@ impl MetadataStore {
     /// Caller holds the publication write gate, including the edge snapshot.
     pub(crate) fn commit_graph_effects(
         &self,
-        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
+        _guard: &MutationGuard<'_>,
         namespace: NamespaceId,
         existing_edges: &[PersistedEdge],
         puts: &[PersistedEdge],
@@ -278,6 +290,7 @@ impl MetadataStore {
         delete_records: bool,
         release_vectors: bool,
     ) -> Result<EffectResult, StorageError> {
+        _guard.check(self)?;
         self.ensure_available()?;
         let tx = self.db.begin_write()?;
         let ctx = MutationContext::unkeyed(namespace);
@@ -302,7 +315,7 @@ impl MetadataStore {
     /// Insertion has already staged its new row/indexes in this transaction.
     pub(super) fn finish_record_effects(
         &self,
-        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
+        _guard: &MutationGuard<'_>,
         tx: redb::WriteTransaction,
         ctx: &MutationContext,
         hash: [u8; 32],
@@ -314,6 +327,7 @@ impl MetadataStore {
         mutation: RecordMutation<'_>,
         child: Option<&crate::storage::batch::BatchChild>,
     ) -> Result<EffectResult, StorageError> {
+        _guard.check(self)?;
         let MutationScope::Namespace(namespace) = ctx.scope else {
             return Err(StorageError::InvalidMutationContext(
                 "record effects require namespace scope".into(),
@@ -633,8 +647,10 @@ impl MetadataStore {
 
     pub(crate) fn acknowledge_canonical_effects(
         &self,
+        guard: &MutationGuard<'_>,
         effect: &PendingEffects,
     ) -> Result<(), StorageError> {
+        guard.check(self)?;
         let mut completed = effect.clone();
         completed.canonical_applied = true;
         let tx = self.db.begin_write()?;
@@ -650,7 +666,15 @@ impl MetadataStore {
         &self,
         operation_id: uuid::Uuid,
     ) -> Result<(), StorageError> {
-        let _publication = self.mutation_guard()?;
+        self.acknowledge_derived_effects_with_work(operation_id, None)
+    }
+
+    pub(crate) fn acknowledge_derived_effects_with_work(
+        &self,
+        operation_id: uuid::Uuid,
+        parent: Option<&WorkTicket>,
+    ) -> Result<(), StorageError> {
+        let _publication = self.mutation_guard_with_work(parent)?;
         let tx = self.db.begin_write()?;
         {
             let mut effects = tx.open_table(EFFECTS)?;

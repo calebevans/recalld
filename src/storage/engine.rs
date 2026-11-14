@@ -1321,12 +1321,12 @@ impl StorageEngine for RedbStorageEngine {
             false,
             false,
         )?;
-        effects::apply_pending(&self.meta_store, &self.edge_store, None).map_err(|source| {
-            StorageError::CommittedEffectsPending {
+        effects::apply_pending(&self.meta_store, &guard, &self.edge_store, None).map_err(
+            |source| StorageError::CommittedEffectsPending {
                 operation_id: result.receipt.operation_id,
                 source: Box::new(source),
-            }
-        })?;
+            },
+        )?;
         Ok(result.edges_removed)
     }
 

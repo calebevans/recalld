@@ -13,6 +13,7 @@ use crate::model::{DecayPhase, EdgeType, MemoryId, NamespaceId};
 use crate::search::{EntityIndex, FlatVectorIndex, SearchFilter, VectorIndex};
 use crate::storage::PersistedEdge;
 use crate::storage::engine::RedbStorageEngine;
+use crate::storage::work::WorkTicket;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Constants
@@ -168,6 +169,17 @@ pub(crate) async fn persist_edges(
     storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: &Arc<CacheManager>,
 ) -> Result<usize, AutoLinkError> {
+    persist_edges_with_work(_new_memory_id, persisted_edges, graph, storage, cache, None).await
+}
+
+pub(crate) async fn persist_edges_with_work(
+    _new_memory_id: MemoryId,
+    persisted_edges: &[PersistedEdge],
+    graph: &SharedGraph,
+    storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: &Arc<CacheManager>,
+    parent: Option<&WorkTicket>,
+) -> Result<usize, AutoLinkError> {
     if persisted_edges.is_empty() {
         return Ok(0);
     }
@@ -196,53 +208,88 @@ pub(crate) async fn persist_edges(
     if accepted.is_empty() {
         return Ok(0);
     }
-    publish_edge_plan(live, planned, accepted, storage, cache).await
+    publish_edge_plan_with_work(live, planned, accepted, storage, cache, parent).await
 }
 
 pub(crate) async fn publish_edge_plan(
-    mut live: tokio::sync::OwnedRwLockWriteGuard<crate::graph::RelationshipGraph>,
+    live: tokio::sync::OwnedRwLockWriteGuard<crate::graph::RelationshipGraph>,
     planned: crate::graph::RelationshipGraph,
     edges: Vec<PersistedEdge>,
     storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: &Arc<CacheManager>,
 ) -> Result<usize, AutoLinkError> {
-    let storage_commit = storage.clone();
-    let (result, live) = tokio::task::spawn_blocking(move || {
-        // Shared lifecycle order: graph -> storage -> metadata publication.
-        let store = storage_commit
-            .write()
-            .map_err(|e| AutoLinkError::LockPoisoned(e.to_string()))?;
-        let result = store
-            .put_edges_with_effects(&edges)
-            .map_err(|e| AutoLinkError::Storage(e.to_string()))?
-            .ok_or_else(|| AutoLinkError::Storage("empty edge plan".into()))?;
-        crate::storage::metadata::effects::crash_point("before_graph_publish");
-        *live = planned;
-        Ok::<_, AutoLinkError>((result, live))
-    })
-    .await
-    .map_err(|e| AutoLinkError::Storage(e.to_string()))??;
-    // Keep graph ownership across cache publication, preventing a later writer
-    // from publishing a newer absolute count before this one.
-    for (id, count) in &result.peer_counts {
-        cache.update_edge_count(*id, *count).await;
-    }
-    let created = result.edges_put;
-    let storage_ack = storage.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = storage_ack
-            .write()
-            .map_err(|e| AutoLinkError::LockPoisoned(e.to_string()))?;
-        crate::storage::metadata::effects::crash_point("before_derived_ack");
-        store
-            .acknowledge_graph_effects(result.receipt.operation_id)
+    publish_edge_plan_with_work(live, planned, edges, storage, cache, None).await
+}
+
+pub(crate) async fn publish_edge_plan_with_work(
+    mut live: tokio::sync::OwnedRwLockWriteGuard<crate::graph::RelationshipGraph>,
+    planned: crate::graph::RelationshipGraph,
+    edges: Vec<PersistedEdge>,
+    storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: &Arc<CacheManager>,
+    parent: Option<&WorkTicket>,
+) -> Result<usize, AutoLinkError> {
+    let work = storage
+        .read()
+        .map_err(|e| AutoLinkError::LockPoisoned(e.to_string()))?
+        .meta_store()
+        .work_tracker()
+        .admit(parent)
+        .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
+    let result = async {
+        let worker = work
+            .child()
             .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
-        drop(live);
-        Ok::<_, AutoLinkError>(())
-    })
-    .await
-    .map_err(|e| AutoLinkError::Storage(e.to_string()))??;
-    Ok(created)
+        let storage_commit = storage.clone();
+        let (result, live) = tokio::task::spawn_blocking(move || {
+            // Shared lifecycle order: graph -> storage -> metadata publication.
+            let store = storage_commit
+                .write()
+                .map_err(|e| AutoLinkError::LockPoisoned(e.to_string()))?;
+            let result = (|| {
+                let result = store
+                    .put_edges_with_effects_with_work(&edges, Some(&worker))
+                    .map_err(|e| AutoLinkError::Storage(e.to_string()))?
+                    .ok_or_else(|| AutoLinkError::Storage("empty edge plan".into()))?;
+                crate::storage::metadata::effects::crash_point("before_graph_publish");
+                *live = planned;
+                Ok::<_, AutoLinkError>((result, live))
+            })();
+            store.meta_store().finish_work(worker);
+            result
+        })
+        .await
+        .map_err(|e| AutoLinkError::Storage(e.to_string()))??;
+        // Hold graph ownership until absolute cache counts and acknowledgement.
+        for (id, count) in &result.peer_counts {
+            cache.update_edge_count(*id, *count).await;
+        }
+        let created = result.edges_put;
+        let worker = work
+            .child()
+            .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
+        let storage_ack = storage.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = storage_ack
+                .write()
+                .map_err(|e| AutoLinkError::LockPoisoned(e.to_string()))?;
+            crate::storage::metadata::effects::crash_point("before_derived_ack");
+            let result = store
+                .acknowledge_graph_effects_with_work(result.receipt.operation_id, Some(&worker))
+                .map_err(|e| AutoLinkError::Storage(e.to_string()));
+            drop(live);
+            store.meta_store().finish_work(worker);
+            result
+        })
+        .await
+        .map_err(|e| AutoLinkError::Storage(e.to_string()))??;
+        Ok(created)
+    }
+    .await;
+    if let Ok(store) = storage.read() {
+        store.meta_store().finish_work(work);
+    }
+    result
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -279,6 +326,35 @@ pub async fn perform_autolink(
     graph: &SharedGraph,
     storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: &Arc<CacheManager>,
+) -> Result<usize, AutoLinkError> {
+    perform_autolink_with_work(
+        new_memory_id,
+        namespace_id,
+        embedding,
+        tags,
+        threshold,
+        max_links,
+        vector_index,
+        graph,
+        storage,
+        cache,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn perform_autolink_with_work(
+    new_memory_id: MemoryId,
+    namespace_id: NamespaceId,
+    embedding: &[f32],
+    tags: &[String],
+    threshold: f32,
+    max_links: usize,
+    vector_index: &Arc<tokio::sync::RwLock<FlatVectorIndex>>,
+    graph: &SharedGraph,
+    storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: &Arc<CacheManager>,
+    parent: Option<&WorkTicket>,
 ) -> Result<usize, AutoLinkError> {
     // Step 1: Search vector index for top candidates.
     let search_limit = max_links * 2 + 1;
@@ -360,7 +436,15 @@ pub async fn perform_autolink(
         .collect();
 
     // Steps 5-7: Persist edges, insert into graph, update edge count.
-    persist_edges(new_memory_id, &persisted_edges, graph, storage, cache).await
+    persist_edges_with_work(
+        new_memory_id,
+        &persisted_edges,
+        graph,
+        storage,
+        cache,
+        parent,
+    )
+    .await
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -380,6 +464,31 @@ pub async fn perform_entity_link(
     graph: &SharedGraph,
     storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: &Arc<CacheManager>,
+) -> Result<usize, AutoLinkError> {
+    perform_entity_link_with_work(
+        new_memory_id,
+        _namespace_id,
+        entities,
+        max_entity_links,
+        entity_index,
+        graph,
+        storage,
+        cache,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn perform_entity_link_with_work(
+    new_memory_id: MemoryId,
+    _namespace_id: NamespaceId,
+    entities: &[String],
+    max_entity_links: usize,
+    entity_index: &tokio::sync::RwLock<EntityIndex>,
+    graph: &SharedGraph,
+    storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: &Arc<CacheManager>,
+    parent: Option<&WorkTicket>,
 ) -> Result<usize, AutoLinkError> {
     if entities.is_empty() {
         return Ok(0);
@@ -454,7 +563,15 @@ pub async fn perform_entity_link(
         })
         .collect();
 
-    persist_edges(new_memory_id, &persisted_edges, graph, storage, cache).await
+    persist_edges_with_work(
+        new_memory_id,
+        &persisted_edges,
+        graph,
+        storage,
+        cache,
+        parent,
+    )
+    .await
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -476,6 +593,33 @@ pub async fn perform_temporal_link(
     graph: &SharedGraph,
     storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: &Arc<CacheManager>,
+) -> Result<usize, AutoLinkError> {
+    perform_temporal_link_with_work(
+        new_memory_id,
+        _namespace_id,
+        created_at_ms,
+        temporal_window_ms,
+        max_temporal_links,
+        recent_memories,
+        graph,
+        storage,
+        cache,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn perform_temporal_link_with_work(
+    new_memory_id: MemoryId,
+    _namespace_id: NamespaceId,
+    created_at_ms: i64,
+    temporal_window_ms: u64,
+    max_temporal_links: usize,
+    recent_memories: &[(MemoryId, i64)],
+    graph: &SharedGraph,
+    storage: &Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: &Arc<CacheManager>,
+    parent: Option<&WorkTicket>,
 ) -> Result<usize, AutoLinkError> {
     if temporal_window_ms == 0 || recent_memories.is_empty() {
         return Ok(0);
@@ -536,5 +680,13 @@ pub async fn perform_temporal_link(
         })
         .collect();
 
-    persist_edges(new_memory_id, &persisted_edges, graph, storage, cache).await
+    persist_edges_with_work(
+        new_memory_id,
+        &persisted_edges,
+        graph,
+        storage,
+        cache,
+        parent,
+    )
+    .await
 }

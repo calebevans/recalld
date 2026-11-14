@@ -291,18 +291,30 @@ fn validate_error(error: &BatchError) -> Result<(), StorageError> {
 
 impl MetadataStore {
     pub(crate) fn pending_batch_items(&self) -> Result<usize, StorageError> {
+        self.pending_batch_items_checked(|| Ok(()))
+    }
+
+    /// Cooperative checks bound CPU scanning between lifetime manifest rows.
+    /// Blocking redb/OS reads are not a hard wall-time guarantee.
+    pub(crate) fn pending_batch_items_checked(
+        &self,
+        mut check: impl FnMut() -> Result<(), StorageError>,
+    ) -> Result<usize, StorageError> {
+        check()?;
         let tx = self.db.begin_read()?;
         if !tx.list_tables()?.any(|t| t.name() == BATCHES.name()) {
             return Ok(0);
         }
         let mut pending = 0usize;
         for row in tx.open_table(BATCHES)?.iter()? {
+            check()?;
             let (_, bytes) = row?;
             let p: BatchProgress = control::decode(bytes.value())?;
             pending = pending
                 .checked_add(p.unresolved())
                 .ok_or(StorageError::GenerationExhausted)?;
         }
+        check()?;
         Ok(pending)
     }
     pub(crate) fn reserve_batch(
@@ -319,6 +331,17 @@ impl MetadataStore {
         kind: BatchKind,
         plans: &[BatchItemPlan],
         parent: Option<Uuid>,
+    ) -> Result<BatchProgress, StorageError> {
+        self.reserve_or_resume_batch_with_work(ctx, kind, plans, parent, None)
+    }
+
+    pub(crate) fn reserve_or_resume_batch_with_work(
+        &self,
+        ctx: &MutationContext,
+        kind: BatchKind,
+        plans: &[BatchItemPlan],
+        parent: Option<Uuid>,
+        work: Option<&WorkTicket>,
     ) -> Result<BatchProgress, StorageError> {
         ctx.validate()?;
         if ctx.scope != MutationScope::Catalog
@@ -338,7 +361,7 @@ impl MetadataStore {
                 .collect::<Vec<_>>(),
         )?;
         let hash = control::request_hash(ctx, "batch_reserve_v1", &[&caller_hash]);
-        let _guard = self.mutation_guard()?;
+        let _guard = self.mutation_guard_with_work(work)?;
         let tx = self.db.begin_write()?;
         if let Some(parent) = parent {
             if parent.is_nil() || ctx.store_id.is_none() || ctx.idempotency_key.is_some() {
@@ -567,8 +590,17 @@ impl MetadataStore {
         child: &BatchChild,
         error: BatchError,
     ) -> Result<BatchProgress, StorageError> {
+        self.finalize_batch_error_with_work(child, error, None)
+    }
+
+    pub(crate) fn finalize_batch_error_with_work(
+        &self,
+        child: &BatchChild,
+        error: BatchError,
+        work: Option<&WorkTicket>,
+    ) -> Result<BatchProgress, StorageError> {
         validate_error(&error)?;
-        let _guard = self.mutation_guard()?;
+        let _guard = self.mutation_guard_with_work(work)?;
         let tx = self.db.begin_write()?;
         let mut p = load_child(&tx, child)?;
         require_turn(&p, child.index)?;
