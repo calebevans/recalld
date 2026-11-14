@@ -54,26 +54,41 @@ pub(crate) fn inspect_database_copy(
 }
 
 /// Canonical text preflight on a disposable metadata copy. This precedes any
-/// writable canonical open; pending graph effects are deliberately not inspected.
+/// writable canonical open; pending plans are checked without applying effects.
 pub(crate) fn preflight_text(path: &Path) -> Result<(), StorageError> {
     // An unclean process exit may require redb free-list recovery. Perform it
     // only on the disposable copy before touching the original database.
     let (_copy, metadata) = inspect_database_copy(&path.join("meta.db"), true)?;
     let read = metadata.begin_read()?;
-    if super::control::validate_existing(&read)?.is_some_and(|c| c.control_schema_version == 2) {
+    let control = super::control::validate_existing(&read)?;
+    if let Some(control) = &control {
+        super::lineage::ensure_serving(&read, control)?;
+    }
+    super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
+    // Valid pending effects are recoverable at startup; only malformed evidence fails here.
+    let effects = super::metadata::effects::validate_existing(&read)?;
+    if control
+        .as_ref()
+        .is_some_and(|c| c.control_schema_version == 2)
+    {
         return Err(StorageError::RecoveryRequired("schema v2 remains offline until participating writers are enabled; use schema inspect/export".into()));
     }
     let text = selected_text(path, &read)?;
     let records = read.open_table(META_TABLE)?;
+    let mut decoded = Vec::new();
     for row in records.iter()? {
         let (_, bytes) = row?;
         let record = DiskRecord::from_bytes(bytes.value())?;
+        decoded.push((MemoryId::from_bytes(record.id), record.clone()));
         if record.text_offset != 0 || record.text_length != 0 {
             text.read(TextRef {
                 file_offset: record.text_offset,
                 length: record.text_length,
             })?;
         }
+    }
+    for effect in effects.iter().filter(|effect| !effect.canonical_applied) {
+        super::metadata::effects::validate_plan(effect, &decoded)?;
     }
     Ok(())
 }
@@ -113,6 +128,7 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
     let (_meta_copy, meta) = inspect_database(&path.join("meta.db"))?;
     let read = meta.begin_read()?;
     let control = super::control::validate_existing(&read)?;
+    super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
     let schema_state = control
         .as_ref()
         .map(|c| super::canonical_schema::read_state(&read, c))
@@ -120,6 +136,14 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
         .flatten();
     if control.is_some() {
         read.open_table(super::metadata::NAMESPACE_COUNTER)?;
+    }
+    if super::metadata::effects::validate_existing(&read)?
+        .iter()
+        .any(|e| !e.canonical_applied)
+    {
+        return Err(StorageError::RecoveryRequired(
+            "pending canonical effects; reopen before backup".into(),
+        ));
     }
     let namespaces = read.open_table(NAMESPACE_TABLE)?;
     let mut inventory: HashSet<String> = ["meta.db", "edges.db", "fulltext.dat"]

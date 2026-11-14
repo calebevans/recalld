@@ -9,6 +9,51 @@ use super::sweep::{DecayMetadata, SweepError};
 use crate::model::{DecayPhase, MemoryId, NamespaceId};
 use crate::storage::StorageEngine;
 
+/// Serialize current-layout feedback with other users of the storage lock.
+/// State and history commit together; public receipts and retry safety remain
+/// outside this legacy compatibility adapter.
+/// Lock order: storage only here. Do not acquire/await graph while holding this
+/// guard: sweep publication holds graph first, then acquires storage.
+pub async fn reinforce(
+    storage: std::sync::Arc<std::sync::RwLock<crate::storage::RedbStorageEngine>>,
+    id: MemoryId,
+    quality: u8,
+    global_multiplier: f64,
+    now_millis: i64,
+) -> Result<super::lifecycle::FeedbackPlan, super::lifecycle::LifecycleError> {
+    use super::lifecycle::{LifecycleError, plan_feedback, resolve_policy};
+    tokio::task::spawn_blocking(move || {
+        let storage = storage
+            .write()
+            .map_err(|e| LifecycleError::Storage(e.to_string()))?;
+        let record = storage
+            .get_record(id)
+            .map_err(|e| LifecycleError::Storage(e.to_string()))?
+            .ok_or(LifecycleError::NotFound)?;
+        let namespace = storage
+            .get_namespace(NamespaceId::new(record.namespace_id))
+            .map_err(|e| LifecycleError::Storage(e.to_string()))?
+            .ok_or(LifecycleError::NotFound)?;
+        let policy = resolve_policy(
+            &namespace,
+            &super::DecayConfig::default(),
+            global_multiplier,
+        )?;
+        let plan = plan_feedback(&record, &policy, now_millis, quality)?;
+        if !storage
+            .apply_legacy_feedback(id, &record, &namespace, &plan)
+            .map_err(|e| LifecycleError::Storage(e.to_string()))?
+        {
+            return Err(LifecycleError::Storage(
+                "lifecycle snapshot changed before feedback commit".into(),
+            ));
+        }
+        Ok(plan)
+    })
+    .await
+    .map_err(|e| LifecycleError::Storage(e.to_string()))?
+}
+
 /// Extract decay-relevant metadata from a `DiskRecord`, including the
 /// namespace's decay rate multiplier (if set).
 pub fn get_decay_metadata(
@@ -17,18 +62,21 @@ pub fn get_decay_metadata(
 ) -> Result<Option<DecayMetadata>, SweepError> {
     match storage.get_record(id) {
         Ok(Some(record)) => {
-            // Look up the namespace config to get the decay rate multiplier.
-            let decay_rate_multiplier = storage
+            if record.phase == DecayPhase::Tombstone {
+                return Ok(None);
+            }
+            let namespace = storage
                 .get_namespace(NamespaceId::new(record.namespace_id))
-                .ok()
-                .flatten()
-                .and_then(|ns| ns.decay_rate_multiplier);
+                .map_err(|e| SweepError::Storage(e.to_string()))?
+                .ok_or_else(|| SweepError::Storage("namespace policy not found".to_string()))?;
 
             Ok(Some(DecayMetadata {
+                phase: record.phase,
+                created_at: record.created_at,
                 stability: record.stability,
                 last_accessed_at: record.last_accessed_at,
                 is_permastore: record.is_permastore != 0,
-                decay_rate_multiplier,
+                namespace,
                 has_summary: !record.summary.is_empty(),
             }))
         }

@@ -1,10 +1,55 @@
-//! Timezone utilities for human-readable timestamp formatting.
+//! Injectable UTC clocks and timezone utilities for timestamp formatting.
 //!
 //! All timestamps in Recalld are stored as UTC epoch milliseconds. This module
 //! provides timezone resolution and formatting for display contexts (MCP, CLI).
 
 use chrono::Utc;
 use chrono_tz::Tz;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Instance-local wall clock. Sample once per lifecycle operation.
+pub trait Clock: Send + Sync {
+    fn now_millis(&self) -> i64;
+}
+
+#[derive(Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_millis(&self) -> i64 {
+        Utc::now().timestamp_millis()
+    }
+}
+
+/// Controlled clock for isolated replay. Reset by constructing a new instance.
+#[derive(Debug)]
+pub struct ManualClock(AtomicI64);
+
+impl ManualClock {
+    pub fn new(now_millis: i64) -> Self {
+        Self(AtomicI64::new(now_millis))
+    }
+
+    pub fn advance_to(&self, now_millis: i64) -> Result<(), &'static str> {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |previous| {
+                (now_millis >= previous).then_some(now_millis)
+            })
+            .map(|_| ())
+            .map_err(|_| "manual clock cannot move backward")
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_millis(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Saturate before converting to floating point, including at i64 extremes.
+pub fn elapsed_days(now_millis: i64, anchor_millis: i64) -> f32 {
+    (now_millis.saturating_sub(anchor_millis).max(0) as f64 / 86_400_000.0) as f32
+}
 
 /// Resolves a timezone configuration string to a `chrono_tz::Tz`.
 ///
@@ -99,6 +144,19 @@ pub fn parse_time_value(value: &serde_json::Value) -> Option<Result<i64, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_clock_and_elapsed_time_are_monotone_and_saturating() {
+        let clock = ManualClock::new(10);
+        assert!(clock.advance_to(9).is_err());
+        assert_eq!(clock.now_millis(), 10);
+        clock.advance_to(10).unwrap();
+        clock.advance_to(i64::MAX).unwrap();
+        assert_eq!(clock.now_millis(), i64::MAX);
+        assert_eq!(elapsed_days(0, 1), 0.0);
+        assert_eq!(elapsed_days(86_400_000, 0), 1.0);
+        assert!(elapsed_days(i64::MAX, i64::MIN).is_finite());
+    }
 
     #[test]
     fn test_resolve_utc() {

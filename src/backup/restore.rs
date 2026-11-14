@@ -82,70 +82,107 @@ pub struct RestoreOptions {
     /// Legacy compatibility flag. Restore never stops an unrelated daemon;
     /// the target must already be quiescent regardless of this value.
     pub no_stop_daemon: bool,
+    /// Explicit fresh-destination historical inspection; ordinary serving is blocked.
+    pub historical: bool,
 }
 
 // ── Main entry point ────────────────────────────────────────────────
 
 /// Restore Recalld data from a backup zip archive.
 pub async fn restore_from_backup(opts: RestoreOptions) -> Result<(), RestoreError> {
+    restore_at(opts, |_| Ok(())).await
+}
+
+async fn restore_at(
+    opts: RestoreOptions,
+    boundary: impl FnMut(crate::storage::restore_journal::Stage) -> Result<(), StorageError>,
+) -> Result<(), RestoreError> {
+    use crate::storage::{
+        lineage::RestoreMode,
+        metadata::restoration,
+        restore_journal::{self, RestoreJournal},
+    };
     if !opts.backup_path.exists() {
         return Err(RestoreError::BackupNotFound(
             opts.backup_path.display().to_string(),
         ));
     }
-    let manifest = read_manifest(&opts.backup_path)?;
-    validate_manifest(&manifest)?;
-    if !opts.force {
-        request_confirmation(&opts, &manifest)?;
-    }
-
-    // No daemon shutdown by global socket: it may own a different target.
-    // Both force and no_stop_daemon still require exclusive target ownership.
     let ownership = StoreOwnership::acquire(&opts.data_dir)?;
     let target = &ownership.path;
     let parent = target.parent().ok_or(StorageError::InvalidPath)?;
+    if opts.historical && target.try_exists()? {
+        return Err(RestoreError::InvalidArchive(
+            "historical restore requires a fresh destination".into(),
+        ));
+    }
+    if !opts.historical && !target.try_exists()? {
+        return Err(RestoreError::InvalidArchive("retained-state restore requires an existing target; use explicit historical mode for a fresh destination".into()));
+    }
     let _old_lock = if target.exists() {
         Some(lock_directory(target)?)
     } else {
         None
     };
+    let captured = if target.exists() {
+        Some(restoration::capture(target)?)
+    } else {
+        None
+    };
+    // Pin one private archive copy: manifest, bytes and provenance hash must
+    // describe the same input even if the source path changes during restore.
+    let mut archive = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut File::open(&opts.backup_path)?, archive.as_file_mut())?;
+    archive.as_file().sync_all()?;
+    let archive_sha256 = restore_journal::hash_file(archive.path())?;
+    let manifest = read_manifest(archive.path())?;
+    validate_manifest(&manifest)?;
+    if !opts.force {
+        request_confirmation(&opts, &manifest)?;
+    }
     let stage = tempfile::Builder::new()
         .prefix(".recalld-restore-")
         .tempdir_in(parent)?;
-    extract_backup(&opts.backup_path, stage.path(), &manifest)?;
-    // FTS is derived. Never serve an old checkpoint as authoritative; normal
-    // system startup rebuilds an absent FTS database from the restored records.
+    extract_backup(archive.path(), stage.path(), &manifest)?;
     if stage.path().join("fts.db").exists() {
         fs::remove_file(stage.path().join("fts.db"))?;
     }
     let _new_lock = lock_directory(stage.path())?;
-    fsync_dir(stage.path())?;
-    let previous = parent.join(format!(
-        "{}.bak-{}",
-        target.file_name().unwrap().to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ));
-    let staged = stage.keep();
-    let journal = serde_json::json!({"target": target, "staged": staged, "previous": previous});
-    let mut marker = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&ownership.pending)?;
-    marker.write_all(journal.to_string().as_bytes())?;
-    marker.sync_all()?;
-    fsync_dir(parent)?;
-    // From this point every error leaves the marker and all available copies.
-    // Startup refuses service until an operator resolves the interrupted swap.
-    if target.exists() {
-        fs::rename(target, &previous)?;
-        fsync_dir(parent)?;
+    let snapshot = restoration::capture(stage.path())?;
+    if captured
+        .as_ref()
+        .is_some_and(|t| !restoration::compatible(&snapshot, t))
+    {
+        return Err(StorageError::StoreLineageMismatch.into());
     }
-    fs::rename(&staged, target)?;
-    fsync_dir(parent)?;
-    validate_existing(target)?;
-    fs::remove_file(&ownership.pending)?;
-    fsync_dir(parent)?;
-    tracing::info!(retained = %previous.display(), "restore published; pre-restore data retained");
+    let operation = uuid::Uuid::new_v4();
+    let new_store_id = uuid::Uuid::new_v4();
+    let mode = if opts.historical {
+        RestoreMode::Historical
+    } else {
+        RestoreMode::Serving
+    };
+    restoration::reconcile(
+        stage.path(),
+        &snapshot,
+        captured.as_ref(),
+        mode,
+        operation,
+        new_store_id,
+        archive_sha256,
+    )?;
+    let journal = RestoreJournal::prepared(
+        &ownership,
+        stage.path().to_owned(),
+        captured,
+        new_store_id,
+        operation,
+        archive_sha256,
+    )?;
+    // Keep the fully validated stage before journal publication. Once the marker
+    // is durable, every failure preserves both captured evidence and copies.
+    let _staged = stage.keep();
+    restore_journal::publish(&ownership, journal, boundary)?;
+    tracing::info!(%new_store_id, historical = opts.historical, "restore published; later deletion coverage cannot be inferred from missing copies");
     Ok(())
 }
 
@@ -412,8 +449,16 @@ mod tests {
     use crate::backup::{archive::create_archive, manifest::generate_manifest};
     use crate::model::{DecayPhase, DiskRecord, MemoryId, NamespaceConfig};
     use crate::storage::{RedbStorageEngine, StorageEngine, validation::canonical_files};
+    use redb::ReadableTable;
 
     fn fixture(root: &Path) -> (PathBuf, BackupManifest) {
+        fixture_with_embedding(root, &[1., 2., 3., 4.])
+    }
+
+    pub(super) fn fixture_with_embedding(
+        root: &Path,
+        embedding: &[f32],
+    ) -> (PathBuf, BackupManifest) {
         let source = root.join("source");
         let mut engine = RedbStorageEngine::open(&source).unwrap();
         let mut ns = NamespaceConfig::default_namespace(0);
@@ -442,13 +487,7 @@ mod tests {
             text_length: 0,
         };
         engine
-            .insert_memory(
-                id,
-                ns,
-                &mut record,
-                &[1., 2., 3., 4.],
-                Some("retained text"),
-            )
+            .insert_memory(id, ns, &mut record, embedding, Some("retained text"))
             .unwrap();
         engine.sync().unwrap();
         drop(engine);
@@ -459,7 +498,10 @@ mod tests {
 
     // Deliberately bypass production generation for semantically corrupt but
     // checksum-consistent archives. Production generation now rejects these.
-    fn checksum_valid_manifest(source: &Path, mut manifest: BackupManifest) -> BackupManifest {
+    pub(super) fn checksum_valid_manifest(
+        source: &Path,
+        mut manifest: BackupManifest,
+    ) -> BackupManifest {
         manifest.total_size_bytes = 0;
         for entry in &mut manifest.files {
             let bytes = fs::read(source.join(&entry.name)).unwrap();
@@ -492,6 +534,7 @@ mod tests {
             data_dir: target.to_path_buf(),
             force: true,
             no_stop_daemon: true,
+            historical: false,
         })
         .await
     }
@@ -516,6 +559,14 @@ mod tests {
                 .retain(|f| missing != "all" && f.name != missing);
             incomplete.total_size_bytes = incomplete.files.iter().map(|f| f.size_bytes).sum();
             let path = archive(root.path(), &source, &incomplete);
+            assert!(
+                extract_backup(
+                    &path,
+                    &root.path().join(format!("stage-{missing}")),
+                    &incomplete
+                )
+                .is_err()
+            );
             assert!(restore(path, &target).await.is_err(), "accepted {missing}");
             assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"preserve");
             assert!(!target.join("meta.db").exists());
@@ -545,6 +596,7 @@ mod tests {
         let target = root.path().join("target");
         fs::create_dir(&target).unwrap();
         fs::write(target.join("sentinel"), b"preserve").unwrap();
+        assert!(extract_backup(&archive, &root.path().join("stage"), &forged_manifest).is_err());
         assert!(restore(archive, &target).await.is_err());
         assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"preserve");
     }
@@ -568,6 +620,7 @@ mod tests {
         let target = root.path().join("target");
         fs::create_dir(&target).unwrap();
         fs::write(target.join("sentinel"), b"old").unwrap();
+        assert!(extract_backup(&path, &root.path().join("stage"), &manifest).is_err());
         assert!(restore(path, &target).await.is_err());
         assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"old");
     }
@@ -588,6 +641,11 @@ mod tests {
         let path = archive(root.path(), &source, &manifest);
         let target = root.path().join("target");
         fs::create_dir(&target).unwrap();
+        for entry in &manifest.files {
+            let dest = target.join(&entry.name);
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::copy(source.join(&entry.name), dest).unwrap();
+        }
         fs::write(target.join("sentinel"), b"old").unwrap();
         restore(path, &target).await.unwrap();
         let engine = RedbStorageEngine::open(&target).unwrap();
@@ -667,7 +725,9 @@ mod tests {
             } else {
                 archive(root.path(), &source, &bad)
             };
-            assert!(restore(path, &target).await.is_err(), "accepted {mode}");
+            let mut opts = retained_options(&path, &target);
+            opts.historical = true;
+            assert!(restore_from_backup(opts).await.is_err(), "accepted {mode}");
             assert!(!target.exists());
         }
     }
@@ -689,9 +749,7 @@ mod tests {
         crate::backup::run_backup(&config, &archive_path, Some(&source), false)
             .await
             .unwrap();
-        restore(archive_path, &root.path().join("restored"))
-            .await
-            .unwrap();
+        restore(archive_path, &source).await.unwrap();
     }
 
     #[test]
@@ -854,6 +912,7 @@ mod tests {
                 data_dir: target.clone(),
                 force: true,
                 no_stop_daemon,
+                historical: false,
             })
             .await;
             assert!(matches!(
@@ -887,4 +946,487 @@ mod tests {
             assert!(StoreOwnership::acquire(&alias).is_err());
         }
     }
+    fn retained_fixture(
+        root: &Path,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        MemoryId,
+        MemoryId,
+        MemoryId,
+        crate::storage::control::WriteReceipt,
+    ) {
+        use crate::model::{AccessKind, Tag};
+        use crate::storage::control::{MutationContext, MutationScope};
+        let (source, _) = fixture(root);
+        let mut engine = RedbStorageEngine::open(&source).unwrap();
+        let a = engine.scan_all().unwrap()[0].0;
+        let original = engine.get_record(a).unwrap().unwrap();
+        let ns = crate::model::NamespaceId::new(original.namespace_id);
+        let mut add = |summary: &str| {
+            let id = MemoryId::new();
+            let mut record = original.clone();
+            record.id = *id.as_bytes();
+            record.summary = summary.into();
+            record.tags = vec![Tag::new("retained-tag").unwrap()];
+            record.text_offset = 0;
+            record.text_length = 0;
+            engine
+                .insert_memory(
+                    id,
+                    ns,
+                    &mut record,
+                    &[1., 2., 3., 4.],
+                    Some("retained payload"),
+                )
+                .unwrap();
+            id
+        };
+        let b = add("summary to remove");
+        let c = add("survivor");
+        engine
+            .add_edge(c, a, crate::model::EdgeType::Associative, 1., false, 0)
+            .unwrap();
+        engine.update_edge_count(c, 1).unwrap();
+        let state = engine.control_state().unwrap();
+        let ctx = MutationContext {
+            store_id: Some(state.store_id),
+            scope: MutationScope::Namespace(ns),
+            idempotency_key: Some("before-restore".into()),
+            expected_generation: None,
+            contract_version: 1,
+        };
+        let receipt = engine
+            .meta_store()
+            .update_access_with_receipt(&ctx, c, 100, AccessKind::DirectRetrieval)
+            .unwrap();
+        engine.sync().unwrap();
+        drop(engine);
+        let files = canonical_files(&source).unwrap();
+        let manifest = generate_manifest(&source, &files).unwrap();
+        let backup = archive(root, &source, &manifest);
+        let mut engine = RedbStorageEngine::open(&source).unwrap();
+        engine.delete_memory(a).unwrap();
+        let nsconfig = engine.get_namespace(ns).unwrap().unwrap();
+        let b_record = engine.get_record(b).unwrap().unwrap();
+        engine
+            .apply_legacy_decay(b, &b_record, &nsconfig, DecayPhase::Summary, 0.6, 0.6)
+            .unwrap();
+        let b_record = engine.get_record(b).unwrap().unwrap();
+        engine
+            .apply_legacy_decay(b, &b_record, &nsconfig, DecayPhase::Ghost, 0.1, 0.1)
+            .unwrap();
+        engine.sync().unwrap();
+        drop(engine);
+        (source, backup, a, b, c, receipt)
+    }
+
+    pub(super) fn retained_options(backup: &Path, target: &Path) -> RestoreOptions {
+        RestoreOptions {
+            backup_path: backup.to_owned(),
+            data_dir: target.to_owned(),
+            force: true,
+            no_stop_daemon: true,
+            historical: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_restore_applies_newer_removals_forks_lineage_and_preserves_historical_receipts()
+     {
+        use crate::model::AccessKind;
+        use crate::storage::control::{MutationContext, MutationScope};
+        let root = tempfile::tempdir().unwrap();
+        let (target, backup, removed, ghost, live, old_receipt) = retained_fixture(root.path());
+        let before = crate::storage::metadata::restoration::capture(&target).unwrap();
+        restore_from_backup(retained_options(&backup, &target))
+            .await
+            .unwrap();
+        let mut engine = RedbStorageEngine::open(&target).unwrap();
+        let state = engine.control_state().unwrap();
+        assert_ne!(state.store_id, before.control.store_id);
+        assert_eq!(state.committed_generation.get(), 1);
+        assert!(engine.get_record(removed).unwrap().is_none());
+        let r = engine.get_record(ghost).unwrap().unwrap();
+        assert_eq!(r.phase, DecayPhase::Ghost);
+        assert!(r.summary.is_empty());
+        assert_eq!((r.text_offset, r.text_length), (0, 0));
+        assert_eq!(r.tags.len(), 1, "v1 retained tags must survive");
+        assert_eq!(engine.get_record(live).unwrap().unwrap().edge_count, 0);
+        assert!(engine.edge_store().load_all_edges().unwrap().is_empty());
+        let ns = crate::model::NamespaceId::new(r.namespace_id);
+        let fts = crate::search::FtsIndex::new(&target).unwrap();
+        assert_eq!(fts.search(ns, "survivor", 10).unwrap()[0].0, live);
+        assert!(fts.search(ns, "summary to remove", 10).unwrap().is_empty());
+        assert!(fts.search(ns, "text", 10).unwrap().is_empty());
+        drop(fts);
+        let stale = MutationContext {
+            store_id: Some(old_receipt.store_id),
+            scope: MutationScope::Namespace(ns),
+            idempotency_key: Some("before-restore".into()),
+            expected_generation: None,
+            contract_version: 1,
+        };
+        assert!(matches!(
+            engine.meta_store().update_access_with_receipt(
+                &stale,
+                live,
+                200,
+                AccessKind::DirectRetrieval
+            ),
+            Err(StorageError::StoreLineageMismatch)
+        ));
+        assert!(
+            engine
+                .meta_store()
+                .lookup_operation(
+                    state.store_id,
+                    MutationScope::Namespace(ns),
+                    old_receipt.operation_id
+                )
+                .unwrap()
+                .is_none()
+        );
+        let fresh = MutationContext {
+            store_id: Some(state.store_id),
+            ..stale
+        };
+        let new_receipt = engine
+            .meta_store()
+            .update_access_with_receipt(&fresh, live, 200, AccessKind::DirectRetrieval)
+            .unwrap();
+        assert!(!new_receipt.replayed);
+        assert_ne!(new_receipt.operation_id, old_receipt.operation_id);
+        engine.sync().unwrap();
+        drop(engine);
+        let capture = crate::storage::metadata::restoration::capture(&target).unwrap();
+        assert_eq!(capture.ledger.entries.len(), before.ledger.entries.len());
+        assert!(capture.receipts.iter().any(|(_, bytes)| {
+            crate::storage::control::validate_receipt(bytes)
+                .unwrap()
+                .receipt
+                .operation_id
+                == old_receipt.operation_id
+        }));
+        assert!(
+            capture
+                .lineage
+                .as_ref()
+                .unwrap()
+                .permits(before.control.generation_ref())
+        );
+        // Repeat from the original ancestor snapshot: evidence from both origins
+        // remains, and ancestor receipts never become active retry keys.
+        restore_from_backup(retained_options(&backup, &target))
+            .await
+            .unwrap();
+        let reopened = RedbStorageEngine::open(&target).unwrap();
+        assert_ne!(reopened.control_state().unwrap().store_id, state.store_id);
+        assert!(reopened.get_record(removed).unwrap().is_none());
+        assert!(
+            reopened
+                .get_record(ghost)
+                .unwrap()
+                .unwrap()
+                .summary
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_journal_restart_finishes_every_durable_publication_boundary() {
+        use crate::storage::restore_journal::Stage;
+        for stop in [
+            Stage::Prepared,
+            Stage::OldMoved,
+            Stage::NewInstalled,
+            Stage::Complete,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (target, backup, removed, ghost, _, receipt) = retained_fixture(root.path());
+            let outcome = restore_at(retained_options(&backup, &target), |stage| {
+                if std::mem::discriminant(&stage) == std::mem::discriminant(&stop) {
+                    Err(StorageError::RecoveryRequired(
+                        "injected publication interruption".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+            assert!(outcome.is_err());
+            let pending = root.path().join("source.recalld-restore-pending");
+            let mut journal: serde_json::Value =
+                serde_json::from_slice(&fs::read(&pending).unwrap()).unwrap();
+            assert!(
+                journal["captured"]["ledger"]["entries"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+                    >= 2
+            );
+            // A rename can reach disk before its state update. Recovery must
+            // inspect identities, not trust the marker's state alone.
+            journal["state"] = "prepared".into();
+            fs::write(&pending, serde_json::to_vec(&journal).unwrap()).unwrap();
+            let journal_before = fs::read(&pending).unwrap();
+            assert!(
+                StoreOwnership::acquire(&target).is_err(),
+                "inspection cannot recover/publish a pending restore"
+            );
+            assert_eq!(fs::read(&pending).unwrap(), journal_before);
+            let engine = RedbStorageEngine::open(&target).unwrap();
+            assert_ne!(engine.control_state().unwrap().store_id, receipt.store_id);
+            assert!(engine.get_record(removed).unwrap().is_none());
+            assert!(
+                engine
+                    .get_record(ghost)
+                    .unwrap()
+                    .unwrap()
+                    .summary
+                    .is_empty()
+            );
+            assert!(!pending.exists());
+            drop(engine);
+            let again = RedbStorageEngine::open(&target).unwrap();
+            assert!(again.get_record(removed).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_staging_after_old_move_restores_retained_target_without_resurrection() {
+        use crate::storage::restore_journal::Stage;
+        let root = tempfile::tempdir().unwrap();
+        let (target, backup, removed, _, _, receipt) = retained_fixture(root.path());
+        assert!(
+            restore_at(retained_options(&backup, &target), |stage| {
+                if matches!(stage, Stage::OldMoved) {
+                    Err(StorageError::RecoveryRequired("stop".into()))
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .is_err()
+        );
+        let pending = root.path().join("source.recalld-restore-pending");
+        let journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&pending).unwrap()).unwrap();
+        fs::remove_dir_all(journal["staged"].as_str().unwrap()).unwrap();
+        assert!(RedbStorageEngine::open(&target).is_err()); // reports rollback
+        assert!(!pending.exists());
+        let original = RedbStorageEngine::open(&target).unwrap();
+        assert_eq!(original.control_state().unwrap().store_id, receipt.store_id);
+        assert!(original.get_record(removed).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unrelated_or_unreadable_target_never_downgrades_to_historical_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let (target, backup, removed, _, _, _) = retained_fixture(root.path());
+        let other_root = tempfile::tempdir().unwrap();
+        let (other, _) = fixture(other_root.path());
+        let bytes = fs::read(other.join("meta.db")).unwrap();
+        assert!(
+            restore_from_backup(retained_options(&backup, &other))
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(other.join("meta.db")).unwrap(), bytes);
+        let db = redb::Database::open(target.join("meta.db")).unwrap();
+        let tx = db.begin_write().unwrap();
+        tx.delete_table(crate::storage::metadata::removal_ledger::LEDGER)
+            .unwrap();
+        tx.commit().unwrap();
+        drop(db);
+        let bytes = fs::read(target.join("meta.db")).unwrap();
+        assert!(
+            restore_from_backup(retained_options(&backup, &target))
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(target.join("meta.db")).unwrap(), bytes);
+        assert!(!root.path().join("source.recalld-restore-pending").exists());
+        assert!(!bytes.is_empty());
+        let _ = removed;
+    }
+
+    #[tokio::test]
+    async fn retained_restore_terminal_ledger_survives_tombstone_and_namespace_purge() {
+        for purge in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (target, manifest) = fixture(root.path());
+            let backup = archive(root.path(), &target, &manifest);
+            let mut engine = RedbStorageEngine::open(&target).unwrap();
+            let (id, original) = engine.scan_all().unwrap().remove(0);
+            let ns = crate::model::NamespaceId::new(original.namespace_id);
+            engine.tombstone_memory(id).unwrap();
+            if purge {
+                engine.purge_namespace(ns).unwrap();
+            }
+            engine.sync().unwrap();
+            drop(engine);
+            restore_from_backup(retained_options(&backup, &target))
+                .await
+                .unwrap();
+            let mut engine = RedbStorageEngine::open(&target).unwrap();
+            if purge {
+                assert!(engine.get_record(id).unwrap().is_none());
+            } else {
+                let record = engine.get_record(id).unwrap().unwrap();
+                assert_eq!(record.phase, DecayPhase::Tombstone);
+                assert!(record.summary.is_empty() && record.tags.is_empty());
+                assert_eq!((record.text_offset, record.text_length), (0, 0));
+            }
+            assert!(
+                engine
+                    .vector_manager()
+                    .get(ns)
+                    .unwrap()
+                    .is_free(original.vector_slot)
+            );
+            let fts = crate::search::FtsIndex::new(&target).unwrap();
+            assert!(fts.search(ns, "backup fixture", 10).unwrap().is_empty());
+            let mut reused = original;
+            assert!(
+                engine
+                    .insert_memory(id, ns, &mut reused, &[1.; 4], Some("resurrect"))
+                    .is_err()
+            );
+            let snapshot = engine.meta_store().control_state().unwrap();
+            assert_eq!(
+                snapshot.committed_generation.get(),
+                1,
+                "rejected UUID reuse cannot write"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_recovery_rejects_unknown_journal_lineage_and_changed_staging() {
+        use crate::storage::restore_journal::Stage;
+        for bad in ["version", "path", "captured", "lineage", "fts"] {
+            let root = tempfile::tempdir().unwrap();
+            let (target, backup, _, _, _, _) = retained_fixture(root.path());
+            assert!(
+                restore_at(retained_options(&backup, &target), |stage| {
+                    if matches!(stage, Stage::Prepared) {
+                        Err(StorageError::RecoveryRequired("stop before rename".into()))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await
+                .is_err()
+            );
+            let before = fs::read(target.join("meta.db")).unwrap();
+            let pending = root.path().join("source.recalld-restore-pending");
+            let mut journal: serde_json::Value =
+                serde_json::from_slice(&fs::read(&pending).unwrap()).unwrap();
+            let stage = PathBuf::from(journal["staged"].as_str().unwrap());
+            match bad {
+                "version" => journal["version"] = 99.into(),
+                "path" => {
+                    journal["staged"] = root
+                        .path()
+                        .join("unrelated")
+                        .to_string_lossy()
+                        .as_ref()
+                        .into()
+                }
+                "captured" => journal["captured"]["ledger"]["entries"] = serde_json::json!([]),
+                "lineage" => {
+                    let db = redb::Database::open(stage.join("meta.db")).unwrap();
+                    let tx = db.begin_write().unwrap();
+                    {
+                        let mut table = tx.open_table(crate::storage::lineage::LINEAGE).unwrap();
+                        let mut lineage: serde_json::Value =
+                            serde_json::from_slice(table.get("state").unwrap().unwrap().value())
+                                .unwrap();
+                        lineage["version"] = 99.into();
+                        table
+                            .insert("state", serde_json::to_vec(&lineage).unwrap().as_slice())
+                            .unwrap();
+                    }
+                    tx.commit().unwrap();
+                }
+                "fts" => fs::write(stage.join("fts.db"), b"changed after journal").unwrap(),
+                _ => unreachable!(),
+            }
+            fs::write(&pending, serde_json::to_vec(&journal).unwrap()).unwrap();
+            assert!(RedbStorageEngine::open(&target).is_err(), "accepted {bad}");
+            assert_eq!(fs::read(target.join("meta.db")).unwrap(), before);
+            assert!(pending.exists() && stage.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_restore_refuses_legacy_in_place_and_accepts_explicit_fresh_text_migration() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        drop(crate::storage::MetadataStore::open(&legacy.join("meta.db")).unwrap());
+        drop(crate::storage::EdgeStore::open(&legacy.join("edges.db")).unwrap());
+        drop(crate::storage::TextStore::open(&legacy.join("fulltext.dat")).unwrap());
+        let before = fs::read(legacy.join("meta.db")).unwrap();
+        let migrated = root.path().join("migrated");
+        crate::storage::text_migration::migrate_legacy_text(&legacy, &migrated).unwrap();
+        let files = canonical_files(&migrated).unwrap();
+        let manifest = generate_manifest(&migrated, &files).unwrap();
+        let backup = archive(root.path(), &migrated, &manifest);
+        let error = restore_from_backup(retained_options(&backup, &legacy))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("old-reader-fenced"));
+        assert_eq!(fs::read(legacy.join("meta.db")).unwrap(), before);
+        assert!(crate::storage::TextStore::open(&legacy.join("fulltext.dat")).is_ok());
+        restore_from_backup(retained_options(&backup, &migrated))
+            .await
+            .unwrap();
+        assert!(RedbStorageEngine::open(&migrated).is_ok());
+        assert!(crate::storage::TextStore::open(&migrated.join("fulltext.dat")).is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_historical_restore_is_fresh_gated_and_excluded_from_writes_and_serving() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, manifest) = fixture(root.path());
+        let backup = archive(root.path(), &source, &manifest);
+        let historical = root.path().join("historical");
+        assert!(
+            restore_from_backup(retained_options(&backup, &historical))
+                .await
+                .is_err()
+        );
+        let mut opts = retained_options(&backup, &historical);
+        opts.historical = true;
+        restore_from_backup(opts.clone()).await.unwrap();
+        assert!(
+            restore_from_backup(opts).await.is_err(),
+            "historical destination cannot overwrite an existing target"
+        );
+        assert!(RedbStorageEngine::open(&historical).is_err());
+        assert!(
+            crate::storage::TextStore::open(&historical.join("fulltext.dat")).is_err(),
+            "old reader must reject the real fence"
+        );
+        let captured = crate::storage::metadata::restoration::capture(&historical).unwrap();
+        assert_eq!(
+            captured.lineage.unwrap().mode,
+            crate::storage::lineage::RestoreMode::Historical
+        );
+        let before = fs::read(historical.join("meta.db")).unwrap();
+        assert!(crate::storage::MetadataStore::open(&historical.join("meta.db")).is_err());
+        assert_eq!(fs::read(historical.join("meta.db")).unwrap(), before);
+        assert!(
+            restore_from_backup(retained_options(&backup, &historical))
+                .await
+                .is_err(),
+            "restoration cannot implicitly promote historical mode"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "schema_restore_tests.rs"]
+mod schema_tests;

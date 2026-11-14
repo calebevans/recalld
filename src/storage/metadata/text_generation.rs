@@ -11,7 +11,8 @@ thread_local! {
     pub(crate) static FAIL_AFTER_TEXT_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-const CATALOG: TableDefinition<&str, &[u8]> = TableDefinition::new("text_generations_v1");
+pub(crate) const CATALOG: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("text_generations_v1");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -103,6 +104,13 @@ pub(crate) fn read_selection(
 impl MetadataStore {
     pub(crate) fn text_selection(&self) -> Result<Option<TextGeneration>, StorageError> {
         self.ensure_available()?;
+        read_selection(&self.db.begin_read()?)
+    }
+
+    /// Constructor-only read before canonical effects replay; the engine has not escaped.
+    pub(crate) fn text_selection_for_recovery(
+        &self,
+    ) -> Result<Option<TextGeneration>, StorageError> {
         read_selection(&self.db.begin_read()?)
     }
 
