@@ -1,6 +1,7 @@
-# Actual PR70 + purge/batch offline compatibility proof
+# Canonical writer and offline consumer shipping join
 
-The isolated `validation/writer-offline-compat` branch combines actual PR70
+The shipping candidate `impl/writer-offline-join` preserves the tested
+`validation/writer-offline-compat` composition and combines actual PR70
 `af20d73` with PR77 `3b0aded`. PR77 contains PR74 `d03116c` and corrected PR72
 `9d8b295` (runtime `98dbef6`, actual PR68 `b2923d1`). No broad integration or
 unrelated native/tracker history is imported. Main worktrees were untouched.
@@ -34,7 +35,11 @@ warnings (523 duplicates), plus one binary warning; no warning-free claim.
 Merge resolution commit `40c7ad5` and primitive adaptation `6ccb480` are retained
 on this validation branch. Compact evidence includes the readable combined
 merge diff and the four-line primitive patch. These are composition details for
-main to carry into its intended join, not a request for a broad shipping PR.
+the minimal shipping join. PR70 and PR77 remain independent; the join is
+based on PR77 and explicitly merges PR70. Adding the new batch-child argument
+to standalone PR70 or the Observed validator arms to standalone PR77 would
+require the other parent, so the glue belongs here. No unrelated integration
+history is needed.
 
 ## What this proves and what remains
 
@@ -43,6 +48,9 @@ joined tree. Completed purge/batch origin IDs, receipts, ledger and retained
 payload survive transfer and restore forks; incomplete work rejects without
 publication. This does not change the behavior of unmodified standalone PR70,
 which intentionally lacks its offline consumer.
+
+The code tree is identical to the passed runtime. Fresh CI on this minimal
+shipping join remains required before main promotes PR70 from draft.
 
 No native serving activation, shared publication registry, deadline/barrier,
 whole-query ReadView, reset or exact-scan performance claim is made. Halley owns
