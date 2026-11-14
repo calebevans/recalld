@@ -1,0 +1,85 @@
+{
+  "runtime_commit": "7223481456564149834429c3dd52c8e1fce7c997",
+  "files": [
+    {
+      "path": "docs/implementation/canonical-label-consumers.md",
+      "sha256": "f5f63b7089eaff69f9330bbc52eebf9f73756a8464737f661b7403a8a506e0d3"
+    },
+    {
+      "path": "docs/mcp.md",
+      "sha256": "534afb5f50b641a2ca7966c62ead19e59b89f1be01339de135d08e717412f6c9"
+    },
+    {
+      "path": "src/api/adapters.rs",
+      "sha256": "a9ae42776b0b6a2963093d5bd9ca77c9a631c0f7d0e115f2bfb1a886f0c1fcf7"
+    },
+    {
+      "path": "src/api/legacy_label_tests.rs",
+      "sha256": "8d5480cf44d4b6520d3d895474c05187ec78cd2bc87310e6440b16c6b4a31d38"
+    },
+    {
+      "path": "src/api/mod.rs",
+      "sha256": "97e2bc378605e7e86430c7bb177ffb56580aa62b7fa207e0137ceb043b17eff2"
+    },
+    {
+      "path": "src/cache/weight.rs",
+      "sha256": "861fe866ae335f83e77ab2be451ee50499b7210992d09ed59803a219c5967f83"
+    },
+    {
+      "path": "src/mcp/bridge.rs",
+      "sha256": "0374cea85b89e30d7a6662b5b8a053a3517ecaba46c02bb7ecdc50f714d812bb"
+    },
+    {
+      "path": "src/mcp/bridge_adapters.rs",
+      "sha256": "f0f37ff10b5368e6661fa775d9997ff1952f6e04e7c843e9bf041a0aa55f33ac"
+    },
+    {
+      "path": "src/mcp/tools.rs",
+      "sha256": "9737e080bec5621d902fb10b4af312115284b6534a3e5f4c12054977aa7ad253"
+    },
+    {
+      "path": "src/model/mod.rs",
+      "sha256": "4edbfbe3591c81a19bfbb31fba6d1bd01835ba2ff1c43a298534536279dfe298"
+    },
+    {
+      "path": "src/model/record.rs",
+      "sha256": "9e6fb5bc6c85565fb70a43386f84e21353ff2eb939b4888efd71988ec54b54a5"
+    },
+    {
+      "path": "src/model/tag.rs",
+      "sha256": "9175ad0650123106418bef6c728477519ce60b9440056df482382356290a1810"
+    },
+    {
+      "path": "src/search/by_id_transport_tests.rs",
+      "sha256": "ea46e95b776798da4ca125d282cdf3612b3daedca9b9fa2dc1a62339b71f5845"
+    },
+    {
+      "path": "src/search/label_tests.rs",
+      "sha256": "3ec8a7200ff332d18b7435963043e94e308ba5be6a5e80b531c1299350a1fd99"
+    },
+    {
+      "path": "src/search/pipeline.rs",
+      "sha256": "984d9e9f19710351613f6bbc16166abe0826ede7c33d763a191d124d9ea6dfda"
+    },
+    {
+      "path": "src/search/query.rs",
+      "sha256": "f35ce18c721323911c22cad3ecfd5b2491490f2b78e4097d5b8d629b012bdcaa"
+    },
+    {
+      "path": "src/search/response.rs",
+      "sha256": "875d892450c69fe84322f12ccb8640d14d4d08ecc08a5c7ec9587a7700c1b7ad"
+    },
+    {
+      "path": "src/search/strength_tests.rs",
+      "sha256": "063d436fa0f4b3a4bf2cc15ab59f8ebe38ae5a5751d44695bcedea1cc14824a2"
+    },
+    {
+      "path": "src/serialization/json.rs",
+      "sha256": "eeb712a1f73434c1539c2f315f1175930ca36af0632a8c524518d749b817f4bb"
+    },
+    {
+      "path": "src/storage/metadata.rs",
+      "sha256": "b121b0e87d996479e5c509c17ea351e9e90bf7b756b0a77cf5b25562961408ab"
+    }
+  ]
+}

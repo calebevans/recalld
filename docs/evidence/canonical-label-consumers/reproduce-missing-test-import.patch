@@ -1,0 +1,10 @@
+--- a/src/search/label_tests.rs
++++ b/src/search/label_tests.rs
+@@ -6,7 +6,6 @@
+ use super::*;
+ use crate::model::schema::{LabelProvenance, StructuredLabels};
+ use crate::model::tag::StructuredLabelFilter;
+-use redb::ReadableTable;
+ 
+ fn labels(provenance: LabelProvenance) -> StructuredLabels {
+     StructuredLabels {

@@ -1,0 +1,46 @@
+{
+  "runtime_commit": "7223481456564149834429c3dd52c8e1fce7c997",
+  "image": "sha256:daefdc9cbe9b0f39b1fc29d975148b3b10adc1bd4309f9ca1be8abd36ed811ef",
+  "toolchain": "1.94.1",
+  "network": "none",
+  "cpus": 2,
+  "memory": "4g",
+  "cargo_jobs": 2,
+  "logs": [
+    {
+      "artifact": "join-compile.log",
+      "bytes": 7306,
+      "sha256": "53d0250e5d0c69c192eec968e724950f625745b729bf92c19fa3964ac1b5251e"
+    },
+    {
+      "artifact": "join-baseline.log",
+      "bytes": 92825,
+      "sha256": "c3aa8e428cd4dda7491a2c37a5f04a9889b3d05c284357f15edf63d292f6fae2"
+    },
+    {
+      "artifact": "focused-initial-compile.log",
+      "bytes": 2576,
+      "sha256": "3722f51092d75f42b463472ebd2fa71fe52fc1a133f8512bc12ec4007c6f75ed"
+    },
+    {
+      "artifact": "focused.log",
+      "bytes": 4513,
+      "sha256": "90b74f17b5894c12c1b2b2a2df701959531f40b7e153523807e48b86f36b2654"
+    },
+    {
+      "artifact": "full.log",
+      "bytes": 79621,
+      "sha256": "9bf49e04517278ec2e421a535555e9ed6abb43aa1e62f541c295498721b0e779"
+    },
+    {
+      "artifact": "fmt.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "artifact": "clippy.log",
+      "bytes": 384112,
+      "sha256": "76a5faf02f71c323c36a4857ace7afd8903cc01c25cb791a50771d28dbadc292"
+    }
+  ]
+}

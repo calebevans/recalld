@@ -12,6 +12,9 @@ use crate::model::{DecayPhase, MemoryId, Tag};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
+    /// Exact canonical labels, including retained-only provenance and empty lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<crate::model::schema::StructuredLabels>,
     /// Unique identifier for the memory.
     pub memory_id: MemoryId,
 
@@ -105,6 +108,9 @@ pub struct SearchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryResponse {
+    /// Exact canonical labels; absence retains legacy response shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<crate::model::schema::StructuredLabels>,
     /// Unique identifier.
     pub id: MemoryId,
     /// Namespace name.

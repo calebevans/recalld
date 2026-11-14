@@ -16,7 +16,7 @@ use crate::embedding::EmbeddingProvider;
 use crate::graph::SharedGraph;
 use crate::model::{
     AccessKind, CachedRecord, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId, Tag,
-    parse_structured_tags,
+    structured_metadata,
 };
 use crate::search::{EntityIndex, FlatVectorIndex, FtsIndex};
 use crate::storage::RedbStorageEngine;
@@ -89,9 +89,10 @@ impl state::SearchPipeline for SearchPipelineAdapter {
     async fn embed_text(
         &self,
         text: &str,
-        _namespace_id: NamespaceId,
-    ) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
-        self.embedding.embed(text).await
+        namespace: &NamespaceConfig,
+    ) -> Result<crate::embedding::runtime::GeneratedEmbedding, crate::embedding::EmbeddingError>
+    {
+        crate::embedding::runtime::generate(self.embedding.as_ref(), namespace, text).await
     }
 
     async fn record_exposures(
@@ -254,18 +255,23 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         }
     }
 
-    async fn entity_index_add(&self, memory_id: MemoryId, entities: &[String]) {
-        if !entities.is_empty() {
-            let mut idx = self.entity_index.write().await;
-            idx.add(memory_id, entities);
-        }
+    async fn entity_index_add(
+        &self,
+        namespace_id: NamespaceId,
+        memory_id: MemoryId,
+        entities: &[String],
+    ) {
+        self.entity_index
+            .write()
+            .await
+            .add(namespace_id, memory_id, entities);
     }
 
-    async fn entity_index_remove(&self, memory_id: MemoryId, entities: &[String]) {
-        if !entities.is_empty() {
-            let mut idx = self.entity_index.write().await;
-            idx.remove(memory_id, entities);
-        }
+    async fn entity_index_remove(&self, namespace_id: NamespaceId, memory_id: MemoryId) {
+        self.entity_index
+            .write()
+            .await
+            .remove(namespace_id, memory_id);
     }
 }
 
@@ -345,6 +351,49 @@ impl state::StorageEngine for StorageEngineAdapter {
         .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
     }
 
+    async fn insert_memory(
+        &self,
+        namespace_id: NamespaceId,
+        input: crate::storage::insertion::InsertMemory,
+        generated_embedding: crate::embedding::runtime::GeneratedEmbedding,
+    ) -> Result<crate::storage::insertion::InsertResult, crate::storage::StorageError> {
+        crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
+        }
+        .insert(
+            crate::storage::control::MutationContext::unkeyed(namespace_id),
+            input,
+            generated_embedding,
+            self.clock.now_millis(),
+        )
+        .await
+    }
+
+    async fn complete_insertion(
+        &self,
+        receipt: &crate::storage::control::WriteReceipt,
+    ) -> Result<(), crate::storage::StorageError> {
+        crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
+        }
+        .complete()
+        .await
+        .map_err(|source| crate::storage::StorageError::CommittedInsertion {
+            receipt: Box::new(receipt.clone()),
+            source: Box::new(source),
+        })
+    }
+
     async fn create_memory(
         &self,
         namespace_id: NamespaceId,
@@ -355,72 +404,30 @@ impl state::StorageEngine for StorageEngineAdapter {
         initial_stability: Option<f32>,
         created_at: Option<i64>,
     ) -> Result<CachedRecord, crate::storage::StorageError> {
-        use crate::model::Tag;
-        use crate::model::record::DiskRecord;
-
-        let id = MemoryId::new();
-        let now = self.clock.now_millis();
-        let ts = created_at.unwrap_or(now);
-        // Over-long tags cannot reach this point: the shared request
-        // validator bounds every tag and reserves the `entity/` /
-        // `topic/` / `emotion/` prefix out of the label limits. A drop
-        // here therefore means a tag outside `Tag`'s alphabet, and it
-        // is logged rather than swallowed.
-        let parsed_tags: Vec<Tag> = crate::model::parse_tags_lossy("create_memory.tags", tags);
-
-        let mut record = DiskRecord {
-            schema: None,
-            version: DiskRecord::CURRENT_VERSION,
-            id: *id.as_bytes(),
-            namespace_id: namespace_id.get(),
-            created_at: ts,
-            last_accessed_at: ts,
-            phase: DecayPhase::Full,
-            strength: 1.0,
-            decay_strength: 1.0,
-            stability: initial_stability.unwrap_or(3.7145),
-            difficulty: 5.0,
-            is_permastore: 0,
-            vector_slot: 0,
-            edge_count: 0,
-            summary: summary.to_string(),
-            tags: parsed_tags,
-            access_history: Vec::new(),
-            text_offset: 0,
-            text_length: 0,
-        };
-
-        let storage = self.storage.clone();
-        let embedding_vec = embedding.to_vec();
-        let full_text_owned = full_text.map(|s| s.to_string());
-
-        let record = tokio::task::spawn_blocking(move || {
-            let mut storage_w = storage.write().map_err(|e| {
-                crate::storage::StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("storage lock poisoned: {e}"),
-                ))
-            })?;
-            storage_w.insert_memory(
-                id,
+        let result = self
+            .insert_memory(
                 namespace_id,
-                &mut record,
-                &embedding_vec,
-                full_text_owned.as_deref(),
-            )?;
-            Ok::<_, crate::storage::StorageError>(record)
+                crate::storage::insertion::InsertMemory {
+                    id: None,
+                    summary: summary.into(),
+                    full_text: full_text.map(str::to_owned),
+                    tags: crate::model::parse_tags_lossy("create_memory.tags", tags),
+                    embedding: Some(embedding.to_vec()),
+                    initial_stability,
+                    created_at,
+                    parent_id: None,
+                    supersedes: None,
+                },
+                vec![].into(),
+            )
+            .await?;
+        result.record.ok_or_else(|| {
+            crate::storage::StorageError::NotFound(
+                crate::storage::insertion::inserted_id(&result.receipt)
+                    .expect("insertion receipt")
+                    .into_inner(),
+            )
         })
-        .await
-        .map_err(|e| {
-            crate::storage::StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("blocking task join error: {e}"),
-            ))
-        })??;
-
-        let cached = CachedRecord::from(&record);
-        self.cache.insert(id, cached.clone()).await;
-        Ok(cached)
     }
 
     async fn get_record(&self, id: MemoryId) -> Option<DiskRecord> {
@@ -1432,6 +1439,120 @@ mod tests {
     use crate::search::{VectorIndex as _, VectorMetadata};
     use crate::test_support::{DIM, Fixture, MemorySpec};
 
+    #[tokio::test]
+    async fn insertion_http_boundary_distinguishes_provider_unavailable_from_caller_invalid() {
+        use axum::response::IntoResponse;
+        let fx = Fixture::new();
+        for supplied in [false, true] {
+            let input = crate::storage::insertion::InsertMemory {
+                id: None,
+                summary: "vector boundary".into(),
+                full_text: None,
+                tags: vec![],
+                initial_stability: None,
+                created_at: None,
+                embedding: supplied.then(|| vec![0.; DIM]),
+                parent_id: None,
+                supersedes: None,
+            };
+            let before = fx
+                .storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation;
+            let error = match adapter(&fx)
+                .insert_memory(NamespaceId::new(1), input, vec![0.; DIM].into())
+                .await
+            {
+                Ok(_) => panic!("zero vector accepted"),
+                Err(error) => error,
+            };
+            let response = super::super::errors::AppError::from(error).into_response();
+            assert_eq!(
+                response.status(),
+                if supplied {
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY
+                } else {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            );
+            assert_eq!(
+                fx.storage
+                    .read()
+                    .unwrap()
+                    .control_state()
+                    .unwrap()
+                    .committed_generation,
+                before
+            );
+            assert!(fx.storage.read().unwrap().scan_all().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_http_insertion_adapter_reports_durable_receipt_if_publication_fails() {
+        use axum::response::IntoResponse;
+        let fx = Fixture::new();
+        *fx.vector_index.write().await = FlatVectorIndex::new(DIM + 1);
+        let error = match adapter(&fx)
+            .insert_memory(
+                NamespaceId::new(1),
+                crate::storage::insertion::InsertMemory {
+                    id: None,
+                    summary: "http committed insertion".into(),
+                    full_text: None,
+                    tags: vec![],
+                    initial_stability: None,
+                    created_at: None,
+                    embedding: Some(unit_vector()),
+                    parent_id: None,
+                    supersedes: None,
+                },
+                vec![].into(),
+            )
+            .await
+        {
+            Ok(_) => panic!("publication failure reported success"),
+            Err(error) => error,
+        };
+        let response = super::super::errors::AppError::from(error).into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["commitState"], "committed");
+        assert_eq!(body["ready"], false);
+        let receipt: crate::storage::control::WriteReceipt =
+            serde_json::from_value(body["receipt"].clone()).unwrap();
+        let id = crate::storage::insertion::inserted_id(&receipt).unwrap();
+        assert!(fx.record(id).is_some());
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .effects_stamp()
+                .is_err()
+        );
+        *fx.vector_index.write().await = FlatVectorIndex::new(DIM);
+        adapter(&fx).complete_insertion(&receipt).await.unwrap();
+        assert!(fx.vector_index.read().await.get_vector(id).is_some());
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .effects_stamp()
+                .is_ok()
+        );
+    }
+
     /// A vector of the fixture's width, so it matches the index.
     fn unit_vector() -> Vec<f32> {
         let mut v = vec![0.0; DIM];
@@ -1482,7 +1603,7 @@ mod tests {
         fx.entity_index
             .write()
             .await
-            .add(id, &["Sarah".to_string()]);
+            .add(ns, id, &["Sarah".to_string()]);
 
         id
     }
@@ -1641,21 +1762,11 @@ impl SearchPipelineAdapter {
             state::QueryInput::TextAndVector { text, embedding } => (Some(text), Some(embedding)),
         };
 
-        // A label that cannot become a tag is an error, not a dropped
-        // filter: dropping one from `includeTags` or `entities` WIDENS
-        // the query, and a caller cannot tell "every memory in the
-        // namespace" from a genuine match.
-        let mut require_tags: Vec<Tag> =
+        // Raw tags remain strict. The pipeline validates structured filters
+        // against the resolved namespace before provider/channel work.
+        let require_tags: Vec<Tag> =
             crate::model::parse_filter_tags("includeTags", "", &query.include_tags)
                 .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?;
-        require_tags.extend(
-            crate::model::parse_filter_tags(
-                "entities",
-                crate::model::constants::ENTITY_TAG_PREFIX,
-                &query.entities,
-            )
-            .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?,
-        );
         // `excludeTags` is the safe direction — dropping one can only
         // ever return MORE than asked for in the same sense a missing
         // exclusion does, and it never masquerades as a match — so it
@@ -1684,6 +1795,10 @@ impl SearchPipelineAdapter {
             fts_query: None,
             namespace: query.namespace_name.clone(), // Issue 1: pass actual namespace name
             filter: crate::search::PipelineSearchFilter {
+                labels: crate::model::tag::StructuredLabelFilter {
+                    entities: query.entities.clone(),
+                    ..Default::default()
+                },
                 require_tags,
                 exclude_tags,
                 phases,
@@ -1708,8 +1823,8 @@ impl SearchPipelineAdapter {
             .results
             .into_iter()
             .map(|r| {
-                // Issue 5: Parse entities from tags
-                let metadata = parse_structured_tags(&r.tags);
+                // Preserve canonical metadata; only legacy records parse retained tags.
+                let metadata = structured_metadata(&r.tags, r.labels.as_ref());
                 state::ResolvedSearchResult {
                     access_kind: if r.activation_score.is_some() {
                         AccessKind::AssociativeRetrieval
@@ -1717,6 +1832,7 @@ impl SearchPipelineAdapter {
                         AccessKind::DirectRetrieval
                     },
                     memory: CachedRecord {
+                        labels: r.labels,
                         lifecycle: None,
                         id: r.memory_id,
                         namespace_id: query.namespace_id, // Issue 6: use actual namespace_id

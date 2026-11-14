@@ -21,6 +21,28 @@ use crate::time::format_timestamp;
 use super::bridge;
 use crate::storage::StorageEngine as StorageEngineTrait;
 
+/// Preserve committed/uncertain insertion outcomes across legacy transport errors.
+fn map_insertion_error(error: crate::storage::StorageError) -> bridge::BridgeError {
+    match error {
+        crate::storage::StorageError::CommittedInsertion { .. }
+        | crate::storage::StorageError::CommitOutcomeUnknown { .. } => {
+            bridge::BridgeError::PartiallyApplied(error.to_string())
+        }
+        crate::storage::StorageError::ProviderVectorUnavailable(_) => {
+            bridge::BridgeError::Unavailable(error.to_string())
+        }
+        crate::storage::StorageError::InvalidMutation(_)
+        | crate::storage::StorageError::EdgeConflict(_)
+        | crate::storage::StorageError::MutationNamespaceMismatch => {
+            bridge::BridgeError::InvalidInput(error.to_string())
+        }
+        crate::storage::StorageError::NotFound(_) => {
+            bridge::BridgeError::NotFound(error.to_string())
+        }
+        _ => bridge::BridgeError::Storage(error.to_string()),
+    }
+}
+
 /// Map an explicit-link validation failure onto the bridge error the tool
 /// layer already knows how to render.
 ///
@@ -147,30 +169,16 @@ impl bridge::SearchPipeline for McpSearchAdapter {
         // A label that cannot become a tag is an ERROR, not a dropped
         // filter: dropping one widens the query, and "every memory in
         // the namespace" is indistinguishable from a real result set.
-        let require_tags = match filter_tags(
-            &[
-                ("tags", "", &query.tags),
-                (
-                    "entities",
-                    crate::model::constants::ENTITY_TAG_PREFIX,
-                    &query.entities,
-                ),
-                (
-                    "topics",
-                    crate::model::constants::TOPIC_TAG_PREFIX,
-                    &query.topics,
-                ),
-                (
-                    "emotions",
-                    crate::model::constants::EMOTION_TAG_PREFIX,
-                    &query.emotions,
-                ),
-            ],
-            "recall_memories",
-        ) {
-            Ok(tags) => tags,
-            Err(e) => return Err(bridge::BridgeError::InvalidInput(e)),
+        let require_tags = filter_tags(&[("tags", "", &query.tags)], "recall_memories")
+            .map_err(bridge::BridgeError::InvalidInput)?;
+        let labels = crate::model::tag::StructuredLabelFilter {
+            entities: query.entities.clone(),
+            topics: query.topics.clone(),
+            emotions: query.emotions.clone(),
         };
+        labels
+            .validate(ns_config.schema.is_some())
+            .map_err(bridge::BridgeError::InvalidInput)?;
 
         let pipeline_query = crate::search::SearchQuery {
             record_access: query.record_access,
@@ -179,6 +187,7 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             fts_query: None,
             namespace: query.namespace.clone(),
             filter: crate::search::PipelineSearchFilter {
+                labels,
                 require_tags,
                 min_strength: query.min_strength,
                 ..Default::default()
@@ -296,10 +305,11 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                     })
                     .collect();
 
-                let metadata = crate::model::parse_structured_tags(&r.tags);
+                let metadata = crate::model::structured_metadata(&r.tags, r.labels.as_ref());
 
                 let tz = self.timezone;
                 bridge::SearchHit {
+                    labels: r.labels.clone(),
                     id: r.memory_id.to_string(),
                     summary: r.summary.unwrap_or_default(),
                     full_text,
@@ -403,9 +413,13 @@ impl bridge::SearchPipeline for McpSearchAdapter {
                     } else {
                         None
                     };
-                    let metadata = crate::model::parse_structured_tags(&disk.tags);
+                    let metadata = crate::model::structured_metadata(
+                        &disk.tags,
+                        disk.schema.as_ref().map(|s| &s.labels),
+                    );
 
                     result.push(bridge::NeighborMemory {
+                        labels: disk.schema.as_ref().map(|s| s.labels.clone()),
                         id: mid.to_string(),
                         summary: disk.summary.clone(),
                         full_text,
@@ -498,10 +512,11 @@ impl bridge::SearchPipeline for McpSearchAdapter {
             let hits = results
                 .into_iter()
                 .map(|r| {
-                    let metadata = crate::model::parse_structured_tags(&r.tags);
+                    let metadata = crate::model::structured_metadata(&r.tags, r.labels.as_ref());
 
                     let tz = self.timezone;
                     bridge::SearchHit {
+                        labels: r.labels.clone(),
                         id: r.memory_id.to_string(),
                         summary: r.summary.unwrap_or_default(),
                         full_text: r.full_text,
@@ -887,16 +902,21 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         input: bridge::StoreInput,
     ) -> Result<bridge::StoredMemory, bridge::BridgeError> {
-        let _publication = crate::derived_completion::publication_gate(&self.storage)
-            .await
-            .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
-            .read_owned()
-            .await;
+        crate::model::validation::validate_legacy_memory_input(
+            crate::model::validation::MemoryInputRef {
+                summary: &input.summary,
+                full_text: input.full_text.as_deref(),
+                tags: &input.tags,
+                entities: &input.entities,
+                topics: &input.topics,
+                emotions: &input.emotions,
+            },
+        )
+        .map_err(|error| bridge::BridgeError::InvalidInput(error.to_string()))?;
         effects_stamp(&self.storage).await?;
 
         use crate::model::Tag;
         use crate::model::constants::{DUPLICATE_SIMILARITY_THRESHOLD, MAX_NEAR_DUPLICATE_MATCHES};
-        use crate::model::record::DiskRecord;
 
         // Resolve namespace.
         let ns_config = {
@@ -919,11 +939,6 @@ impl bridge::StorageEngine for McpStorageAdapter {
             })??
         };
 
-        // The ID is minted here rather than just before the insert so the
-        // link pre-validation below can reject a self-reference. Minting is
-        // pure (UUIDv7 from the clock), so an early mint costs nothing.
-        let memory_id = MemoryId::new();
-
         // Validate caller-specified links BEFORE anything is written.
         //
         // The record is committed to meta.db, fulltext.dat, vectors.dat, FTS
@@ -934,7 +949,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
         if let Some(parent_id) = input.parent_id {
             crate::graph::check_link_target(
                 "parentId",
-                Some(memory_id),
+                None,
                 parent_id,
                 ns_config.id,
                 &self.graph,
@@ -947,7 +962,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
         if let Some(old_id) = input.supersedes {
             crate::graph::check_link_target(
                 "supersedes",
-                Some(memory_id),
+                None,
                 old_id,
                 ns_config.id,
                 &self.graph,
@@ -983,8 +998,8 @@ impl bridge::StorageEngine for McpStorageAdapter {
         }
 
         // Generate full embedding (summary + full_text + tags for max surface).
-        let embedding = match input.embedding {
-            Some(emb) => emb,
+        let raw_embedding = match &input.embedding {
+            Some(emb) => emb.clone().into(),
             None => {
                 let mut embed_text = match &input.full_text {
                     Some(ft) => format!(
@@ -997,12 +1012,30 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 if !merged_tags.is_empty() {
                     embed_text = format!("{} {}", embed_text, merged_tags.join(" "));
                 }
-                self.embedding
-                    .embed(&embed_text)
-                    .await
-                    .map_err(|e| bridge::BridgeError::Internal(e.to_string()))?
+                crate::embedding::runtime::generate(
+                    self.embedding.as_ref(),
+                    &ns_config,
+                    &embed_text,
+                )
+                .await
+                .map_err(|e| match e {
+                    crate::embedding::EmbeddingError::TextTooLong { .. } => {
+                        bridge::BridgeError::InvalidInput(e.to_string())
+                    }
+                    _ => bridge::BridgeError::Unavailable(e.to_string()),
+                })?
             }
         };
+
+        crate::embedding::runtime::check_namespace(&ns_config, raw_embedding.profile.as_ref())
+            .map_err(|e| bridge::BridgeError::Unavailable(e.to_string()))?;
+        let mut embedding = raw_embedding.values.clone();
+        crate::storage::insertion::normalize_embedding(
+            &mut embedding,
+            ns_config.embedding_dim,
+            input.embedding.is_some(),
+        )
+        .map_err(map_insertion_error)?;
 
         // Near-duplicate advisory.
         //
@@ -1046,132 +1079,53 @@ impl bridge::StorageEngine for McpStorageAdapter {
         let parsed_tags: Vec<Tag> =
             crate::model::parse_tags_lossy("store_memory.tags", &merged_tags);
 
-        let mut record = DiskRecord {
-            schema: None,
-            version: DiskRecord::CURRENT_VERSION,
-            id: *memory_id.as_bytes(),
-            namespace_id: ns_config.id.get(),
-            created_at: now,
-            last_accessed_at: now,
-            phase: DecayPhase::Full,
-            strength: 1.0,
-            decay_strength: 1.0,
-            stability: input
-                .initial_stability
-                .unwrap_or(ns_config.initial_stability),
-            difficulty: 5.0,
-            is_permastore: 0,
-            vector_slot: 0,
-            edge_count: 0,
-            summary: input.summary.clone(),
-            tags: parsed_tags,
-            access_history: Vec::new(),
-            text_offset: 0,
-            text_length: 0,
+        let completion = crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
         };
-
-        // Insert into storage (on blocking thread to avoid starving the async runtime).
-        let record = {
-            let storage = self.storage.clone();
-            let embedding_clone = embedding.clone();
-            let full_text_clone = input.full_text.clone();
-            let ns_id = ns_config.id;
-            tokio::task::spawn_blocking(move || {
-                let mut storage_w = storage.write().map_err(|e| {
-                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-                })?;
-                storage_w
-                    .insert_memory(
-                        memory_id,
-                        ns_id,
-                        &mut record,
-                        &embedding_clone,
-                        full_text_clone.as_deref(),
-                    )
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
-                Ok::<_, bridge::BridgeError>(record)
-            })
-            .await
-            .map_err(|e| {
-                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
-            })??
-        };
-
-        // Insert into cache.
-        let cached = crate::model::CachedRecord::from(&record);
-        self.cache.insert(memory_id, cached).await;
-
-        // Index the embedding in the vector index.
-        {
-            use crate::search::{VectorIndex, VectorMetadata};
-            let mut index = self.vector_index.write().await;
-            let metadata = VectorMetadata {
-                namespace_id: ns_config.id,
-                decay_phase: DecayPhase::Full.as_u8(),
-                tags: merged_tags.clone(),
-            };
-            let _ = index.add(memory_id, &embedding, metadata);
-        }
-
-        // Index in FTS5 — summary, full_text, and tags as separate columns.
-        {
-            let fts = self.fts_index.lock().await;
-            if let Err(e) = fts.add(
-                ns_config.id,
-                memory_id,
-                &input.summary,
-                input.full_text.as_deref(),
-                &merged_tags,
-            ) {
-                tracing::warn!(
-                    memory_id = %memory_id,
-                    %e,
-                    "FTS5 indexing failed (non-fatal)"
-                );
-            }
-        }
-
-        // Add node to the relationship graph (must happen BEFORE autolink,
-        // and before either explicit edge — both endpoints must exist).
-        {
-            let mut graph_w = self.graph.write().await;
-            // Silently ignore DuplicateNode (should not happen for a new memory).
-            let _ = graph_w.add_node(
-                memory_id,
-                ns_config.id,
-                DecayPhase::Full,
-                1.0,
-                record.vector_slot,
-            );
-        } // graph write lock released
-
-        // Explicit links. Both targets were validated before the record was
-        // written, so anything that goes wrong here is a durability or
-        // idempotency detail, not a reason to fail a store that succeeded.
-        if let Some(parent_id) = input.parent_id {
-            crate::graph::apply_parent_edge(
-                parent_id,
-                memory_id,
-                &self.graph,
-                &self.storage,
-                &self.cache,
+        let inserted = completion
+            .insert(
+                crate::storage::control::MutationContext::unkeyed(ns_config.id),
+                crate::storage::insertion::InsertMemory {
+                    id: None,
+                    summary: input.summary.clone(),
+                    full_text: input.full_text.clone(),
+                    tags: parsed_tags,
+                    embedding: input.embedding.clone(),
+                    initial_stability: input.initial_stability,
+                    created_at: None,
+                    parent_id: input.parent_id,
+                    supersedes: input.supersedes,
+                },
+                raw_embedding,
+                now,
             )
-            .await;
-        }
+            .await
+            .map_err(map_insertion_error)?;
+        let receipt = inserted.receipt;
+        let record = inserted.record.ok_or_else(|| {
+            map_insertion_error(crate::storage::StorageError::CommittedInsertion {
+                receipt: Box::new(receipt.clone()),
+                source: Box::new(crate::storage::StorageError::RecoveryRequired(
+                    "inserted record unavailable".into(),
+                )),
+            })
+        })?;
+        let memory_id = record.id;
+        let supersedes_outcome = input.supersedes.map(|id| {
+            crate::model::SupersedesOutcome::new(id, crate::model::SupersedesStatus::Applied)
+        });
 
-        let supersedes_outcome = match input.supersedes {
-            Some(old_id) => Some(
-                crate::graph::apply_supersedes_edge(
-                    memory_id,
-                    old_id,
-                    &self.graph,
-                    &self.storage,
-                    &self.cache,
-                )
-                .await,
-            ),
-            None => None,
-        };
+        // Entity recall is independent of automatic graph linking. Publish the
+        // accepted names directly; legacy tags cannot represent every name.
+        self.entity_index
+            .write()
+            .await
+            .add(ns_config.id, memory_id, &input.entities);
 
         // Auto-link: discover and create edges to similar existing memories.
         if self.config.graph.autolink_enabled {
@@ -1214,10 +1168,6 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     &self.cache,
                 )
                 .await;
-
-                // Update entity index.
-                let mut idx = self.entity_index.write().await;
-                idx.add(memory_id, &entities);
             }
 
             // Temporal edges: link to recently-stored memories in the same namespace.
@@ -1267,6 +1217,13 @@ impl bridge::StorageEngine for McpStorageAdapter {
             }
         }
 
+        completion.complete().await.map_err(|source| {
+            map_insertion_error(crate::storage::StorageError::CommittedInsertion {
+                receipt: Box::new(receipt),
+                source: Box::new(source),
+            })
+        })?;
+        self.cache.insert(memory_id, record.clone()).await;
         Ok(bridge::StoredMemory {
             id: memory_id.to_string(),
             namespace: input.namespace,
@@ -1315,6 +1272,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                                 .unwrap_or_default();
 
                             return Ok(Some(bridge::MemoryRecord {
+                                labels: record.schema.as_ref().map(|s| s.labels.clone()),
                                 id: id.to_string(),
                                 namespace: ns_name,
                                 summary: String::new(),
@@ -1350,6 +1308,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                         };
 
                         Ok(Some(bridge::MemoryRecord {
+                            labels: record.schema.as_ref().map(|s| s.labels.clone()),
                             id: id.to_string(),
                             namespace: ns_name,
                             summary: record.summary.clone(),
@@ -1594,22 +1553,11 @@ impl bridge::StorageEngine for McpStorageAdapter {
     ) -> Result<bridge::ListMemoriesResponse, bridge::BridgeError> {
         let stamp = effects_stamp(&self.storage).await?;
         let result = async {
-            // Build tag filters: merge explicit tags + entity tags for AND
-            // semantics. An unfilterable label is an error — see
-            // `filter_tags`.
-            let require_tags = match filter_tags(
-                &[
-                    ("tags", "", &input.tags),
-                    (
-                        "entities",
-                        crate::model::constants::ENTITY_TAG_PREFIX,
-                        &input.entities,
-                    ),
-                ],
-                "list_memories",
-            ) {
-                Ok(tags) => tags,
-                Err(e) => return Err(bridge::BridgeError::InvalidInput(e)),
+            let require_tags = filter_tags(&[("tags", "", &input.tags)], "list_memories")
+                .map_err(bridge::BridgeError::InvalidInput)?;
+            let labels = crate::model::tag::StructuredLabelFilter {
+                entities: input.entities.clone(),
+                ..Default::default()
             };
 
             // Resolve namespace and query in a single blocking task.
@@ -1629,15 +1577,22 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     .ok_or_else(|| {
                         bridge::BridgeError::NotFound(format!("namespace '{}' not found", ns_name,))
                     })?;
+                labels
+                    .validate(ns.schema.is_some())
+                    .map_err(bridge::BridgeError::InvalidInput)?;
+                let labels = labels.compile();
                 let (page, total) = storage_r
                     .meta_store()
-                    .list_memories_filtered(
+                    .list_memories_filtered_by(
                         ns.id,
                         &require_tags,
                         time_range_start,
                         time_range_end,
                         offset,
                         limit,
+                        |record| {
+                            labels.matches(&record.tags, record.schema.as_ref().map(|s| &s.labels))
+                        },
                     )
                     .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
                 Ok::<_, bridge::BridgeError>((ns, page, total))
@@ -1652,8 +1607,12 @@ impl bridge::StorageEngine for McpStorageAdapter {
             let memories: Vec<bridge::ListMemoryEntry> = page
                 .into_iter()
                 .map(|(mid, record)| {
-                    let metadata = crate::model::parse_structured_tags(&record.tags);
+                    let metadata = crate::model::structured_metadata(
+                        &record.tags,
+                        record.schema.as_ref().map(|s| &s.labels),
+                    );
                     bridge::ListMemoryEntry {
+                        labels: record.schema.as_ref().map(|s| s.labels.clone()),
                         id: mid.to_string(),
                         summary: record.summary,
                         entities: metadata.entities,
@@ -2912,6 +2871,208 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_profile_mcp_store_rejects_runtime_dimension_before_provider_and_writes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Provider(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for Provider {
+            async fn embed(&self, _: &str) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![1., 0., 0., 0.])
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            fn model_name(&self) -> &str {
+                "fixture"
+            }
+            fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+                let mut profile = crate::embedding::runtime::tests::profile();
+                profile.dimension = 8;
+                Some(profile)
+            }
+        }
+        let fixture = Fixture::new();
+        let mut adapter = fixture.storage_adapter();
+        let calls = Arc::new(AtomicUsize::new(0));
+        adapter.embedding = Arc::new(Provider(calls.clone()));
+        let mut input = store_input("profile probe", "default", vec![]);
+        input.embedding = None;
+        let before = fixture
+            .storage
+            .read()
+            .unwrap()
+            .control_state()
+            .unwrap()
+            .committed_generation;
+        let error = adapter.store_memory(input).await.unwrap_err();
+        assert!(
+            matches!(error, bridge::BridgeError::Unavailable(_)),
+            "{error}"
+        );
+        assert_eq!(
+            crate::daemon::protocol::DaemonRpcError::from(&error).code,
+            -32008
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture
+                .storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation,
+            before
+        );
+        assert!(
+            fixture
+                .storage
+                .read()
+                .unwrap()
+                .scan_all()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn insertion_adapter_rejects_bad_provider_and_caller_vectors_and_normalizes_advisory() {
+        use crate::search::VectorIndex as _;
+        struct Provider(Vec<f32>);
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for Provider {
+            async fn embed(&self, _: &str) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
+                Ok(self.0.clone())
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            fn model_name(&self) -> &str {
+                "synthetic-vector-boundary"
+            }
+        }
+        let fx = Fixture::new();
+        for supplied in [false, true] {
+            let mut adapter = fx.storage_adapter();
+            adapter.embedding = Arc::new(Provider(vec![0.; 4]));
+            let mut input = store_input("invalid", "default", vec![0.; 4]);
+            if !supplied {
+                input.embedding = None;
+            }
+            let before = fx
+                .storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation;
+            let error = adapter.store_memory(input).await.unwrap_err();
+            assert!(
+                if supplied {
+                    matches!(error, bridge::BridgeError::InvalidInput(_))
+                } else {
+                    matches!(error, bridge::BridgeError::Unavailable(_))
+                },
+                "{error}"
+            );
+            let rpc = crate::daemon::protocol::DaemonRpcError::from(&error);
+            assert_eq!(
+                rpc.code,
+                if supplied {
+                    crate::daemon::protocol::ERR_INVALID_INPUT
+                } else {
+                    crate::daemon::protocol::ERR_UNAVAILABLE
+                }
+            );
+            assert!(if supplied {
+                matches!(
+                    rpc.into_bridge_error(),
+                    bridge::BridgeError::InvalidInput(_)
+                )
+            } else {
+                matches!(rpc.into_bridge_error(), bridge::BridgeError::Unavailable(_))
+            });
+            assert_eq!(
+                fx.storage
+                    .read()
+                    .unwrap()
+                    .control_state()
+                    .unwrap()
+                    .committed_generation,
+                before
+            );
+            assert!(fx.storage.read().unwrap().scan_all().unwrap().is_empty());
+        }
+        let mut adapter = fx.storage_adapter();
+        adapter.embedding = Arc::new(Provider(vec![3., 4., 0., 0.]));
+        let first = adapter
+            .store_memory(store_input(
+                "supplied vector",
+                "default",
+                vec![3., 4., 0., 0.],
+            ))
+            .await
+            .unwrap();
+        let mut generated = store_input("provider vector", "default", vec![]);
+        generated.embedding = None;
+        let second = adapter.store_memory(generated).await.unwrap();
+        assert_eq!(
+            second.near_duplicates.unwrap().matches[0].id.to_string(),
+            first.id
+        );
+        for text in [first.id, second.id] {
+            let id = MemoryId::from_uuid(uuid::Uuid::parse_str(&text).unwrap());
+            let record = fx.record(id).unwrap();
+            let vector = fx
+                .storage
+                .read()
+                .unwrap()
+                .get_vector(NamespaceId::new(1), record.vector_slot)
+                .unwrap()
+                .unwrap();
+            assert_eq!(vector, vec![0.6, 0.8, 0., 0.]);
+            assert_eq!(
+                fx.vector_index.read().await.get_vector(id).unwrap(),
+                vector.as_slice()
+            );
+        }
+        // This fixture changes one f32 bit if normalized a second time. Both
+        // consumer paths must pass raw bytes to canonical staging, so their
+        // advisory working vector and persisted vector share one transform.
+        let raw: Vec<f32> = [0xc3f82a4a, 0xc3cf0889, 0xc401baf5, 0x432cdfd5]
+            .into_iter()
+            .map(f32::from_bits)
+            .collect();
+        let expected = [0xbf160f3a, 0xbefa6047, 0xbf1ce3b9, 0x3e5110db];
+        adapter.embedding = Arc::new(Provider(raw.clone()));
+        for supplied in [false, true] {
+            let mut input = store_input("rounding fixture", "default", raw.clone());
+            if !supplied {
+                input.embedding = None;
+            }
+            let result = adapter.store_memory(input).await.unwrap();
+            let id = MemoryId::from_uuid(uuid::Uuid::parse_str(&result.id).unwrap());
+            let slot = fx.record(id).unwrap().vector_slot;
+            let vector = fx
+                .storage
+                .read()
+                .unwrap()
+                .get_vector(NamespaceId::new(1), slot)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                vector.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                fx.vector_index.read().await.get_vector(id).unwrap(),
+                vector.as_slice()
+            );
+        }
+    }
+
     fn unit_x() -> Vec<f32> {
         vec![1.0, 0.0, 0.0, 0.0]
     }
@@ -3738,6 +3899,78 @@ mod tests {
                 .len(),
             1,
             "a case-variant of 'default' left a namespace row behind"
+        );
+    }
+    #[tokio::test]
+    async fn canonical_legacy_entity_postings_survive_disabled_autolink_rebuild_and_delete() {
+        let fx = Fixture::new();
+        let foreign = fx.create_namespace("foreign");
+        let mut adapter = fx.storage_adapter();
+        Arc::make_mut(&mut adapter.config).graph.autolink_enabled = false;
+        let names = vec!["John-Smith".into(), "JOSE".into(), "Alice".into()];
+        let mut ids = Vec::new();
+        for namespace in ["default", "foreign"] {
+            let mut input = store_input("accepted names", namespace, unit_x());
+            input.entities = names.clone();
+            let stored = adapter.store_memory(input).await.unwrap();
+            ids.push(MemoryId::from_uuid(
+                uuid::Uuid::parse_str(&stored.id).unwrap(),
+            ));
+        }
+        {
+            let index = fx.entity_index.read().await;
+            assert_eq!(index.len(), 2);
+            assert_eq!(
+                index.find_by_entities(default_ns(), &names, MemoryId::new()),
+                vec![(ids[0], 3)]
+            );
+            assert_eq!(
+                index.find_by_entities(foreign, &names, MemoryId::new()),
+                vec![(ids[1], 3)]
+            );
+        }
+        assert!(adapter.delete_memory(ids[0], None).await.unwrap());
+        let index = fx.entity_index.read().await;
+        assert_eq!(index.len(), 1);
+        assert!(
+            index
+                .find_by_entities(default_ns(), &names, MemoryId::new())
+                .is_empty()
+        );
+        assert_eq!(
+            index.find_by_entities(foreign, &names, MemoryId::new()),
+            vec![(ids[1], 3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_deletion_clears_orphan_entity_postings_only_in_its_scope() {
+        let fx = Fixture::new();
+        let scratch = fx.create_namespace("scratch");
+        let orphan = MemoryId::new();
+        let names = vec!["José".into()];
+        {
+            let mut index = fx.entity_index.write().await;
+            index.add(scratch, orphan, &names);
+            index.add(default_ns(), orphan, &names);
+        }
+        fx.namespace_adapter()
+            .delete_namespace(bridge::DeleteNamespaceInput {
+                name: "scratch".into(),
+                force: false,
+            })
+            .await
+            .unwrap();
+        let index = fx.entity_index.read().await;
+        assert_eq!(index.len(), 1);
+        assert!(
+            index
+                .find_by_entities(scratch, &names, MemoryId::new())
+                .is_empty()
+        );
+        assert_eq!(
+            index.find_by_entities(default_ns(), &names, MemoryId::new()),
+            vec![(orphan, 1)]
         );
     }
 }

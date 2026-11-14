@@ -185,6 +185,14 @@ impl EmbeddingProvider for OllamaProvider {
         self.dim
     }
 
+    fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+        Some(super::runtime::native_profile(
+            crate::model::schema::ProviderKind::Ollama,
+            self.model_name(),
+            self.dimensions(),
+        ))
+    }
+
     fn model_name(&self) -> &str {
         &self.model
     }

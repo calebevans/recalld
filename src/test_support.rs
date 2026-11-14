@@ -530,6 +530,7 @@ fn clone_bridge_error(e: &crate::mcp::bridge::BridgeError) -> crate::mcp::bridge
         E::NotFound(m) => E::NotFound(m.clone()),
         E::InvalidInput(m) => E::InvalidInput(m.clone()),
         E::Storage(m) => E::Storage(m.clone()),
+        E::Unavailable(m) => E::Unavailable(m.clone()),
         E::Search(m) => E::Search(m.clone()),
         E::Internal(m) => E::Internal(m.clone()),
         E::TooLarge(m) => E::TooLarge(m.clone()),

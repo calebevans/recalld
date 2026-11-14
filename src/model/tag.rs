@@ -106,8 +106,8 @@ impl From<Tag> for String {
 /// prefix out of the `entities`/`topics`/`emotions` limits, so no
 /// request that validates can produce an over-long tag here. What
 /// remains reachable is the alphabet: `Tag::new` accepts only
-/// `[a-z0-9/_.:-]`, which the request validator deliberately does not
-/// duplicate (an entity named `José` is a legitimate thing to send).
+/// `[a-z0-9/_.:-]`, which legacy structured-label writer admission now rejects before this
+/// helper. Retained canonical UTF-8 labels use their separate schema carrier.
 pub fn parse_tags_lossy(context: &str, raw: &[String]) -> Vec<Tag> {
     raw.iter()
         .filter_map(|t| match Tag::new(t) {
@@ -178,6 +178,123 @@ pub struct StructuredMetadata {
     pub entities: Vec<String>,
     pub topics: Vec<String>,
     pub emotions: Vec<String>,
+}
+
+/// Canonical labels are authoritative even when every list is empty. Only
+/// records without this carrier use the legacy tag display conventions.
+pub fn structured_metadata(
+    tags: &[Tag],
+    labels: Option<&super::schema::StructuredLabels>,
+) -> StructuredMetadata {
+    match labels {
+        Some(labels) => StructuredMetadata {
+            entities: labels.entities.clone(),
+            topics: labels.topics.clone(),
+            emotions: labels.emotions.clone(),
+        },
+        None => parse_structured_tags(tags),
+    }
+}
+
+/// Structured hard filters use canonical labels when present, never entity-index
+/// aliases. Legacy records retain their existing prefixed-tag matching semantics.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StructuredLabelFilter {
+    #[serde(default)]
+    pub entities: Vec<String>,
+    #[serde(default)]
+    pub topics: Vec<String>,
+    #[serde(default)]
+    pub emotions: Vec<String>,
+}
+
+impl StructuredLabelFilter {
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty() && self.topics.is_empty() && self.emotions.is_empty()
+    }
+
+    /// Validate against the resolved namespace before querying any provider or
+    /// channel. Legacy filters keep the exact existing tag validation contract.
+    pub fn validate(&self, canonical: bool) -> Result<(), String> {
+        for (field, prefix, values) in [
+            ("entities", "entity/", &self.entities),
+            ("topics", "topic/", &self.topics),
+            ("emotions", "emotion/", &self.emotions),
+        ] {
+            if canonical {
+                super::validation::validate_count(field, values.len(), super::constants::MAX_TAGS)
+                    .map_err(|e| e.to_string())?;
+                super::validation::validate_item_lens(
+                    field,
+                    values,
+                    super::constants::LABEL_MAX_BYTES,
+                )
+                .map_err(|e| e.to_string())?;
+                if let Some(index) = values.iter().position(String::is_empty) {
+                    return Err(format!("{field}[{index}] must not be empty"));
+                }
+            } else {
+                parse_filter_tags(field, prefix, values).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile caller labels once, retaining their original values on the query.
+    pub fn compile(&self) -> CompiledLabelFilter {
+        CompiledLabelFilter {
+            entities: self
+                .entities
+                .iter()
+                .map(|label| label.to_lowercase())
+                .collect(),
+            topics: self
+                .topics
+                .iter()
+                .map(|label| label.to_lowercase())
+                .collect(),
+            emotions: self
+                .emotions
+                .iter()
+                .map(|label| label.to_lowercase())
+                .collect(),
+        }
+    }
+}
+
+/// Whole-label Unicode lowercase comparison. No trimming, alias expansion or
+/// Unicode normalization; returned/persisted labels remain byte-for-byte exact.
+#[derive(Debug, Clone)]
+pub struct CompiledLabelFilter {
+    entities: Vec<String>,
+    topics: Vec<String>,
+    emotions: Vec<String>,
+}
+
+impl CompiledLabelFilter {
+    pub fn matches(&self, tags: &[Tag], labels: Option<&super::schema::StructuredLabels>) -> bool {
+        for (prefix, required, canonical) in [
+            ("entity/", &self.entities, labels.map(|l| &l.entities)),
+            ("topic/", &self.topics, labels.map(|l| &l.topics)),
+            ("emotion/", &self.emotions, labels.map(|l| &l.emotions)),
+        ] {
+            for normalized in required {
+                let found = match canonical {
+                    Some(values) => values
+                        .iter()
+                        .any(|value| value.to_lowercase() == *normalized),
+                    None => tags
+                        .iter()
+                        .any(|tag| tag.as_str().strip_prefix(prefix) == Some(normalized.as_str())),
+                };
+                if !found {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 /// Parse a slice of tags into structured metadata buckets by prefix.

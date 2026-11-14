@@ -35,6 +35,15 @@ impl Default for QueryMode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchFilter {
+    /// Structured predicates remain separate from explicit raw tag predicates.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::model::tag::StructuredLabelFilter::is_empty"
+    )]
+    pub labels: crate::model::tag::StructuredLabelFilter,
+    /// Prepared by admission after validation; never decoded from caller input.
+    #[serde(skip)]
+    pub(crate) compiled_labels: Option<crate::model::tag::CompiledLabelFilter>,
     /// Require ALL of these tags to be present on the memory.
     #[serde(default)]
     pub require_tags: Vec<Tag>,
@@ -170,6 +179,7 @@ impl SearchQuery {
             }
             QueryMode::MetadataOnly => {
                 if self.filter.require_tags.is_empty()
+                    && self.filter.labels.is_empty()
                     && self.filter.phases.is_empty()
                     && self.filter.min_strength.is_none()
                     && !self.filter.permastore_only

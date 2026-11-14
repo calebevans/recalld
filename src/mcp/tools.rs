@@ -599,6 +599,9 @@ async fn handle_recall_memories(
                         if !hit.topics.is_empty() {
                             obj["topics"] = json!(hit.topics);
                         }
+                        if let Some(labels) = &hit.labels {
+                            obj["labels"] = json!(labels);
+                        }
                         obj
                     })
                     .collect();

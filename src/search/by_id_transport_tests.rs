@@ -10,6 +10,20 @@ struct OfflineHttpStorage(Arc<OfflineSnapshot>);
 #[async_trait::async_trait]
 #[allow(unused_variables)]
 impl crate::api::StorageEngine for OfflineHttpStorage {
+    async fn insert_memory(
+        &self,
+        _: NamespaceId,
+        _: crate::storage::insertion::InsertMemory,
+        _: crate::embedding::runtime::GeneratedEmbedding,
+    ) -> std::result::Result<crate::storage::insertion::InsertResult, StorageError> {
+        panic!("unexpected offline HTTP insertion")
+    }
+    async fn complete_insertion(
+        &self,
+        _: &crate::storage::control::WriteReceipt,
+    ) -> std::result::Result<(), StorageError> {
+        panic!("unexpected offline HTTP insertion completion")
+    }
     async fn create_memory(
         &self,
         namespace_id: NamespaceId,
@@ -88,7 +102,7 @@ impl crate::api::StorageEngine for OfflineHttpStorage {
     }
 }
 
-struct FixtureEmbedding;
+pub(super) struct FixtureEmbedding;
 #[async_trait::async_trait]
 impl crate::embedding::EmbeddingProvider for FixtureEmbedding {
     async fn embed(
@@ -124,7 +138,11 @@ impl VectorIndexRegistry for CountSelection {
         self.inner.get_vector(id)
     }
 }
-fn router(f: &Fixture, snapshot: Arc<OfflineSnapshot>, engine: Arc<QueryEngine>) -> axum::Router {
+pub(super) fn router(
+    f: &Fixture,
+    snapshot: Arc<OfflineSnapshot>,
+    engine: Arc<QueryEngine>,
+) -> axum::Router {
     use crate::api::adapters::*;
     let config = Arc::new(crate::config::RecalldConfig::default());
     crate::api::router(
@@ -159,7 +177,11 @@ fn router(f: &Fixture, snapshot: Arc<OfflineSnapshot>, engine: Arc<QueryEngine>)
         &crate::api::ApiConfig::default(),
     )
 }
-async fn http(router: axum::Router, id: MemoryId, access: bool) -> (axum::http::StatusCode, Value) {
+pub(super) async fn http(
+    router: axum::Router,
+    id: MemoryId,
+    access: bool,
+) -> (axum::http::StatusCode, Value) {
     use tower::ServiceExt;
     let response = router
         .oneshot(
