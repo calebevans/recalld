@@ -140,7 +140,7 @@ fn ctx(d: &Data, g: GenerationRef, key: &str) -> MutationContext {
     }
 }
 fn record(session: &NativeLifecycleSession, id: MemoryId) -> DiskRecord {
-    session.metadata.get(id).unwrap().unwrap()
+    session.metadata().get(id).unwrap().unwrap()
 }
 fn open(d: &Data, clock: Arc<TestClock>) -> NativeLifecycleSession {
     NativeLifecycleSession::open(&d.path, NativePolicyInputs::default(), clock).unwrap()
@@ -153,7 +153,7 @@ fn outcome(receipt: &WriteReceipt) -> &NativeLifecycleWrite {
     }
 }
 fn logical(session: &NativeLifecycleSession) -> Vec<Vec<u8>> {
-    let read = session.metadata.db.begin_read().unwrap();
+    let read = session.metadata().db.begin_read().unwrap();
     let mut rows = Vec::new();
     for row in read.open_table(META_TABLE).unwrap().iter().unwrap() {
         rows.push(row.unwrap().1.value().to_vec());
@@ -290,7 +290,7 @@ async fn replay_precedes_stale_tokens_policy_and_clock_but_not_lineage_or_payloa
     };
     clock.set(i64::MAX);
     let replay = session
-        .metadata
+        .metadata()
         .apply_native_feedback(&key, &intent, &wrong_policy, clock.as_ref())
         .unwrap();
     assert!(replay.replayed);
@@ -302,7 +302,7 @@ async fn replay_precedes_stale_tokens_policy_and_clock_but_not_lineage_or_payloa
     newkey.expected_generation = None;
     assert!(matches!(
         session
-            .metadata
+            .metadata()
             .apply_native_feedback(&newkey, &intent, &wrong_policy, clock.as_ref()),
         Err(StorageError::LifecycleConflict(_))
     ));
@@ -341,9 +341,9 @@ async fn abandoned_real_transaction_and_invalid_inputs_leave_records_receipts_an
     let intent = session.capture_feedback(d.a, None, 3).unwrap();
     let key = ctx(&d, intent.capture_generation(), "abandoned");
     {
-        let guard = session.metadata.native_guard().unwrap();
+        let guard = session.metadata().native_guard().unwrap();
         let (tx, receipt) = session
-            .metadata
+            .metadata()
             .prepare_native(
                 &guard,
                 &key,
@@ -429,29 +429,29 @@ async fn native_entry_excludes_other_owners_legacy_stores_and_unparticipating_wr
     let r = record(&session, d.a);
     assert!(
         session
-            .metadata
+            .metadata()
             .update_access(d.a, DAY, AccessKind::DirectRetrieval)
             .is_err()
     );
-    assert!(session.metadata.tombstone(d.a).is_err());
-    assert!(session.metadata.delete(d.a).is_err());
-    assert!(session.metadata.strip_full_text(d.a).is_err());
+    assert!(session.metadata().tombstone(d.a).is_err());
+    assert!(session.metadata().delete(d.a).is_err());
+    assert!(session.metadata().strip_full_text(d.a).is_err());
     assert!(
         session
-            .metadata
+            .metadata()
             .update_decay_state(d.a, DecayPhase::Summary, 0.1, 0.1, 1., false)
             .is_err()
     );
-    assert!(session.metadata.insert(MemoryId::new(), &r).is_err());
-    assert!(session.metadata.persist_phase_index().is_err());
-    assert!(session.metadata.rebuild_phase_index().is_err());
+    assert!(session.metadata().insert(MemoryId::new(), &r).is_err());
+    assert!(session.metadata().persist_phase_index().is_err());
+    assert!(session.metadata().rebuild_phase_index().is_err());
     assert!(
         session
-            .metadata
+            .metadata()
             .create_namespace(&NamespaceConfig::default_namespace(0))
             .is_err()
     );
-    assert!(session.metadata.purge_namespace_records(d.ns, 1).is_err());
+    assert!(session.metadata().purge_namespace_records(d.ns, 1).is_err());
     assert_eq!(logical(&session), before);
     drop(session);
     assert!(
@@ -803,7 +803,7 @@ async fn native_backup_fork_preserves_receipts_applies_later_deletion_and_blocks
         session.apply_feedback(&key, &intent),
         Err(StorageError::StoreLineageMismatch)
     ));
-    let read = session.metadata.db.begin_read().unwrap();
+    let read = session.metadata().db.begin_read().unwrap();
     let receipt_key = control::scoped_key(
         receipt.store_id,
         MutationScope::Namespace(d.ns),
@@ -866,7 +866,7 @@ async fn malformed_native_proof_and_missing_suffix_fail_read_only_inspection() {
         receipt.operation_id.as_bytes(),
     );
     let original = {
-        let read = session.metadata.db.begin_read().unwrap();
+        let read = session.metadata().db.begin_read().unwrap();
         let table = read.open_table(control::RECEIPTS).unwrap();
         table.get(key.as_slice()).unwrap().unwrap().value().to_vec()
     };
@@ -1087,7 +1087,7 @@ async fn capture_rechecks_poison_after_waiting_for_publication() {
     for feedback in [false, true] {
         let session = open(&d, clock.clone());
         let before = logical(&session);
-        let guard = session.metadata.publication.write().unwrap();
+        let guard = session.metadata().publication.write().unwrap();
         std::thread::scope(|threads| {
             let (sender, checked) = std::sync::mpsc::channel();
             let pending = threads.spawn(|| {
@@ -1101,7 +1101,7 @@ async fn capture_rechecks_poison_after_waiting_for_publication() {
                 }
             });
             checked.recv().unwrap(); // Capture passed its initial admission check.
-            session.metadata.mark_unavailable(); // Publication fails while it waits.
+            session.metadata().mark_unavailable(); // Publication fails while it waits.
             drop(guard);
             assert!(matches!(
                 pending.join().unwrap(),
@@ -1142,7 +1142,7 @@ async fn native_hot_path_work_is_independent_of_receipt_count_but_reopen_checks_
         let work = control::take_validation_work();
         exposure_work.push(work);
         if [1, 16, 64].contains(&n) {
-            let read = session.metadata.db.begin_read().unwrap();
+            let read = session.metadata().db.begin_read().unwrap();
             let count = read.open_table(control::RECEIPTS).unwrap().len().unwrap();
             eprintln!("native receipt scaling: receipts={count}, work={work:?}");
             drop(read);

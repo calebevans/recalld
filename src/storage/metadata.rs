@@ -13,6 +13,7 @@ mod insertion;
 mod lifecycle_updates;
 pub(crate) mod namespace_state;
 mod native_lifecycle;
+mod native_records;
 pub(crate) mod purge;
 pub(crate) mod removal_ledger;
 pub(crate) mod restoration;

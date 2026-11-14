@@ -213,6 +213,12 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    NativeMemoryInserted {
+        transition: super::native_records::NativeRecordWrite,
+    },
+    NativeMemoryTombstoned {
+        transition: super::native_records::NativeRecordWrite,
+    },
     LifecycleExposureRecorded {
         transition: super::native_lifecycle::NativeLifecycleWrite,
     },
@@ -415,6 +421,8 @@ pub(crate) fn validate_existing(
             MutationOutcome::LifecyclePolicyMigrated { .. }
                 | MutationOutcome::LifecycleExposureRecorded { .. }
                 | MutationOutcome::LifecycleFeedbackApplied { .. }
+                | MutationOutcome::NativeMemoryInserted { .. }
+                | MutationOutcome::NativeMemoryTombstoned { .. }
         ) && state.control_schema_version != 2
         {
             return Err(StorageError::InvalidControl(
@@ -576,6 +584,12 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
         ));
     }
     match &stored.receipt.outcome {
+        MutationOutcome::NativeMemoryInserted { transition } => {
+            transition.validate(&stored.receipt, true)?
+        }
+        MutationOutcome::NativeMemoryTombstoned { transition } => {
+            transition.validate(&stored.receipt, false)?
+        }
         MutationOutcome::LifecycleExposureRecorded { transition } => {
             transition.validate(&stored.receipt, false)?
         }

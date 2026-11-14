@@ -6,7 +6,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::control::{Generation, GenerationRef, MutationContext, WriteReceipt};
-use super::ownership::{OwnedFileLock, StoreOwnership, lock_directory};
 use super::{MetadataStore, StorageError};
 use crate::decay::{
     DecayConfig,
@@ -100,7 +99,7 @@ impl LifecycleState {
         matches!(self.phase, DecayPhase::Full | DecayPhase::Summary)
             && (self.has_summary || (self.phase == DecayPhase::Full && self.has_text))
     }
-    fn validate(&self) -> Result<(), StorageError> {
+    pub(crate) fn validate(&self) -> Result<(), StorageError> {
         let t = &self.lifecycle;
         if self.stability.get() <= 0.
             || !(1. ..=10.).contains(&self.difficulty.get())
@@ -298,18 +297,19 @@ impl NativeLifecycleWrite {
         }
         Ok(())
     }
-    pub(crate) fn rewind(&self, rows: &mut [DiskRecord]) -> Result<(), StorageError> {
+    pub(crate) fn rewind(
+        &self,
+        rows: &mut [super::native_records::ProofRecord],
+    ) -> Result<(), StorageError> {
         for step in &self.records {
             let r = rows
                 .iter_mut()
-                .find(|r| r.id == *step.memory_id.as_bytes())
+                .find(|r| r.id == step.memory_id)
                 .ok_or_else(|| invalid("native receipt record absent"))?;
-            if LifecycleState::capture(r)? != step.after
-                || history_hash(&r.access_history)? != step.history_after
-            {
+            if r.state.lifecycle != step.after || history_hash(&r.history)? != step.history_after {
                 return Err(invalid("native receipt does not match record state"));
             }
-            if r.access_history.pop()
+            if r.history.pop()
                 != Some(AccessEvent {
                     timestamp: step.after.lifecycle.lifecycle_updated_at,
                     kind: step.kind,
@@ -318,15 +318,16 @@ impl NativeLifecycleWrite {
                 return Err(invalid("native receipt history event missing"));
             }
             if let Some(event) = step.evicted_event {
-                if r.access_history.len() + 1 != crate::model::constants::ACCESS_HISTORY_MAX {
+                if r.history.len() + 1 != crate::model::constants::ACCESS_HISTORY_MAX {
                     return Err(invalid("invalid native history eviction"));
                 }
-                r.access_history.insert(0, event);
+                r.history.insert(0, event);
             }
-            if history_hash(&r.access_history)? != step.history_before {
+            if history_hash(&r.history)? != step.history_before {
                 return Err(invalid("native receipt prior history mismatch"));
             }
-            step.before.apply(r);
+            r.state.lifecycle = step.before.clone();
+            r.state.history_sha256 = step.history_before;
         }
         Ok(())
     }
@@ -399,13 +400,14 @@ impl FeedbackIntent {
 }
 
 pub struct NativeLifecycleSession {
-    pub(crate) metadata: MetadataStore,
-    policy: NativePolicyInputs,
-    clock: Arc<dyn Clock>,
-    _legacy_lock: OwnedFileLock,
-    _owner: StoreOwnership,
+    pub(crate) engine: super::RedbStorageEngine,
+    pub(crate) policy: NativePolicyInputs,
+    pub(crate) clock: Arc<dyn Clock>,
 }
 impl NativeLifecycleSession {
+    pub(crate) fn metadata(&self) -> &MetadataStore {
+        self.engine.meta_store()
+    }
     /// Reconcile an uncertain commit after reopening this same origin. This is
     /// canonical receipt lookup, not a derived publication/readiness assertion.
     pub fn lookup_operation(
@@ -414,7 +416,7 @@ impl NativeLifecycleSession {
         namespace_id: NamespaceId,
         operation_id: uuid::Uuid,
     ) -> Result<Option<WriteReceipt>, StorageError> {
-        self.metadata.lookup_operation(
+        self.metadata().lookup_operation(
             store_id,
             super::control::MutationScope::Namespace(namespace_id),
             operation_id,
@@ -425,19 +427,11 @@ impl NativeLifecycleSession {
         policy: NativePolicyInputs,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, StorageError> {
-        if !path.is_dir() {
-            return Err(StorageError::InvalidPath);
-        }
-        let owner = StoreOwnership::acquire(path)?;
-        let lock = lock_directory(&owner.path)?;
-        super::validation::canonical_files(&owner.path)?;
-        let metadata = MetadataStore::open_native_lifecycle(&owner.path.join("meta.db"))?;
+        let engine = super::RedbStorageEngine::open_native(path)?;
         Ok(Self {
-            metadata,
+            engine,
             policy,
             clock,
-            _legacy_lock: lock,
-            _owner: owner,
         })
     }
     pub fn capture_exposure(
@@ -445,7 +439,7 @@ impl NativeLifecycleSession {
         scope: LifecycleScope,
         original: &[(MemoryId, AccessKind)],
     ) -> Result<ExposureIntent, StorageError> {
-        self.metadata
+        self.metadata()
             .capture_exposure(scope, original, &self.policy)
     }
     pub fn record_exposure(
@@ -453,7 +447,7 @@ impl NativeLifecycleSession {
         ctx: &MutationContext,
         intent: &ExposureIntent,
     ) -> Result<Option<WriteReceipt>, StorageError> {
-        self.metadata
+        self.metadata()
             .record_native_exposure(ctx, intent, &self.policy, self.clock.as_ref())
     }
     pub fn capture_feedback(
@@ -462,7 +456,7 @@ impl NativeLifecycleSession {
         namespace: Option<NamespaceId>,
         quality: u8,
     ) -> Result<FeedbackIntent, StorageError> {
-        self.metadata
+        self.metadata()
             .capture_feedback(id, namespace, quality, &self.policy)
     }
     pub fn apply_feedback(
@@ -470,7 +464,7 @@ impl NativeLifecycleSession {
         ctx: &MutationContext,
         intent: &FeedbackIntent,
     ) -> Result<WriteReceipt, StorageError> {
-        self.metadata
+        self.metadata()
             .apply_native_feedback(ctx, intent, &self.policy, self.clock.as_ref())
     }
 }

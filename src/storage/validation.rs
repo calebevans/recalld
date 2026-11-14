@@ -106,16 +106,21 @@ fn selected_text(path: &Path, read: &redb::ReadTransaction) -> Result<TextStore,
 /// Caller owns/quiesces the store, or supplies an inaccessible staging copy.
 /// Returns the required canonical inventory derived from validated metadata.
 pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageError> {
-    validate_snapshot(path, false)
+    validate_snapshot(path, false, false)
 }
-
-/// Only the logical importer may inspect its unpublished, explicitly importing
-/// stage. Ordinary inspection/export/backup must not treat partial imports as snapshots.
+/// Only the logical importer may inspect its unpublished, explicitly importing stage.
 pub(crate) fn validate_import_stage(path: &Path) -> Result<HashSet<String>, StorageError> {
-    validate_snapshot(path, true)
+    validate_snapshot(path, true, false)
 }
-
-fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, StorageError> {
+/// Strict private-native preflight admits only validated native recovery plans.
+pub(crate) fn preflight_native(path: &Path) -> Result<(), StorageError> {
+    validate_snapshot(path, false, true).map(|_| ())
+}
+fn validate_snapshot(
+    path: &Path,
+    importing: bool,
+    native_recovery: bool,
+) -> Result<HashSet<String>, StorageError> {
     if !importing && std::fs::symlink_metadata(path.join(".recalld-importing")).is_ok() {
         return Err(StorageError::RecoveryRequired(
             "incomplete logical import; resume using its original export".into(),
@@ -128,6 +133,22 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
     let (_meta_copy, meta) = inspect_database(&path.join("meta.db"))?;
     let read = meta.begin_read()?;
     let control = super::control::validate_existing(&read)?;
+    if native_recovery {
+        let state = control
+            .as_ref()
+            .ok_or_else(|| StorageError::InvalidControl("native control missing".into()))?;
+        if state.control_schema_version != 2
+            || super::metadata::text_generation::read_selection(&read)?.is_none()
+        {
+            return Err(StorageError::InvalidControl(
+                "native entry requires gated schema 2".into(),
+            ));
+        }
+        super::lineage::ensure_serving(&read, state)?;
+        super::metadata::restoration::validate_inventory(&read)?;
+        super::canonical_schema::validate_metadata_format(&read, Some(state))?;
+    }
+
     if super::metadata::purge::validate_existing(&read, control.as_ref())?
         .iter()
         .any(|p| p.stage != super::purge::PurgeStage::Complete)
@@ -137,6 +158,14 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
         ));
     }
     super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
+    let native_creations = if control
+        .as_ref()
+        .is_some_and(|c| c.control_schema_version == 2)
+    {
+        super::native_records::creation_proofs(&read)?
+    } else {
+        HashMap::new()
+    };
     let schema_state = control
         .as_ref()
         .map(|c| super::canonical_schema::read_state(&read, c))
@@ -145,10 +174,16 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
     if control.is_some() {
         read.open_table(super::metadata::NAMESPACE_COUNTER)?;
     }
-    if super::metadata::effects::validate_existing(&read)?
-        .iter()
-        .any(|e| !e.canonical_applied)
-    {
+    let effects = super::metadata::effects::validate_existing(&read)?;
+    if effects.iter().any(|e| {
+        !e.canonical_applied
+            && (!native_recovery
+                || !matches!(
+                    e.receipt.outcome,
+                    super::control::MutationOutcome::NativeMemoryInserted { .. }
+                        | super::control::MutationOutcome::NativeMemoryTombstoned { .. }
+                ))
+    }) {
         return Err(StorageError::RecoveryRequired(
             "pending canonical effects; reopen before backup".into(),
         ));
@@ -203,6 +238,7 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
     let records = read.open_table(META_TABLE)?;
     let mut ids = HashSet::new();
     let mut owners = HashSet::new();
+    let mut decoded = Vec::new();
     for item in records.iter()? {
         let (key, value) = item?;
         let record = DiskRecord::from_bytes(value.value())?;
@@ -212,6 +248,7 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
             ));
         }
         let id = MemoryId::from_bytes(record.id);
+        decoded.push((id, record.clone()));
         ids.insert(id);
         let namespace = configs
             .get(&record.namespace_id)
@@ -261,11 +298,19 @@ fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, St
             }
         }
         if record.text_offset != 0 || record.text_length != 0 {
-            text.read(TextRef {
+            let retained = text.read(TextRef {
                 file_offset: record.text_offset,
                 length: record.text_length,
             })?;
+            super::native_records::validate_retained_text(
+                &record,
+                native_creations.get(&id),
+                &retained,
+            )?;
         }
+    }
+    for effect in effects.iter().filter(|e| !e.canonical_applied) {
+        super::metadata::effects::validate_plan(effect, &decoded)?;
     }
     let (_edges_copy, edges) = inspect_database(&path.join("edges.db"))?;
     let read = edges.begin_read()?;

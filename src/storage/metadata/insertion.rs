@@ -118,6 +118,12 @@ mod profile_boundary_tests {
 }
 
 impl MetadataStore {
+    /// Shared owned-core allocation point for legacy/native receipt writers.
+    /// Still nondeterministic until the real scoped ID/RNG prerequisite lands.
+    pub(super) fn allocate_memory_id(&self, supplied: Option<MemoryId>) -> MemoryId {
+        supplied.unwrap_or_else(MemoryId::new)
+    }
+
     pub(crate) fn lookup_insert_replay(
         &self,
         ctx: &MutationContext,
@@ -220,7 +226,7 @@ impl MetadataStore {
             config.embedding_dim,
             input.embedding.is_some(),
         )?;
-        let id = input.id.unwrap_or_else(MemoryId::new);
+        let id = self.allocate_memory_id(input.id);
         if id == MemoryId::nil() {
             return Err(StorageError::InvalidMutation("nil memory ID".into()));
         }
@@ -232,28 +238,7 @@ impl MetadataStore {
         {
             return Err(StorageError::DuplicateId(id.into_inner()));
         }
-        // Validate explicit targets and branches before staging. The common
-        // effect tail repeats endpoint checks inside this same transaction.
-        for target in [input.parent_id, input.supersedes].into_iter().flatten() {
-            if target == id {
-                return Err(StorageError::InvalidMutation("self link".into()));
-            }
-            let row = tx.open_table(META_TABLE)?;
-            let value = row
-                .get(target.as_bytes().as_slice())?
-                .ok_or(StorageError::NotFound(target.into_inner()))?;
-            let record = DiskRecord::from_bytes(value.value())?;
-            if record.id != *target.as_bytes() || record.namespace_id != namespace.get() {
-                return Err(StorageError::MutationNamespaceMismatch);
-            }
-        }
-        if input.supersedes.is_some_and(|target| {
-            existing_edges
-                .iter()
-                .any(|edge| edge.edge_type == EdgeType::Supersedes && edge.target == target)
-        }) {
-            return Err(StorageError::EdgeConflict("supersedes branch".into()));
-        }
+        validate_insert_targets(&tx, input, namespace, id, existing_edges)?;
         let mut record = DiskRecord {
             schema: None,
             version: 1,
@@ -275,32 +260,15 @@ impl MetadataStore {
             text_offset: 0,
             text_length: 0,
         };
-        record.encode()?;
-        stage(&config, &mut record, &normalized)?;
-        tx.open_table(META_TABLE)?
-            .insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
-        for tag in &record.tags {
-            tx.open_multimap_table(TAG_INDEX)?
-                .insert(tag.as_str(), id.as_bytes().as_slice())?;
-        }
-        tx.open_multimap_table(NAMESPACE_INDEX)?
-            .insert(namespace.get(), id.as_bytes().as_slice())?;
-        let mut puts = Vec::new();
-        for (source, target, edge_type) in input
-            .parent_id
-            .map(|parent| (parent, id, EdgeType::ParentChild))
-            .into_iter()
-            .chain(input.supersedes.map(|old| (id, old, EdgeType::Supersedes)))
-        {
-            puts.push(PersistedEdge {
-                source,
-                target,
-                edge_type,
-                weight: 1.0,
-                auto_created: false,
-                created_at: sampled_at.max(0) as u64,
-            });
-        }
+        let puts = stage_insert(
+            &tx,
+            input,
+            &config,
+            &mut record,
+            &normalized,
+            sampled_at,
+            stage,
+        )?;
         self.finish_record_effects(
             guard,
             tx,
@@ -387,4 +355,78 @@ mod schema_tests {
         assert_eq!(store.control_state().unwrap(), before);
         assert!(store.scan_all().unwrap().is_empty());
     }
+}
+
+pub(super) fn validate_insert_targets(
+    tx: &redb::WriteTransaction,
+    input: &InsertMemory,
+    namespace: NamespaceId,
+    id: MemoryId,
+    existing_edges: &[PersistedEdge],
+) -> Result<(), StorageError> {
+    // Validate explicit targets and branches before staging. The common
+    // effect tail repeats endpoint checks inside this same transaction.
+    for target in [input.parent_id, input.supersedes].into_iter().flatten() {
+        if target == id {
+            return Err(StorageError::InvalidMutation("self link".into()));
+        }
+        let row = tx.open_table(META_TABLE)?;
+        let value = row
+            .get(target.as_bytes().as_slice())?
+            .ok_or(StorageError::NotFound(target.into_inner()))?;
+        let record = DiskRecord::from_bytes(value.value())?;
+        if record.id != *target.as_bytes() || record.namespace_id != namespace.get() {
+            return Err(StorageError::MutationNamespaceMismatch);
+        }
+    }
+    if input.supersedes.is_some_and(|target| {
+        existing_edges
+            .iter()
+            .any(|edge| edge.edge_type == EdgeType::Supersedes && edge.target == target)
+    }) {
+        return Err(StorageError::EdgeConflict("supersedes branch".into()));
+    }
+    Ok(())
+}
+pub(super) fn stage_insert(
+    tx: &redb::WriteTransaction,
+    input: &InsertMemory,
+    config: &NamespaceConfig,
+    record: &mut DiskRecord,
+    normalized: &[f32],
+    sampled_at: i64,
+    stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord, &[f32]) -> Result<(), StorageError>,
+) -> Result<Vec<PersistedEdge>, StorageError> {
+    let id = MemoryId::from_bytes(record.id);
+    let namespace = config.id;
+    record.encode()?;
+    stage(config, record, normalized)?;
+    if let Some(reference) = record.schema.as_mut().and_then(|s| s.vector.as_mut()) {
+        reference.slot = record.vector_slot;
+    }
+    tx.open_table(META_TABLE)?
+        .insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
+    for tag in &record.tags {
+        tx.open_multimap_table(TAG_INDEX)?
+            .insert(tag.as_str(), id.as_bytes().as_slice())?;
+    }
+    tx.open_multimap_table(NAMESPACE_INDEX)?
+        .insert(namespace.get(), id.as_bytes().as_slice())?;
+    let mut puts = Vec::new();
+    for (source, target, edge_type) in input
+        .parent_id
+        .map(|parent| (parent, id, EdgeType::ParentChild))
+        .into_iter()
+        .chain(input.supersedes.map(|old| (id, old, EdgeType::Supersedes)))
+    {
+        puts.push(PersistedEdge {
+            source,
+            target,
+            edge_type,
+            weight: 1.0,
+            auto_created: false,
+            created_at: sampled_at.max(0) as u64,
+        });
+    }
+    Ok(puts)
 }

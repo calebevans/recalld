@@ -10,6 +10,7 @@
 mod catalog;
 mod effects;
 mod insertion;
+mod native_records;
 mod purge;
 mod text_compaction;
 mod tombstone;
@@ -360,6 +361,15 @@ impl RedbStorageEngine {
     /// 6. Opens vector files for all existing namespaces.
     /// 7. Runs startup validation (rebuilds phase index, cleans orphans).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_mode(path, false)
+    }
+    pub(crate) fn open_native(path: &Path) -> Result<Self, StorageError> {
+        if !path.is_dir() {
+            return Err(StorageError::InvalidPath);
+        }
+        Self::open_mode(path, true)
+    }
+    fn open_mode(path: impl AsRef<Path>, native: bool) -> Result<Self, StorageError> {
         let ownership =
             crate::storage::ownership::StoreOwnership::acquire_recovering(path.as_ref())?;
         let db_path = ownership.path.clone();
@@ -377,11 +387,19 @@ impl RedbStorageEngine {
             for name in ["meta.db", "edges.db", "fulltext.dat"] {
                 crate::storage::validation::require_file(&db_path.join(name))?;
             }
-            crate::storage::validation::preflight_text(&db_path)?;
+            if native {
+                crate::storage::validation::preflight_native(&db_path)?;
+            } else {
+                crate::storage::validation::preflight_text(&db_path)?;
+            }
         }
 
         // Step 2: Open meta.db.
-        let meta_store = MetadataStore::open(&db_path.join("meta.db"))?;
+        let meta_store = if native {
+            MetadataStore::open_native_lifecycle(&db_path.join("meta.db"))?
+        } else {
+            MetadataStore::open(&db_path.join("meta.db"))?
+        };
 
         // Step 3: Open edges.db.
         let edge_store = EdgeStore::open(&db_path.join("edges.db"))?;

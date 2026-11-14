@@ -90,13 +90,19 @@ impl MetadataStore {
         crate::storage::lineage::ensure_serving(read, &state)?;
         Ok(state)
     }
-    fn native_guard(&self) -> Result<MutationGuard<'_>, StorageError> {
+    pub(super) fn native_guard(&self) -> Result<MutationGuard<'_>, StorageError> {
         if !self.native_lifecycle_only {
             return Err(StorageError::RecoveryRequired(
                 "explicit native lifecycle entry required".into(),
             ));
         }
-        let guard = self.publication_guard(None)?;
+        self.native_guard_with_work(None)
+    }
+    pub(crate) fn native_guard_with_work(
+        &self,
+        parent: Option<&WorkTicket>,
+    ) -> Result<MutationGuard<'_>, StorageError> {
+        let guard = self.publication_guard(parent)?;
         self.ensure_available()?;
         let read = self.db.begin_read()?;
         self.native_control_at(&read)?;
@@ -132,7 +138,7 @@ impl MetadataStore {
                 ids.push(id);
             }
         }
-        let capture = self.capture_at(read, &scope, &ids, policy)?;
+        let capture = self.capture_at(read, &scope, &ids, policy, true)?;
         Ok(ExposureIntent {
             scope,
             original,
@@ -180,7 +186,7 @@ impl MetadataStore {
             namespace_name: cfg.name,
             source: None,
         };
-        let capture = self.capture_at(&read, &scope, &[id], policy)?;
+        let capture = self.capture_at(&read, &scope, &[id], policy, true)?;
         Ok(FeedbackIntent {
             scope,
             id,
@@ -188,12 +194,13 @@ impl MetadataStore {
             capture,
         })
     }
-    fn capture_at(
+    pub(super) fn capture_at(
         &self,
         read: &redb::ReadTransaction,
         scope: &LifecycleScope,
         ids: &[MemoryId],
         policy: &NativePolicyInputs,
+        live_only: bool,
     ) -> Result<CapturedLifecycle, StorageError> {
         let state = self.native_control_at(read)?;
         let ns = {
@@ -222,7 +229,7 @@ impl MetadataStore {
                 return Err(StorageError::MutationNamespaceMismatch);
             }
             let fields = LifecycleState::capture(&r)?;
-            if !fields.eligible() {
+            if live_only && !fields.eligible() {
                 return Err(StorageError::LifecycleContentUnavailable);
             }
             records.push((*id, fields.lifecycle.record_generation));
@@ -234,6 +241,76 @@ impl MetadataStore {
             policy_hash: policy_hash(&ns, &resolved)?,
             records,
         })
+    }
+    pub(super) fn check_native_capture(
+        &self,
+        tx: &redb::WriteTransaction,
+        scope: &LifecycleScope,
+        capture: &CapturedLifecycle,
+        policy: &NativePolicyInputs,
+        live_only: bool,
+    ) -> Result<
+        (
+            ControlState,
+            NamespaceConfig,
+            crate::decay::lifecycle::EffectiveLifecyclePolicy,
+            HashMap<MemoryId, DiskRecord>,
+        ),
+        StorageError,
+    > {
+        let state = control::read_control(tx)?;
+        if state.store_id != capture.generation.store_id {
+            return Err(StorageError::StoreLineageMismatch);
+        }
+        if capture.generation.generation > state.committed_generation {
+            return Err(StorageError::LifecycleConflict(
+                "capture generation is in the future".into(),
+            ));
+        }
+        let ns = namespace_state::require_namespace_active(tx, scope.namespace_id)?;
+        if ns.name != scope.namespace_name {
+            return Err(StorageError::MutationNamespaceMismatch);
+        }
+        let schema = ns
+            .schema
+            .as_ref()
+            .ok_or_else(|| invalid("native namespace schema missing"))?;
+        let resolved = policy.resolve(&ns)?;
+        if schema.lifecycle_version != capture.version
+            || schema.policy_revision != capture.revision
+            || policy_hash(&ns, &resolved)? != capture.policy_hash
+        {
+            return Err(StorageError::LifecycleConflict(
+                "namespace policy changed after capture".into(),
+            ));
+        }
+        let mut current = HashMap::new();
+        {
+            let table = tx.open_table(META_TABLE)?;
+            for (id, token) in &capture.records {
+                let value = table
+                    .get(id.as_bytes().as_slice())?
+                    .ok_or(StorageError::NotFound(id.into_inner()))?;
+                let record = DiskRecord::from_bytes(value.value())?;
+                if record.namespace_id != scope.namespace_id.get() {
+                    return Err(StorageError::MutationNamespaceMismatch);
+                }
+                let fields = LifecycleState::capture(&record)?;
+                if live_only && !fields.eligible() {
+                    return Err(StorageError::LifecycleContentUnavailable);
+                }
+                if fields.lifecycle.record_generation != *token
+                    || fields.lifecycle.lifecycle_version != capture.version
+                    || fields.lifecycle.policy_revision != capture.revision
+                {
+                    return Err(StorageError::LifecycleConflict(format!(
+                        "record {id} changed after capture"
+                    )));
+                }
+                current.insert(*id, record);
+            }
+        }
+        Ok((state, ns, resolved, current))
     }
     pub fn record_native_exposure(
         &self,
@@ -343,64 +420,8 @@ impl MetadataStore {
         if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
             return Ok((tx, Some(receipt)));
         }
-        let state = control::read_control(&tx)?;
-        if state.store_id != capture.generation.store_id {
-            return Err(StorageError::StoreLineageMismatch);
-        }
-        if capture.generation.generation > state.committed_generation {
-            return Err(StorageError::LifecycleConflict(
-                "capture generation is in the future".into(),
-            ));
-        }
-        let ns = {
-            let table = tx.open_table(NAMESPACE_TABLE)?;
-            let value = table
-                .get(scope.namespace_id.get())?
-                .ok_or(StorageError::NamespaceNotFound(scope.namespace_id.get()))?;
-            NamespaceConfig::decode(value.value())?
-        };
-        if ns.name != scope.namespace_name {
-            return Err(StorageError::MutationNamespaceMismatch);
-        }
-        let schema = ns
-            .schema
-            .as_ref()
-            .ok_or_else(|| invalid("native namespace schema missing"))?;
-        let resolved = policy.resolve(&ns)?;
-        if schema.lifecycle_version != capture.version
-            || schema.policy_revision != capture.revision
-            || policy_hash(&ns, &resolved)? != capture.policy_hash
-        {
-            return Err(StorageError::LifecycleConflict(
-                "namespace policy changed after capture".into(),
-            ));
-        }
-        let mut current = HashMap::new();
-        {
-            let table = tx.open_table(META_TABLE)?;
-            for (id, token) in &capture.records {
-                let value = table
-                    .get(id.as_bytes().as_slice())?
-                    .ok_or(StorageError::NotFound(id.into_inner()))?;
-                let record = DiskRecord::from_bytes(value.value())?;
-                if record.namespace_id != scope.namespace_id.get() {
-                    return Err(StorageError::MutationNamespaceMismatch);
-                }
-                let fields = LifecycleState::capture(&record)?;
-                if !fields.eligible() {
-                    return Err(StorageError::LifecycleContentUnavailable);
-                }
-                if fields.lifecycle.record_generation != *token
-                    || fields.lifecycle.lifecycle_version != capture.version
-                    || fields.lifecycle.policy_revision != capture.revision
-                {
-                    return Err(StorageError::LifecycleConflict(format!(
-                        "record {id} changed after capture"
-                    )));
-                }
-                current.insert(*id, record);
-            }
-        }
+        let (state, _namespace, resolved, mut current) =
+            self.check_native_capture(&tx, scope, capture, policy, true)?;
         if original.is_empty() {
             return Ok((tx, None));
         }
