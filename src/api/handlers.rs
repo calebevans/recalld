@@ -350,25 +350,36 @@ pub async fn create_memory(
 pub async fn get_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(options): Query<GetMemoryQuery>,
 ) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
 
-    let record = state
-        .cache
-        .get_or_load(memory_id, state.storage.as_ref())
-        .await
-        .ok_or_else(|| AppError::NotFound {
-            resource: "memory",
-            id: id.clone(),
-        })?;
+    let record = if options.record_access {
+        state
+            .cache
+            .get_or_load(memory_id, state.storage.as_ref())
+            .await
+    } else {
+        state
+            .storage
+            .get_record(memory_id)
+            .await
+            .map(|r| std::sync::Arc::new(crate::model::CachedRecord::from(&r)))
+    }
+    .ok_or_else(|| AppError::NotFound {
+        resource: "memory",
+        id: id.clone(),
+    })?;
 
     // Record access for decay tracking
-    state
-        .decay
-        .record_access(memory_id, AccessKind::DirectRetrieval)
-        .await;
+    if options.record_access {
+        state
+            .decay
+            .record_access(memory_id, AccessKind::DirectRetrieval)
+            .await;
+    }
 
     let ns_name = state
         .namespaces
@@ -810,6 +821,7 @@ pub async fn search_memories(
     };
 
     let search_query = SearchQuery {
+        record_access: req.record_access,
         query: query_input.unwrap_or(QueryInput::Text(String::new())),
         namespace_id: ns.id,
         namespace_name: ns.name.clone(),
@@ -885,14 +897,22 @@ pub async fn find_similar(
     let memory_id = parse_memory_id(&id)?;
 
     // Load source memory to get namespace
-    let source = state
-        .cache
-        .get_or_load(memory_id, state.storage.as_ref())
-        .await
-        .ok_or_else(|| AppError::NotFound {
-            resource: "memory",
-            id: id.clone(),
-        })?;
+    let source = if req.record_access {
+        state
+            .cache
+            .get_or_load(memory_id, state.storage.as_ref())
+            .await
+    } else {
+        state
+            .storage
+            .get_record(memory_id)
+            .await
+            .map(|r| std::sync::Arc::new(crate::model::CachedRecord::from(&r)))
+    }
+    .ok_or_else(|| AppError::NotFound {
+        resource: "memory",
+        id: id.clone(),
+    })?;
 
     let source_embedding =
         state
@@ -912,6 +932,7 @@ pub async fn find_similar(
     // Search using source embedding, requesting limit+1 to account
     // for the source memory appearing in its own results.
     let search_query = SearchQuery {
+        record_access: req.record_access,
         query: QueryInput::Vector(source_embedding),
         namespace_id: source.namespace_id,
         namespace_name: ns_name,

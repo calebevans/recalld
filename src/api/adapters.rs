@@ -141,6 +141,7 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             .unwrap_or_default();
 
         let pipeline_query = crate::search::SearchQuery {
+            record_access: query.record_access,
             text,
             fts_query: None,
             namespace: query.namespace_name.clone(), // Issue 1: pass actual namespace name

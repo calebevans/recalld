@@ -446,7 +446,9 @@ impl QueryEngine {
 
         // -- Stage 4: Load Metadata & Build Candidates --------------------
         let stage_start = Instant::now();
-        let records = self.load_records(&all_candidate_ids).await?;
+        let records = self
+            .load_records(&all_candidate_ids, query.record_access)
+            .await?;
 
         let entity_recall_map: std::collections::HashMap<MemoryId, f32> =
             entity_only_ids.iter().cloned().collect();
@@ -483,8 +485,13 @@ impl QueryEngine {
         // -- Stage 4b: Graph Expansion ------------------------------------
         {
             let stage_start = Instant::now();
-            self.expand_graph_candidates(&mut candidates, ns_config.id, query.graph_depth)
-                .await?;
+            self.expand_graph_candidates(
+                &mut candidates,
+                ns_config.id,
+                query.graph_depth,
+                query.record_access,
+            )
+            .await?;
             timings.graph_expansion_us = stage_start.elapsed().as_micros() as u64;
         }
 
@@ -539,7 +546,9 @@ impl QueryEngine {
         timings.total_us = pipeline_start.elapsed().as_micros() as u64;
         let query_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
 
-        self.record_accesses_async(&candidates);
+        if query.record_access {
+            self.record_accesses_async(&candidates);
+        }
 
         let response = SearchResponse {
             results,
@@ -617,6 +626,7 @@ impl QueryEngine {
         candidates: &mut Vec<Candidate>,
         namespace_id: NamespaceId,
         graph_depth: u8,
+        record_access: bool,
     ) -> Result<()> {
         if graph_depth == 0 || candidates.is_empty() {
             return Ok(());
@@ -647,7 +657,7 @@ impl QueryEngine {
             let load_ids: Vec<MemoryId> = new_ids.iter().map(|(mid, _)| *mid).collect();
             let activation_map: std::collections::HashMap<MemoryId, f32> =
                 new_ids.into_iter().collect();
-            let expand_records = self.load_records(&load_ids).await?;
+            let expand_records = self.load_records(&load_ids, record_access).await?;
 
             for record in expand_records {
                 let activation = activation_map.get(&record.id).copied().unwrap_or(0.0);
@@ -806,7 +816,7 @@ impl QueryEngine {
         // query's filters before letting it displace anything.
         let mut injected: Vec<Candidate> = Vec::with_capacity(to_load.len());
         if !to_load.is_empty() {
-            let records = match self.load_records(&to_load).await {
+            let records = match self.load_records(&to_load, query.record_access).await {
                 Ok(records) => records,
                 Err(e) => {
                     // Without the replacements there is nothing to put in
@@ -868,7 +878,15 @@ impl QueryEngine {
     /// Retrieve a single memory by ID.
     #[instrument(skip(self))]
     pub async fn get_memory(&self, id: MemoryId) -> Result<Option<MemoryResponse>> {
-        let record = match self.cache.get(&id) {
+        self.get_memory_with_access(id, true).await
+    }
+
+    pub async fn get_memory_with_access(
+        &self,
+        id: MemoryId,
+        record_access: bool,
+    ) -> Result<Option<MemoryResponse>> {
+        let record = match record_access.then(|| self.cache.get(&id)).flatten() {
             Some(r) => r,
             None => match self.meta_store.get(&id).await? {
                 Some(r) => r,
@@ -876,18 +894,19 @@ impl QueryEngine {
             },
         };
 
-        // Record access (fire-and-forget).
-        let recorder = Arc::clone(&self.access_recorder);
-        let access_id = id;
-        tokio::spawn(async move {
-            if let Err(e) = recorder
-                .record_access(access_id, AccessKind::DirectRetrieval)
-                .await
-            {
-                warn!("failed to record access for {access_id:?}: {e}");
-            }
-        });
-
+        // Preserve legacy fire-and-forget only when access is permitted.
+        if record_access {
+            let recorder = Arc::clone(&self.access_recorder);
+            let access_id = id;
+            tokio::spawn(async move {
+                if let Err(e) = recorder
+                    .record_access(access_id, AccessKind::DirectRetrieval)
+                    .await
+                {
+                    warn!("failed to record access for {access_id:?}: {e}");
+                }
+            });
+        }
         Ok(Some(MemoryResponse {
             id: record.id,
             namespace: String::new(), // Resolved by API layer from namespace_id
@@ -913,9 +932,18 @@ impl QueryEngine {
     /// Find the K most similar memories to a given memory.
     #[instrument(skip(self))]
     pub async fn similar(&self, id: MemoryId, k: usize) -> Result<Vec<SearchResult>> {
+        self.similar_with_access(id, k, true).await
+    }
+
+    pub async fn similar_with_access(
+        &self,
+        id: MemoryId,
+        k: usize,
+        record_access: bool,
+    ) -> Result<Vec<SearchResult>> {
         let k = k.clamp(1, SearchQuery::MAX_USER_LIMIT);
 
-        let record = match self.cache.get(&id) {
+        let record = match record_access.then(|| self.cache.get(&id)).flatten() {
             Some(r) => r,
             None => self
                 .meta_store
@@ -942,7 +970,7 @@ impl QueryEngine {
             .collect();
 
         let result_ids: Vec<MemoryId> = filtered.iter().map(|s| s.memory_id).collect();
-        let records = self.load_records(&result_ids).await?;
+        let records = self.load_records(&result_ids, record_access).await?;
 
         // Build a lookup map so we can iterate `filtered` (which preserves
         // descending similarity order from the vector search) instead of
@@ -987,7 +1015,7 @@ impl QueryEngine {
             .iter()
             .map(|r| (r.memory_id, AccessKind::AssociativeRetrieval))
             .collect();
-        if !accesses.is_empty() {
+        if record_access && !accesses.is_empty() {
             let recorder = Arc::clone(&self.access_recorder);
             tokio::spawn(async move {
                 if let Err(e) = recorder.record_access_batch(&accesses).await {
@@ -1004,7 +1032,10 @@ impl QueryEngine {
     // =====================================================================
 
     /// Load records for a batch of MemoryIds, checking RAM cache first.
-    async fn load_records(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>> {
+    async fn load_records(&self, ids: &[MemoryId], use_cache: bool) -> Result<Vec<CachedRecord>> {
+        if !use_cache {
+            return self.meta_store.get_batch(ids).await;
+        }
         let mut results = Vec::with_capacity(ids.len());
         let mut cache_misses = Vec::new();
 

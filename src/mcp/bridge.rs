@@ -34,6 +34,7 @@ pub trait SearchPipeline: Send + Sync {
         limit: usize,
         min_score: Option<f32>,
         same_namespace: bool,
+        record_access: bool,
     ) -> Result<Vec<SearchHit>, BridgeError>;
 
     /// Scan a namespace for clusters of near-duplicate memories.
@@ -56,7 +57,11 @@ pub trait StorageEngine: Send + Sync {
     async fn store_memory(&self, input: StoreInput) -> Result<StoredMemory, BridgeError>;
 
     /// Retrieve a full memory record by ID, or `None` if not found.
-    async fn get_memory(&self, id: MemoryId) -> Result<Option<MemoryRecord>, BridgeError>;
+    async fn get_memory(
+        &self,
+        id: MemoryId,
+        record_access: bool,
+    ) -> Result<Option<MemoryRecord>, BridgeError>;
 
     /// Delete a memory by ID. Returns `true` if the memory existed and was deleted.
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, BridgeError>;
@@ -133,6 +138,12 @@ pub trait HealthChecker: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchInput {
+    /// False forbids retrieval-attributable writes; omission preserves v1 behavior.
+    #[serde(
+        rename = "recordAccess",
+        default = "crate::search::default_record_access"
+    )]
+    pub record_access: bool,
     /// Natural language search query.
     pub query: String,
     /// Namespace to search within.

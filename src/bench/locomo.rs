@@ -1637,6 +1637,7 @@ pub(super) async fn search_memories(
             ..PipelineSearchFilter::default()
         };
         let query = SearchQuery {
+            record_access: true,
             text: Some(bq.query.clone()),
             fts_query: bq.fts_query.clone(),
             namespace: "default".to_string(),
@@ -1724,6 +1725,7 @@ pub(super) async fn search_memories(
                             ..PipelineSearchFilter::default()
                         };
                         let query = SearchQuery {
+                            record_access: true,
                             text: Some(bq.query.clone()),
                             fts_query: bq.fts_query.clone(),
                             namespace: "default".to_string(),
