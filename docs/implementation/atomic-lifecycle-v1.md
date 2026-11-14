@@ -65,3 +65,12 @@ existing doctests ignored; `cargo fmt --all --check` passed;
 warnings (including the existing large `StorageError` lint pattern in new helper
 signatures). No warning-free or macOS validation claim. Scratch outputs are not
 part of the commit.
+
+P1 follow-up: merged earliest-parent correction `745ca69` from PR #22. Final
+projection and threshold are recomputed under graph -> storage using the original
+sampled clock, resolved policy and activation settings, including strength-only
+writes and Ghost deletion. The atomic helpers still commit phase/strength/content
+once; planned transitions still skip the preliminary strength write. Current
+published graph state is covered, not general canonical-edge publication parity.
+Forward-merge validation: **558 tests passed**, four existing doctests ignored,
+formatting passed, Clippy completed with warnings under the same offline limits.
