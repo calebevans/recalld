@@ -460,7 +460,7 @@ pub struct CachedRecord {
     pub edge_count: u16,
     /// Index into the namespace's vectors.dat.
     pub vector_slot: u32,
-    /// Named entities extracted from the summary (derived at load time).
+    /// Exact canonical entities, or entities parsed from retained legacy tags.
     pub entities: Vec<String>,
 }
 
@@ -533,9 +533,13 @@ impl From<&Memory> for DiskRecord {
 impl From<&DiskRecord> for CachedRecord {
     /// Convert a DiskRecord to a CachedRecord for insertion into the
     /// moka cache. Drops full_text pointer and access_history (not
-    /// cached). Parses entities from stored tags (entity/ prefix).
+    /// cached). Preserves schema entities verbatim; schema-less records use
+    /// the existing retained-tag parser (entity/ prefix).
     fn from(d: &DiskRecord) -> Self {
-        let entities = crate::model::parse_structured_tags(&d.tags).entities;
+        let entities = d.schema.as_ref().map_or_else(
+            || crate::model::parse_structured_tags(&d.tags).entities,
+            |schema| schema.labels.entities.clone(),
+        );
         CachedRecord {
             id: MemoryId::from_bytes(d.id),
             namespace_id: NamespaceId::new(d.namespace_id),
