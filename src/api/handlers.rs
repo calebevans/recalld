@@ -789,14 +789,6 @@ pub async fn search_memories(
         });
     }
 
-    // Validate: query and embedding are mutually exclusive
-    if req.query.is_some() && req.embedding.is_some() {
-        return Err(AppError::UnprocessableEntity {
-            message: "'query' and 'embedding' are mutually exclusive".into(),
-            field: Some("embedding".into()),
-        });
-    }
-
     // Validate limit
     let limit = req.limit.min(100) as usize;
 
@@ -839,17 +831,16 @@ pub async fn search_memories(
         }
     }
 
-    let query_input = if let Some(ref text) = req.query {
-        Some(QueryInput::Text(text.clone()))
-    } else {
-        req.embedding
-            .as_ref()
-            .map(|vec| QueryInput::Vector(vec.clone()))
+    let query_input = match (req.query, req.embedding) {
+        (Some(text), Some(embedding)) => QueryInput::TextAndVector { text, embedding },
+        (Some(text), None) => QueryInput::Text(text),
+        (None, Some(embedding)) => QueryInput::Vector(embedding),
+        (None, None) => QueryInput::Text(String::new()),
     };
 
     let search_query = SearchQuery {
         record_access: req.record_access,
-        query: query_input.unwrap_or(QueryInput::Text(String::new())),
+        query: query_input,
         namespace_id: ns.id,
         namespace_name: ns.name.clone(),
         k: limit,

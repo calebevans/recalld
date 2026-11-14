@@ -356,12 +356,16 @@ impl QueryEngine {
         let stage_start = Instant::now();
         query.validate()?;
         let ns_config = self.namespace_resolver.resolve(&query.namespace).await?;
+        if let Some(embedding) = query.query_embedding.as_mut() {
+            super::query::normalize_query_embedding(embedding, ns_config.embedding_dim as usize)?;
+        }
         timings.parse_us = stage_start.elapsed().as_micros() as u64;
 
         // -- Stage 2: Embed ----------------------------------------------
         let stage_start = Instant::now();
         let query_embedding = match query.query_mode {
             QueryMode::MetadataOnly => None,
+            _ if query.query_embedding.is_some() => query.query_embedding.take(),
             _ => {
                 let text = query.text.as_ref().ok_or(SearchError::EmptyQuery)?;
                 let embedding = self
