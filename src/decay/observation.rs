@@ -26,6 +26,9 @@ impl<T> Observed<T> {
     where
         E: From<ObservationError> + std::fmt::Debug,
     {
+        crate::performance::receipts(&self.receipts);
+        tracing::trace!(target: "recalld::performance", kind = "final_admission",
+            accepted = admission.is_ok(), receipt_count = self.receipts.len());
         match admission {
             Ok(()) => Ok(self.value),
             Err(error) if self.receipts.is_empty() => Err(error),
@@ -132,16 +135,24 @@ pub async fn record_exposures_scoped(
     if accesses.is_empty() {
         return Ok(Vec::new());
     }
-    tokio::task::spawn_blocking(move || {
+    let worker = crate::performance::Worker::new("exposure.worker_queue");
+    tokio::task::spawn_blocking(move || worker.run(|| {
+        let wait = crate::performance::Timer::new("storage.write.wait");
         let storage = storage
             .write()
             .map_err(|e| ObservationError::failed(e, vec![]))?;
+        wait.complete();
+        let storage = crate::performance::Hold::new("storage.write.hold", storage);
+        let transaction = crate::performance::Timer::new("exposure.canonical_commit");
         let result = record_locked_scoped(&storage, &accesses, sampled_at, scope.as_ref());
+        transaction.outcome(result.is_ok());
         let receipts = match &result {
             Ok(r) => r,
             Err(e) => &e.receipts,
         };
+        crate::performance::receipts(receipts);
         let ids: Vec<_> = accesses.iter().map(|(id, _)| *id).collect();
+        let publication = crate::performance::Timer::new("exposure.cache_publication");
         // Publish even preceding successful batches when a later batch fails.
         if let Err(mut publication) = publish(&storage, receipts, || {
             tokio::runtime::Handle::current().block_on(cache.batch_invalidate(&ids));
@@ -154,12 +165,14 @@ pub async fn record_exposures_scoped(
             }
             return Err(publication);
         }
+        publication.complete();
+        tracing::trace!(target: "recalld::performance", kind = "exposure", requested = accesses.len(), receipt_count = receipts.len(), success = result.is_ok());
         #[cfg(test)]
         if result.as_ref().is_ok_and(|r| !r.is_empty()) {
             storage.meta_store().after_observation_probe();
         }
         result
-    })
+    }))
     .await
     .map_err(ObservationError::worker_failed)?
 }
