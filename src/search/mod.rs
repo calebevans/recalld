@@ -48,7 +48,9 @@ pub use error::SearchError;
 pub use pipeline::{
     AccessRecorder, EmbeddingProviderRegistry, EntityIndexReader, EntityRecallResult,
     FtsIndexRegistry, FtsResult, GraphReader, MetadataStore, NamespaceResolver, QueryEngine,
-    RecordCache, RifProcessor, RifSuppression, ScoredResult, VectorIndexRegistry,
+    RecordCache, RetrievalSemantics, RifProcessor, RifSuppression, ScoredResult,
+    SemanticsDiagnostics, SemanticsResponse, UnresolvedReason, VectorIndexRegistry, VersionMode,
+    VersionStatus,
 };
 pub use query::SearchFilter as PipelineSearchFilter;
 pub use query::{QueryMode, SearchQuery};

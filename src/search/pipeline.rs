@@ -15,6 +15,16 @@ use super::query::{QueryMode, SearchFilter, SearchQuery};
 use super::response::{MemoryResponse, SearchResponse, SearchResult, StageTimings};
 use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConfig, NamespaceId};
 
+#[path = "semantics.rs"]
+mod semantics;
+#[cfg(test)]
+#[path = "semantics_tests.rs"]
+mod semantics_tests;
+pub use semantics::{
+    RetrievalSemantics, SemanticsDiagnostics, SemanticsResponse, UnresolvedReason, VersionMode,
+    VersionStatus,
+};
+
 // ---------------------------------------------------------------------------
 // Subsystem Traits (DI contracts for QueryEngine)
 // ---------------------------------------------------------------------------
@@ -133,6 +143,28 @@ pub trait AccessRecorder: Send + Sync {
 /// identifying RIF competitors. In production, this wraps an
 /// `Arc<tokio::sync::RwLock<RelationshipGraph>>`.
 pub trait GraphReader: Send + Sync {
+    /// Internal v2 structural read. Unsupported adapters must fail, never prove currentness.
+    fn supersession_links(
+        &self,
+        _id: MemoryId,
+        _allowance: usize,
+    ) -> Result<crate::graph::query::SupersessionLinks> {
+        Err(SearchError::Internal(
+            "semantics2 graph reads unavailable".into(),
+        ))
+    }
+
+    fn expand_eligible(
+        &self,
+        _seeds: &[(MemoryId, f32)],
+        _namespace: NamespaceId,
+        _depth: u8,
+        _eligible: &HashMap<MemoryId, CachedRecord>,
+    ) -> Result<crate::graph::query::GraphExpansion> {
+        Err(SearchError::Internal(
+            "semantics2 graph expansion unavailable".into(),
+        ))
+    }
     /// Get the neighbor IDs for a given memory.
     /// Used by RIF computation (line 601) to find competitors.
     fn neighbors(&self, id: &MemoryId) -> Vec<MemoryId>;
@@ -196,6 +228,7 @@ pub struct EntityRecallResult {
 // ---------------------------------------------------------------------------
 
 /// Internal candidate struct used during pipeline processing.
+#[derive(Clone)]
 struct Candidate {
     record: CachedRecord,
     /// Fused relevance score via convex combination of normalized
@@ -224,6 +257,10 @@ struct Candidate {
     /// where score encodes edge weights, fan attenuation, hop decay,
     /// and neighbor retrievability.
     activation_score: Option<f32>,
+    /// Internal v2 provenance; never a transport field in this slice.
+    graph_depth: Option<u8>,
+    /// V2 graph seed evidence, merged independently of discovery order.
+    seed_score: f32,
 }
 
 impl Candidate {
@@ -239,6 +276,8 @@ impl Candidate {
             entity_recall_score: 0.0,
             composite_score: 0.0,
             activation_score: None,
+            graph_depth: None,
+            seed_score: 0.0,
         }
     }
 }
@@ -353,12 +392,28 @@ impl QueryEngine {
     /// 8. **Rank**: Composite score, sort descending, truncate to limit.
     /// 9. **Return**: Assemble SearchResponse, record access events async.
     #[instrument(skip(self, query), fields(namespace = %query.namespace, mode = ?query.query_mode))]
-    pub async fn search(&self, mut query: SearchQuery) -> Result<SearchResponse> {
+    pub async fn search(&self, query: SearchQuery) -> Result<SearchResponse> {
+        Ok(self
+            .search_with_semantics(query, RetrievalSemantics::V1)
+            .await?
+            .response)
+    }
+
+    /// Rust-only harness entry point. No transport selects semantics2 until A1/A4 readiness.
+    pub async fn search_with_semantics(
+        &self,
+        mut query: SearchQuery,
+        semantics: RetrievalSemantics,
+    ) -> Result<SemanticsResponse> {
+        let mut diagnostics = SemanticsDiagnostics::new(semantics);
         let pipeline_start = Instant::now();
         let mut timings = StageTimings::default();
 
         // -- Stage 1: Parse & Validate -----------------------------------
         let stage_start = Instant::now();
+        if semantics != RetrievalSemantics::V1 {
+            semantics::validate_query(&query)?;
+        }
         query.validate()?;
         let ns_config = self.namespace_resolver.resolve(&query.namespace).await?;
         timings.parse_us = stage_start.elapsed().as_micros() as u64;
@@ -377,6 +432,15 @@ impl QueryEngine {
             }
         };
         timings.embed_us = stage_start.elapsed().as_micros() as u64;
+        if semantics != RetrievalSemantics::V1
+            && query_embedding
+                .as_ref()
+                .is_some_and(|v| v.iter().any(|x| !x.is_finite()))
+        {
+            return Err(SearchError::EmbeddingFailed(
+                "nonfinite query embedding".into(),
+            ));
+        }
 
         // Canonical metadata, not cached/index metadata, decides hard eligibility.
         // ponytail: load every namespace member until A1 supplies certified filtered views.
@@ -395,6 +459,11 @@ impl QueryEngine {
             .collect();
         let eligible_ids: HashSet<MemoryId> = eligible_records.keys().copied().collect();
         timings.eligibility_us = stage_start.elapsed().as_micros() as u64;
+        if semantics != RetrievalSemantics::V1 {
+            for record in eligible_records.values() {
+                semantics::validate_record(record)?;
+            }
+        }
 
         // -- Stage 3: Vector Search + FTS + Entity Recall -----------------
         let fetch_k = match query.query_mode {
@@ -408,6 +477,14 @@ impl QueryEngine {
 
         let (fts_results, fts_search_us) = self.run_fts_search(&query, ns_config.id, fetch_k)?;
         timings.fts_search_us = fts_search_us;
+        if semantics != RetrievalSemantics::V1
+            && (scored_candidates.iter().any(|r| !r.score.is_finite())
+                || fts_results.iter().any(|r| !r.score.is_finite()))
+        {
+            return Err(SearchError::Internal(
+                "nonfinite retrieval source score".into(),
+            ));
+        }
 
         // -- Score fusion: build lookup maps --
         let fusion_stage_start = Instant::now();
@@ -487,6 +564,11 @@ impl QueryEngine {
                 let raw_vector = vector_score_map.get(&record.id).copied();
                 let raw_fts = fts_score_map.get(&record.id).copied();
                 let relevance = Self::fuse_scores(raw_vector, raw_fts);
+                if semantics != RetrievalSemantics::V1
+                    && relevance.is_some_and(|score| !score.is_finite())
+                {
+                    return Err(SearchError::Internal("nonfinite fused relevance".into()));
+                }
 
                 let mut c = Candidate::new(record);
                 c.relevance_score = relevance;
@@ -498,64 +580,80 @@ impl QueryEngine {
 
         if query.query_mode == QueryMode::MetadataOnly {
             // Scan through completion; only ranked results may consume the limit.
-            for record in eligible_records.into_values() {
-                candidates.push(Candidate::new(record));
+            for record in eligible_records.values() {
+                candidates.push(Candidate::new(record.clone()));
             }
         }
         timings.load_metadata_us = stage_start.elapsed().as_micros() as u64;
 
-        // -- Stage 4b: Graph Expansion ------------------------------------
-        {
+        let total_matches;
+        if matches!(semantics, RetrievalSemantics::V2(_)) {
+            self.finish_semantics2(
+                &mut candidates,
+                &query,
+                ns_config.id,
+                &eligible_records,
+                &mut diagnostics,
+                &mut timings,
+            )
+            .await?;
+            total_matches = candidates.len();
+        } else {
+            // -- Stage 4b: Graph Expansion ------------------------------------
+            {
+                let stage_start = Instant::now();
+                self.expand_graph_candidates(&mut candidates, ns_config.id, query.graph_depth)
+                    .await?;
+                timings.graph_expansion_us = stage_start.elapsed().as_micros() as u64;
+            }
+
+            // -- Stage 5: Apply Filters (entity overlap + metadata filters) ---
             let stage_start = Instant::now();
-            self.expand_graph_candidates(&mut candidates, ns_config.id, query.graph_depth)
-                .await?;
-            timings.graph_expansion_us = stage_start.elapsed().as_micros() as u64;
+            self.apply_filters(&mut candidates, &query, &query_entities, ns_config.id);
+            timings.apply_filters_us = stage_start.elapsed().as_micros() as u64;
+
+            // -- Stage 6: Calculate Effective R --------------------------------
+            let stage_start = Instant::now();
+            for candidate in &mut candidates {
+                candidate.effective_r = Self::compute_effective_r(&candidate.record);
+            }
+            timings.calculate_r_us = stage_start.elapsed().as_micros() as u64;
+
+            // -- Stage 7: Apply RIF -------------------------------------------
+            let stage_start = Instant::now();
+            self.apply_rif(&mut candidates);
+            timings.apply_rif_us = stage_start.elapsed().as_micros() as u64;
+
+            // -- Stage 8: Composite Score + Boosts + Sort ----------------------
+            let stage_start = Instant::now();
+            total_matches = candidates.len();
+            self.apply_boosts(&mut candidates, &query);
+
+            // UUID ties make scan/cache insertion order irrelevant.
+            candidates.sort_by(|a, b| {
+                b.composite_score
+                    .partial_cmp(&a.composite_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.record.id.cmp(&b.record.id))
+            });
+            timings.rank_us = stage_start.elapsed().as_micros() as u64;
+
+            // -- Stage 8c: Supersedes Resolution ------------------------------
+            self.resolve_supersedes(&mut candidates, &query, &query_entities, ns_config.id)
+                .await;
+
+            candidates.sort_by(|a, b| {
+                b.composite_score
+                    .partial_cmp(&a.composite_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.record.id.cmp(&b.record.id))
+            });
         }
-
-        // -- Stage 5: Apply Filters (entity overlap + metadata filters) ---
-        let stage_start = Instant::now();
-        self.apply_filters(&mut candidates, &query, &query_entities, ns_config.id);
-        timings.apply_filters_us = stage_start.elapsed().as_micros() as u64;
-
-        // -- Stage 6: Calculate Effective R --------------------------------
-        let stage_start = Instant::now();
-        for candidate in &mut candidates {
-            candidate.effective_r = Self::compute_effective_r(&candidate.record);
-        }
-        timings.calculate_r_us = stage_start.elapsed().as_micros() as u64;
-
-        // -- Stage 7: Apply RIF -------------------------------------------
-        let stage_start = Instant::now();
-        self.apply_rif(&mut candidates);
-        timings.apply_rif_us = stage_start.elapsed().as_micros() as u64;
-
-        // -- Stage 8: Composite Score + Boosts + Sort ----------------------
-        let stage_start = Instant::now();
-        let total_matches = candidates.len();
-        self.apply_boosts(&mut candidates, &query);
-
-        // UUID ties make scan/cache insertion order irrelevant.
-        candidates.sort_by(|a, b| {
-            b.composite_score
-                .partial_cmp(&a.composite_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.record.id.cmp(&b.record.id))
-        });
-        timings.rank_us = stage_start.elapsed().as_micros() as u64;
-
-        // -- Stage 8c: Supersedes Resolution ------------------------------
-        self.resolve_supersedes(&mut candidates, &query, &query_entities, ns_config.id)
-            .await;
-
-        candidates.sort_by(|a, b| {
-            b.composite_score
-                .partial_cmp(&a.composite_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.record.id.cmp(&b.record.id))
-        });
 
         // -- Stage 8d: Truncate -------------------------------------------
+        diagnostics.result_limit_applied = candidates.len() > query.limit;
         candidates.truncate(query.limit);
+        diagnostics.retain_returned(&candidates);
 
         // -- Stage 9: Build Response & Record Access ----------------------
         let stage_start = Instant::now();
@@ -582,7 +680,10 @@ impl QueryEngine {
             "search complete"
         );
 
-        Ok(response)
+        Ok(SemanticsResponse {
+            response,
+            diagnostics,
+        })
     }
 
     /// Stage 3a: Run vector similarity search.
@@ -1398,16 +1499,16 @@ mod tests {
 
     // -- Fixtures ---------------------------------------------------------
 
-    fn ns() -> NamespaceId {
+    pub(super) fn ns() -> NamespaceId {
         NamespaceId::new(1)
     }
 
-    fn other_ns() -> NamespaceId {
+    pub(super) fn other_ns() -> NamespaceId {
         NamespaceId::new(2)
     }
 
     /// A Full-phase, strong, untagged record in namespace 1.
-    fn rec(id: MemoryId) -> CachedRecord {
+    pub(super) fn rec(id: MemoryId) -> CachedRecord {
         CachedRecord {
             id,
             namespace_id: ns(),
@@ -1436,7 +1537,7 @@ mod tests {
         c
     }
 
-    fn query(value: serde_json::Value) -> SearchQuery {
+    pub(super) fn query(value: serde_json::Value) -> SearchQuery {
         serde_json::from_value(value).expect("valid query")
     }
 
@@ -1690,7 +1791,7 @@ mod tests {
         assert_eq!(ids(&candidates), vec![new]);
         assert!(candidates[0].composite_score >= 0.85);
     }
-    fn mid(n: u128) -> MemoryId {
+    pub(super) fn mid(n: u128) -> MemoryId {
         MemoryId::from_bytes(n.to_be_bytes())
     }
 
@@ -1763,7 +1864,10 @@ mod tests {
         }
     }
 
-    fn search_engine(records: Vec<CachedRecord>, vectors: &[(MemoryId, f32)]) -> QueryEngine {
+    pub(super) fn search_engine(
+        records: Vec<CachedRecord>,
+        vectors: &[(MemoryId, f32)],
+    ) -> QueryEngine {
         use crate::search::adapters::{SharedEntityIndexReader, SharedVectorIndexRegistry};
         use crate::search::{EntityIndex, FlatVectorIndex, VectorIndex, VectorMetadata};
 
