@@ -1182,3 +1182,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "batch_label_tests.rs"]
+mod batch_label_tests;

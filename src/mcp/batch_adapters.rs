@@ -188,7 +188,12 @@ impl McpStorageAdapter {
                     return Ok(outcome);
                 }
                 Err(error) => {
-                    if let Some(final_error) = final_error(&error) {
+                    if let Some(mut final_error) = final_error(&error) {
+                        // A pre-correction pending manifest can now fail input
+                        // admission. Keep its indexed field diagnostic too.
+                        if let BatchItemPlan::Invalid { error, .. } = &prepared.plan {
+                            final_error = error.clone();
+                        }
                         let storage = self.storage.clone();
                         let worker = work
                             .child()
@@ -719,6 +724,114 @@ mod tests {
             crate::model::DecayPhase::Tombstone
         );
         assert!(store.meta_store().freeze_metadata(lease).is_ok());
+    }
+
+    #[tokio::test]
+    async fn batch_labels_historical_receipt_replays_but_old_pending_input_cannot_bypass_admission()
+    {
+        struct NeverProvider;
+        #[async_trait::async_trait]
+        impl crate::embedding::EmbeddingProvider for NeverProvider {
+            async fn embed(&self, _: &str) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
+                panic!("historical replay or invalid pending input invoked provider")
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            fn model_name(&self) -> &str {
+                "synthetic-historical-labels"
+            }
+        }
+        for committed in [false, true] {
+            let f = Fixture::new();
+            let mut adapter = f.storage_adapter();
+            adapter.embedding = Arc::new(NeverProvider);
+            let input = request(
+                &f,
+                "historical-label",
+                vec![
+                    json!({"summary":"old caller identity","entities":["José"],"checkDuplicates":false}),
+                ],
+            );
+            let prepared = batches::prepare(&input).unwrap();
+            assert!(matches!(prepared[0].plan, BatchItemPlan::Invalid { .. }));
+            // Exact old accepted representation: UTF-8 entity was dropped by
+            // parse_tags_lossy. The caller hash still binds original raw labels.
+            let old_record = crate::storage::insertion::InsertMemory {
+                id: None,
+                summary: "old caller identity".into(),
+                full_text: None,
+                tags: vec![],
+                initial_stability: None,
+                created_at: None,
+                embedding: None,
+                parent_id: None,
+                supersedes: None,
+            };
+            let plan = BatchItemPlan::Insert {
+                request_hash: prepared[0].plan.request_hash(),
+                namespace: "default".into(),
+                input: old_record.clone(),
+            };
+            let progress = f
+                .storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .reserve_batch(&input.context(), BatchKind::Insert, &[plan])
+                .unwrap();
+            let child = progress.child(0).unwrap();
+            let old_receipt = if committed {
+                Some(
+                    f.storage
+                        .write()
+                        .unwrap()
+                        .insert_memory_reserved(
+                            &child.context(),
+                            &old_record,
+                            &[1., 0., 0., 0.],
+                            123,
+                            Some(&child),
+                        )
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let before = generation(&f);
+            let result = adapter.mutate_batch(input.clone()).await.unwrap();
+            assert_eq!(
+                result.batch_operation_id,
+                progress.reservation_receipt.operation_id
+            );
+            if let Some(receipt) = old_receipt {
+                assert!(result.all_ready());
+                assert_eq!(
+                    result.items[0].receipt.as_ref().unwrap().operation_id,
+                    receipt.operation_id
+                );
+                assert!(result.items[0].receipt.as_ref().unwrap().replayed);
+                assert!(result.items[0].result.is_some());
+                assert_eq!(generation(&f), before);
+            } else {
+                assert_eq!(result.items[0].status, BatchStatus::Error);
+                assert_eq!(
+                    result.items[0].error.as_ref().unwrap().code,
+                    "INVALID_INPUT"
+                );
+                assert!(f.storage.read().unwrap().scan_all().unwrap().is_empty());
+                assert_eq!(
+                    result.items[0].error.as_ref().unwrap().field.as_deref(),
+                    Some("entities")
+                );
+                assert_eq!(result.bookkeeping_receipts.len(), 1);
+                assert_eq!(generation(&f), before + 1);
+            }
+            let replay_before = generation(&f);
+            let replay = adapter.mutate_batch(input).await.unwrap();
+            assert_eq!(replay.items[0].status, result.items[0].status);
+            assert_eq!(generation(&f), replay_before);
+        }
     }
 
     #[tokio::test]

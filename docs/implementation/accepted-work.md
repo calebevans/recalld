@@ -51,6 +51,10 @@ before and after validation: late success is rejected, but validation scans and
 blocking OS I/O are **not bounded** by those checks. No hard 30-second completion
 claim is made.
 
+The [batch/accepted-work follow-up](batch-accepted-work.md) adds actual batch
+root/descendant participation and cooperative checks between durable batch
+manifest rows. The original validation below describes this foundation parent.
+
 ## Validation
 
 Passing regressions cover accepted children/grandchildren during closing; a parent dropped

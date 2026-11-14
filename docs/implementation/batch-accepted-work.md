@@ -2,8 +2,10 @@
 
 This join consumes canonical batches `e51cb67ad5442c99c4b7d9c585dfed91d7448ba1`
 and published accepted-work PR73 `05cd2542d8478ed395e062a87ec9d3d83f4e8fcc`.
-The separate minimal batch/PR68 admission correction is a required follow-up
-parent before final validation and handoff.
+The separate validated batch/PR68 admission correction `9d8b295` (runtime
+`98dbef6`, actual PR68 `b2923d1`) is also consumed. Its shared validator remains
+inside the work-aware reserved/single adapter, before canonical conversion and
+provider work. Historical caller hashes and receipt replay are preserved.
 
 The actual MCP/daemon batch runner accepts one owned-core root before its first
 await, reservation, provider work or child operation. Reservation, pre-provider
@@ -42,8 +44,11 @@ readiness, generation-targeted barrier, whole-core snapshot or frozen clock/RNG
 claim. A4 batch result version 1 only negotiates the existing envelope. Feynman
 owns the separate ancestry-aware offline preservation consumer.
 
-Validation evidence will be sealed after the corrected batch/PR68 parent joins.
-The initial focused join passed 39 tests, including provider/graph and tombstone
+Final combined validation passed **43 batch + 14 tracker/metadata + 9 coordinator
+focused checks, 744 library tests and 1 CLI test**. Four doctests were ignored;
+format passed and Clippy completed with warnings. Exact hashes and raw logs are
+in the [evidence package](../evidence/batch-accepted-work/README.md).
+The initial pre-correction-parent focused join passed 39 tests, including provider/graph and tombstone
 completion during closing, runtime rejection bookkeeping, cancellation/reopen,
 unknown receipt identities, actual framed daemon rejection, and durable pending
 checks. Two development failures were incorrect test assertions: safe cache
