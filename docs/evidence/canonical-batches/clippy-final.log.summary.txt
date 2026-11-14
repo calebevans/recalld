@@ -1,0 +1,5 @@
+warning: `recalld` (lib) generated 448 warnings (run `cargo clippy --fix --lib -p recalld` to apply 91 suggestions)
+warning: `recalld` (bin "recalld" test) generated 1 warning
+warning: `recalld` (bin "recalld") generated 1 warning (1 duplicate)
+warning: `recalld` (lib test) generated 467 warnings (446 duplicates) (run `cargo clippy --fix --lib -p recalld --tests` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.66s

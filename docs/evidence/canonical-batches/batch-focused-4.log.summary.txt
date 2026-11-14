@@ -1,0 +1,10 @@
+warning: `recalld` (lib) generated 7 warnings (run `cargo fix --lib -p recalld` to apply 2 suggestions)
+warning: `recalld` (lib test) generated 5 warnings (5 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.32s
+thread 'mcp::bridge_adapters::batch_adapters::tests::actual_batch_concurrent_identical_requests_share_children_and_mutations' (946) panicked at src/mcp/batch_adapters.rs:394:9:
+assertion failed: two.all_ready()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test mcp::bridge_adapters::batch_adapters::tests::actual_batch_concurrent_identical_requests_share_children_and_mutations ... FAILED
+test mcp::bridge_adapters::batch_adapters::tests::actual_batch_mixed_results_and_changed_default_or_original_bits_conflict ... ok
+test result: FAILED. 33 passed; 1 failed; 0 ignored; 0 measured; 683 filtered out; finished in 9.69s
+error: test failed, to rerun pass `--lib`
