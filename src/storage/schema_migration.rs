@@ -158,6 +158,11 @@ fn migrate_at(
             actual: inspection.control.committed_generation.into(),
         });
     }
+    if inspection.schema.is_some() && !options.attestations.is_empty() {
+        return Err(StorageError::InvalidMutation(
+            "schema-v2 attestation requires a dedicated typed transition; original publication evidence cannot be replaced".into(),
+        ));
+    }
     {
         let (_copy, db) = super::validation::inspect_database(&source.join("meta.db"))?;
         if super::metadata::text_generation::read_selection(&db.begin_read()?)?.is_none() {
@@ -179,7 +184,15 @@ fn migrate_at(
         fsync_dir(directory)?;
     }
     boundary(Stage::Copied)?;
-    let report = convert_staging(stage.path(), options)?;
+    // A supported format-only v2 copy must not reset the immutable publication
+    // baseline past later canonical operations and hide their receipt proofs.
+    let report = match inspection.schema {
+        Some(state) => MigrationReport {
+            state,
+            receipt: None,
+        },
+        None => convert_staging(stage.path(), options)?,
+    };
     boundary(Stage::Converted)?;
     for file in super::validation::canonical_files(stage.path())? {
         std::fs::File::open(file)?.sync_all()?;

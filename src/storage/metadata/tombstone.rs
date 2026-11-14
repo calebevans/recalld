@@ -43,12 +43,7 @@ impl MetadataStore {
             return Ok(receipt);
         }
         control::read_control(&tx)?.committed_generation.next()?;
-        let config = NamespaceConfig::decode(
-            tx.open_table(NAMESPACE_TABLE)?
-                .get(namespace.get())?
-                .ok_or(StorageError::NamespaceNotFound(namespace.get()))?
-                .value(),
-        )?;
+        let config = namespace_state::require_namespace_active(&tx, namespace)?;
         if config.schema.is_some() || control::read_control(&tx)?.control_schema_version != 1 {
             return Err(StorageError::RecoveryRequired(
                 "schema-v2 tombstone requires participating writers; serving remains disabled"

@@ -32,7 +32,13 @@ impl SearchPipeline for RemoteSearchAdapter {
     async fn search(&self, query: SearchInput) -> Result<SearchResponse, BridgeError> {
         let params =
             serde_json::to_value(&query).map_err(|e| BridgeError::Internal(e.to_string()))?;
-        let result = self.client.call("search", params).await?;
+        // Private aliases fail closed against daemons that would ignore the flag.
+        let method = if query.record_access {
+            "search"
+        } else {
+            "search_read_only"
+        };
+        let result = self.client.call(method, params).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
@@ -43,15 +49,23 @@ impl SearchPipeline for RemoteSearchAdapter {
         limit: usize,
         min_score: Option<f32>,
         same_namespace: bool,
+        record_access: bool,
+        namespace: Option<&str>,
     ) -> Result<Vec<SearchHit>, BridgeError> {
         let params = serde_json::to_value(protocol::FindSimilarParams {
+            record_access,
             id: id.to_string(),
             limit,
             min_score,
             same_namespace,
         })
         .map_err(|e| BridgeError::Internal(e.to_string()))?;
-        let result = self.client.call("find_similar", params).await?;
+        let method = if record_access {
+            "find_similar"
+        } else {
+            "find_similar_read_only"
+        };
+        let result = call_scoped(&self.client, method, params, namespace).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
@@ -120,18 +134,35 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
 
-    async fn get_memory(&self, id: MemoryId) -> Result<Option<MemoryRecord>, BridgeError> {
-        let params = serde_json::to_value(protocol::GetMemoryParams { id: id.to_string() })
-            .map_err(|e| BridgeError::Internal(e.to_string()))?;
-        let result = self.client.call("get_memory", params).await?;
+    async fn get_memory(
+        &self,
+        id: MemoryId,
+        record_access: bool,
+        namespace: Option<&str>,
+    ) -> Result<Option<MemoryRecord>, BridgeError> {
+        let params = serde_json::to_value(protocol::GetMemoryParams {
+            id: id.to_string(),
+            record_access,
+        })
+        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let method = if record_access {
+            "get_memory"
+        } else {
+            "get_memory_read_only"
+        };
+        let result = call_scoped(&self.client, method, params, namespace).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
 
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, BridgeError> {
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, BridgeError> {
         let params = serde_json::to_value(protocol::DeleteMemoryParams { id: id.to_string() })
             .map_err(|e| BridgeError::Internal(e.to_string()))?;
-        let result = self.client.call("delete_memory", params).await?;
+        let result = call_scoped(&self.client, "delete_memory", params, namespace).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
@@ -150,13 +181,14 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<ReinforceResult, BridgeError> {
         let params = serde_json::to_value(protocol::ReinforceParams {
             id: id.to_string(),
             quality,
         })
         .map_err(|e| BridgeError::Internal(e.to_string()))?;
-        let result = self.client.call("reinforce_memory", params).await?;
+        let result = call_scoped(&self.client, "reinforce_memory", params, namespace).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
@@ -284,5 +316,27 @@ impl bridge::HealthChecker for RemoteHealthAdapter {
                 }],
             },
         }
+    }
+}
+
+// A separate method makes old daemons reject assertions instead of ignoring fields.
+async fn call_scoped(
+    client: &DaemonClient,
+    method: &str,
+    mut params: serde_json::Value,
+    namespace: Option<&str>,
+) -> Result<serde_json::Value, BridgeError> {
+    if let Some(namespace) = namespace {
+        params["namespace"] = serde_json::Value::String(namespace.to_owned());
+        // Assertion-only servers reject recordAccess fields. Combined false
+        // requests use their own alias so neither control can be ignored.
+        params.as_object_mut().unwrap().remove("recordAccess");
+        let method = match method.strip_suffix("_read_only") {
+            Some(base) => format!("{base}_scoped_read_only"),
+            None => format!("{method}_scoped"),
+        };
+        client.call(&method, params).await
+    } else {
+        client.call(method, params).await
     }
 }

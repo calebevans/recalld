@@ -144,4 +144,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
+mod vector_query_tests;
+
+#[cfg(test)]
 mod legacy_label_tests;

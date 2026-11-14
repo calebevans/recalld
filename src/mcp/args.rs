@@ -871,6 +871,18 @@ pub fn opt_enum(obj: &Value, key: &str, allowed: &[&str]) -> Result<Option<Strin
     Ok(Some(value))
 }
 
+/// The new access switch is missing-only defaulted, never null/string coerced.
+pub fn record_access(obj: &Value) -> Result<bool, ArgError> {
+    match obj.get("recordAccess") {
+        None => Ok(true),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ArgError::new(
+            "recordAccess",
+            "recordAccess must be a boolean",
+        )),
+    }
+}
+
 /// A parsed `recall_memories` call.
 pub struct RecallArgs {
     /// What the search pipeline is given.
@@ -904,6 +916,8 @@ pub fn parse_recall_input(obj: &Value, default_namespace: &str) -> Result<Recall
 
     Ok(RecallArgs {
         input: SearchInput {
+            include_neighbors: !compact,
+            record_access: record_access(obj)?,
             query,
             namespace,
             limit,
@@ -920,8 +934,34 @@ pub fn parse_recall_input(obj: &Value, default_namespace: &str) -> Result<Recall
     })
 }
 
+/// Parse an opt-in by-ID assertion. Only omission disables the assertion.
+pub fn parse_namespace_assertion(obj: &Value) -> Result<Option<&str>, ArgError> {
+    let Some(value) = obj.get("namespace") else {
+        return Ok(None);
+    };
+    let name = value.as_str().ok_or_else(|| {
+        ArgError::new(
+            "namespace",
+            "namespace assertion must be a string; omit it to use the record scope",
+        )
+    })?;
+    crate::model::validation::validate_namespace_name(name)
+        .map_err(|e| ArgError::new("namespace", e.to_string()))?;
+    Ok(Some(name))
+}
+
+/// Deserialize a present namespace assertion; serde default handles omission.
+pub fn deserialize_namespace_assertion<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+    crate::model::validation::validate_namespace_name(&name).map_err(serde::de::Error::custom)?;
+    Ok(Some(name))
+}
+
 /// A parsed `find_similar_memories` call in `single` mode.
 pub struct FindSimilarArgs {
+    pub record_access: bool,
     /// The memory to find neighbours of.
     pub id: MemoryId,
     /// Maximum neighbours to return.
@@ -941,6 +981,7 @@ pub fn parse_find_similar_args(obj: &Value) -> Result<FindSimilarArgs, ArgError>
     let same_namespace = opt_bool(obj, "sameNamespace")?.unwrap_or(true);
 
     Ok(FindSimilarArgs {
+        record_access: record_access(obj)?,
         id,
         limit,
         min_score,

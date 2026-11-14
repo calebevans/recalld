@@ -1,4 +1,5 @@
-use recalld::storage::{EdgeStore, MetadataStore, RedbStorageEngine, StorageEngine, TextStore};
+use recalld::storage::{RedbStorageEngine, StorageEngine};
+use zerocopy::{FromBytes, IntoBytes};
 
 #[test]
 fn offline_text_migration_cli_publishes_only_fresh_gated_destination() {
@@ -6,11 +7,32 @@ fn offline_text_migration_cli_publishes_only_fresh_gated_destination() {
     let source = root.path().join("source");
     let target = root.path().join("target");
     std::fs::create_dir(&source).unwrap();
-    let metadata = MetadataStore::open(&source.join("meta.db")).unwrap();
-    let lineage = metadata.control_state().unwrap().store_id;
-    drop(metadata);
-    drop(EdgeStore::open(&source.join("edges.db")).unwrap());
-    drop(TextStore::open(&source.join("fulltext.dat")).unwrap());
+    // Historical empty layout assembled only in this integration test. No
+    // public raw-store constructor is needed by production callers.
+    let db = redb::Database::create(source.join("meta.db")).unwrap();
+    let tx = db.begin_write().unwrap();
+    tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("memories"))
+        .unwrap();
+    tx.open_table(redb::TableDefinition::<u32, &[u8]>::new("namespaces"))
+        .unwrap();
+    tx.commit().unwrap();
+    drop(db);
+    let db = redb::Database::create(source.join("edges.db")).unwrap();
+    let tx = db.begin_write().unwrap();
+    tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("edges_forward"))
+        .unwrap();
+    tx.open_table(redb::TableDefinition::<&[u8], ()>::new("edges_reverse"))
+        .unwrap();
+    tx.commit().unwrap();
+    drop(db);
+    std::fs::write(
+        source.join("fulltext.dat"),
+        recalld::storage::text::TextLogHeader::new().as_bytes(),
+    )
+    .unwrap();
+    let engine = RedbStorageEngine::open(&source).unwrap();
+    let lineage = engine.control_state().unwrap().store_id;
+    drop(engine);
     let before = std::fs::read(source.join("meta.db")).unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_recalld-text-migrate"))
         .args([&source, &target])
@@ -24,7 +46,13 @@ fn offline_text_migration_cli_publishes_only_fresh_gated_destination() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["storeId"], lineage.to_string());
     assert_eq!(std::fs::read(source.join("meta.db")).unwrap(), before);
-    assert!(TextStore::open(&target.join("fulltext.dat")).is_err());
+    let gate = std::fs::read(target.join("fulltext.dat")).unwrap();
+    assert!(
+        recalld::storage::text::TextLogHeader::read_from_bytes(&gate[..16])
+            .unwrap()
+            .validate()
+            .is_err()
+    );
     assert_eq!(
         RedbStorageEngine::open(&target).unwrap().count().unwrap(),
         0

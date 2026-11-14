@@ -385,15 +385,26 @@ async fn purge_actual_completion_resumes_accepted_work_and_reopens_all_views_wit
         let ctx = context(&e, ns);
         e.begin_namespace_purge(&ctx, true).unwrap()
     };
-    assert!(fx.storage_adapter().get_memory(survivor).await.is_err());
+    assert!(
+        fx.storage_adapter()
+            .get_memory(survivor, false, None)
+            .await
+            .is_err()
+    );
     tokio::time::timeout(std::time::Duration::from_secs(5), publisher(&fx).complete())
         .await
         .unwrap()
         .unwrap();
-    assert!(fx.storage_adapter().get_memory(id).await.unwrap().is_none());
     assert!(
         fx.storage_adapter()
-            .get_memory(survivor)
+            .get_memory(id, false, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fx.storage_adapter()
+            .get_memory(survivor, false, None)
             .await
             .unwrap()
             .is_some()
@@ -432,7 +443,12 @@ async fn purge_actual_consumer_publication_failure_retains_completion_receipt_th
         text.contains("commitState=committed") && text.contains("receipt="),
         "{text}"
     );
-    assert!(fx.storage_adapter().get_memory(survivor).await.is_err());
+    assert!(
+        fx.storage_adapter()
+            .get_memory(survivor, false, None)
+            .await
+            .is_err()
+    );
     let (progress, generation) = {
         let e = fx.storage.read().unwrap();
         (
@@ -446,14 +462,14 @@ async fn purge_actual_consumer_publication_failure_retains_completion_receipt_th
     publisher(&fx).complete().await.unwrap();
     assert!(
         fx.storage_adapter()
-            .get_memory(removed)
+            .get_memory(removed, false, None)
             .await
             .unwrap()
             .is_none()
     );
     assert!(
         fx.storage_adapter()
-            .get_memory(survivor)
+            .get_memory(survivor, false, None)
             .await
             .unwrap()
             .is_some()

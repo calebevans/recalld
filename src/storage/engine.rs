@@ -10,11 +10,12 @@
 mod catalog;
 mod effects;
 mod insertion;
+mod maintenance;
 mod purge;
 mod text_compaction;
 mod tombstone;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -54,6 +55,7 @@ pub trait StorageEngine: Send + Sync {
     /// 2. Appends full_text to fulltext.dat (if provided).
     /// 3. Sets vector_slot and text pointer on the record.
     /// 4. Inserts the record into meta.db with secondary indexes.
+    #[cfg(test)]
     fn insert_memory(
         &mut self,
         id: MemoryId,
@@ -97,6 +99,7 @@ pub trait StorageEngine: Send + Sync {
     /// FTS, and entity indexes separately.
     ///
     /// Returns `Ok(())` if the memory existed, or `Err(NotFound)` if not.
+    #[cfg(test)]
     fn tombstone_memory(&self, id: MemoryId) -> Result<(), StorageError>;
 
     // ── Decay State ─────────────────────────────────────────────────
@@ -109,6 +112,7 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Returns `Err(NotFound)` if the memory does not exist or has been
     /// tombstoned; a tombstone is never rewritten.
+    #[cfg(test)]
     fn update_decay_state(
         &self,
         id: MemoryId,
@@ -120,6 +124,7 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// Atomic v1 feedback state/history patch; false rejects a stale snapshot.
+    #[cfg(test)]
     fn apply_legacy_feedback(
         &self,
         id: MemoryId,
@@ -144,11 +149,13 @@ pub trait StorageEngine: Send + Sync {
     /// Called during Full -> Summary phase transitions to mark the
     /// text data in fulltext.dat as dead space reclaimable by
     /// compaction.
+    #[cfg(test)]
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError>;
 
     /// Clear the summary field on a memory record.
     ///
     /// Called during Summary -> Ghost phase transitions.
+    #[cfg(test)]
     fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError>;
 
     /// Return the IDs of all memories currently in the given phase.
@@ -163,6 +170,7 @@ pub trait StorageEngine: Send + Sync {
     /// Execute a decay sweep using the provided transition function.
     ///
     /// Returns the number of records transitioned.
+    #[cfg(test)]
     fn decay_sweep(
         &self,
         compute_new_state: &dyn Fn(&DiskRecord) -> Option<DiskRecord>,
@@ -226,6 +234,27 @@ pub trait StorageEngine: Send + Sync {
     /// Get a namespace by name.
     fn get_namespace_by_name(&self, name: &str) -> Result<Option<NamespaceConfig>, StorageError>;
 
+    /// Check an opt-in by-ID assertion using canonical rows, never a session default
+    /// or cache. Call under the same storage guard as the protected operation.
+    fn assert_memory_namespace(&self, id: MemoryId, namespace: &str) -> Result<(), StorageError> {
+        validate_namespace_name(namespace).map_err(|e| StorageError::InvalidNamespaceName {
+            name: namespace.to_owned(),
+            reason: e.to_string(),
+        })?;
+        let record = self
+            .get_record(id)?
+            .ok_or(StorageError::NotFound(id.into_inner()))?;
+        let asserted = self.get_namespace_by_name(namespace)?;
+        if asserted.is_some_and(|ns| ns.id.get() == record.namespace_id) {
+            Ok(())
+        } else {
+            Err(StorageError::NamespaceMismatch {
+                id: id.into_inner(),
+                namespace: namespace.to_owned(),
+            })
+        }
+    }
+
     // ── Text Compaction ─────────────────────────────────────────────
 
     /// Run fulltext.dat compaction, reclaiming dead space from decayed
@@ -245,6 +274,7 @@ pub trait StorageEngine: Send + Sync {
     /// Update the edge_count field on a memory's DiskRecord.
     ///
     /// Performs a read-modify-write in a single redb transaction.
+    #[cfg(test)]
     fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError>;
 
     // ── Bulk / Diagnostic ───────────────────────────────────────────
@@ -265,6 +295,7 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Called after tombstoning a memory to return the on-disk slot
     /// to the free list so it can be reused.
+    #[cfg(test)]
     fn free_vector_slot(
         &mut self,
         namespace_id: NamespaceId,
@@ -337,6 +368,30 @@ impl RedbStorageEngine {
     ) -> Result<WriteReceipt, StorageError> {
         self.meta_store
             .update_access_with_receipt(ctx, id, timestamp, kind)
+    }
+
+    /// Atomic per-namespace exposure batch; canonical commit only, not readiness.
+    pub fn record_exposure_batch(
+        &self,
+        ctx: &MutationContext,
+        accesses: &[(MemoryId, AccessKind)],
+        sampled_at: i64,
+    ) -> Result<Option<WriteReceipt>, StorageError> {
+        self.meta_store
+            .record_exposure_batch(ctx, accesses, sampled_at)
+    }
+
+    /// Fresh-state legacy feedback and a payload-free receipt in one transaction.
+    pub fn record_legacy_feedback(
+        &self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        quality: u8,
+        sampled_at: i64,
+        global_multiplier: f64,
+    ) -> Result<WriteReceipt, StorageError> {
+        self.meta_store
+            .record_legacy_feedback(ctx, id, quality, sampled_at, global_multiplier)
     }
 
     pub fn lookup_operation(
@@ -752,22 +807,22 @@ impl RedbStorageEngine {
     /// Return a reference to the underlying MetadataStore.
     /// Useful for callers that need direct access (e.g., batch
     /// operations not covered by the trait).
-    pub fn meta_store(&self) -> &MetadataStore {
+    pub(crate) fn meta_store(&self) -> &MetadataStore {
         &self.meta_store
     }
 
     /// Return a reference to the underlying EdgeStore.
-    pub fn edge_store(&self) -> &EdgeStore {
+    pub(crate) fn edge_store(&self) -> &EdgeStore {
         &self.edge_store
     }
 
     /// Return a reference to the underlying VectorManager.
-    pub fn vector_manager(&self) -> &VectorManager {
+    pub(crate) fn vector_manager(&self) -> &VectorManager {
         &self.vector_manager
     }
 
     /// Return a mutable reference to the underlying VectorManager.
-    pub fn vector_manager_mut(&mut self) -> &mut VectorManager {
+    pub(crate) fn vector_manager_mut(&mut self) -> &mut VectorManager {
         &mut self.vector_manager
     }
 
@@ -1065,6 +1120,7 @@ const QUARANTINE_DIR_NAME: &str = ".orphaned";
 impl StorageEngine for RedbStorageEngine {
     // ── Memory CRUD ─────────────────────────────────────────────────
 
+    #[cfg(test)]
     fn insert_memory(
         &mut self,
         id: MemoryId,
@@ -1168,6 +1224,7 @@ impl StorageEngine for RedbStorageEngine {
             .and_then(|r| r.removed.into_iter().next().map(|(_, r)| r)))
     }
 
+    #[cfg(test)]
     fn tombstone_memory(&self, id: MemoryId) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.meta_store.tombstone(id)
@@ -1175,6 +1232,7 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Decay State ─────────────────────────────────────────────────
 
+    #[cfg(test)]
     fn update_decay_state(
         &self,
         id: MemoryId,
@@ -1195,6 +1253,7 @@ impl StorageEngine for RedbStorageEngine {
         )
     }
 
+    #[cfg(test)]
     fn apply_legacy_feedback(
         &self,
         id: MemoryId,
@@ -1217,15 +1276,30 @@ impl StorageEngine for RedbStorageEngine {
         decay_strength: f32,
     ) -> Result<bool, StorageError> {
         self.ensure_available()?;
-        self.meta_store
-            .apply_legacy_decay(id, expected, namespace, phase, strength, decay_strength)
+        self.apply_legacy_decay_with_receipt(
+            &MutationContext::unkeyed(namespace.id),
+            id,
+            expected,
+            namespace,
+            phase,
+            strength,
+            decay_strength,
+        )
+        .map(|result| {
+            matches!(
+                result,
+                crate::storage::maintenance::DecayMutationResult::Committed(_)
+            )
+        })
     }
 
+    #[cfg(test)]
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.meta_store.strip_full_text(id)
     }
 
+    #[cfg(test)]
     fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.meta_store.strip_summary(id)
@@ -1244,6 +1318,7 @@ impl StorageEngine for RedbStorageEngine {
         self.meta_store.scan_phase_records(phase)
     }
 
+    #[cfg(test)]
     fn decay_sweep(
         &self,
         compute_new_state: &dyn Fn(&DiskRecord) -> Option<DiskRecord>,
@@ -1391,6 +1466,7 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Edge Count ──────────────────────────────────────────────────
 
+    #[cfg(test)]
     fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.meta_store.update_edge_count(id, edge_count)
@@ -1418,6 +1494,7 @@ impl StorageEngine for RedbStorageEngine {
         self.meta_store.exists(id)
     }
 
+    #[cfg(test)]
     fn free_vector_slot(
         &mut self,
         namespace_id: NamespaceId,

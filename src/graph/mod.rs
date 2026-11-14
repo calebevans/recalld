@@ -12,6 +12,7 @@
 pub mod activation;
 pub mod autolink;
 pub mod explicit_links;
+pub mod query;
 pub mod rebuild;
 mod structure;
 

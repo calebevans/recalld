@@ -24,6 +24,7 @@ impl MetadataStore {
         if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
             return Ok(receipt);
         }
+        purge::require_no_active_write(&tx)?;
         control::read_control(&tx)?.committed_generation.next()?;
         let id;
         {
@@ -81,13 +82,8 @@ impl MetadataStore {
             return Ok(receipt);
         }
         {
+            let mut config = namespace_state::require_namespace_active(&tx, id)?;
             let mut table = tx.open_table(NAMESPACE_TABLE)?;
-            let mut config = NamespaceConfig::decode(
-                table
-                    .get(id.get())?
-                    .ok_or(StorageError::NamespaceNotFound(id.get()))?
-                    .value(),
-            )?;
             if config.schema.is_some() {
                 return Err(StorageError::InvalidMutation(
                     "v2 policy and profile changes require a separate migration".into(),

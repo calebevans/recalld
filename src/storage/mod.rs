@@ -24,8 +24,12 @@ pub mod error;
 pub mod fsync;
 pub mod indexes;
 pub mod insertion;
+pub mod lifecycle_migration;
 pub(crate) mod lineage;
 pub mod logical_export;
+pub mod maintenance;
+#[cfg(test)]
+mod maintenance_tests;
 pub mod metadata;
 pub mod offline_snapshot;
 pub(crate) mod ownership;

@@ -1,5 +1,14 @@
-//! Atomic current-layout lifecycle patches. No receipt/retry or v2 contract.
+//! Current-layout lifecycle staging shared by legacy feedback and receipted maintenance.
 use super::*;
+use crate::storage::maintenance::{DecayMutationResult, DecaySkip};
+
+enum StagedPatch {
+    Changed {
+        before: DiskRecord,
+        after: DiskRecord,
+    },
+    Skipped(DecaySkip),
+}
 use crate::decay::lifecycle::FeedbackPlan;
 
 #[derive(Clone, Copy)]
@@ -15,7 +24,8 @@ enum LegacyPatch<'a> {
 impl MetadataStore {
     /// Patch feedback state and append its legacy event in one transaction.
     /// False means the record/policy snapshot changed; nothing was committed.
-    pub fn apply_legacy_feedback(
+    #[cfg(test)]
+    pub(crate) fn apply_legacy_feedback(
         &self,
         id: MemoryId,
         expected: &DiskRecord,
@@ -27,7 +37,8 @@ impl MetadataStore {
 
     /// Materialize strength, optionally losing exactly one retained phase.
     /// V1 Summary->Ghost clears summary only; tags and other fields are retained.
-    pub fn apply_legacy_decay(
+    #[cfg(test)]
+    pub(crate) fn apply_legacy_decay(
         &self,
         id: MemoryId,
         expected: &DiskRecord,
@@ -48,6 +59,7 @@ impl MetadataStore {
         )
     }
 
+    #[cfg(test)]
     fn apply_legacy_patch(
         &self,
         id: MemoryId,
@@ -78,6 +90,7 @@ impl MetadataStore {
 
     /// Actual write preparation, shared with boundary tests that abandon the
     /// redb transaction after all fields and generation have been staged.
+    #[cfg(test)]
     fn prepare_legacy_patch(
         &self,
         _publication: &std::sync::RwLockWriteGuard<'_, ()>,
@@ -87,10 +100,35 @@ impl MetadataStore {
         patch: LegacyPatch<'_>,
     ) -> Result<Option<(redb::WriteTransaction, DiskRecord)>, StorageError> {
         let tx = self.db.begin_write()?;
+        let StagedPatch::Changed {
+            before,
+            after: record,
+        } = self.stage_legacy_patch(&tx, id, expected, namespace, patch)?
+        else {
+            return Ok(None);
+        };
+        let state = control::advance_generation(&tx)?;
+        removal_ledger::record_change(
+            &tx,
+            state.generation_ref(),
+            &before,
+            &record,
+            uuid::Uuid::new_v4(),
+        )?;
+        Ok(Some((tx, record)))
+    }
+    fn stage_legacy_patch(
+        &self,
+        tx: &redb::WriteTransaction,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        patch: LegacyPatch<'_>,
+    ) -> Result<StagedPatch, StorageError> {
         let mut record = {
             let table = tx.open_table(META_TABLE)?;
             let Some(value) = table.get(id.as_bytes().as_slice())? else {
-                return Ok(None);
+                return Ok(StagedPatch::Skipped(DecaySkip::Stale));
             };
             DiskRecord::from_bytes(value.value())?
         };
@@ -98,18 +136,22 @@ impl MetadataStore {
             || record.phase == DecayPhase::Tombstone
             || !same_inputs(&record, expected)
         {
-            return Ok(None);
+            return Ok(StagedPatch::Skipped(DecaySkip::Stale));
         }
         // Read policy in the SAME write transaction, under the publication gate.
         // Concrete namespace configuration is the v1 policy snapshot; no invented
         // policy revision or public CAS token. Global config is caller-owned/frozen.
         {
-            let table = tx.open_table(NAMESPACE_TABLE)?;
-            let Some(value) = table.get(record.namespace_id)? else {
-                return Ok(None);
+            let current = match namespace_state::require_namespace_active(
+                tx,
+                NamespaceId::new(record.namespace_id),
+            ) {
+                Ok(config) => config,
+                Err(StorageError::NamespaceNotFound(_)) => {
+                    return Ok(StagedPatch::Skipped(DecaySkip::Stale));
+                }
+                Err(error) => return Err(error),
             };
-            let current: NamespaceConfig = serde_json::from_slice(value.value())
-                .map_err(|e| StorageError::Deserialize(e.to_string()))?;
             if current.id != namespace.id
                 || current.id.get() != record.namespace_id
                 || serde_json::to_vec(&current)
@@ -117,40 +159,20 @@ impl MetadataStore {
                     != serde_json::to_vec(namespace)
                         .map_err(|e| StorageError::Serialize(e.to_string()))?
             {
-                return Ok(None);
+                return Ok(StagedPatch::Skipped(DecaySkip::Stale));
             }
+        }
+        if record.schema.is_some() || record.version != 1 || namespace.schema.is_some() {
+            return Err(StorageError::InvalidMutation(
+                "native lifecycle requires participating schema-v2 planner".into(),
+            ));
         }
         let before = record.clone();
         match patch {
             LegacyPatch::Feedback(plan) => {
-                if !matches!(record.phase, DecayPhase::Full | DecayPhase::Summary)
-                    || (record.phase == DecayPhase::Summary && record.summary.is_empty())
-                {
-                    return Ok(None);
+                if !patch_legacy_feedback(&mut record, plan)? {
+                    return Ok(StagedPatch::Skipped(DecaySkip::Stale));
                 }
-                if plan.phase != record.phase
-                    || plan.timestamp < record.created_at.max(record.last_accessed_at)
-                    || !plan.stability.is_finite()
-                    || plan.stability <= 0.0
-                    || !valid_strength(plan.strength)
-                    || (record.is_permastore != 0 && !plan.is_permastore)
-                {
-                    return Err(StorageError::InvalidMutation(
-                        "invalid legacy feedback patch".into(),
-                    ));
-                }
-                record.strength = plan.strength;
-                record.decay_strength = plan.strength;
-                record.stability = plan.stability;
-                record.is_permastore = u8::from(plan.is_permastore);
-                record.last_accessed_at = plan.timestamp;
-                if record.access_history.len() >= ACCESS_HISTORY_MAX {
-                    record.access_history.remove(0);
-                }
-                record.access_history.push(AccessEvent {
-                    timestamp: plan.timestamp,
-                    kind: AccessKind::ManualReinforcement,
-                });
             }
             LegacyPatch::Decay {
                 phase,
@@ -163,7 +185,7 @@ impl MetadataStore {
                     ));
                 }
                 if record.is_permastore != 0 || namespace.decay_rate_multiplier == Some(0.0) {
-                    return Ok(None);
+                    return Ok(StagedPatch::Skipped(DecaySkip::Exempt));
                 }
                 if phase != record.phase {
                     match (record.phase, phase) {
@@ -184,22 +206,125 @@ impl MetadataStore {
                 record.decay_strength = decay_strength;
             }
         }
+        if matches!(patch, LegacyPatch::Decay { .. }) && before.encode()? == record.encode()? {
+            return Ok(StagedPatch::Skipped(DecaySkip::Unchanged));
+        }
         // Patch the freshly read record: edge counts, tags and fields outside
         // lifecycle are preserved, never copied back from a stale full record.
         {
             let mut table = tx.open_table(META_TABLE)?;
             table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
         }
-        let state = control::advance_generation(&tx)?;
-        removal_ledger::record_change(
-            &tx,
-            state.generation_ref(),
-            &before,
-            &record,
-            uuid::Uuid::new_v4(),
-        )?;
-        Ok(Some((tx, record)))
+        Ok(StagedPatch::Changed {
+            before,
+            after: record,
+        })
     }
+
+    pub(crate) fn decay_with_effects(
+        &self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        expected: &DiskRecord,
+        namespace: &NamespaceConfig,
+        phase: DecayPhase,
+        strength: f32,
+        decay_strength: f32,
+        edges: &[crate::storage::PersistedEdge],
+    ) -> Result<DecayMutationResult, StorageError> {
+        let guard = self.mutation_guard()?;
+        ctx.validate()?;
+        if ctx.contract_version != 1 || ctx.scope != MutationScope::Namespace(namespace.id) {
+            return Err(StorageError::InvalidMutationContext(
+                "legacy maintenance requires matching namespace scope".into(),
+            ));
+        }
+        let hash = control::request_hash(
+            ctx,
+            "lifecycle_materialize_v1",
+            &[
+                id.as_bytes(),
+                &expected.encode()?,
+                &control::encode(namespace)?,
+                &[phase.as_u8()],
+                &strength.to_bits().to_be_bytes(),
+                &decay_strength.to_bits().to_be_bytes(),
+            ],
+        );
+        let tx = self.db.begin_write()?;
+        if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
+            return Ok(DecayMutationResult::Committed(receipt));
+        }
+        let staged = self.stage_legacy_patch(
+            &tx,
+            id,
+            expected,
+            namespace,
+            LegacyPatch::Decay {
+                phase,
+                strength,
+                decay_strength,
+            },
+        )?;
+        let StagedPatch::Changed { before, after } = staged else {
+            let StagedPatch::Skipped(reason) = staged else {
+                unreachable!()
+            };
+            return Ok(DecayMutationResult::Skipped(reason));
+        };
+        self.finish_record_effects(
+            &guard,
+            tx,
+            ctx,
+            hash,
+            edges,
+            &[],
+            &[],
+            false,
+            false,
+            effects::RecordMutation::LifecyclePatched {
+                before: &before,
+                after: &after,
+            },
+        )
+        .map(|result| DecayMutationResult::Committed(result.receipt))
+    }
+}
+
+/// Shared patch semantics for planned legacy feedback and receipt-bearing feedback.
+pub(super) fn patch_legacy_feedback(
+    record: &mut DiskRecord,
+    plan: &FeedbackPlan,
+) -> Result<bool, StorageError> {
+    if !matches!(record.phase, DecayPhase::Full | DecayPhase::Summary)
+        || (record.phase == DecayPhase::Summary && record.summary.is_empty())
+    {
+        return Ok(false);
+    }
+    if plan.phase != record.phase
+        || plan.timestamp < record.created_at.max(record.last_accessed_at)
+        || !plan.stability.is_finite()
+        || plan.stability <= 0.0
+        || !valid_strength(plan.strength)
+        || (record.is_permastore != 0 && !plan.is_permastore)
+    {
+        return Err(StorageError::InvalidMutation(
+            "invalid legacy feedback patch".into(),
+        ));
+    }
+    record.strength = plan.strength;
+    record.decay_strength = plan.strength;
+    record.stability = plan.stability;
+    record.is_permastore = u8::from(plan.is_permastore);
+    record.last_accessed_at = plan.timestamp;
+    if record.access_history.len() >= ACCESS_HISTORY_MAX {
+        record.access_history.remove(0);
+    }
+    record.access_history.push(AccessEvent {
+        timestamp: plan.timestamp,
+        kind: AccessKind::ManualReinforcement,
+    });
+    Ok(true)
 }
 
 fn valid_strength(value: f32) -> bool {

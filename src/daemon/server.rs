@@ -386,6 +386,49 @@ async fn dispatch(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, BridgeError> {
+    let (method, namespace) = match method {
+        "get_memory_scoped_read_only" | "find_similar_scoped_read_only" => {
+            let namespace = crate::mcp::args::parse_namespace_assertion(&params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?
+                .ok_or_else(|| BridgeError::InvalidInput("scoped RPC requires namespace".into()))?
+                .to_owned();
+            let method = if method == "get_memory_scoped_read_only" {
+                "get_memory_read_only"
+            } else {
+                "find_similar_read_only"
+            };
+            (method, Some(namespace))
+        }
+        "get_memory_scoped"
+        | "delete_memory_scoped"
+        | "reinforce_memory_scoped"
+        | "find_similar_scoped" => {
+            if params.get("recordAccess").is_some() {
+                return Err(BridgeError::InvalidInput(
+                    "recordAccess requires a scoped_read_only RPC".into(),
+                ));
+            }
+            let namespace = crate::mcp::args::parse_namespace_assertion(&params)
+                .map_err(|e| BridgeError::InvalidInput(e.to_string()))?
+                .ok_or_else(|| BridgeError::InvalidInput("scoped RPC requires namespace".into()))?
+                .to_owned();
+            (method.strip_suffix("_scoped").unwrap(), Some(namespace))
+        }
+        "get_memory"
+        | "delete_memory"
+        | "reinforce_memory"
+        | "find_similar"
+        | "get_memory_read_only"
+        | "find_similar_read_only"
+            if params.get("namespace").is_some() =>
+        {
+            return Err(BridgeError::InvalidInput(
+                "namespace assertion requires a scoped RPC".into(),
+            ));
+        }
+        _ => (method, None),
+    };
+    let namespace = namespace.as_deref();
     match method {
         // Doubles as the protocol handshake. A v1 client ignores the extra
         // fields; a v2 client uses them to size its outgoing frames.
@@ -396,19 +439,29 @@ async fn dispatch(
 
         "shutdown" => Ok(serde_json::json!({})),
 
-        "search" => {
-            let input: SearchInput = serde_json::from_value(params)
+        "search" | "search_read_only" => {
+            let mut input: SearchInput = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
+            if method == "search_read_only" {
+                input.record_access = false;
+            }
             let response = search.search(input).await?;
             serde_json::to_value(response).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
-        "find_similar" => {
+        "find_similar" | "find_similar_read_only" => {
             let p: FindSimilarParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let id = parse_memory_id(&p.id)?;
             let results = search
-                .find_similar(id, p.limit, p.min_score, p.same_namespace)
+                .find_similar(
+                    id,
+                    p.limit,
+                    p.min_score,
+                    p.same_namespace,
+                    p.record_access && method != "find_similar_read_only",
+                    namespace,
+                )
                 .await?;
             serde_json::to_value(results).map_err(|e| BridgeError::Internal(e.to_string()))
         }
@@ -451,11 +504,17 @@ async fn dispatch(
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
-        "get_memory" => {
+        "get_memory" | "get_memory_read_only" => {
             let p: GetMemoryParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let id = parse_memory_id(&p.id)?;
-            let result = storage.get_memory(id).await?;
+            let result = storage
+                .get_memory(
+                    id,
+                    p.record_access && method != "get_memory_read_only",
+                    namespace,
+                )
+                .await?;
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
@@ -463,7 +522,7 @@ async fn dispatch(
             let p: DeleteMemoryParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let id = parse_memory_id(&p.id)?;
-            let result = storage.delete_memory(id).await?;
+            let result = storage.delete_memory(id, namespace).await?;
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
@@ -491,7 +550,7 @@ async fn dispatch(
             let p: ReinforceParams = serde_json::from_value(params)
                 .map_err(|e| BridgeError::InvalidInput(e.to_string()))?;
             let id = parse_memory_id(&p.id)?;
-            let result = storage.reinforce_memory(id, p.quality).await?;
+            let result = storage.reinforce_memory(id, p.quality, namespace).await?;
             serde_json::to_value(result).map_err(|e| BridgeError::Internal(e.to_string()))
         }
 
@@ -814,6 +873,8 @@ mod tests {
             _: usize,
             _: Option<f32>,
             _: bool,
+            _record_access: bool,
+            _namespace: Option<&str>,
         ) -> Result<Vec<SearchHit>, BridgeError> {
             unreachable!()
         }
@@ -832,10 +893,19 @@ mod tests {
         async fn store_memory(&self, _: StoreInput) -> Result<StoredMemory, BridgeError> {
             unreachable!()
         }
-        async fn get_memory(&self, _: MemoryId) -> Result<Option<MemoryRecord>, BridgeError> {
+        async fn get_memory(
+            &self,
+            _: MemoryId,
+            _record_access: bool,
+            _namespace: Option<&str>,
+        ) -> Result<Option<MemoryRecord>, BridgeError> {
             unreachable!()
         }
-        async fn delete_memory(&self, _: MemoryId) -> Result<bool, BridgeError> {
+        async fn delete_memory(
+            &self,
+            _: MemoryId,
+            _namespace: Option<&str>,
+        ) -> Result<bool, BridgeError> {
             unreachable!()
         }
         async fn delete_memories(&self, _: &[MemoryId]) -> Result<Vec<bool>, BridgeError> {
@@ -845,6 +915,7 @@ mod tests {
             &self,
             _: MemoryId,
             _: u8,
+            _namespace: Option<&str>,
         ) -> Result<ReinforceResult, BridgeError> {
             unreachable!()
         }
@@ -1160,3 +1231,11 @@ mod tests {
 #[cfg(test)]
 #[path = "batch_label_tests.rs"]
 mod batch_label_tests;
+
+#[cfg(test)]
+#[path = "read_only_tests.rs"]
+mod read_only_tests;
+
+#[cfg(test)]
+#[path = "scope_tests.rs"]
+mod scope_tests;

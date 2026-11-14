@@ -104,7 +104,7 @@ pub(crate) fn read_selection(
 impl MetadataStore {
     pub(crate) fn text_selection(&self) -> Result<Option<TextGeneration>, StorageError> {
         self.ensure_available()?;
-        read_selection(&self.db.begin_read()?)
+        self.text_selection_for_recovery()
     }
 
     /// Constructor-only read before canonical effects replay; the engine has not escaped.

@@ -13,9 +13,9 @@ use crate::model::{DecayPhase, Tag};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMode {
-    /// Vector similarity search only; skips metadata filtering.
+    /// Embedding-driven retrieval; all supplied hard filters still apply.
     EmbeddingOnly,
-    /// Vector search with post-hoc metadata filters (default).
+    /// Embedding-driven retrieval with explicit metadata criteria (default).
     EmbeddingPlusMetadata,
     /// Tag and attribute filtering without vector search.
     MetadataOnly,
@@ -31,7 +31,7 @@ impl Default for QueryMode {
 // SearchFilter (pipeline-level)
 // ---------------------------------------------------------------------------
 
-/// Post-retrieval filters applied after vector search and metadata loading.
+/// Canonical hard filters apply in every query mode, including EmbeddingOnly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchFilter {
@@ -64,7 +64,15 @@ pub struct SearchFilter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchQuery {
-    /// Free-text query, embedded via the namespace's provider.
+    /// Permit legacy exposure recording. False also bypasses behavioral record caches.
+    #[serde(default = "default_record_access")]
+    pub record_access: bool,
+    /// Precomputed vector for semantic search. Takes precedence over text for
+    /// embedding; text (or fts_query) still supplies the keyword channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_embedding: Option<Vec<f32>>,
+
+    /// Free-text query, embedded via the namespace's provider unless a vector is supplied.
     #[serde(default)]
     pub text: Option<String>,
 
@@ -79,7 +87,7 @@ pub struct SearchQuery {
     #[serde(default = "default_namespace")]
     pub namespace: String,
 
-    /// Post-retrieval filters.
+    /// Hard eligibility filters applied in every query mode.
     #[serde(default)]
     pub filter: SearchFilter,
 
@@ -116,6 +124,11 @@ pub struct SearchQuery {
     pub entities: Vec<String>,
 }
 
+/// Omitted access control preserves each v1 path's existing behavior.
+pub fn default_record_access() -> bool {
+    true
+}
+
 fn default_namespace() -> String {
     "default".to_string()
 }
@@ -149,7 +162,9 @@ impl SearchQuery {
         // Mode-specific validation
         match self.query_mode {
             QueryMode::EmbeddingOnly | QueryMode::EmbeddingPlusMetadata => {
-                if self.text.as_ref().is_none_or(|t| t.trim().is_empty()) {
+                if self.query_embedding.is_none()
+                    && self.text.as_ref().is_none_or(|t| t.trim().is_empty())
+                {
                     return Err(SearchError::EmptyQuery);
                 }
             }
@@ -166,4 +181,36 @@ impl SearchQuery {
 
         Ok(())
     }
+}
+
+/// Validate and normalize only explicitly supplied query vectors. Keep provider
+/// output handling unchanged for text-only legacy requests.
+pub(crate) fn normalize_query_embedding(
+    embedding: &mut [f32],
+    dimensions: usize,
+) -> Result<(), SearchError> {
+    if embedding.len() != dimensions {
+        return Err(SearchError::InvalidEmbedding(format!(
+            "embedding has {} dimensions, namespace requires {dimensions}",
+            embedding.len(),
+        )));
+    }
+    if embedding.iter().any(|x| !x.is_finite()) {
+        return Err(SearchError::InvalidEmbedding(
+            "embedding elements must be finite".into(),
+        ));
+    }
+    // f64 accumulation handles every finite f32, including huge values and
+    // subnormals, without the overflow/underflow of a squared f32 norm.
+    let norm_squared: f64 = embedding.iter().map(|&x| f64::from(x).powi(2)).sum();
+    if !norm_squared.is_finite() || norm_squared <= 0.0 {
+        return Err(SearchError::InvalidEmbedding(
+            "embedding must have a finite positive norm".into(),
+        ));
+    }
+    let norm = norm_squared.sqrt();
+    for x in embedding {
+        *x = (f64::from(*x) / norm) as f32;
+    }
+    Ok(())
 }
