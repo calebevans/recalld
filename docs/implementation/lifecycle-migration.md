@@ -2,7 +2,9 @@
 
 Parent: `ad6408929b98831e40fc39ac7d13ff288b47d4cf` (schema/restore bridge,
 PR48; includes the schema, selected-text fence, ledger and canonical-effects
-prerequisites). This implements the explicit policy switch in A3 §8. It does
+prerequisites). The branch also merges the minimal schema/ownership prerequisite
+`6c0aa74b9164bcb624b26f9c4b42af874ecf8347` (ownership repair `2788645` plus
+the `OfflineSnapshot` guard type), without importing integration history. This implements the explicit policy switch in A3 §8. It does
 not enable ordinary schema-v2 serving, exposure, feedback, or sweep writers.
 Defaults remain `legacy_access_v1`.
 
@@ -163,3 +165,42 @@ variants (also reported at new call sites); this is not a warning-free build.
 All execution used `recalld-ci:1.94`, `RUSTUP_TOOLCHAIN=1.94.1`, offline Cargo,
 Docker `--network none --cpus 2 --memory 4g`, and a separate cargo/target cache.
 Tests used synthetic temporary data without home, credential or socket mounts.
+
+After merging `6c0aa74`: the complete **653 library tests + 2 real CLI integration
+tests passed**, including all 11 lifecycle tests and the ownership/fork
+regressions. Four existing doctests remained ignored. Formatting passed and
+Clippy exited 0 with the same warning categories. Validation logs are retained
+locally in `.test-scratch/`; none of its caches, outputs or logs are committed.
+
+## Next native-writer slice (plan only)
+
+Use an explicit ownership-checked entry through the existing metadata/publication
+path. Permit the two validated canonical lifecycle operations while retaining
+rejection of unparticipating writers and the ordinary-serving gate. Do not create
+a parallel storage subsystem or implicitly upgrade namespace policy.
+
+Halley's guarded caller should retain the original per-namespace exposure intent
+(UUIDs, access kinds/roles, expected policy revision and record tokens), rather
+than hashing a newly filtered retry list. Validate scope, visibility and terminal
+state in the final transaction. V2 exposure changes retrieval history/time but
+not anchor or stability; v1 also changes the anchor. Feedback uses the explicit
+anchor and matching namespace policy, preserving observed time and retained
+phase. One sampled clock, clamped against persisted lifecycle-update time, drives
+each operation; commit fields, history, record tokens and receipt together.
+
+Retry identity excludes generated timestamps. Lineage validation precedes replay,
+which precedes fresh CAS checks. Return original numeric outcomes and receipts;
+re-read content under current visibility, never retain deleted payloads in replay
+state. Keep pre-exposure read generation distinct from per-namespace committed
+receipts and skipped/conflicted outcomes. A postcommit publication failure must
+carry its committed receipt, not become a generic retryable failure.
+
+Add only typed outcomes for actual exposure/feedback writers. Extend the
+contiguous proof validator with their explicit policy/token transitions, replacing
+the current policy-only token-rewind assumption. Unknown operations, gaps,
+duplicates, incorrect ordering and unsupported historical origins continue to
+fail. Tests must cover commit/reopen/replay, original intent under visibility
+changes, backward clocks, retrieval-before-feedback anchor invariance, stale
+policy/tokens, terminal races and abandoned real transactions. Exact consumer API
+names require coordination with Halley's current guarded-caller implementation;
+this handoff introduces no native writer or transport activation.
