@@ -50,7 +50,7 @@ impl DerivedCompletion {
                 let records = storage.scan_all()?;
                 let mut next_graph = RelationshipGraph::with_capacity(records.len());
                 let mut next_vectors = FlatVectorIndex::new(vectors.dimensions());
-                let mut next_entities = EntityIndex::with_capacity(records.len());
+                let next_entities = EntityIndex::from_records(&records);
                 fts.clear().map_err(|e| failed(e.to_string()))?;
                 for (id, record) in &records {
                     let ns = NamespaceId::new(record.namespace_id);
@@ -95,10 +95,6 @@ impl DerivedCompletion {
                     };
                     fts.add(ns, *id, &record.summary, text.as_deref(), &tags)
                         .map_err(|e| failed(e.to_string()))?;
-                    next_entities.add(
-                        *id,
-                        &crate::model::parse_structured_tags(&record.tags).entities,
-                    );
                 }
                 let edges = storage.load_all_edges()?;
                 let count = edges.len();
@@ -144,6 +140,65 @@ mod tests {
             fts: fx.fts_index.clone(),
             entities: fx.entity_index.clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn entity_rebuild_online_completion_replaces_stale_namespace_postings() {
+        let fx = Fixture::new();
+        let local = NamespaceId::new(1);
+        let foreign = fx.create_namespace("foreign");
+        let live = fx.insert_memory_in(local, &["entity/alice"]).await;
+        let peer = fx
+            .insert_memory_in(foreign, &["entity/alice", "entity/bob"])
+            .await;
+        let dead = fx.insert_memory_in(local, &["entity/dead"]).await;
+        {
+            let mut index = fx.entity_index.write().await;
+            index.add(local, live, &["stale".into()]);
+            index.add(local, dead, &["dead".into()]);
+        }
+        // Real canonical deletion dirties every view and requires completion.
+        fx.storage.write().unwrap().delete_memory(dead).unwrap();
+        let query = vec!["Alice".into(), "Bob".into()];
+        for _ in 0..2 {
+            publisher(&fx).complete().await.unwrap();
+            let index = fx.entity_index.read().await;
+            assert_eq!(index.len(), 2);
+            assert_eq!(
+                index.find_by_entities(local, &query, MemoryId::new()),
+                vec![(live, 1)]
+            );
+            assert_eq!(
+                index.find_by_entities(foreign, &query, MemoryId::new()),
+                vec![(peer, 2)]
+            );
+            assert!(
+                index
+                    .find_by_entities(local, &["stale".into(), "dead".into()], MemoryId::new())
+                    .is_empty()
+            );
+            assert!(
+                fx.storage
+                    .read()
+                    .unwrap()
+                    .meta_store()
+                    .effects_stamp()
+                    .is_ok()
+            );
+        }
+        fx.storage.write().unwrap().delete_memory(live).unwrap();
+        publisher(&fx).complete().await.unwrap();
+        let index = fx.entity_index.read().await;
+        assert_eq!(index.len(), 1);
+        assert!(
+            index
+                .find_by_entities(local, &query, MemoryId::new())
+                .is_empty()
+        );
+        assert_eq!(
+            index.find_by_entities(foreign, &query, MemoryId::new()),
+            vec![(peer, 2)]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

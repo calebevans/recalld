@@ -1,7 +1,7 @@
 //! Namespace-partitioned entity postings with complete per-memory replacement.
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{MemoryId, NamespaceId};
+use crate::model::{CachedRecord, DecayPhase, DiskRecord, MemoryId, NamespaceId};
 
 /// Derived entity index. Callers provide the complete accepted entity list;
 /// legacy tags are not a lossless representation of multiword/Unicode names.
@@ -21,6 +21,20 @@ impl EntityIndex {
             index: HashMap::new(),
             keys_by_memory: HashMap::with_capacity(capacity),
         }
+    }
+
+    /// Build a fresh view for startup or committed-effect completion. Callers
+    /// publish only after their existing canonical/readiness checks succeed.
+    pub(crate) fn from_records(records: &[(MemoryId, DiskRecord)]) -> Self {
+        let mut index = Self::with_capacity(records.len());
+        for (id, record) in records {
+            if matches!(record.phase, DecayPhase::Ghost | DecayPhase::Tombstone) {
+                continue;
+            }
+            let cached = CachedRecord::from(record);
+            index.add(cached.namespace_id, *id, &cached.entities);
+        }
+        index
     }
 
     /// Replace this namespace/UUID's complete postings. Repeating an update is
@@ -126,6 +140,159 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes[15] = n;
         MemoryId::from_bytes(bytes)
+    }
+
+    // Codec-only canonical fixture: no schema-v2 serving or writer admission.
+    fn canonical_record(
+        n: u8,
+        namespace: NamespaceId,
+        entities: &[&str],
+    ) -> (MemoryId, DiskRecord) {
+        use crate::model::schema::{LabelProvenance, RecordSchemaV2, VectorReference};
+        let id = mid(n);
+        let mut record = DiskRecord {
+            version: 1,
+            schema: None,
+            id: *id.as_bytes(),
+            namespace_id: namespace.get(),
+            created_at: 0,
+            last_accessed_at: 0,
+            phase: DecayPhase::Full,
+            strength: 1.0,
+            decay_strength: 1.0,
+            stability: 1.0,
+            difficulty: 5.0,
+            is_permastore: 0,
+            vector_slot: 0,
+            edge_count: 0,
+            summary: "fixture".into(),
+            tags: vec![crate::model::Tag::new("entity/retained-only").unwrap()],
+            access_history: vec![],
+            text_offset: 0,
+            text_length: 0,
+        };
+        let mut schema = RecordSchemaV2::from_legacy(
+            &record,
+            0,
+            Some(VectorReference {
+                slot: 0,
+                allocation_epoch: Default::default(),
+                sha256: [0; 32],
+            }),
+        );
+        schema.labels.entities = entities.iter().map(|s| (*s).to_owned()).collect();
+        schema.labels.provenance = LabelProvenance::NativeV2;
+        record.version = 2;
+        record.schema = Some(schema);
+        let decoded = DiskRecord::from_bytes(&record.encode().unwrap()).unwrap();
+        (id, decoded)
+    }
+
+    #[test]
+    fn entity_rebuild_uses_canonical_labels_and_replaces_the_complete_view() {
+        let other = NamespaceId::new(2);
+        let mut records = vec![
+            canonical_record(1, ns(), &["Dr. John Smith", "JOHN SMITH", "José", "José"]),
+            canonical_record(2, other, &["José"]),
+            canonical_record(3, ns(), &[]), // retained tags are NOT a fallback
+            canonical_record(4, ns(), &["日本語"]),
+        ];
+        let before: Vec<_> = records.iter().map(|(_, r)| r.encode().unwrap()).collect();
+        let query = vec!["John Smith".into(), "José".into(), "José".into()];
+        for _ in 0..3 {
+            let index = EntityIndex::from_records(&records);
+            assert_eq!(index.len(), 3);
+            assert_eq!(
+                index.find_by_entities(ns(), &query, mid(0)),
+                vec![(mid(1), 3)]
+            );
+            assert_eq!(
+                index.find_by_entities(other, &query, mid(0)),
+                vec![(mid(2), 1)]
+            );
+            assert_eq!(
+                index.find_by_entities(ns(), &["日本語".into()], mid(0)),
+                vec![(mid(4), 1)]
+            );
+            assert!(
+                index
+                    .find_by_entities(ns(), &["retained-only".into()], mid(0))
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            records
+                .iter()
+                .map(|(_, r)| r.encode().unwrap())
+                .collect::<Vec<_>>(),
+            before
+        );
+
+        // Replacement and disappearance must remove old keys and old UUIDs,
+        // while authoritative empty does not recover the conflicting tag.
+        records[0] = canonical_record(1, ns(), &["Alice's"]);
+        records[1] = canonical_record(2, other, &[]);
+        records.pop();
+        let replacement = EntityIndex::from_records(&records);
+        assert_eq!(replacement.len(), 1);
+        assert!(
+            replacement
+                .find_by_entities(ns(), &query, mid(0))
+                .is_empty()
+        );
+        assert!(
+            replacement
+                .find_by_entities(other, &query, mid(0))
+                .is_empty()
+        );
+        assert!(
+            replacement
+                .find_by_entities(ns(), &["日本語".into()], mid(0))
+                .is_empty()
+        );
+        assert_eq!(
+            replacement.find_by_entities(ns(), &["Alice".into()], mid(0)),
+            vec![(mid(1), 1)]
+        );
+    }
+
+    #[test]
+    fn entity_rebuild_preserves_retained_only_provenance_and_excludes_removed_records() {
+        use crate::model::schema::LabelProvenance;
+        let (id, mut legacy) = canonical_record(1, ns(), &[]);
+        legacy.version = 1;
+        legacy.schema = None;
+        let mut retained = canonical_record(2, ns(), &["retained-only"]);
+        retained.1.schema.as_mut().unwrap().labels.provenance = LabelProvenance::LegacyRetainedOnly;
+        let mut ghost = canonical_record(3, ns(), &[]);
+        ghost.1.phase = DecayPhase::Ghost;
+        let mut tombstone = canonical_record(4, ns(), &[]);
+        tombstone.1.phase = DecayPhase::Tombstone;
+        tombstone.1.schema.as_mut().unwrap().vector = None;
+        let records = vec![(id, legacy), retained, ghost, tombstone];
+        let bytes: Vec<_> = records.iter().map(|(_, r)| r.encode().unwrap()).collect();
+        let index = EntityIndex::from_records(&records);
+        assert_eq!(index.len(), 2);
+        assert_eq!(
+            index.find_by_entities(ns(), &["retained-only".into()], mid(0)),
+            vec![(mid(1), 1), (mid(2), 1)]
+        );
+        assert!(
+            index
+                .find_by_entities(ns(), &["José".into()], mid(0))
+                .is_empty()
+        );
+        assert_eq!(
+            records[1].1.schema.as_ref().unwrap().labels.provenance,
+            LabelProvenance::LegacyRetainedOnly
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|(_, r)| r.encode().unwrap())
+                .collect::<Vec<_>>(),
+            bytes
+        );
     }
 
     #[test]

@@ -617,20 +617,8 @@ impl Recalld {
         };
 
         // -- Step 6c: Build entity index from scanned records ----------
-        // Legacy tags expose only retained labels, not the full accepted names.
-        // Structured-label schema integration must replace this fallback on v2 reads.
         let entity_index = {
-            let mut idx = EntityIndex::with_capacity(all_records.len());
-            for (memory_id, record) in &all_records {
-                let entities = crate::model::parse_structured_tags(&record.tags).entities;
-                if !entities.is_empty() {
-                    idx.add(
-                        crate::model::NamespaceId::new(record.namespace_id),
-                        *memory_id,
-                        &entities,
-                    );
-                }
-            }
+            let idx = EntityIndex::from_records(&all_records);
             tracing::info!(memories = idx.len(), "entity index built");
             Arc::new(RwLock::new(idx))
         };
@@ -1588,23 +1576,27 @@ mod tests {
                 .await;
             (fx.close(), other, local_id, foreign_id)
         };
-        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
-        let index = system.entity_index().read().await;
-        assert_eq!(index.len(), 2);
-        let query = vec!["Alice".into(), "Bob".into()];
-        assert_eq!(
-            index.find_by_entities(ns(), &query, MemoryId::new()),
-            vec![(local_id, 1)]
-        );
-        assert_eq!(
-            index.find_by_entities(other, &query, MemoryId::new()),
-            vec![(foreign_id, 2)]
-        );
-        // This fixture claims fidelity only for labels retained in legacy tags.
-        assert!(
-            index
-                .find_by_entities(ns(), &["José".into()], MemoryId::new())
-                .is_empty()
-        );
+        for _ in 0..2 {
+            let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+            let index = system.entity_index().read().await;
+            assert_eq!(index.len(), 2);
+            let query = vec!["Alice".into(), "Bob".into()];
+            assert_eq!(
+                index.find_by_entities(ns(), &query, MemoryId::new()),
+                vec![(local_id, 1)]
+            );
+            assert_eq!(
+                index.find_by_entities(other, &query, MemoryId::new()),
+                vec![(foreign_id, 2)]
+            );
+            // This fixture claims fidelity only for labels retained in legacy tags.
+            assert!(
+                index
+                    .find_by_entities(ns(), &["José".into()], MemoryId::new())
+                    .is_empty()
+            );
+            drop(index);
+            system.shutdown().await.unwrap();
+        }
     }
 }
