@@ -30,6 +30,13 @@ use super::{EntityIndex, FlatVectorIndex, FtsIndex, SearchFilter, VectorIndex};
 // v2. Snapshot ownership pins canonical files; this adapter has no write API.
 #[async_trait]
 impl NamespaceResolver for crate::storage::offline_snapshot::OfflineSnapshot {
+    async fn resolve_id(&self, id: NamespaceId) -> Result<NamespaceConfig> {
+        self.namespaces()
+            .iter()
+            .find(|ns| ns.id == id)
+            .cloned()
+            .ok_or_else(|| SearchError::NamespaceNotFound(format!("id {}", id.get())))
+    }
     async fn resolve(&self, name: &str) -> Result<NamespaceConfig> {
         self.namespaces()
             .iter()
