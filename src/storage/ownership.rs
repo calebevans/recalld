@@ -14,6 +14,15 @@ pub(crate) struct StoreOwnership {
 
 impl StoreOwnership {
     pub fn acquire(path: &Path) -> Result<Self, StorageError> {
+        Self::acquire_mode(path, false)
+    }
+
+    /// Engine startup may finish a journal; inspection/backup must not publish it.
+    pub(crate) fn acquire_recovering(path: &Path) -> Result<Self, StorageError> {
+        Self::acquire_mode(path, true)
+    }
+
+    fn acquire_mode(path: &Path, recover: bool) -> Result<Self, StorageError> {
         let absolute = std::path::absolute(path)?;
         let name = absolute.file_name().ok_or(StorageError::InvalidPath)?;
         let parent = absolute.parent().ok_or(StorageError::InvalidPath)?;
@@ -39,17 +48,21 @@ impl StoreOwnership {
         let mut pending_name = name.to_os_string();
         pending_name.push(".recalld-restore-pending");
         let pending = parent.join(pending_name);
-        if pending.try_exists()? {
-            return Err(StorageError::RecoveryRequired(format!(
-                "interrupted restore: inspect {} and retain the old/staged stores",
-                pending.display()
-            )));
-        }
-        Ok(Self {
+        let owner = Self {
             path,
             pending,
             _file: file,
-        })
+        };
+        if owner.pending.is_symlink() || owner.pending.try_exists()? {
+            if !recover {
+                return Err(StorageError::RecoveryRequired(format!(
+                    "interrupted restore at {}; recover through engine startup before inspection or another operation",
+                    owner.pending.display()
+                )));
+            }
+            super::restore_journal::recover(&owner)?;
+        }
+        Ok(owner)
     }
 }
 

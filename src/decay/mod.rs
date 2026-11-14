@@ -19,6 +19,7 @@
 
 pub mod config;
 pub mod fsrs;
+pub mod lifecycle;
 pub mod storage_adapter;
 pub mod sweep;
 

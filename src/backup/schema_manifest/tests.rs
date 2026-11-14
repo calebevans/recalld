@@ -99,6 +99,7 @@ async fn actual_v2_backup_captures_canonical_identity_configuration_counts_and_h
         data_dir: target.clone(),
         force: true,
         no_stop_daemon: true,
+            historical: true,
     })
     .await
     .unwrap();
@@ -145,6 +146,7 @@ async fn self_consistent_manifest_lies_fail_before_target_publication_and_source
                 data_dir: target.clone(),
                 force: true,
                 no_stop_daemon: true,
+            historical: true,
             })
             .await
             .is_err(),
@@ -221,6 +223,7 @@ async fn manifest_versions_are_strict_and_legacy_crc_remains_semantically_valida
             data_dir: target.clone(),
             force: true,
             no_stop_daemon: true,
+            historical: true,
         })
         .await
         .is_err()

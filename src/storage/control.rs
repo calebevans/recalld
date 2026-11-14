@@ -74,16 +74,14 @@ pub struct GenerationRef {
     pub generation: Generation,
 }
 
-/// Validate a generation in its own lineage. Standalone schema builds know only
-/// the active lineage. Restore integration delegates this boundary to
-/// `lineage::permits_origin`, which checks verified ancestor generation bounds.
-/// Unknown ancestry must remain rejected, never inferred from a receipt.
+/// Validate a generation in its own lineage, including verified restore ancestors.
+/// This never infers ancestry from a receipt or compares counters across store IDs.
 pub(crate) fn permits_generation_origin(
-    _read: &ReadTransaction,
+    read: &ReadTransaction,
     control: &ControlState,
     origin: GenerationRef,
 ) -> Result<bool, StorageError> {
-    Ok(origin.store_id == control.store_id && origin.generation <= control.committed_generation)
+    super::lineage::permits_origin(read, control, origin)
 }
 
 /// Versioned separately from the untouched DiskRecord v1 and payload layout.
@@ -93,6 +91,10 @@ pub struct ControlState {
     pub control_schema_version: u32,
     pub store_id: Uuid,
     pub committed_generation: Generation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_ledger_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_lineage_version: Option<u32>,
 }
 
 impl ControlState {
@@ -191,6 +193,11 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    GraphChanged {
+        edges_put: usize,
+        edges_removed: usize,
+        memories_removed: usize,
+    },
     SchemaMigrated {
         #[serde(rename = "migrationId")]
         migration_id: Uuid,
@@ -292,15 +299,25 @@ pub(crate) fn validate_existing(
             .ok_or_else(|| StorageError::InvalidControl("missing control state".into()))?
             .value(),
     )?;
+    let ancestry = super::lineage::read_lineage(tx, &state)?;
     super::canonical_schema::read_state(tx, &state)?;
     for entry in receipts.iter()? {
         let (key, value) = entry?;
         let (lineage, _, operation) = decode_scope(key.value())?;
         let stored = validate_receipt(value.value())?;
-        if lineage != state.store_id
+        let permitted_origin = if lineage == state.store_id {
+            stored.receipt.committed_generation <= state.committed_generation
+        } else {
+            ancestry.as_ref().is_some_and(|a| {
+                a.permits(GenerationRef {
+                    store_id: lineage,
+                    generation: stored.receipt.committed_generation,
+                })
+            })
+        };
+        if !permitted_origin
             || stored.receipt.store_id != lineage
             || operation != stored.receipt.operation_id.as_bytes()
-            || stored.receipt.committed_generation > state.committed_generation
         {
             return Err(StorageError::InvalidControl(
                 "receipt identity/generation disagrees with control".into(),
@@ -311,7 +328,10 @@ pub(crate) fn validate_existing(
         let (key, value) = entry?;
         let (lineage, scope, client_key) = decode_scope(key.value())?;
         let (receipt_lineage, receipt_scope, _) = decode_scope(value.value())?;
-        if lineage != state.store_id
+        if (lineage != state.store_id
+            && !ancestry
+                .as_ref()
+                .is_some_and(|a| a.ancestors.iter().any(|r| r.store_id == lineage)))
             || lineage != receipt_lineage
             || scope != receipt_scope
             || client_key.is_empty()
@@ -361,6 +381,8 @@ pub(crate) fn initialize(tx: &WriteTransaction) -> Result<(), StorageError> {
             control_schema_version: 1,
             store_id: Uuid::new_v4(),
             committed_generation: Generation::default(),
+            removal_ledger_version: None,
+            restore_lineage_version: None,
         };
         tx.open_table(CONTROL)?
             .insert("state", encode(&state)?.as_slice())?;

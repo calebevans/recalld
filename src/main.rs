@@ -97,6 +97,10 @@ enum Command {
         /// Legacy compatibility flag; restore requires an already stopped target
         #[arg(long)]
         no_stop_daemon: bool,
+
+        /// Restore into a fresh historical/read-only destination, excluded from serving
+        #[arg(long)]
+        historical: bool,
     },
 
     /// Run external benchmarks (LoCoMo, etc.)
@@ -296,7 +300,8 @@ async fn async_main(cli: Cli) -> ExitCode {
             from,
             force,
             no_stop_daemon,
-        } => run_restore_command(loaded.config, from, force, no_stop_daemon).await,
+            historical,
+        } => run_restore_command(loaded.config, from, force, no_stop_daemon, historical).await,
         #[cfg(feature = "bench")]
         Command::Bench { target, format } => run_bench(loaded.config, target, &format).await,
     }
@@ -432,14 +437,17 @@ async fn run_serve(
             system.fts_index().clone(),
             system.entity_index().clone(),
         ));
-        let storage: Arc<dyn recalld::api::StorageEngine> = Arc::new(StorageEngineAdapter::new(
-            system.storage().clone(),
-            system.cache().clone(),
-            system.vector_index().clone(),
-            system.fts_index().clone(),
-            system.entity_index().clone(),
-            system.graph().clone(),
-        ));
+        let storage: Arc<dyn recalld::api::StorageEngine> = Arc::new(
+            StorageEngineAdapter::new(
+                system.storage().clone(),
+                system.cache().clone(),
+                system.vector_index().clone(),
+                system.fts_index().clone(),
+                system.entity_index().clone(),
+                system.graph().clone(),
+            )
+            .with_clock(system.clock().clone()),
+        );
         let cache: Arc<dyn recalld::api::RecordCache> =
             Arc::new(RecordCacheAdapter::new(system.cache().clone()));
         let graph: Arc<dyn recalld::api::RelationshipGraph> =
@@ -451,13 +459,21 @@ async fn run_serve(
                 system.cache().clone(),
                 Arc::new(system.config().clone()),
             ));
-        let decay: Arc<dyn recalld::api::FsrsEngine> = Arc::new(FsrsEngineAdapter::new(
-            system.storage().clone(),
-            system.cache().clone(),
-            system.graph().clone(),
-            Arc::new(system.config().clone()),
-            true,
-        ));
+        let decay: Arc<dyn recalld::api::FsrsEngine> = Arc::new(
+            FsrsEngineAdapter::new(
+                system.storage().clone(),
+                system.cache().clone(),
+                system.graph().clone(),
+                Arc::new(system.config().clone()),
+                true,
+            )
+            .with_indexes(
+                system.vector_index().clone(),
+                system.fts_index().clone(),
+                system.entity_index().clone(),
+            )
+            .with_clock(system.clock().clone()),
+        );
         let namespaces: Arc<dyn recalld::api::NamespaceRegistry> =
             Arc::new(NamespaceRegistryAdapter::new(system.storage().clone()));
         let metrics: Arc<dyn recalld::api::MetricsCollector> = Arc::new(NoopMetricsCollector);
@@ -555,17 +571,20 @@ fn create_direct_mcp_bridge(
         system.graph().clone(),
         tz,
     ));
-    let storage: Arc<dyn recalld::mcp::bridge::StorageEngine> = Arc::new(McpStorageAdapter::new(
-        system.storage().clone(),
-        system.cache().clone(),
-        system.embedding().clone(),
-        system.vector_index().clone(),
-        system.fts_index().clone(),
-        system.entity_index().clone(),
-        system.graph().clone(),
-        std::sync::Arc::new(system.config().clone()),
-        tz,
-    ));
+    let storage: Arc<dyn recalld::mcp::bridge::StorageEngine> = Arc::new(
+        McpStorageAdapter::new(
+            system.storage().clone(),
+            system.cache().clone(),
+            system.embedding().clone(),
+            system.vector_index().clone(),
+            system.fts_index().clone(),
+            system.entity_index().clone(),
+            system.graph().clone(),
+            std::sync::Arc::new(system.config().clone()),
+            tz,
+        )
+        .with_clock(system.clock().clone()),
+    );
     let namespaces: Arc<dyn recalld::mcp::bridge::NamespaceRegistry> =
         Arc::new(McpNamespaceAdapter::new(
             system.storage().clone(),
@@ -750,6 +769,7 @@ async fn run_restore_command(
     backup_path: std::path::PathBuf,
     force: bool,
     no_stop_daemon: bool,
+    historical: bool,
 ) -> ExitCode {
     use recalld::backup::{RestoreOptions, restore_from_backup};
 
@@ -760,6 +780,7 @@ async fn run_restore_command(
         data_dir,
         force,
         no_stop_daemon,
+        historical,
     };
 
     match restore_from_backup(opts).await {
@@ -767,9 +788,15 @@ async fn run_restore_command(
             eprintln!();
             eprintln!("Restore completed successfully");
             eprintln!();
-            eprintln!("Next steps:");
-            eprintln!("  1. Start the daemon: recalld daemon start");
-            eprintln!("  2. Verify data: recalld daemon status");
+            if historical {
+                eprintln!("Historical/read-only destination; ordinary serving is blocked.");
+                eprintln!(
+                    "Deletion coverage is through the available snapshot; later coverage is unknown."
+                );
+            } else {
+                eprintln!("Retained removal evidence applied; restored store has a new lineage.");
+                eprintln!("Start the daemon when ready: recalld daemon start");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
