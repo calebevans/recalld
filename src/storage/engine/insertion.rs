@@ -34,12 +34,12 @@ impl RedbStorageEngine {
             sampled_at,
             embedding,
             &edges,
-            |namespace, record| {
+            |namespace, record, normalized| {
                 let store = vectors
                     .get_mut(namespace.id)
                     .ok_or(StorageError::NamespaceNotFound(namespace.id.get()))?;
                 staging_started = true;
-                record.vector_slot = store.insert_vector(embedding)?;
+                record.vector_slot = store.insert_vector(normalized)?;
                 if let Some(value) = &input.full_text {
                     let reference = text.append(value)?;
                     record.text_offset = reference.file_offset;

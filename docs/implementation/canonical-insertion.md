@@ -27,8 +27,8 @@ new insertion cannot normally form a cycle because its UUID must be new.
 Legacy retained parent/old-version identities remain valid structural targets,
 including retained Ghost/Tombstone targets. The new child/replacement is Full.
 
-Finite vectors of the namespace dimension (1–8192), finite positive stability,
-representable timestamps and valid content are required before generating a
+Finite, nonzero vectors of the namespace dimension (1–8192), finite positive
+stability, representable timestamps and valid content are required before generating a
 UUID or allocating payloads. Text/vector bytes are staged and synced before
 metadata commits references. Final configuration is read inside the transaction,
 so provider work cannot authorize a stale namespace, resolved default or edge
@@ -175,3 +175,49 @@ store/daemon, provider credentials, networked runtime tests, push or deployment
 was used. Dependent tombstone work may generalize the internal
 `CommittedInsertion` variant to `CommittedMutation` without changing this wire
 shape or dropping receipts.
+
+
+## Publication review correction: vector boundary
+
+Review reproduced an actual defect in `bfb4c85`: both supplied and generated
+zero vectors committed. The two added no-mutation regressions failed against
+that source (`.validation/zero-before.log`). The initial validation above did
+not establish this missing invariant; publication was held for this correction.
+
+`embedding::validation::normalize_vector` now owns the pure shared boundary:
+length 1–8192 matching namespace, finite values, positive norm, unit normalization.
+It uses the f64 accumulation/division algorithm already present in the separate
+PR28 explicit-query implementation (`f022127`), without importing that stack.
+Huygens's provider/profile child will consume this helper; it does not infer
+provenance from dimensions or activate schema-v2 serving.
+
+Final metadata validation runs after replay and reads the canonical namespace
+before UUID generation or payload allocation. It transforms a copy of the chosen
+raw vector, then passes only that normalized slice to staging. Original supplied
+float bits stay in `InsertMemory` and the request hash: scaled `[1,0,...]` and
+`[2,0,...]` vectors conflict under the same key even though their normalized bytes
+match, and signed zero remains distinct caller intent. Generated output remains
+outside the hash; a valid replay skips a newly invalid provider result.
+
+HTTP single/batch and MCP consumers retain both the original raw vector and a
+normalized working copy for advisory/autolinking. They pass the raw generated
+vector to final insertion, so advisory and persisted bytes each come from one
+identical transform, not two normalizations. A real adapter regression uses a
+vector whose second normalization changes a float bit, for both input origins.
+The existing legacy batch envelope still reports indexed item failures; this
+correction does not implement the catalog-manifest/v2 batch protocol.
+
+Bad supplied vectors are invalid input (HTTP 422). Bad generated vectors use
+`ProviderVectorUnavailable` (HTTP 503), including provider shape/invalid-response
+errors, without poisoning storage or requiring reopen. MCP preserves
+`BridgeError::Unavailable`; daemon code `-32008` preserves that category across
+the socket conversion. `-32007` is reserved by the independent namespace-assertion
+stack and is not reused. No payload/provider secret enters any receipt.
+
+Correction tests cover both origins for zero/signed-zero, nonfinite and wrong
+length vectors with unchanged files, rows, receipts and generation; `[3,4,...]`
+normalization; f32 extrema/subnormals; stable raw hash identity; replay-before-
+provider-validation; actual HTTP/MCP error categories and daemon roundtrip; and
+identical canonical/index bytes with the double-rounding fixture. Lifecycle
+fixtures now use nonzero vectors at the actual insertion boundary, while their
+phase/content assertions remain unchanged.

@@ -129,7 +129,7 @@ fn caller_identity_bits_conflicts_and_preallocation_rejections() {
     let mut input = request();
     input.id = Some(MemoryId::new());
     input.created_at = Some(0);
-    input.embedding = Some(vec![0.; DIM]);
+    input.embedding = Some(vec![1., 0., 0., 0.]);
     let ctx = context(&engine, "caller");
     let receipt = engine
         .insert_memory_with_receipt(&ctx, &input, &[], 999)
@@ -141,7 +141,7 @@ fn caller_identity_bits_conflicts_and_preallocation_rejections() {
     let baseline = payloads(&engine);
     let before = generation(&engine);
     let mut changed = input.clone();
-    changed.embedding.as_mut().unwrap()[0] = -0.0;
+    changed.embedding.as_mut().unwrap()[1] = -0.0;
     assert!(matches!(
         engine.insert_memory_with_receipt(&ctx, &changed, &[], 999),
         Err(StorageError::IdempotencyConflict)
@@ -629,4 +629,128 @@ async fn insertion_uses_canonical_target_after_preflight_and_retains_structural_
         engine.get_record(old).unwrap().unwrap().phase,
         crate::model::DecayPhase::Tombstone
     );
+}
+
+fn reject_zero_insertion(supplied: bool) {
+    let f = Fixture::new();
+    let mut engine = f.storage.write().unwrap();
+    let mut input = request();
+    input.embedding = supplied.then(|| vec![0.; DIM]);
+    let ctx = context(&engine, "zero");
+    let bytes = payloads(&engine);
+    let before = generation(&engine);
+    let error = engine.insert_memory_with_receipt(&ctx, &input, &[0.; DIM], 123);
+    let error = error.expect_err("zero-norm insertion must fail");
+    assert!(
+        if supplied {
+            matches!(error, StorageError::InvalidMutation(_))
+        } else {
+            matches!(error, StorageError::ProviderVectorUnavailable(_))
+        },
+        "{error}"
+    );
+    assert_eq!(generation(&engine), before);
+    assert_eq!(payloads(&engine), bytes);
+    assert!(engine.scan_all().unwrap().is_empty());
+    assert!(engine.lookup_insert_replay(&ctx, &input).unwrap().is_none());
+}
+
+#[test]
+fn insertion_rejects_zero_supplied_without_mutation() {
+    reject_zero_insertion(true);
+}
+
+#[test]
+fn insertion_rejects_zero_generated_without_mutation() {
+    reject_zero_insertion(false);
+}
+
+#[test]
+fn insertion_vector_boundary_normalizes_both_origins_and_preserves_request_identity() {
+    for supplied in [false, true] {
+        let f = Fixture::new();
+        let mut engine = f.storage.write().unwrap();
+        for (index, raw) in [
+            vec![3., 4., 0., 0.],
+            vec![f32::MAX, f32::MAX, 0., 0.],
+            vec![f32::from_bits(1), 0., 0., 0.],
+            vec![1., 0., 0., 0.],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut input = request();
+            input.embedding = supplied.then(|| raw.clone());
+            let ctx = context(&engine, &format!("normalized{index}"));
+            let receipt = engine
+                .insert_memory_with_receipt(&ctx, &input, &raw, 123)
+                .unwrap();
+            let id = crate::storage::insertion::inserted_id(&receipt).unwrap();
+            let slot = engine.get_record(id).unwrap().unwrap().vector_slot;
+            let persisted = engine
+                .get_vector(NamespaceId::new(1), slot)
+                .unwrap()
+                .unwrap();
+            let norm: f64 = persisted.iter().map(|&v| f64::from(v).powi(2)).sum();
+            assert!((norm - 1.).abs() < 1e-6, "{persisted:?}");
+            if index == 0 {
+                assert_eq!(persisted, vec![0.6, 0.8, 0., 0.]);
+            }
+            let bytes = payloads(&engine);
+            assert_eq!(
+                engine
+                    .insert_memory_with_receipt(&ctx, &input, &[0.; DIM], i64::MAX)
+                    .unwrap()
+                    .operation_id,
+                receipt.operation_id
+            );
+            assert_eq!(payloads(&engine), bytes);
+            if supplied && (index == 0 || index == 3) {
+                let mut changed = input.clone();
+                changed.embedding = Some(if index == 0 {
+                    vec![6., 8., 0., 0.]
+                } else {
+                    vec![2., 0., 0., 0.]
+                });
+                assert!(
+                    matches!(
+                        engine.insert_memory_with_receipt(&ctx, &changed, &[], 123),
+                        Err(StorageError::IdempotencyConflict)
+                    ),
+                    "normalized-equivalent caller bytes must not alias"
+                );
+            }
+        }
+        let bytes = payloads(&engine);
+        let before = generation(&engine);
+        for (index, invalid) in [
+            vec![0.; DIM],
+            vec![-0.; DIM],
+            vec![f32::NAN; DIM],
+            vec![f32::INFINITY; DIM],
+            vec![1.; DIM - 1],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut input = request();
+            input.embedding = supplied.then(|| invalid.clone());
+            let ctx = context(&engine, &format!("invalid-vector{index}"));
+            let error = engine
+                .insert_memory_with_receipt(&ctx, &input, &invalid, 123)
+                .unwrap_err();
+            assert!(
+                if supplied {
+                    matches!(error, StorageError::InvalidMutation(_))
+                } else {
+                    matches!(error, StorageError::ProviderVectorUnavailable(_))
+                },
+                "{error}"
+            );
+            assert_eq!(generation(&engine), before);
+            assert_eq!(payloads(&engine), bytes);
+            assert!(engine.lookup_insert_replay(&ctx, &input).unwrap().is_none());
+            assert!(engine.ensure_available().is_ok());
+        }
+    }
 }

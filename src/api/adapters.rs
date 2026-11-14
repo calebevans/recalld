@@ -1452,6 +1452,58 @@ mod tests {
     use crate::test_support::{DIM, Fixture, MemorySpec};
 
     #[tokio::test]
+    async fn insertion_http_boundary_distinguishes_provider_unavailable_from_caller_invalid() {
+        use axum::response::IntoResponse;
+        let fx = Fixture::new();
+        for supplied in [false, true] {
+            let input = crate::storage::insertion::InsertMemory {
+                id: None,
+                summary: "vector boundary".into(),
+                full_text: None,
+                tags: vec![],
+                initial_stability: None,
+                created_at: None,
+                embedding: supplied.then(|| vec![0.; DIM]),
+                parent_id: None,
+                supersedes: None,
+            };
+            let before = fx
+                .storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation;
+            let error = match adapter(&fx)
+                .insert_memory(NamespaceId::new(1), input, vec![0.; DIM])
+                .await
+            {
+                Ok(_) => panic!("zero vector accepted"),
+                Err(error) => error,
+            };
+            let response = super::super::errors::AppError::from(error).into_response();
+            assert_eq!(
+                response.status(),
+                if supplied {
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY
+                } else {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            );
+            assert_eq!(
+                fx.storage
+                    .read()
+                    .unwrap()
+                    .control_state()
+                    .unwrap()
+                    .committed_generation,
+                before
+            );
+            assert!(fx.storage.read().unwrap().scan_all().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn actual_http_insertion_adapter_reports_durable_receipt_if_publication_fails() {
         use axum::response::IntoResponse;
         let fx = Fixture::new();

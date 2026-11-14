@@ -1370,7 +1370,7 @@ mod tests {
                 "initial valid summary",
                 Some("only retained text"),
                 &[],
-                &[0.0; DIM],
+                &[1., 0., 0., 0.],
                 Some(1.0),
                 None,
             )
@@ -1750,7 +1750,7 @@ mod independent_review_regressions {
                 "retained summary",
                 Some("retained full text"),
                 &["retained".into()],
-                &[0.; 4],
+                &[1., 0., 0., 0.],
                 Some(1.),
                 None,
             )
