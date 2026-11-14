@@ -454,3 +454,31 @@ async fn interrupted_import_resumes_checksummed_chunks_without_duplicate_logical
         assert_eq!(std::fs::read(&export).unwrap(), export_bytes);
     }
 }
+
+#[tokio::test]
+async fn insufficient_staging_space_rejects_before_stage_or_source_mutation() {
+    let (root, _) = fixture().await;
+    let source = root.path().join("source");
+    let before = file_bytes(&source);
+    let input = root.path().join("export.jsonl");
+    export_store(&source, &input).unwrap();
+    let exported = std::fs::read(&input).unwrap();
+    let target = root.path().join("insufficient-space");
+    TEST_AVAILABLE_SPACE.with(|v| v.set(Some(0)));
+    let error = import_store(&input, &target).unwrap_err();
+    assert!(
+        error.to_string().contains("insufficient staging space"),
+        "{error}"
+    );
+    assert!(!target.exists());
+    assert!(!std::fs::read_dir(root.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".recalld-import-")
+    }));
+    assert_eq!(std::fs::read(&input).unwrap(), exported);
+    assert_eq!(file_bytes(&source), before);
+    import_store(&input, &target).unwrap();
+}
