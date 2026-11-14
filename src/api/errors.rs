@@ -50,7 +50,9 @@ pub enum AppError {
     },
 
     /// 409 -- Explicit by-ID namespace assertion failed.
-    NamespaceMismatch { message: String },
+    NamespaceMismatch {
+        message: String,
+    },
 
     /// 422 -- Semantically invalid request (e.g. dimension mismatch,
     /// mutually exclusive fields both provided).

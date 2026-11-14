@@ -7,6 +7,35 @@ use crate::model::{AccessKind, MemoryId, NamespaceId};
 use crate::storage::control::{MutationContext, WriteReceipt};
 use crate::storage::{RedbStorageEngine, StorageEngine, StorageError};
 
+/// Internal result: receipts survive every admission check before a transport
+/// releases the value. This is deliberately not a serialized success envelope.
+pub(crate) struct Observed<T> {
+    pub value: T,
+    pub receipts: Vec<WriteReceipt>,
+}
+
+impl<T> Observed<T> {
+    pub fn unobserved(value: T) -> Self {
+        Self {
+            value,
+            receipts: Vec::new(),
+        }
+    }
+
+    pub fn finish<E>(self, admission: Result<(), E>) -> Result<T, E>
+    where
+        E: From<ObservationError> + std::fmt::Debug,
+    {
+        match admission {
+            Ok(()) => Ok(self.value),
+            Err(error) if self.receipts.is_empty() => Err(error),
+            Err(error) => {
+                Err(ObservationError::not_ready(self.receipts, format!("{error:?}")).into())
+            }
+        }
+    }
+}
+
 /// Payload-free failure, including preceding namespace commits. Never present
 /// a failed multi-namespace observation as an ordinary safely retryable write.
 #[derive(Debug, Clone, serde::Serialize, thiserror::Error)]
@@ -21,6 +50,12 @@ pub struct ObservationError {
 }
 
 impl ObservationError {
+    /// A completed exposure cannot become an ordinary retryable read failure.
+    /// Retain the original numerical/ID receipts, never the selected payload.
+    pub(crate) fn not_ready(receipts: Vec<WriteReceipt>, source: impl std::fmt::Display) -> Self {
+        Self::failed(format!("INDEX_NOT_READY: {source}"), receipts)
+    }
+
     pub(super) fn worker_failed(error: impl std::fmt::Display) -> Self {
         Self {
             commit_state: "unknown",
@@ -84,6 +119,16 @@ pub async fn record_exposures(
     accesses: Vec<(MemoryId, AccessKind)>,
     sampled_at: i64,
 ) -> Result<Vec<WriteReceipt>, ObservationError> {
+    record_exposures_scoped(storage, cache, accesses, sampled_at, None).await
+}
+
+pub async fn record_exposures_scoped(
+    storage: Arc<RwLock<RedbStorageEngine>>,
+    cache: Arc<CacheManager>,
+    accesses: Vec<(MemoryId, AccessKind)>,
+    sampled_at: i64,
+    scope: Option<crate::storage::control::ExposureScope>,
+) -> Result<Vec<WriteReceipt>, ObservationError> {
     if accesses.is_empty() {
         return Ok(Vec::new());
     }
@@ -91,7 +136,7 @@ pub async fn record_exposures(
         let storage = storage
             .write()
             .map_err(|e| ObservationError::failed(e, vec![]))?;
-        let result = record_locked(&storage, &accesses, sampled_at);
+        let result = record_locked_scoped(&storage, &accesses, sampled_at, scope.as_ref());
         let receipts = match &result {
             Ok(r) => r,
             Err(e) => &e.receipts,
@@ -109,16 +154,21 @@ pub async fn record_exposures(
             }
             return Err(publication);
         }
+        #[cfg(test)]
+        if result.as_ref().is_ok_and(|r| !r.is_empty()) {
+            storage.meta_store().after_observation_probe();
+        }
         result
     })
     .await
     .map_err(ObservationError::worker_failed)?
 }
 
-fn record_locked(
+fn record_locked_scoped(
     storage: &RedbStorageEngine,
     accesses: &[(MemoryId, AccessKind)],
     sampled_at: i64,
+    scope: Option<&crate::storage::control::ExposureScope>,
 ) -> Result<Vec<WriteReceipt>, ObservationError> {
     // First occurrence order within each namespace; namespace order ascending.
     // Direct exposure dominates an additional associative occurrence.
@@ -153,10 +203,11 @@ fn record_locked(
     }
     let mut receipts = Vec::new();
     for (namespace, batch) in groups {
-        match storage.record_exposure_batch(
+        match storage.meta_store().record_exposure_batch_scoped(
             &MutationContext::unkeyed(NamespaceId::new(namespace)),
             &batch,
             sampled_at,
+            scope,
         ) {
             Ok(Some(receipt)) => receipts.push(receipt),
             Ok(None) => {}
@@ -169,3 +220,12 @@ fn record_locked(
 #[cfg(test)]
 #[path = "observation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+fn record_locked(
+    storage: &RedbStorageEngine,
+    accesses: &[(MemoryId, AccessKind)],
+    sampled_at: i64,
+) -> Result<Vec<WriteReceipt>, ObservationError> {
+    record_locked_scoped(storage, accesses, sampled_at, None)
+}

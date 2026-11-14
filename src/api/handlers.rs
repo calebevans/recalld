@@ -5,6 +5,7 @@
 //! the same pattern: extract, validate, delegate to subsystem, convert
 //! result, respond.
 
+use crate::decay::observation::Observed;
 use std::time::Instant;
 
 use axum::{
@@ -19,6 +20,7 @@ use super::errors::AppError;
 use super::models::*;
 use super::state::{AppState, QueryInput, SearchQuery};
 use crate::health::report as health_report_compute;
+use crate::model::DecayPhase;
 use crate::model::constants::{
     EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, MAX_BATCH_MEMORIES, TOPIC_TAG_PREFIX,
 };
@@ -374,20 +376,16 @@ pub async fn get_memory(
     Query(options): Query<GetMemoryQuery>,
 ) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
     let stamp = state.storage.effects_stamp().await?;
-    let result = get_memory_admitted(State(state.clone()), Path(id), Query(options)).await;
-    if state.storage.effects_stamp().await? != stamp {
-        return Err(AppError::ServiceUnavailable {
-            message: "graph effects changed during query; retry".into(),
-        });
-    }
-    result
+    let observed = get_memory_admitted(State(state.clone()), Path(id), Query(options), stamp).await;
+    observed?.finish(check_read_admission(&state, stamp).await)
 }
 
 async fn get_memory_admitted(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(options): Query<GetMemoryQuery>,
-) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
+    admitted_stamp: u64,
+) -> Result<Observed<Json<ApiResponse<MemoryResponse>>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
@@ -415,27 +413,37 @@ async fn get_memory_admitted(
         id: id.clone(),
     })?;
 
-    // Record access for decay tracking
-    if options.record_access {
-        state
-            .decay
-            .record_access(memory_id, AccessKind::DirectRetrieval)
-            .await;
-    }
-
     let ns_name = state
         .namespaces
         .name_for(record.namespace_id)
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut response = MemoryResponse::from_cached(&record, ns_name);
-    response.full_text = state.storage.get_full_text(memory_id).await.unwrap_or(None);
+    response.full_text = state.storage.get_full_text(memory_id).await?;
+    check_read_admission(&state, admitted_stamp).await?;
+    let receipts = if options.record_access && record.phase != DecayPhase::Tombstone {
+        state
+            .search
+            .record_exposures(
+                &[(memory_id, AccessKind::DirectRetrieval)],
+                crate::storage::control::ExposureScope {
+                    namespace: response.namespace.clone(),
+                    source: Some(memory_id),
+                },
+            )
+            .await?
+    } else {
+        Vec::new()
+    };
     let took = start.elapsed().as_micros() as u64;
 
-    Ok(Json(ApiResponse {
-        data: response,
-        took_us: Some(took),
-    }))
+    Ok(Observed {
+        receipts,
+        value: Json(ApiResponse {
+            data: response,
+            took_us: Some(took),
+        }),
+    })
 }
 
 /// DELETE /memories/:id -- delete a memory.
@@ -555,6 +563,7 @@ pub async fn reinforce_memory(
 fn feedback_error(error: Box<dyn std::error::Error + Send + Sync>, id: &str) -> AppError {
     use crate::decay::lifecycle::LifecycleError;
     match error.downcast_ref::<LifecycleError>() {
+        Some(LifecycleError::Observation(error)) => AppError::Observation(error.clone()),
         Some(LifecycleError::NamespaceMismatch(_)) => AppError::NamespaceMismatch {
             message: error.to_string(),
         },
@@ -819,19 +828,15 @@ pub async fn search_memories(
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
     let stamp = state.storage.effects_stamp().await?;
-    let result = search_memories_admitted(State(state.clone()), Json(req)).await;
-    if state.storage.effects_stamp().await? != stamp {
-        return Err(AppError::ServiceUnavailable {
-            message: "graph effects changed during query; retry".into(),
-        });
-    }
-    result
+    let observed = search_memories_admitted(State(state.clone()), Json(req), stamp).await;
+    observed?.finish(check_read_admission(&state, stamp).await)
 }
 
 async fn search_memories_admitted(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
-) -> Result<Json<SearchResponse>, AppError> {
+    admitted_stamp: u64,
+) -> Result<Observed<Json<SearchResponse>>, AppError> {
     let start = Instant::now();
 
     // Validate: need at least one search signal
@@ -908,7 +913,7 @@ async fn search_memories_admitted(
         entities: req.entities.clone(),
     };
 
-    let results = state.search.search(search_query).await?;
+    let results = state.search.prepare_search(search_query).await?;
 
     // Batch-load embeddings with a single lock acquisition if requested.
     let embeddings = if req.include_embeddings {
@@ -920,17 +925,37 @@ async fn search_memories_admitted(
 
     // Convert to API response, loading full_text from storage
     let mut hits: Vec<SearchHit> = Vec::with_capacity(results.len());
+    let mut exposures = Vec::new();
     for r in results {
-        let ns_name = state
-            .namespaces
-            .name_for(r.memory.namespace_id)
-            .unwrap_or_else(|| "unknown".to_string());
-        let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
-        mem.full_text = state
-            .storage
-            .get_full_text(r.memory.id)
-            .await
-            .unwrap_or(None);
+        exposures.push((r.memory.id, r.access_kind));
+        let canonical =
+            state
+                .storage
+                .get_record(r.memory.id)
+                .await
+                .ok_or_else(|| AppError::NotFound {
+                    resource: "memory",
+                    id: r.memory.id.to_string(),
+                })?;
+        if canonical.namespace_id != ns.id.get()
+            || matches!(canonical.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
+        {
+            return Err(AppError::ServiceUnavailable {
+                message: "search result changed during hydration".into(),
+            });
+        }
+        let mut mem = MemoryResponse::from_cached(
+            &crate::model::CachedRecord::from(&canonical),
+            ns.name.clone(),
+        );
+        if canonical.schema.as_ref().is_some_and(|s| {
+            s.lifecycle.lifecycle_version
+                == crate::model::schema::LifecycleVersion::ExplicitFeedbackV2
+        }) {
+            mem.strength = r.memory.strength;
+            mem.decay_strength = r.memory.decay_strength;
+        }
+        mem.full_text = state.storage.get_full_text(r.memory.id).await?;
         if req.include_embeddings {
             mem.embedding = embeddings.get(&r.memory.id).cloned();
         }
@@ -940,14 +965,32 @@ async fn search_memories_admitted(
         });
     }
 
+    check_read_admission(&state, admitted_stamp).await?;
+    let receipts = if req.record_access {
+        state
+            .search
+            .record_exposures(
+                &exposures,
+                crate::storage::control::ExposureScope {
+                    namespace: ns.name.clone(),
+                    source: None,
+                },
+            )
+            .await?
+    } else {
+        Vec::new()
+    };
     let total = hits.len() as u64;
     let took = start.elapsed().as_micros() as u64;
 
-    Ok(Json(SearchResponse {
-        hits,
-        total,
-        took_us: Some(took),
-    }))
+    Ok(Observed {
+        receipts,
+        value: Json(SearchResponse {
+            hits,
+            total,
+            took_us: Some(took),
+        }),
+    })
 }
 
 /// POST /similar/:id -- find memories similar to an existing memory.
@@ -964,13 +1007,8 @@ pub async fn find_similar(
     Json(req): Json<FindSimilarRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
     let stamp = state.storage.effects_stamp().await?;
-    let result = find_similar_admitted(State(state.clone()), Path(id), Json(req), stamp).await;
-    if state.storage.effects_stamp().await? != stamp {
-        return Err(AppError::ServiceUnavailable {
-            message: "graph effects changed during query; retry".into(),
-        });
-    }
-    result
+    let observed = find_similar_admitted(State(state.clone()), Path(id), Json(req), stamp).await;
+    observed?.finish(check_read_admission(&state, stamp).await)
 }
 
 async fn find_similar_admitted(
@@ -978,7 +1016,7 @@ async fn find_similar_admitted(
     Path(id): Path<String>,
     Json(req): Json<FindSimilarRequest>,
     admitted_stamp: u64,
-) -> Result<Json<SearchResponse>, AppError> {
+) -> Result<Observed<Json<SearchResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
@@ -1051,19 +1089,36 @@ async fn find_similar_admitted(
             message: "graph effects changed during query; retry".into(),
         });
     }
-    if req.record_access {
+    let receipts = if req.record_access {
         let ids: Vec<_> = hits.iter().map(|hit| hit.memory.id).collect();
-        state.search.record_similar_accesses(&ids).await?;
-    }
+        state
+            .search
+            .record_similar_accesses(
+                &ids,
+                crate::storage::control::ExposureScope {
+                    namespace: hits
+                        .first()
+                        .map(|h| h.memory.namespace.clone())
+                        .unwrap_or_default(),
+                    source: Some(memory_id),
+                },
+            )
+            .await?
+    } else {
+        Vec::new()
+    };
 
     let total = hits.len() as u64;
     let took = start.elapsed().as_micros() as u64;
 
-    Ok(Json(SearchResponse {
-        hits,
-        total,
-        took_us: Some(took),
-    }))
+    Ok(Observed {
+        receipts,
+        value: Json(SearchResponse {
+            hits,
+            total,
+            took_us: Some(took),
+        }),
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2019,3 +2074,12 @@ mod lifecycle_error_tests {
 #[cfg(test)]
 #[path = "validation_tests.rs"]
 mod validation_tests;
+
+async fn check_read_admission(state: &AppState, stamp: u64) -> Result<(), AppError> {
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query".into(),
+        });
+    }
+    Ok(())
+}

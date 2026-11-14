@@ -57,12 +57,14 @@ pub async fn reinforce(
         )?;
         plan_feedback(&record, &policy, now_millis, quality)?;
         let receipt = storage
-            .record_legacy_feedback(
+            .meta_store()
+            .record_legacy_feedback_scoped(
                 &crate::storage::control::MutationContext::unkeyed(namespace.id),
                 id,
                 quality,
                 now_millis,
                 global_multiplier,
+                Some(&namespace.name),
             )
             .map_err(|e| super::observation::ObservationError::storage(e, vec![]))?;
         super::observation::publish(&storage, std::slice::from_ref(&receipt), || {

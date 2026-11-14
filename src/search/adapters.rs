@@ -499,18 +499,27 @@ impl StorageAccessRecorder {
 
 #[async_trait]
 impl AccessRecorder for StorageAccessRecorder {
-    async fn record_access(&self, id: MemoryId, kind: AccessKind) -> Result<()> {
-        self.record_access_batch(&[(id, kind)]).await
+    async fn record_access(
+        &self,
+        id: MemoryId,
+        kind: AccessKind,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
+        self.record_access_batch(&[(id, kind)], None).await
     }
-    async fn record_access_batch(&self, accesses: &[(MemoryId, AccessKind)]) -> Result<()> {
-        crate::decay::observation::record_exposures(
+    async fn record_access_batch(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+        scope: Option<&crate::storage::control::ExposureScope>,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
+        crate::decay::observation::record_exposures_scoped(
             self.storage.clone(),
             self.cache.clone(),
             accesses.to_vec(),
             self.clock.now_millis(),
+            scope.cloned(),
         )
-        .await?;
-        Ok(())
+        .await
+        .map_err(Into::into)
     }
 }
 

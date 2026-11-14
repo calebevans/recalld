@@ -2763,17 +2763,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a4_mcp_get_does_not_change_the_record() {
+    async fn a4_mcp_get_false_is_unchanged_and_default_observes_once() {
         let fixture = crate::test_support::Fixture::new();
         let id = fixture.insert_memory().await;
         let mut bridge = crate::test_support::StubBridge::default().into_bridge();
         bridge.storage = std::sync::Arc::new(fixture.storage_adapter());
         let before = format!("{:?}", fixture.record(id).unwrap());
         for _ in 0..2 {
-            let result = dispatch_tool(&bridge, "get_memory", json!({"id": id.to_string()})).await;
+            let result = dispatch_tool(
+                &bridge,
+                "get_memory",
+                json!({"id": id.to_string(), "recordAccess": false}),
+            )
+            .await;
             assert_ne!(result.is_error, Some(true));
             assert_eq!(before, format!("{:?}", fixture.record(id).unwrap()));
         }
+        let count = fixture.record(id).unwrap().access_history.len();
+        let result = dispatch_tool(&bridge, "get_memory", json!({"id": id.to_string()})).await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(fixture.record(id).unwrap().access_history.len(), count + 1);
     }
 
     #[test]

@@ -42,6 +42,14 @@ pub trait SearchPipeline: Send + Sync {
 
     /// Execute a search query, returning scored results.
     async fn search(&self, query: SearchQuery) -> Result<Vec<ResolvedSearchResult>, SearchError>;
+    async fn prepare_search(
+        &self,
+        _query: SearchQuery,
+    ) -> Result<Vec<ResolvedSearchResult>, SearchError> {
+        Err(SearchError::Unavailable(
+            "prepared search unavailable".into(),
+        ))
+    }
 
     async fn find_similar(
         &self,
@@ -66,7 +74,11 @@ pub trait SearchPipeline: Send + Sync {
     }
 
     /// Record the final, fully hydrated similarity result IDs exactly once.
-    async fn record_similar_accesses(&self, _ids: &[MemoryId]) -> Result<(), SearchError> {
+    async fn record_similar_accesses(
+        &self,
+        _ids: &[MemoryId],
+        _scope: crate::storage::control::ExposureScope,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, SearchError> {
         Err(SearchError::Internal(
             "similarity exposure unavailable".into(),
         ))
@@ -74,7 +86,8 @@ pub trait SearchPipeline: Send + Sync {
     async fn record_exposures(
         &self,
         accesses: &[(MemoryId, AccessKind)],
-    ) -> Result<(), SearchError>;
+        scope: crate::storage::control::ExposureScope,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, SearchError>;
 
     /// Find existing memories at or above `threshold` similarity to a
     /// pre-computed embedding, closest first, at most `limit` of them.
@@ -335,13 +348,19 @@ pub trait FsrsEngine: Send + Sync {
         &self,
         id: MemoryId,
         kind: AccessKind,
-    ) -> Result<(), crate::decay::observation::ObservationError> {
+    ) -> Result<
+        Vec<crate::storage::control::WriteReceipt>,
+        crate::decay::observation::ObservationError,
+    > {
         self.record_access_batch(&[(id, kind)]).await
     }
     async fn record_access_batch(
         &self,
         accesses: &[(MemoryId, AccessKind)],
-    ) -> Result<(), crate::decay::observation::ObservationError>;
+    ) -> Result<
+        Vec<crate::storage::control::WriteReceipt>,
+        crate::decay::observation::ObservationError,
+    >;
 
     /// Apply manual reinforcement with the given FSRS quality rating.
     async fn reinforce(

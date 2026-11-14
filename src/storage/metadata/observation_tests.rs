@@ -13,6 +13,7 @@ fn fixture() -> (tempfile::TempDir, MetadataStore, NamespaceId, [MemoryId; 2]) {
             .insert(
                 *id,
                 &DiskRecord {
+                    schema: None,
                     version: DiskRecord::CURRENT_VERSION,
                     id: *id.as_bytes(),
                     namespace_id: ns.get(),
@@ -709,4 +710,107 @@ fn observation_timestamps_fail_without_mutation_but_replay_ignores_current_clock
         }
         assert!(control::validate_receipt(&control::encode(&stored).unwrap()).is_err());
     }
+}
+
+#[test]
+fn final_transaction_decodes_namespace_and_rejects_unsupported_policy_without_writes() {
+    use crate::model::schema::{LifecycleVersion, NamespaceSchemaV2};
+    for mode in ["explicit", "requiredFeature", "legacySchema"] {
+        let (_dir, store, ns, [id, other]) = fixture();
+        // Simulate policy/schema changing after a successful preparation read.
+        let selected = store.get(id).unwrap().unwrap();
+        assert_eq!(selected.namespace_id, ns.get());
+        let mut policy = store.get_namespace(ns).unwrap().unwrap();
+        let mut schema = NamespaceSchemaV2::from_legacy();
+        if mode == "explicit" {
+            schema.lifecycle_version = LifecycleVersion::ExplicitFeedbackV2;
+        }
+        if mode == "requiredFeature" {
+            schema.required_features.push("unsupported-probe".into());
+        }
+        policy.schema = Some(schema);
+        {
+            let _guard = store.mutation_guard().unwrap();
+            let tx = store.db.begin_write().unwrap();
+            tx.open_table(NAMESPACE_TABLE)
+                .unwrap()
+                .insert(ns.get(), serde_json::to_vec(&policy).unwrap().as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let before = snapshot(&store, &[id, other]);
+        let ctx = MutationContext::unkeyed(ns);
+        for error in [
+            store
+                .record_exposure_batch(&ctx, &[(id, AccessKind::DirectRetrieval)], 100)
+                .unwrap_err(),
+            store
+                .record_legacy_feedback(&ctx, id, 3, 100, 1.0)
+                .unwrap_err(),
+        ] {
+            let expected = match mode {
+                "explicit" => "explicit-feedback",
+                "requiredFeature" => "unsupported namespace schema/features",
+                _ => "schema-v2 observation",
+            };
+            assert!(error.to_string().contains(expected), "{mode}: {error}");
+        }
+        assert_eq!(snapshot(&store, &[id, other]), before);
+    }
+}
+
+#[test]
+fn final_transaction_asserts_scope_and_unexposed_similarity_source() {
+    use crate::storage::control::ExposureScope;
+    let (_dir, store, ns, [source, returned]) = fixture();
+    let ctx = MutationContext::unkeyed(ns);
+    let before = snapshot(&store, &[source, returned]);
+    for scope in [
+        ExposureScope {
+            namespace: "foreign".into(),
+            source: Some(source),
+        },
+        ExposureScope {
+            namespace: "default".into(),
+            source: Some(MemoryId::new()),
+        },
+    ] {
+        assert!(
+            store
+                .record_exposure_batch_scoped(
+                    &ctx,
+                    &[(returned, AccessKind::AssociativeRetrieval)],
+                    100,
+                    Some(&scope)
+                )
+                .is_err()
+        );
+        assert_eq!(snapshot(&store, &[source, returned]), before);
+    }
+    assert!(
+        store
+            .record_legacy_feedback_scoped(&ctx, returned, 3, 100, 1.0, Some("foreign"))
+            .is_err()
+    );
+    assert_eq!(snapshot(&store, &[source, returned]), before);
+    let receipt = store
+        .record_exposure_batch_scoped(
+            &ctx,
+            &[(returned, AccessKind::AssociativeRetrieval)],
+            100,
+            Some(&ExposureScope {
+                namespace: "default".into(),
+                source: Some(source),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(receipt.outcome, MutationOutcome::ExposuresRecorded { accesses } if accesses.len() == 1 && accesses[0].memory_id == returned)
+    );
+    assert_eq!(store.get(source).unwrap().unwrap().access_history.len(), 0);
+    assert_eq!(
+        store.get(returned).unwrap().unwrap().access_history.len(),
+        1
+    );
 }

@@ -37,20 +37,21 @@ impl AccessRecorder for ObservedAccess {
         &self,
         id: MemoryId,
         kind: AccessKind,
-    ) -> Result<(), crate::search::SearchError> {
-        self.inner.record_access(id, kind).await?;
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, crate::search::SearchError> {
+        let receipts = self.inner.record_access(id, kind).await?;
         self.completed.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_one();
-        Ok(())
+        Ok(receipts)
     }
     async fn record_access_batch(
         &self,
         values: &[(MemoryId, AccessKind)],
-    ) -> Result<(), crate::search::SearchError> {
-        self.inner.record_access_batch(values).await?;
+        scope: Option<&crate::storage::control::ExposureScope>,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, crate::search::SearchError> {
+        let receipts = self.inner.record_access_batch(values, scope).await?;
         self.completed.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_one();
-        Ok(())
+        Ok(receipts)
     }
 }
 struct Harness {
@@ -61,6 +62,9 @@ struct Harness {
 }
 impl Harness {
     async fn new() -> Self {
+        Self::new_with_distinct_vectors(false).await
+    }
+    async fn new_with_distinct_vectors(distinct: bool) -> Self {
         let f = Fixture::new();
         let access = Arc::new(ObservedAccess {
             inner: StorageAccessRecorder::new(f.storage.clone(), f.cache.clone())
@@ -84,10 +88,15 @@ impl Harness {
             access.clone(),
         ));
         let mut ids = Vec::new();
-        for _ in 0..3 {
+        for i in 0..3 {
+            let vector = if distinct && i > 0 {
+                [0.8, 0.6, 0.0, 0.0]
+            } else {
+                VECTOR
+            };
             let id = f
                 .insert_memory_with(MemorySpec {
-                    embedding: Some(&VECTOR),
+                    embedding: Some(&vector),
                     tags: &["entity/fixture"],
                     ..MemorySpec::new(NamespaceId::new(1))
                 })
@@ -97,7 +106,7 @@ impl Harness {
                 .await
                 .add(
                     id,
-                    &VECTOR,
+                    &vector,
                     VectorMetadata {
                         namespace_id: NamespaceId::new(1),
                         decay_phase: 1,
@@ -812,7 +821,7 @@ async fn awaited_similarity_filters_before_single_exposure_and_false_skips_all_w
     for record_access in [false, true] {
         let hits = bridge
             .search
-            .find_similar(source, 10, Some(1.1), true, record_access)
+            .find_similar(source, 10, Some(1.1), true, record_access, None)
             .await
             .unwrap();
         assert!(hits.is_empty());
@@ -1377,3 +1386,6 @@ async fn similarity_rest_full_text_failure_rejects_without_exposure() {
         h.assert_quiet(&before).await;
     }
 }
+
+#[path = "observed_join_tests.rs"]
+mod observed_join_tests;

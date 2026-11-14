@@ -221,6 +221,7 @@ async fn actual_feedback_consumer_commits_one_receipt_and_invalidates_before_ret
         3,
         1.0,
         100,
+        None,
     )
     .await
     .unwrap();
@@ -247,6 +248,12 @@ async fn actual_feedback_consumer_commits_one_receipt_and_invalidates_before_ret
             crate::storage::control::validate_receipt(value.value())
                 .unwrap()
                 .receipt
+        })
+        .filter(|receipt| {
+            matches!(
+                receipt.outcome,
+                MutationOutcome::LegacyFeedbackRecorded { .. }
+            )
         })
         .collect();
     assert_eq!(receipts.len(), 1);

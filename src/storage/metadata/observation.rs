@@ -14,6 +14,16 @@ impl MetadataStore {
         accesses: &[(MemoryId, AccessKind)],
         sampled_at: i64,
     ) -> Result<Option<WriteReceipt>, StorageError> {
+        self.record_exposure_batch_scoped(ctx, accesses, sampled_at, None)
+    }
+
+    pub(crate) fn record_exposure_batch_scoped(
+        &self,
+        ctx: &MutationContext,
+        accesses: &[(MemoryId, AccessKind)],
+        sampled_at: i64,
+        scope: Option<&crate::storage::control::ExposureScope>,
+    ) -> Result<Option<WriteReceipt>, StorageError> {
         self.ensure_available()?;
         let namespace = legacy_scope(ctx)?;
         if accesses.is_empty() {
@@ -27,18 +37,32 @@ impl MetadataStore {
             return Ok(None);
         }
         let publication = self.mutation_guard()?;
-        let (tx, receipt) = self.prepare_exposures(&publication, ctx, accesses, sampled_at)?;
+        let (tx, receipt) =
+            self.prepare_exposures_scoped(&publication, ctx, accesses, sampled_at, scope)?;
         self.commit_observation(tx, &receipt)?;
         Ok(Some(receipt))
     }
 
+    #[cfg(test)]
     fn prepare_exposures(
+        &self,
+        publication: &std::sync::RwLockWriteGuard<'_, ()>,
+        ctx: &MutationContext,
+        accesses: &[(MemoryId, AccessKind)],
+        sampled_at: i64,
+    ) -> Result<(redb::WriteTransaction, WriteReceipt), StorageError> {
+        self.prepare_exposures_scoped(publication, ctx, accesses, sampled_at, None)
+    }
+
+    fn prepare_exposures_scoped(
         &self,
         _publication: &std::sync::RwLockWriteGuard<'_, ()>,
         ctx: &MutationContext,
         accesses: &[(MemoryId, AccessKind)],
         sampled_at: i64,
+        scope: Option<&crate::storage::control::ExposureScope>,
     ) -> Result<(redb::WriteTransaction, WriteReceipt), StorageError> {
+        self.effects_stamp()?;
         let namespace = legacy_scope(ctx)?;
         let mut seen = HashMap::new();
         let mut distinct = Vec::new();
@@ -69,17 +93,33 @@ impl MetadataStore {
             ));
         }
         let bytes = control::encode(&distinct)?;
-        let hash = control::request_hash(ctx, "record_exposure_batch", &[&bytes]);
+        let scope_bytes = scope.map(control::encode).transpose()?;
+        let hash = match scope_bytes.as_deref() {
+            Some(assertion) => {
+                control::request_hash(ctx, "record_exposure_batch", &[&bytes, assertion])
+            }
+            None => control::request_hash(ctx, "record_exposure_batch", &[&bytes]),
+        };
         let tx = self.db.begin_write()?;
         if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
             return Ok((tx, receipt));
         }
         validate_observation_time(sampled_at)?;
-        read_namespace(&tx, namespace)?;
+        let canonical_namespace = read_namespace(&tx, namespace)?;
+        if let Some(scope) = scope {
+            if canonical_namespace.name != scope.namespace {
+                return Err(StorageError::MutationNamespaceMismatch);
+            }
+            if let Some(source) = scope.source {
+                super::removal_ledger::ensure_insertable(&tx, source)?;
+                read_record(&tx.open_table(META_TABLE)?, source, namespace)?;
+            }
+        }
         let mut outcomes = Vec::with_capacity(distinct.len());
         {
             let mut table = tx.open_table(META_TABLE)?;
             for (id, kind) in distinct {
+                super::removal_ledger::ensure_insertable(&tx, id)?;
                 let mut record = read_record(&table, id, namespace)?;
                 // Legacy exposure still updates the decay anchor/history. A clock
                 // moving backwards must not overwrite a later canonical anchor.
@@ -120,20 +160,54 @@ impl MetadataStore {
         sampled_at: i64,
         global_multiplier: f64,
     ) -> Result<WriteReceipt, StorageError> {
+        self.record_legacy_feedback_scoped(ctx, id, quality, sampled_at, global_multiplier, None)
+    }
+
+    pub(crate) fn record_legacy_feedback_scoped(
+        &self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        quality: u8,
+        sampled_at: i64,
+        global_multiplier: f64,
+        expected_namespace: Option<&str>,
+    ) -> Result<WriteReceipt, StorageError> {
         let publication = self.mutation_guard()?;
-        let (tx, receipt) = self.prepare_feedback(
+        let (tx, receipt) = self.prepare_feedback_scoped(
             &publication,
             ctx,
             id,
             quality,
             sampled_at,
             global_multiplier,
+            expected_namespace,
         )?;
         self.commit_observation(tx, &receipt)?;
         Ok(receipt)
     }
 
+    #[cfg(test)]
     fn prepare_feedback(
+        &self,
+        publication: &std::sync::RwLockWriteGuard<'_, ()>,
+        ctx: &MutationContext,
+        id: MemoryId,
+        quality: u8,
+        sampled_at: i64,
+        global_multiplier: f64,
+    ) -> Result<(redb::WriteTransaction, WriteReceipt), StorageError> {
+        self.prepare_feedback_scoped(
+            publication,
+            ctx,
+            id,
+            quality,
+            sampled_at,
+            global_multiplier,
+            None,
+        )
+    }
+
+    fn prepare_feedback_scoped(
         &self,
         _publication: &std::sync::RwLockWriteGuard<'_, ()>,
         ctx: &MutationContext,
@@ -141,16 +215,29 @@ impl MetadataStore {
         quality: u8,
         sampled_at: i64,
         global_multiplier: f64,
+        expected_namespace: Option<&str>,
     ) -> Result<(redb::WriteTransaction, WriteReceipt), StorageError> {
         let namespace = legacy_scope(ctx)?;
-        let hash =
-            control::request_hash(ctx, "record_legacy_feedback", &[id.as_bytes(), &[quality]]);
+        let hash = match expected_namespace {
+            Some(name) => control::request_hash(
+                ctx,
+                "record_legacy_feedback",
+                &[id.as_bytes(), &[quality], name.as_bytes()],
+            ),
+            None => {
+                control::request_hash(ctx, "record_legacy_feedback", &[id.as_bytes(), &[quality]])
+            }
+        };
         let tx = self.db.begin_write()?;
         if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
             return Ok((tx, receipt));
         }
         validate_observation_time(sampled_at)?;
         let policy = read_namespace(&tx, namespace)?;
+        if expected_namespace.is_some_and(|name| name != policy.name) {
+            return Err(StorageError::MutationNamespaceMismatch);
+        }
+        super::removal_ledger::ensure_insertable(&tx, id)?;
         let mut record = read_record(&tx.open_table(META_TABLE)?, id, namespace)?;
         let resolved = crate::decay::lifecycle::resolve_policy(
             &policy,
@@ -222,10 +309,22 @@ fn read_namespace(
     let value = table
         .get(id.get())?
         .ok_or(StorageError::NamespaceNotFound(id.get()))?;
-    let ns: NamespaceConfig = serde_json::from_slice(value.value())
+    let ns = NamespaceConfig::decode(value.value())
         .map_err(|e| StorageError::Deserialize(e.to_string()))?;
     if ns.id != id {
         return Err(StorageError::MutationNamespaceMismatch);
+    }
+    if ns.schema.as_ref().is_some_and(|s| {
+        s.lifecycle_version == crate::model::schema::LifecycleVersion::ExplicitFeedbackV2
+    }) {
+        return Err(StorageError::InvalidMutation(
+            "explicit-feedback observation writer unavailable".into(),
+        ));
+    }
+    if ns.schema.is_some() {
+        return Err(StorageError::InvalidMutation(
+            "schema-v2 observation writer unavailable".into(),
+        ));
     }
     Ok(ns)
 }
@@ -246,6 +345,18 @@ fn read_record(
     }
     if record.namespace_id != ns.get() {
         return Err(StorageError::MutationNamespaceMismatch);
+    }
+    if record.schema.as_ref().is_some_and(|s| {
+        s.lifecycle.lifecycle_version == crate::model::schema::LifecycleVersion::ExplicitFeedbackV2
+    }) {
+        return Err(StorageError::InvalidMutation(
+            "explicit-feedback observation writer unavailable".into(),
+        ));
+    }
+    if record.schema.is_some() {
+        return Err(StorageError::InvalidMutation(
+            "schema-v2 observation writer unavailable".into(),
+        ));
     }
     if record.phase == DecayPhase::Tombstone {
         return Err(StorageError::NotFound(id.into_inner()));

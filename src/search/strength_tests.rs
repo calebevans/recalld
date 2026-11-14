@@ -157,10 +157,18 @@ impl RecordCache for NoSideEffects {
 }
 #[async_trait::async_trait]
 impl AccessRecorder for NoSideEffects {
-    async fn record_access(&self, _: MemoryId, _: AccessKind) -> Result<()> {
+    async fn record_access(
+        &self,
+        _: MemoryId,
+        _: AccessKind,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
         panic!("offline exposure")
     }
-    async fn record_access_batch(&self, _: &[(MemoryId, AccessKind)]) -> Result<()> {
+    async fn record_access_batch(
+        &self,
+        _: &[(MemoryId, AccessKind)],
+        _scope: Option<&crate::storage::control::ExposureScope>,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
         panic!("offline exposure batch")
     }
 }
@@ -971,7 +979,13 @@ async fn by_id_prepared_selection_preserves_original_true_intent_and_false_thres
     // hook; it must not repin a clock or reach the legacy recorder either.
     assert!(
         engine
-            .record_similar_accesses(&[f.ids[1]])
+            .record_similar_accesses(
+                &[f.ids[1]],
+                crate::storage::control::ExposureScope {
+                    namespace: "default".into(),
+                    source: Some(f.ids[0])
+                }
+            )
             .await
             .unwrap_err()
             .to_string()
