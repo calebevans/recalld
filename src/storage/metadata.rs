@@ -87,6 +87,16 @@ impl MetadataStore {
     /// - Creates all tables on first open.
     /// - Loads or rebuilds the phase index from persisted bitmaps.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        // redb's writable open changes bookkeeping. Refuse an offline v2 store
+        // using a disposable inspection copy, including direct metadata callers.
+        if path.try_exists()? && std::fs::metadata(path)?.len() > 0 {
+            let (_copy, inspection) = super::validation::inspect_database_copy(path, true)?;
+            if control::validate_existing(&inspection.begin_read()?)?
+                .is_some_and(|state| state.control_schema_version == 2)
+            {
+                return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
+            }
+        }
         let db = redb::Builder::new()
             .set_cache_size(16 * 1024 * 1024)
             .create(path)?;
@@ -96,7 +106,10 @@ impl MetadataStore {
         {
             let read = db.begin_read()?;
             text_generation::read_selection(&read)?;
-            if control::validate_existing(&read)?.is_some() {
+            if let Some(state) = control::validate_existing(&read)? {
+                if state.control_schema_version == 2 {
+                    return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
+                }
                 // An adopted store must retain its canonical tables. Do not
                 // recreate records, namespaces or the never-reused ID counter.
                 read.open_table(META_TABLE)?;

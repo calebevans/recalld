@@ -93,7 +93,7 @@ impl ControlState {
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         let state: Self = decode(bytes)?;
-        if state.control_schema_version != 1 || state.store_id.is_nil() {
+        if !matches!(state.control_schema_version, 1 | 2) || state.store_id.is_nil() {
             return Err(StorageError::InvalidControl(
                 "unsupported version or nil store ID".into(),
             ));
@@ -179,6 +179,14 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    SchemaMigrated {
+        #[serde(rename = "migrationId")]
+        migration_id: Uuid,
+        #[serde(rename = "recordCount")]
+        record_count: u64,
+        #[serde(rename = "attestedNamespaces")]
+        attested_namespaces: u64,
+    },
     TextGenerationSelected {
         #[serde(rename = "generationId")]
         generation_id: Uuid,
@@ -230,10 +238,9 @@ pub(crate) fn validate_existing(
     tx: &ReadTransaction,
 ) -> Result<Option<ControlState>, StorageError> {
     let reserved = [CONTROL.name(), RECEIPTS.name(), KEYS.name()];
-    if tx
-        .list_multimap_tables()?
-        .any(|table| reserved.contains(&table.name()))
-    {
+    if tx.list_multimap_tables()?.any(|table| {
+        reserved.contains(&table.name()) || table.name() == super::canonical_schema::SCHEMA.name()
+    }) {
         return Err(StorageError::InvalidControl(
             "control table is a multimap".into(),
         ));
@@ -244,6 +251,14 @@ pub(crate) fn validate_existing(
         .collect();
     let present = reserved.map(|name| names.iter().any(|n| n == name));
     if !present.iter().any(|p| *p) {
+        if names
+            .iter()
+            .any(|n| n == super::canonical_schema::SCHEMA.name())
+        {
+            return Err(StorageError::InvalidControl(
+                "schema without control lineage".into(),
+            ));
+        }
         return Ok(None);
     }
     if !present.iter().all(|p| *p) {
@@ -265,6 +280,7 @@ pub(crate) fn validate_existing(
             .ok_or_else(|| StorageError::InvalidControl("missing control state".into()))?
             .value(),
     )?;
+    super::canonical_schema::read_state(tx, &state)?;
     for entry in receipts.iter()? {
         let (key, value) = entry?;
         let (lineage, _, operation) = decode_scope(key.value())?;

@@ -31,7 +31,7 @@ pub(crate) fn inspect_database(
     inspect_database_copy(path, false)
 }
 
-fn inspect_database_copy(
+pub(crate) fn inspect_database_copy(
     path: &Path,
     recover_copy: bool,
 ) -> Result<(tempfile::TempDir, redb::Database), StorageError> {
@@ -60,7 +60,9 @@ pub(crate) fn preflight_text(path: &Path) -> Result<(), StorageError> {
     // only on the disposable copy before touching the original database.
     let (_copy, metadata) = inspect_database_copy(&path.join("meta.db"), true)?;
     let read = metadata.begin_read()?;
-    super::control::validate_existing(&read)?;
+    if super::control::validate_existing(&read)?.is_some_and(|c| c.control_schema_version == 2) {
+        return Err(StorageError::RecoveryRequired("schema v2 remains offline until participating writers are enabled; use schema inspect/export".into()));
+    }
     let text = selected_text(path, &read)?;
     let records = read.open_table(META_TABLE)?;
     for row in records.iter()? {
@@ -95,7 +97,13 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
     }
     let (_meta_copy, meta) = inspect_database(&path.join("meta.db"))?;
     let read = meta.begin_read()?;
-    if super::control::validate_existing(&read)?.is_some() {
+    let control = super::control::validate_existing(&read)?;
+    let schema_state = control
+        .as_ref()
+        .map(|c| super::canonical_schema::read_state(&read, c))
+        .transpose()?
+        .flatten();
+    if control.is_some() {
         read.open_table(super::metadata::NAMESPACE_COUNTER)?;
     }
     let namespaces = read.open_table(NAMESPACE_TABLE)?;
@@ -104,11 +112,11 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
         .map(str::to_owned)
         .collect();
     let mut vectors = HashMap::new();
+    let mut configs = HashMap::new();
     let mut names = HashSet::new();
     for item in namespaces.iter()? {
         let (key, value) = item?;
-        let config: NamespaceConfig = serde_json::from_slice(value.value())
-            .map_err(|e| StorageError::Deserialize(e.to_string()))?;
+        let config = NamespaceConfig::decode(value.value())?;
         validate_namespace_name(&config.name).map_err(|reason| {
             StorageError::InvalidNamespaceName {
                 name: config.name.clone(),
@@ -123,6 +131,12 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
                 "invalid namespace identity/dimension".into(),
             ));
         }
+        if schema_state.is_some() != config.schema.is_some() {
+            return Err(StorageError::InvalidControl(
+                "mixed namespace schema".into(),
+            ));
+        }
+        configs.insert(config.id.get(), config.clone());
         let dir = path.join(&config.name);
         if !std::fs::symlink_metadata(&dir)?.is_dir() {
             return Err(StorageError::InvalidPath);
@@ -152,6 +166,14 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
         }
         let id = MemoryId::from_bytes(record.id);
         ids.insert(id);
+        let namespace = configs
+            .get(&record.namespace_id)
+            .ok_or(StorageError::NamespaceNotFound(record.namespace_id))?;
+        super::canonical_schema::validate_record_namespace(
+            &record,
+            namespace,
+            schema_state.as_ref(),
+        )?;
         let store = vectors
             .get(&record.namespace_id)
             .ok_or(StorageError::NamespaceNotFound(record.namespace_id))?;
@@ -165,6 +187,31 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
             return Err(StorageError::OwnershipMismatch(format!(
                 "invalid vector owner {id}"
             )));
+        }
+        if let Some(reference) = record
+            .schema
+            .as_ref()
+            .and_then(|schema| schema.vector.as_ref())
+        {
+            use sha2::{Digest, Sha256};
+            let vector = store
+                .get_vector(record.vector_slot)
+                .ok_or_else(|| StorageError::OwnershipMismatch("missing v2 vector".into()))?;
+            let mut hash = Sha256::new();
+            for value in vector {
+                hash.update(value.to_le_bytes());
+            }
+            if <[u8; 32]>::from(hash.finalize()) != reference.sha256 {
+                return Err(StorageError::OwnershipMismatch(
+                    "v2 vector hash mismatch".into(),
+                ));
+            }
+            if matches!(
+                &namespace.schema.as_ref().unwrap().embedding_binding,
+                crate::model::schema::EmbeddingBinding::Bound { .. }
+            ) {
+                super::canonical_schema::validate_bound_vector(vector)?;
+            }
         }
         if record.text_offset != 0 || record.text_length != 0 {
             text.read(TextRef {
