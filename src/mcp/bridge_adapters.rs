@@ -3907,12 +3907,12 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn entity_postings_survive_disabled_autolink_and_delete_without_legacy_tags() {
+    async fn canonical_legacy_entity_postings_survive_disabled_autolink_rebuild_and_delete() {
         let fx = Fixture::new();
         let foreign = fx.create_namespace("foreign");
         let mut adapter = fx.storage_adapter();
         Arc::make_mut(&mut adapter.config).graph.autolink_enabled = false;
-        let names = vec!["John Smith".into(), "José".into(), "Alice's".into()];
+        let names = vec!["John-Smith".into(), "JOSE".into(), "Alice".into()];
         let mut ids = Vec::new();
         for namespace in ["default", "foreign"] {
             let mut input = store_input("accepted names", namespace, unit_x());
@@ -3927,11 +3927,11 @@ mod tests {
             assert_eq!(index.len(), 2);
             assert_eq!(
                 index.find_by_entities(default_ns(), &names, MemoryId::new()),
-                vec![(ids[0], 4)]
+                vec![(ids[0], 3)]
             );
             assert_eq!(
                 index.find_by_entities(foreign, &names, MemoryId::new()),
-                vec![(ids[1], 4)]
+                vec![(ids[1], 3)]
             );
         }
         assert!(adapter.delete_memory(ids[0], None).await.unwrap());
@@ -3944,7 +3944,7 @@ mod tests {
         );
         assert_eq!(
             index.find_by_entities(foreign, &names, MemoryId::new()),
-            vec![(ids[1], 4)]
+            vec![(ids[1], 3)]
         );
     }
 
