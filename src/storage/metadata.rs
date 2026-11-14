@@ -67,6 +67,7 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 /// concurrent read transactions and exclusive write transactions.
 pub struct MetadataStore {
     db: Database,
+    unavailable: std::sync::atomic::AtomicBool,
     // Lock order: engine gate -> publication -> redb -> phase_index.
     // Hold across commit and bitmap publication, including direct callers.
     publication: std::sync::RwLock<()>,
@@ -118,11 +119,44 @@ impl MetadataStore {
         // from canonical records, even for direct MetadataStore callers.
         let store = Self {
             db,
+            unavailable: std::sync::atomic::AtomicBool::new(false),
             publication: std::sync::RwLock::new(()),
             phase_index: std::sync::RwLock::new(PhaseIndex::new()),
         };
         store.rebuild_phase_index()?;
         Ok(store)
+    }
+}
+
+impl MetadataStore {
+    /// A failed publication/uncertain commit poisons this handle until reopen.
+    /// Caller holds the outer storage write gate or metadata publication guard.
+    pub(crate) fn mark_unavailable(&self) {
+        self.unavailable
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn ensure_available(&self) -> Result<(), StorageError> {
+        if self.unavailable.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(StorageError::RecoveryRequired(
+                "store handle unavailable; reopen for recovery".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit(&self, tx: redb::WriteTransaction) -> Result<(), StorageError> {
+        tx.commit().map_err(|e| {
+            self.mark_unavailable();
+            StorageError::RedbCommit(e)
+        })
+    }
+
+    fn mutation_guard(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
+        let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        // Recheck after waiting: the preceding writer may have failed.
+        self.ensure_available()?;
+        Ok(guard)
     }
 }
 
@@ -142,7 +176,7 @@ impl MetadataStore {
     where
         F: FnOnce(&mut DiskRecord) -> Result<(), StorageError>,
     {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        let _publication = self.mutation_guard()?;
         let old_phase;
         let key = id.as_bytes().as_slice();
 
@@ -163,7 +197,7 @@ impl MetadataStore {
             record
         };
         control::advance_generation(&write_txn)?;
-        write_txn.commit()?;
+        self.commit(write_txn)?;
 
         if old_phase != record.phase {
             self.phase_index
@@ -186,7 +220,8 @@ impl MetadataStore {
     /// # Errors
     /// - `StorageError::DuplicateId` if a record with this ID already exists.
     pub fn insert(&self, id: MemoryId, record: &DiskRecord) -> Result<(), StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         if record.id != *id.as_bytes() {
             return Err(StorageError::InvalidMutation(
                 "record ID disagrees with key".into(),
@@ -215,7 +250,7 @@ impl MetadataStore {
             }
         }
         control::advance_generation(&write_txn)?;
-        write_txn.commit()?;
+        self.commit(write_txn)?;
 
         // 4. Publish the actual committed phase; tombstones own no slot.
         if record.phase != DecayPhase::Tombstone {
@@ -235,6 +270,7 @@ impl MetadataStore {
     ///
     /// Returns `None` if no record exists for this ID.
     pub fn get(&self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         match table.get(id.as_bytes().as_slice())? {
@@ -277,6 +313,7 @@ impl MetadataStore {
         stability: f32,
         is_permastore: bool,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.update_record(&id, |record| {
             if record.phase == DecayPhase::Tombstone {
                 return Err(StorageError::NotFound(id.into_inner()));
@@ -298,6 +335,7 @@ impl MetadataStore {
     /// text data in fulltext.dat as dead space reclaimable by
     /// compaction. Does not modify fulltext.dat itself.
     pub fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.update_record(&id, |record| {
             record.text_offset = 0;
             record.text_length = 0;
@@ -311,6 +349,7 @@ impl MetadataStore {
     /// Called during Summary -> Ghost phase transitions. After this,
     /// only the embedding and relationship edges remain.
     pub fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.update_record(&id, |record| {
             record.summary = String::new();
             Ok(())
@@ -328,6 +367,7 @@ impl MetadataStore {
         timestamp: i64,
         kind: AccessKind,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         let record = self
             .get(id)?
             .ok_or(StorageError::NotFound(id.into_inner()))?;
@@ -343,6 +383,7 @@ impl MetadataStore {
     /// The current metadata control state. This is not a coherent cross-file
     /// read view or a derived readiness watermark (see `storage::control`).
     pub fn control_state(&self) -> Result<ControlState, StorageError> {
+        self.ensure_available()?;
         let tx = self.db.begin_read()?;
         let table = tx.open_table(control::CONTROL)?;
         let value = table
@@ -359,6 +400,7 @@ impl MetadataStore {
         scope: MutationScope,
         operation_id: uuid::Uuid,
     ) -> Result<Option<WriteReceipt>, StorageError> {
+        self.ensure_available()?;
         let tx = self.db.begin_read()?;
         let table = tx.open_table(control::CONTROL)?;
         let value = table
@@ -388,14 +430,17 @@ impl MetadataStore {
         timestamp: i64,
         kind: AccessKind,
     ) -> Result<WriteReceipt, StorageError> {
-        let publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let publication = self.mutation_guard()?;
         let (tx, receipt) = self.prepare_access(&publication, ctx, id, timestamp, kind)?;
         if !receipt.replayed {
-            tx.commit()
-                .map_err(|source| StorageError::CommitOutcomeUnknown {
+            tx.commit().map_err(|source| {
+                self.mark_unavailable();
+                StorageError::CommitOutcomeUnknown {
                     operation_id: receipt.operation_id,
                     source,
-                })?;
+                }
+            })?;
         }
         Ok(receipt)
     }
@@ -458,7 +503,8 @@ impl MetadataStore {
     /// The deleted `DiskRecord` (for the caller to know which vector
     /// slot to free, etc.), or `None` if the ID did not exist.
     pub fn delete(&self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         let key = id.as_bytes().as_slice();
 
         let write_txn = self.db.begin_write()?;
@@ -486,7 +532,7 @@ impl MetadataStore {
             ns_idx.remove(deleted_record.namespace_id, key)?;
         }
         control::advance_generation(&write_txn)?;
-        write_txn.commit()?;
+        self.commit(write_txn)?;
 
         // 4. Remove from in-memory phase bitmap.
         {
@@ -513,7 +559,8 @@ impl MetadataStore {
     /// tombstoned records don't have valid vector slots for bitmap
     /// tracking).
     pub fn tombstone(&self, id: MemoryId) -> Result<(), StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         let key = id.as_bytes().as_slice();
 
         let write_txn = self.db.begin_write()?;
@@ -557,7 +604,7 @@ impl MetadataStore {
             ns_idx.remove(record.namespace_id, key)?;
         }
         control::advance_generation(&write_txn)?;
-        write_txn.commit()?;
+        self.commit(write_txn)?;
 
         // Update phase bitmap: remove from old phase.
         // Tombstoned records are not tracked in the bitmap since their
@@ -575,6 +622,7 @@ impl MetadataStore {
     /// Uses the in-memory roaring bitmap index. Requires a META_TABLE
     /// lookup per matching slot to resolve vector_slot -> MemoryId.
     pub fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError> {
+        self.ensure_available()?;
         let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
         if phase == DecayPhase::Tombstone {
             return Ok(self
@@ -624,6 +672,7 @@ impl MetadataStore {
         &self,
         phase: DecayPhase,
     ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+        self.ensure_available()?;
         let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
         if phase == DecayPhase::Tombstone {
             return Ok(self
@@ -674,6 +723,7 @@ impl MetadataStore {
     /// Performs a read-modify-write in a single redb write transaction.
     /// Does not update any secondary indexes (edge_count is not indexed).
     pub fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.update_record(&id, |record| {
             record.edge_count = edge_count;
             Ok(())
@@ -688,6 +738,7 @@ impl MetadataStore {
 impl MetadataStore {
     /// Find all memory IDs that carry a given tag.
     pub fn memories_with_tag(&self, tag: &str) -> Result<Vec<MemoryId>, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_multimap_table(TAG_INDEX)?;
         let mut ids = Vec::new();
@@ -706,6 +757,7 @@ impl MetadataStore {
 
     /// List all distinct tags in the index with their memory counts.
     pub fn list_tags(&self) -> Result<Vec<(String, u64)>, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_multimap_table(TAG_INDEX)?;
         let mut tags = Vec::new();
@@ -735,6 +787,7 @@ impl MetadataStore {
         &self,
         namespace_id: NamespaceId,
     ) -> Result<(HashMap<String, u64>, u64), StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let ns_table = read_txn.open_multimap_table(NAMESPACE_INDEX)?;
         let meta_table = read_txn.open_table(META_TABLE)?;
@@ -772,6 +825,7 @@ impl MetadataStore {
         &self,
         namespace_id: NamespaceId,
     ) -> Result<Vec<MemoryId>, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_multimap_table(NAMESPACE_INDEX)?;
         let mut ids = Vec::new();
@@ -810,6 +864,7 @@ impl MetadataStore {
         &self,
         namespace_id: NamespaceId,
     ) -> Result<u64, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let ns_table = read_txn.open_multimap_table(NAMESPACE_INDEX)?;
         let meta_table = read_txn.open_table(META_TABLE)?;
@@ -849,6 +904,7 @@ impl MetadataStore {
         offset: usize,
         limit: usize,
     ) -> Result<(Vec<(MemoryId, DiskRecord)>, u64), StorageError> {
+        self.ensure_available()?;
         // Step 1: Get all memory IDs in this namespace from the index.
         let read_txn = self.db.begin_read()?;
         let ns_table = read_txn.open_multimap_table(NAMESPACE_INDEX)?;
@@ -932,7 +988,8 @@ impl MetadataStore {
         &self,
         compute_new_state: impl Fn(&DiskRecord) -> Option<DiskRecord>,
     ) -> Result<usize, StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         let mut updates = Vec::new();
         for (id, record) in self.scan_all()? {
             if record.phase != DecayPhase::Tombstone {
@@ -950,7 +1007,8 @@ impl MetadataStore {
         &self,
         records: &[(MemoryId, DiskRecord)],
     ) -> Result<(), StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         self.batch_update_records_locked(records)
     }
 
@@ -1006,7 +1064,7 @@ impl MetadataStore {
             }
         }
         control::advance_generation(&write_txn)?;
-        write_txn.commit()?;
+        self.commit(write_txn)?;
         let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
         for (ns, slot, from, to) in transitions {
             pi.transition(ns, slot, from, to);
@@ -1017,7 +1075,8 @@ impl MetadataStore {
     /// Persist the current in-memory phase bitmaps to INDEX_TABLE.
     /// Called periodically (end of decay sweep, graceful shutdown).
     pub fn persist_phase_index(&self) -> Result<(), StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         let bytes = {
             let pi = self.phase_index.read().unwrap_or_else(|e| e.into_inner());
             pi.to_bytes()
@@ -1027,7 +1086,7 @@ impl MetadataStore {
             let mut table = write_txn.open_table(INDEX_TABLE)?;
             table.insert("phase_bitmaps", bytes.as_slice())?;
         }
-        write_txn.commit()?;
+        self.commit(write_txn)?;
         Ok(())
     }
 
@@ -1036,7 +1095,8 @@ impl MetadataStore {
     /// missing, corrupt, or when the record count does not match the
     /// bitmap cardinality.
     pub fn rebuild_phase_index(&self) -> Result<(), StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         let mut slot_phases = Vec::new();
@@ -1058,7 +1118,7 @@ impl MetadataStore {
             let mut idx_table = write_txn.open_table(INDEX_TABLE)?;
             idx_table.insert("phase_bitmaps", bytes.as_slice())?;
         }
-        write_txn.commit()?;
+        self.commit(write_txn)?;
 
         // Replace the in-memory copy.
         *self.phase_index.write().unwrap_or_else(|e| e.into_inner()) = rebuilt;
@@ -1076,7 +1136,8 @@ impl MetadataStore {
     /// - `StorageError::DuplicateName` if a namespace with this name
     ///   already exists.
     pub fn create_namespace(&self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         let write_txn = self.db.begin_write()?;
         let new_id;
         {
@@ -1130,13 +1191,14 @@ impl MetadataStore {
             ns_table.insert(new_id, bytes.as_slice())?;
         }
         control::advance_generation(&write_txn)?;
-        write_txn.commit()?;
+        self.commit(write_txn)?;
 
         Ok(NamespaceId::new(new_id))
     }
 
     /// List all namespace configurations.
     pub fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(NAMESPACE_TABLE)?;
         let mut configs = Vec::new();
@@ -1153,6 +1215,7 @@ impl MetadataStore {
 
     /// Get a single namespace configuration by ID.
     pub fn get_namespace(&self, id: NamespaceId) -> Result<Option<NamespaceConfig>, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(NAMESPACE_TABLE)?;
         match table.get(id.get())? {
@@ -1183,6 +1246,7 @@ impl MetadataStore {
         &self,
         name: &str,
     ) -> Result<Option<NamespaceConfig>, StorageError> {
+        self.ensure_available()?;
         let all = self.list_namespaces()?;
         if let Some(exact) = all.iter().find(|c| c.name == name) {
             return Ok(Some(exact.clone()));
@@ -1208,7 +1272,8 @@ impl MetadataStore {
     /// Only removes the config entry. Memory cleanup is the caller's
     /// responsibility. The namespace ID is never recycled.
     pub fn delete_namespace(&self, id: NamespaceId) -> Result<NamespaceConfig, StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         let write_txn = self.db.begin_write()?;
         let config;
         {
@@ -1220,7 +1285,7 @@ impl MetadataStore {
                 .map_err(|e| StorageError::Deserialize(e.to_string()))?;
         }
         control::advance_generation(&write_txn)?;
-        write_txn.commit()?;
+        self.commit(write_txn)?;
         Ok(config)
     }
 
@@ -1259,7 +1324,10 @@ impl MetadataStore {
         namespace_id: NamespaceId,
         batch_size: usize,
     ) -> Result<Vec<(MemoryId, DiskRecord)>, PartialPurge> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        let _publication = self.mutation_guard().map_err(|source| PartialPurge {
+            destroyed: Vec::new(),
+            source,
+        })?;
         // chunks(0) panics, and a zero batch would never terminate
         // anyway.
         let batch_size = batch_size.max(1);
@@ -1335,6 +1403,7 @@ impl MetadataStore {
         &self,
         namespace_id: NamespaceId,
     ) -> Result<u64, StorageError> {
+        self.ensure_available()?;
         let ns = namespace_id.get();
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
@@ -1393,7 +1462,7 @@ impl MetadataStore {
             }
         }
         control::advance_generation(&write_txn)?;
-        write_txn.commit()?;
+        self.commit(write_txn)?;
         Ok(())
     }
 }
@@ -1468,7 +1537,8 @@ impl MetadataStore {
     /// which would build a cycle in the free list and underflow
     /// `live_count`.
     pub fn batch_tombstone(&self, ids: &[MemoryId]) -> Result<Vec<TombstoneOutcome>, StorageError> {
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+        self.ensure_available()?;
+        let _publication = self.mutation_guard()?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1517,7 +1587,7 @@ impl MetadataStore {
             }
         }
         control::advance_generation(&write_txn)?;
-        write_txn.commit()?;
+        self.commit(write_txn)?;
 
         // Phase bitmaps only after the commit: a bitmap update rolled
         // forward against a transaction that never landed would point
@@ -1540,6 +1610,7 @@ impl MetadataStore {
 impl MetadataStore {
     /// Iterate all records in creation order (UUID v7 byte order).
     pub fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         let mut records = Vec::new();
@@ -1559,6 +1630,7 @@ impl MetadataStore {
     ///
     /// For a count that excludes tombstoned records, use `count_active()`.
     pub fn count(&self) -> Result<u64, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         Ok(table.len()?)
@@ -1566,6 +1638,7 @@ impl MetadataStore {
 
     /// Count only active (non-tombstoned) memory records.
     pub fn count_active(&self) -> Result<u64, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         let mut count = 0u64;
@@ -1581,6 +1654,7 @@ impl MetadataStore {
 
     /// Check if a memory ID exists without deserializing the record.
     pub fn exists(&self, id: MemoryId) -> Result<bool, StorageError> {
+        self.ensure_available()?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META_TABLE)?;
         Ok(table.get(id.as_bytes().as_slice())?.is_some())
