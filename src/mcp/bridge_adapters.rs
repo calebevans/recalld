@@ -801,8 +801,12 @@ impl McpStorageAdapter {
         child: Option<crate::storage::batch::BatchChild>,
     ) -> Result<(bridge::StoredMemory, crate::storage::control::WriteReceipt), StoreWriteError>
     {
+        // This is shared by direct single writes and reserved batch children.
+        // Validate before replay normalization, provider work or payload staging.
+        let (merged_tags, canonical_input) = crate::mcp::batches::canonical_input(&input)
+            .map_err(|error| bridge::BridgeError::InvalidInput(error.to_string()))?;
         if let Some(child) = child.clone() {
-            let (_, canonical) = crate::mcp::batches::canonical_input(&input);
+            let canonical = canonical_input.clone();
             let storage = self.storage.clone();
             let replay = tokio::task::spawn_blocking(move || {
                 storage
@@ -820,6 +824,7 @@ impl McpStorageAdapter {
                 ));
             }
         }
+
         effects_stamp(&self.storage).await?;
 
         use crate::model::constants::{DUPLICATE_SIMILARITY_THRESHOLD, MAX_NEAR_DUPLICATE_MATCHES};
@@ -882,8 +887,6 @@ impl McpStorageAdapter {
             .await
             .map_err(map_link_error)?;
         }
-
-        let (merged_tags, canonical_input) = crate::mcp::batches::canonical_input(&input);
 
         // Generate full embedding (summary + full_text + tags for max surface).
         let raw_embedding = match &input.embedding {

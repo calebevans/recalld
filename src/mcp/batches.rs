@@ -49,7 +49,24 @@ pub(crate) fn prepare(input: &BatchInput) -> Result<Vec<PreparedItem>, bridge::B
                 )?;
                 match parsed {
                     Ok(store) => {
-                        let (_, record) = canonical_input(&store);
+                        let record = match canonical_input(&store) {
+                            Ok((_, record)) => record,
+                            Err(error) => {
+                                return Ok(PreparedItem {
+                                    plan: BatchItemPlan::Invalid {
+                                        request_hash,
+                                        error: BatchError {
+                                            code: "INVALID_INPUT".into(),
+                                            field: error.field().map(str::to_owned),
+                                        },
+                                    },
+                                    // A matching historical committed outcome may still
+                                    // render its receipt. Fresh invalid plans never run.
+                                    store: Some(store),
+                                    forget: None,
+                                });
+                            }
+                        };
                         Ok(PreparedItem {
                             plan: BatchItemPlan::Insert {
                                 request_hash,
@@ -107,7 +124,7 @@ fn parse_store(
     index: usize,
     default_namespace: &str,
 ) -> Result<bridge::StoreInput, args::ArgError> {
-    let mut input = args::parse_store_item(value, index, default_namespace)?;
+    let mut input = args::parse_store_input_fields(value, default_namespace)?;
     for field in [
         "id",
         "createdAt",
@@ -154,7 +171,19 @@ fn parse_store(
 /// Reuse the single-write normalization for structured tags and canonical input.
 /// Original supplied float bits stay in InsertMemory; working normalization is
 /// performed later on a separate copy by the shared storage validator.
-pub(crate) fn canonical_input(input: &bridge::StoreInput) -> (Vec<String>, InsertMemory) {
+pub(crate) fn canonical_input(
+    input: &bridge::StoreInput,
+) -> Result<(Vec<String>, InsertMemory), crate::model::ValidationError> {
+    crate::model::validation::validate_legacy_memory_input(
+        crate::model::validation::MemoryInputRef {
+            summary: &input.summary,
+            full_text: input.full_text.as_deref(),
+            tags: &input.tags,
+            entities: &input.entities,
+            topics: &input.topics,
+            emotions: &input.emotions,
+        },
+    )?;
     use crate::model::constants::{EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, TOPIC_TAG_PREFIX};
     let mut tags = input.tags.clone();
     for (values, prefix) in [
@@ -181,7 +210,7 @@ pub(crate) fn canonical_input(input: &bridge::StoreInput) -> (Vec<String>, Inser
         parent_id: input.parent_id,
         supersedes: input.supersedes,
     };
-    (tags, record)
+    Ok((tags, record))
 }
 
 fn item_hash(
