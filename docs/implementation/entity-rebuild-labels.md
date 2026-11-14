@@ -6,6 +6,16 @@ and its publication boundary; PR35 supplies namespace-partitioned, idempotent
 postings; PR40 supplies authoritative `CachedRecord.entities`. No insertion,
 maintenance, Observed, catalog or evaluation branch is added as a parent.
 
+PR45 is a correctness prerequisite, not a convenient collection of changes.
+The earlier PR39 + PR40 composition could open canonical storage for writes
+before rejecting a corrupt pending plan (the confirmed P2). PR45 uses recovery
+reads during construction, validates pending plans on a disposable preflight
+before canonical mutation, and supplies ledger/terminal-UUID protection during
+replay. Its corrected startup/recovery/snapshot ownership composition is needed
+for the actual startup and completion paths exercised here. Taking only the
+constructor backport would reintroduce that known invalid composition. PR59
+insertion and PR60 tombstone writers are not required by this rebuild change.
+
 Startup and `DerivedCompletion::complete` build their fresh entity views through
 one `EntityIndex::from_records` function. It uses the shared disk-to-cache
 conversion rather than reparsing tags, excludes Ghost/Tombstone records, and
