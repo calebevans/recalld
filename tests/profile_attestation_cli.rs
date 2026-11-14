@@ -348,3 +348,132 @@ fn offline_cli_without_attestation_preserves_unknown_provenance() {
     }
     assert_eq!(snapshot(&source), before);
 }
+
+fn transfer(command: &str, source: &Path, destination: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_recalld-schema"))
+        .arg(command)
+        .arg(source)
+        .arg(destination)
+        .output()
+        .unwrap()
+}
+
+fn export_summary(output: &Output) -> recalld::storage::logical_export::ExportSummary {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn offline_cli_export_import_preserves_profiles_source_and_completed_retry() {
+    for attested in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy");
+        fixture(&legacy, &[1., 0., 0., 0.]);
+        let legacy_before = snapshot(&legacy);
+        let schema = root.path().join("schema");
+        let control = inspect(&legacy)["control"].clone();
+        let files = if attested {
+            vec![attestation(root.path(), &input())]
+        } else {
+            vec![]
+        };
+        assert!(migrate(&legacy, &schema, &control, &files).status.success());
+        let inspection = inspect(&schema);
+        let source_before = snapshot(&schema);
+        let file = root.path().join("retained.jsonl");
+        let exported = export_summary(&transfer("export", &schema, &file));
+        assert_eq!(exported.records, 2);
+        let file_before = std::fs::read(&file).unwrap();
+        let destination = root.path().join("imported");
+        let output = transfer("import", &file, &destination);
+        assert_eq!(export_summary(&output), exported);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("remains offline"));
+        assert_eq!(inspect(&destination), inspection);
+        let imported_before = snapshot(&destination);
+        assert_eq!(
+            export_summary(&transfer("import", &file, &destination)),
+            exported
+        );
+        assert_eq!(snapshot(&destination), imported_before);
+        let second = root.path().join("reexport.jsonl");
+        let reexported = export_summary(&transfer("export", &destination, &second));
+        assert_eq!(reexported.source, exported.source);
+        assert_eq!(reexported.logical_sha256, exported.logical_sha256);
+        assert_eq!(reexported.records, exported.records);
+        assert_ne!(reexported.export_id, exported.export_id);
+        assert!(RedbStorageEngine::open(&destination).is_err());
+        assert_eq!(snapshot(&destination), imported_before);
+        assert_eq!(snapshot(&schema), source_before);
+        assert_eq!(snapshot(&legacy), legacy_before);
+        assert_eq!(std::fs::read(&file).unwrap(), file_before);
+    }
+}
+
+#[test]
+fn offline_cli_export_import_rejects_legacy_malformed_and_existing_destinations() {
+    let root = tempfile::tempdir().unwrap();
+    let legacy = root.path().join("legacy");
+    fixture(&legacy, &[1., 0., 0., 0.]);
+    let legacy_before = snapshot(&legacy);
+    let file = root.path().join("retained.jsonl");
+    let failed = transfer("export", &legacy, &file);
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    assert!(!file.exists());
+    assert_eq!(snapshot(&legacy), legacy_before);
+    let schema = root.path().join("schema");
+    assert!(
+        migrate(&legacy, &schema, &inspect(&legacy)["control"], &[])
+            .status
+            .success()
+    );
+    export_summary(&transfer("export", &schema, &file));
+    let original = std::fs::read(&file).unwrap();
+    let schema_before = snapshot(&schema);
+    assert!(!transfer("export", &schema, &file).status.success());
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+    assert!(!transfer("import", &file, &legacy).status.success());
+    assert_eq!(snapshot(&legacy), legacy_before);
+    let imported = root.path().join("imported");
+    export_summary(&transfer("import", &file, &imported));
+    let imported_before = snapshot(&imported);
+    let other_file = root.path().join("other.jsonl");
+    export_summary(&transfer("export", &schema, &other_file));
+    assert!(!transfer("import", &other_file, &imported).status.success());
+    assert_eq!(snapshot(&imported), imported_before);
+
+    let mut lines: Vec<Value> = std::str::from_utf8(&original)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    lines[0]["data"]["exportFormatVersion"] = json!(99);
+    let future = lines
+        .iter()
+        .map(|v| format!("{v}\n"))
+        .collect::<String>()
+        .into_bytes();
+    for (name, bytes) in [
+        ("future", future),
+        ("truncated", original[..original.len() / 2].to_vec()),
+        ("garbage", b"not json\n".to_vec()),
+    ] {
+        let bad = root.path().join(format!("{name}.jsonl"));
+        std::fs::write(&bad, &bytes).unwrap();
+        let destination = root.path().join(name);
+        let output = transfer("import", &bad, &destination);
+        assert!(!output.status.success(), "{name}");
+        if name == "future" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported export version"));
+        }
+        assert!(output.stdout.is_empty());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&bad).unwrap(), bytes);
+    }
+    assert_eq!(snapshot(&schema), schema_before);
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+}
