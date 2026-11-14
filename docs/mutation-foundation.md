@@ -139,7 +139,7 @@ that gate. Sweep/batch replacement uses the same guarded helper and advances
 exactly once per nonempty transaction; checkpoint/rebuild writes still do not
 advance generation. Access receipt preparation now requires a held publication
 write guard, retained through commit or replay. This prevents a concurrent
-sweep snapshot from overwriting an acknowledged access event.
+`MetadataStore::decay_sweep` snapshot from overwriting an acknowledged access event.
 
 Metadata startup and staged backup/restore share read-only validation of the
 additive control schema: partial table sets, multimap/type conflicts, extra or
@@ -156,6 +156,23 @@ partial table-presence combinations, missing canonical tables, table/type and
 receipt-integrity conflicts, and checksum-valid bad-control archives preserving
 the original restore target. Source bytes remain unchanged during strict
 backup validation. General whole-store CAS/readiness is still unsupported.
+
+### Final integration validation
+
+Validated source revision: `40d7cd6` on `impl/mutation-foundation`, with
+`impl/storage` ancestor `4bf07dc`. The documentation-only result commit follows
+that tested revision; it changes no source. Executed 2026-11-14 in
+`recalld-ci:1.94`, Rust `1.94.1`, with `--network none --cpus 2 --memory 4g`,
+`CARGO_BUILD_JOBS=2`, and private worktree Cargo/target directories.
+
+| Check | Final integrated result |
+| --- | --- |
+| `cargo test --offline --locked --all-features -- --test-threads=2` | 530 passed; 4 existing doctests ignored |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --offline --locked --all-targets --all-features` | Passed with warnings; not warning-free |
+
+Logs are untracked under `.validation/{tests,fmt,clippy}.log` in the foundation
+worktree. No home, credentials or host socket mounts; no personal data used.
 
 ## Next dependent slice: canonical graph effects
 
