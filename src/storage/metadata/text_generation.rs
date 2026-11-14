@@ -11,7 +11,8 @@ thread_local! {
     pub(crate) static FAIL_AFTER_TEXT_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-const CATALOG: TableDefinition<&str, &[u8]> = TableDefinition::new("text_generations_v1");
+pub(crate) const CATALOG: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("text_generations_v1");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

@@ -9,6 +9,7 @@
 
 mod lifecycle_updates;
 pub(crate) mod removal_ledger;
+pub(crate) mod restoration;
 pub(crate) mod text_generation;
 
 use std::collections::HashMap;
@@ -89,6 +90,15 @@ impl MetadataStore {
     /// - Creates all tables on first open.
     /// - Loads or rebuilds the phase index from persisted bitmaps.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        // redb's writable open can change bookkeeping. Reject historical mode
+        // on a disposable copy even for callers bypassing the engine.
+        if path.try_exists()? && path.metadata()?.len() > 0 {
+            let (_copy, db) = super::validation::inspect_database_copy(path, true)?;
+            let read = db.begin_read()?;
+            if let Some(control) = control::validate_existing(&read)? {
+                super::lineage::ensure_serving(&read, &control)?;
+            }
+        }
         let db = redb::Builder::new()
             .set_cache_size(16 * 1024 * 1024)
             .create(path)?;
@@ -167,6 +177,13 @@ impl MetadataStore {
         let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
         // Recheck after waiting: the preceding writer may have failed.
         self.ensure_available()?;
+        let read = self.db.begin_read()?;
+        let table = read.open_table(control::CONTROL)?;
+        let value = table
+            .get("state")?
+            .ok_or_else(|| StorageError::InvalidControl("missing control".into()))?;
+        let control = ControlState::decode(value.value())?;
+        crate::storage::lineage::ensure_serving(&read, &control)?;
         Ok(guard)
     }
 }

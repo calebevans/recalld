@@ -97,6 +97,10 @@ enum Command {
         /// Legacy compatibility flag; restore requires an already stopped target
         #[arg(long)]
         no_stop_daemon: bool,
+
+        /// Restore into a fresh historical/read-only destination, excluded from serving
+        #[arg(long)]
+        historical: bool,
     },
 
     /// Run external benchmarks (LoCoMo, etc.)
@@ -296,7 +300,8 @@ async fn async_main(cli: Cli) -> ExitCode {
             from,
             force,
             no_stop_daemon,
-        } => run_restore_command(loaded.config, from, force, no_stop_daemon).await,
+            historical,
+        } => run_restore_command(loaded.config, from, force, no_stop_daemon, historical).await,
         #[cfg(feature = "bench")]
         Command::Bench { target, format } => run_bench(loaded.config, target, &format).await,
     }
@@ -759,6 +764,7 @@ async fn run_restore_command(
     backup_path: std::path::PathBuf,
     force: bool,
     no_stop_daemon: bool,
+    historical: bool,
 ) -> ExitCode {
     use recalld::backup::{RestoreOptions, restore_from_backup};
 
@@ -769,6 +775,7 @@ async fn run_restore_command(
         data_dir,
         force,
         no_stop_daemon,
+        historical,
     };
 
     match restore_from_backup(opts).await {
@@ -776,9 +783,15 @@ async fn run_restore_command(
             eprintln!();
             eprintln!("Restore completed successfully");
             eprintln!();
-            eprintln!("Next steps:");
-            eprintln!("  1. Start the daemon: recalld daemon start");
-            eprintln!("  2. Verify data: recalld daemon status");
+            if historical {
+                eprintln!("Historical/read-only destination; ordinary serving is blocked.");
+                eprintln!(
+                    "Deletion coverage is through the available snapshot; later coverage is unknown."
+                );
+            } else {
+                eprintln!("Retained removal evidence applied; restored store has a new lineage.");
+                eprintln!("Start the daemon when ready: recalld daemon start");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

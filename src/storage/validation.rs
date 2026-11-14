@@ -31,7 +31,7 @@ pub(crate) fn inspect_database(
     inspect_database_copy(path, false)
 }
 
-fn inspect_database_copy(
+pub(crate) fn inspect_database_copy(
     path: &Path,
     recover_copy: bool,
 ) -> Result<(tempfile::TempDir, redb::Database), StorageError> {
@@ -60,7 +60,9 @@ pub(crate) fn preflight_text(path: &Path) -> Result<(), StorageError> {
     // only on the disposable copy before touching the original database.
     let (_copy, metadata) = inspect_database_copy(&path.join("meta.db"), true)?;
     let read = metadata.begin_read()?;
-    super::control::validate_existing(&read)?;
+    if let Some(control) = super::control::validate_existing(&read)? {
+        super::lineage::ensure_serving(&read, &control)?;
+    }
     let text = selected_text(path, &read)?;
     let records = read.open_table(META_TABLE)?;
     for row in records.iter()? {
