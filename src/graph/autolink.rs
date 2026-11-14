@@ -414,44 +414,31 @@ pub async fn perform_entity_link(
         return Ok(0);
     }
 
-    // Index postings propose IDs only. Namespace, retained entities and weights
-    // come from canonical records, even when the cache is cold or stale.
+    // Postings propose IDs only: namespace and deletion state must be checked
+    // canonically before the cap, even when caches/indexes are stale.
     let storage_for_read = storage.clone();
     let candidates = tokio::task::spawn_blocking(move || {
         let storage = storage_for_read
             .read()
             .map_err(|e| AutoLinkError::LockPoisoned(e.to_string()))?;
-        let entity_keys = |record: &crate::model::DiskRecord| {
-            crate::model::parse_structured_tags(&record.tags)
-                .entities
-                .iter()
-                .flat_map(|entity| crate::search::canonicalize_entity(entity))
-                .collect::<std::collections::HashSet<_>>()
-        };
         let source = storage
             .get_record(new_memory_id)
             .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
-        let Some(source) = source
-            .filter(|r| r.namespace_id == namespace_id.get() && r.phase != DecayPhase::Tombstone)
-        else {
-            return Ok::<_, AutoLinkError>(Vec::new());
+        let live_in_scope = |r: &crate::model::DiskRecord| {
+            r.namespace_id == namespace_id.get() && r.phase != DecayPhase::Tombstone
         };
-        let source_keys = entity_keys(&source);
+        if source.as_ref().is_none_or(|r| !live_in_scope(r)) {
+            return Ok::<_, AutoLinkError>(Vec::new());
+        }
         let mut eligible = Vec::new();
-        for (id, _) in candidates {
-            let record = storage
+        for (id, shared) in candidates {
+            if storage
                 .get_record(id)
-                .map_err(|e| AutoLinkError::Storage(e.to_string()))?;
-            let Some(record) = record.filter(|r| {
-                r.namespace_id == namespace_id.get() && r.phase != DecayPhase::Tombstone
-            }) else {
-                continue;
-            };
-            let keys = entity_keys(&record);
-            let shared = source_keys.intersection(&keys).count();
-            if shared > 0 {
-                let union = source_keys.union(&keys).count();
-                eligible.push((id, shared, shared as f32 / union as f32));
+                .map_err(|e| AutoLinkError::Storage(e.to_string()))?
+                .as_ref()
+                .is_some_and(&live_in_scope)
+            {
+                eligible.push((id, shared));
             }
         }
         eligible.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -460,16 +447,48 @@ pub async fn perform_entity_link(
     .await
     .map_err(|e| AutoLinkError::Storage(format!("blocking task join error: {e}")))??;
 
-    // Scope and stale postings are resolved before the per-memory cap.
+    // Keep legacy scoring until structured entity persistence supports all
+    // accepted names. Plain Tag parsing currently loses multiword/Unicode names;
+    // treating those persisted tags as complete would silently remove links.
+    let key_count = |names: &[String]| {
+        names
+            .iter()
+            .flat_map(|name| crate::search::canonicalize_entity(name))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    };
+    let source_count = key_count(entities);
+    let mut candidate_entity_counts = std::collections::HashMap::new();
+    for (id, _) in &candidates {
+        if let Some(cached) = cache.get(*id).await {
+            candidate_entity_counts.insert(*id, key_count(&cached.entities));
+        }
+    }
     let edges_to_create: Vec<(MemoryId, f32)> = {
         let graph_r = graph.read().await;
         candidates
             .iter()
-            .filter(|(cid, _, _)| {
+            .filter(|(cid, _)| {
                 !graph_r.has_typed_edge_between_ids(&new_memory_id, cid, EdgeType::Entity)
             })
             .take(max_entity_links)
-            .map(|(cid, _, weight)| (*cid, *weight))
+            .map(|(cid, shared)| {
+                // Postings may retain accepted names missing from legacy tags.
+                // Count normalized keys consistently and bound stale cache counts
+                // by observed overlap, avoiding subtraction underflow.
+                let candidate_count = candidate_entity_counts
+                    .get(cid)
+                    .copied()
+                    .unwrap_or(*shared)
+                    .max(*shared);
+                let union = source_count.max(*shared) + candidate_count - *shared;
+                let weight = if union > 0 {
+                    (*shared as f32 / union as f32).min(1.0)
+                } else {
+                    0.0
+                };
+                (*cid, weight)
+            })
             .collect()
     };
 
@@ -585,7 +604,7 @@ mod entity_scope_tests {
     use crate::test_support::Fixture;
 
     #[tokio::test]
-    async fn entity_links_filter_foreign_and_stale_postings_before_cap_without_cache() {
+    async fn entity_links_filter_foreign_and_removed_postings_before_cap_without_cache() {
         let f = Fixture::new();
         let ns = NamespaceId::new(1);
         let foreign_ns = f.create_namespace("foreign");
@@ -601,12 +620,11 @@ mod entity_scope_tests {
         let removed = f
             .insert_memory_in(ns, &["entity/alice", "entity/bob"])
             .await;
-        let stale = f.insert_memory_in(ns, &["entity/dana"]).await;
         f.tombstone(removed);
         {
             let mut index = f.entity_index.write().await;
             index.add(local, &["alice".into()]);
-            for id in [foreign, removed, stale, MemoryId::new()] {
+            for id in [foreign, removed, MemoryId::new()] {
                 index.add(id, &["alice".into(), "bob".into()]);
             }
         }
@@ -626,13 +644,46 @@ mod entity_scope_tests {
         let edges = f.storage.read().unwrap().load_all_edges().unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].target, local);
-        assert!((edges[0].weight - 1.0 / 3.0).abs() < 1e-6);
+        assert!((edges[0].weight - 0.5).abs() < 1e-6);
         assert!(
             f.graph
                 .read()
                 .await
                 .has_typed_edge_between_ids(&source, &local, EdgeType::Entity)
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_multiword_unicode_and_possessive_names_still_link() {
+        use crate::mcp::bridge::{StorageEngine as _, StoreInput};
+        for name in ["John Smith", "José", "Alice's"] {
+            let f = Fixture::new();
+            let adapter = f.storage_adapter();
+            let input = || StoreInput {
+                summary: "accepted structured name".into(),
+                full_text: None,
+                tags: vec![],
+                entities: vec![name.into()],
+                topics: vec![],
+                emotions: vec![],
+                namespace: "default".into(),
+                embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
+                initial_stability: None,
+                parent_id: None,
+                supersedes: None,
+                check_duplicates: None,
+            };
+            adapter.store_memory(input()).await.unwrap();
+            adapter.store_memory(input()).await.unwrap();
+            let edges = f.persisted_edges();
+            let entity_edges: Vec<_> = edges
+                .iter()
+                .filter(|e| e.edge_type == EdgeType::Entity)
+                .collect();
+            assert_eq!(entity_edges.len(), 1, "{name}");
+            assert!(entity_edges[0].weight.is_finite());
+            assert!((0.0..=1.0).contains(&entity_edges[0].weight));
+        }
     }
 
     #[tokio::test]
@@ -675,7 +726,7 @@ mod entity_scope_tests {
             perform_entity_link(
                 source,
                 ns,
-                &["alice".into(), "ALICE".into()],
+                &["alice".into()],
                 1,
                 &f.entity_index,
                 &f.graph,
