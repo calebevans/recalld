@@ -1405,6 +1405,19 @@ async fn ingest_conversation(
         };
 
         for mem in &memories {
+            // Preserve the original input field in validation errors. In
+            // particular, an empty entity must not become a valid `entity/`
+            // tag that retained decoding later drops.
+            crate::model::validation::validate_legacy_memory_input(
+                crate::model::validation::MemoryInputRef {
+                    summary: &mem.summary,
+                    full_text: mem.full_text.as_deref(),
+                    tags: &[],
+                    entities: &mem.entities,
+                    topics: &mem.topics,
+                    emotions: &mem.emotions,
+                },
+            )?;
             let supersedes_id = mem
                 .supersedes
                 .as_ref()
