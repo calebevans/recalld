@@ -68,7 +68,7 @@ fn invalid(reason: &str) -> StorageError {
     StorageError::InvalidControl(format!("removal ledger: {reason}"))
 }
 
-fn key(origin: Uuid, namespace: u32, id: Uuid) -> [u8; 36] {
+pub(crate) fn key(origin: Uuid, namespace: u32, id: Uuid) -> [u8; 36] {
     let mut bytes = [0; 36];
     bytes[..16].copy_from_slice(origin.as_bytes());
     bytes[16..20].copy_from_slice(&namespace.to_be_bytes());
@@ -126,8 +126,7 @@ pub(crate) fn read_export(
     let state: LedgerState =
         serde_json::from_slice(value.value()).map_err(|_| invalid("invalid state encoding"))?;
     if state.ledger_version != 1
-        || state.tracking_started_at.store_id != control.store_id
-        || state.tracking_started_at.generation > control.committed_generation
+        || !crate::storage::lineage::permits_origin(tx, control, state.tracking_started_at)?
     {
         return Err(invalid("invalid coverage boundary/version"));
     }
@@ -137,8 +136,14 @@ pub(crate) fn read_export(
         let (k, value) = row?;
         let entry = decode_entry(value.value())?;
         if k.value() != key(entry.origin_lineage, entry.namespace_id, entry.memory_uuid)
-            || (entry.origin_lineage == control.store_id
-                && entry.generation > control.committed_generation)
+            || !crate::storage::lineage::permits_origin(
+                tx,
+                control,
+                GenerationRef {
+                    store_id: entry.origin_lineage,
+                    generation: entry.generation,
+                },
+            )?
         {
             return Err(invalid("key mismatch or future generation"));
         }
@@ -160,6 +165,10 @@ fn validate_retained_record(entry: &RemovalEntry, record: &DiskRecord) -> Result
             && (record.text_offset != 0 || record.text_length != 0))
         || (entry.removed_fields_mask & SUMMARY != 0 && !record.summary.is_empty())
         || (entry.removed_fields_mask & TAGS != 0 && !record.tags.is_empty())
+        || (entry.removed_fields_mask & TAGS != 0
+            && record.schema.as_ref().is_some_and(|s| !s.labels.is_empty()))
+        || (entry.removed_fields_mask & EMBEDDING != 0
+            && record.schema.as_ref().is_some_and(|s| s.vector.is_some()))
     {
         return Err(invalid("record contradicts retained removal evidence"));
     }

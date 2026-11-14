@@ -3,9 +3,7 @@ use super::{
     StorageError,
     control::{ControlState, Generation, GenerationRef},
 };
-use redb::{
-    MultimapTableHandle, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
-};
+use redb::{MultimapTableHandle, ReadableTableMetadata, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -71,8 +69,6 @@ pub(crate) fn read_state(
                 generation: state.publication_generation,
             },
         )?
-        || (state.source.store_id == control.store_id
-            && state.publication_generation != control.committed_generation)
         || chrono::DateTime::from_timestamp_millis(state.migration_now).is_none()
     {
         return Err(StorageError::InvalidControl(
@@ -102,8 +98,6 @@ pub(crate) fn read_state(
                     generation: receipt.committed_generation,
                 },
             )?
-            || (state.source.store_id == control.store_id
-                && receipt.committed_generation != control.committed_generation)
             || !matches!(receipt.outcome, super::control::MutationOutcome::SchemaMigrated { migration_id, attested_namespaces, .. } if migration_id == state.migration_id && attested_namespaces > 0)
         {
             return Err(StorageError::InvalidControl(
@@ -111,13 +105,14 @@ pub(crate) fn read_state(
             ));
         }
     } else if state.source.generation != state.publication_generation {
-        // There are no ordinary offline-v2 writers. A format-only migration
+        // Policy migrations never rewrite this original publication. A format-only migration
         // cannot explain an increment; an attestation must retain its evidence,
         // including after a restore fork changes the active store ID/counter.
         return Err(StorageError::InvalidControl(
             "format-only migration changed generation without an attestation receipt".into(),
         ));
     }
+    super::lifecycle_migration::validate_policy_history(read, control, &state)?;
     Ok(Some(state))
 }
 

@@ -11,6 +11,7 @@ pub(crate) mod effects;
 mod lifecycle_updates;
 mod observation;
 pub(crate) mod removal_ledger;
+pub(crate) mod restoration;
 pub(crate) mod text_generation;
 
 use std::collections::HashMap;
@@ -99,14 +100,16 @@ impl MetadataStore {
     /// - Creates all tables on first open.
     /// - Loads or rebuilds the phase index from persisted bitmaps.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
-        // redb's writable open changes bookkeeping. Refuse an offline v2 store
-        // using a disposable inspection copy, including direct metadata callers.
-        if path.try_exists()? && std::fs::metadata(path)?.len() > 0 {
-            let (_copy, inspection) = super::validation::inspect_database_copy(path, true)?;
-            if control::validate_existing(&inspection.begin_read()?)?
-                .is_some_and(|state| state.control_schema_version == 2)
-            {
-                return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
+        // redb's writable open can change bookkeeping. Reject historical mode
+        // on a disposable copy even for callers bypassing the engine.
+        if path.try_exists()? && path.metadata()?.len() > 0 {
+            let (_copy, db) = super::validation::inspect_database_copy(path, true)?;
+            let read = db.begin_read()?;
+            if let Some(control) = control::validate_existing(&read)? {
+                super::lineage::ensure_serving(&read, &control)?;
+                if control.control_schema_version == 2 {
+                    return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
+                }
             }
         }
         let db = redb::Builder::new()
@@ -214,6 +217,13 @@ impl MetadataStore {
         let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
         // Recheck after waiting: the preceding writer may have failed.
         self.ensure_available()?;
+        let read = self.db.begin_read()?;
+        let table = read.open_table(control::CONTROL)?;
+        let value = table
+            .get("state")?
+            .ok_or_else(|| StorageError::InvalidControl("missing control".into()))?;
+        let control = ControlState::decode(value.value())?;
+        crate::storage::lineage::ensure_serving(&read, &control)?;
         Ok(guard)
     }
 }

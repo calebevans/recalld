@@ -1717,7 +1717,7 @@ mod independent_review_regressions {
                     .committed_generation
                     .get(),
                 generation + 1 + u64::from(result.compaction_triggered),
-                "one phase/content commit plus an explicitly reported compaction"
+                "one lifecycle commit plus any separate text-compaction commit"
             );
         }
         assert_eq!(f.record(id).unwrap().phase, DecayPhase::Ghost);

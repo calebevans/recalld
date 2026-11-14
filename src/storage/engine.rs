@@ -401,7 +401,8 @@ impl RedbStorageEngine {
     /// 6. Opens vector files for all existing namespaces.
     /// 7. Runs startup validation (rebuilds phase index, cleans orphans).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let ownership = crate::storage::ownership::StoreOwnership::acquire(path.as_ref())?;
+        let ownership =
+            crate::storage::ownership::StoreOwnership::acquire_recovering(path.as_ref())?;
         let db_path = ownership.path.clone();
         std::fs::create_dir_all(&db_path)?;
         let lock_file = crate::storage::ownership::lock_directory(&db_path)?;
