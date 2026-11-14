@@ -19,6 +19,12 @@ Independent branches target main. A branch targets another implementation branch
 | Scan coverage/session | [#19](https://github.com/calebevans/recalld/pull/19) → #16 | Observed bounded scan counts and v1 session context | 513 tests |
 | Entity-link scope | [#20](https://github.com/calebevans/recalld/pull/20) | Canonical namespace checks before link caps | 499 tests after accepted-name review fix |
 | Paired retrieval study | [#23](https://github.com/calebevans/recalld/pull/23) → #18 | Five seeds, 1k/10k, unchanged internal harness | 20 processes / 8,000 measured queries; evidence archived |
+| Retrieval semantics | [#25](https://github.com/calebevans/recalld/pull/25) → #17 | Internal opt-in current/history, bounded graph work and diagnostics | 526 tests; no public v2 selector |
+| Mutation admission | [#26](https://github.com/calebevans/recalld/pull/26) → #21 | Sticky unavailable handle after uncertain publication | 531 tests; entry checks, not whole-pipeline leases |
+| Namespace assertions | [#27](https://github.com/calebevans/recalld/pull/27) → #19 | Canonical opt-in by-ID scope across transports | 518 tests |
+| Precomputed vectors | [#28](https://github.com/calebevans/recalld/pull/28) | HTTP vector search/similarity, validation and normalization | 499 tests |
+| Eligible FTS refill | [#29](https://github.com/calebevans/recalld/pull/29) → #25 | Stable bounded refill and internal coverage/error diagnostics | 533 tests |
+| Text generations | impl/text-compaction → #26 | Metadata-selected durable text generations | Held for independent review corrections |
 | Namespace read batching | impl/namespace-read-batch → #17 | One metadata snapshot per eligibility load | 509 tests; paired measurement underway |
 
 ## Remaining contract gates
@@ -31,10 +37,14 @@ Test counts apply to each branch separately, not a combined release. Integrated 
 
 A temporary integration branch combined structured results, embedding cache, tool validation, retrieval, storage, lifecycle and offline harness. Formatting passed, 556 library tests and two harness tests passed, with four existing doctests ignored. This run preceded the storage path-alias test and lifecycle review fixes and does not certify the later dependent slices.
 
-Independent lifecycle review reproduced a stale sweep overwriting newer feedback/permastore state, graph phase lag and a backward HTTP access timestamp. The lifecycle PR is held for fixes and dedicated regressions. Storage macOS CI exposed an expected-path assertion mismatch after parent canonicalization; the fix also tests that symlinked parent aliases share ownership. These findings remain recorded despite earlier green local suites.
+Independent lifecycle review reproduced a stale sweep overwriting newer feedback/permastore state, graph phase lag and a backward HTTP access timestamp. The lifecycle PR now includes fixes and dedicated regressions. Storage macOS CI exposed an expected-path assertion mismatch after parent canonicalization; the fix also tests that symlinked parent aliases share ownership. These findings remain recorded despite earlier green local suites.
 
-The next integration checkpoint passed 577 library, two Rust harness and three Python runner tests after including mutation foundations, coverage and the first entity-scope change. A later checkpoint includes the lifecycle review fixes, accepted-name compatibility correction, namespace-read batching and read-only transport; its tests are in progress.
+The next integration checkpoint passed 577 library, two Rust harness and three Python runner tests after including mutation foundations, coverage and the first entity-scope change. A later checkpoint includes the lifecycle review fixes, accepted-name compatibility correction, namespace-read batching and read-only transport; it passed 608 library and two Rust harness tests after also incorporating the internal retrieval-semantics branch. Four existing doctests were ignored. The next checkpoint adds precomputed vector queries and updates the read-only HTTP similarity regression to require successful, no-write retrieval.
 
 The paired study measured corrected retrieval at approximately 2.85x baseline p95 at 10k total records (1k queried-namespace records). Canonical eligibility dominated that overhead. This is characterization on a shared host, not a release-gate result. A separate transactional batching optimization retains the correctness rules and is being measured against the corrected baseline.
 
 Entity-link review found that legacy tag parsing drops accepted multiword/Unicode names. The scope PR therefore checks canonical namespace/deletion state without treating incomplete stored tags as the full entity set. Real store-call regressions preserve accepted-name linking and prevent alias-count arithmetic underflow; durable structured-label persistence remains a schema/migration requirement.
+
+The combined vector checkpoint passed 611 library and two Rust harness tests, including successful HTTP similarity with `recordAccess=false` and no access writes. Namespace-assertion integration is being checked separately against the combined read-only daemon protocol.
+
+Independent compaction review found an old-writer window between selecting a copied legacy text generation and installing the rejection gate. It also demonstrated that a failed open with a missing selected payload could modify metadata before validation. Compaction publication is held for fixes and regressions; new-reader interruption tests alone did not establish safe upgrade behavior.
