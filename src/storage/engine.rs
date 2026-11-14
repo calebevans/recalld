@@ -7,8 +7,10 @@
 //!
 //! See Spec 04 Section 7 for the design rationale.
 
+mod catalog;
 mod effects;
 mod insertion;
+mod purge;
 mod text_compaction;
 mod tombstone;
 
@@ -436,6 +438,7 @@ impl RedbStorageEngine {
 
         // Step 7: Startup validation.
         engine.recover_pending_effects()?;
+        engine.resume_pending_purges()?;
         engine.startup_validation()?;
         if let Some(selected) = selected_text {
             if let Err(error) =
@@ -800,6 +803,8 @@ pub struct PurgedNamespace {
     /// Whether the namespace's vector directory was removed. `false`
     /// means it was already gone, or a guard refused to touch it.
     pub directory_removed: bool,
+    /// Durable completion outcome; derived views still require acknowledgement.
+    pub receipt: WriteReceipt,
 }
 
 /// A [`RedbStorageEngine::purge_namespace`] that failed.
@@ -865,154 +870,6 @@ impl std::error::Error for NamespacePurgeError {
 }
 
 impl RedbStorageEngine {
-    /// Destroy a namespace: its records, its edges, its configuration
-    /// row and its vector file.
-    ///
-    /// # DESTRUCTIVE AND IRREVERSIBLE
-    ///
-    /// Every memory in the namespace is gone when this returns. There
-    /// is no undo and no backup. Callers are expected to have obtained
-    /// explicit confirmation before getting here.
-    ///
-    /// # The caller must finish the job
-    ///
-    /// This method can only reach what storage owns. The returned
-    /// records are the caller's input for cleaning the FTS index, the
-    /// in-memory vector index, the entity index and the relationship
-    /// graph — none of which this layer holds a handle to. Skip that and
-    /// the namespace is gone from disk but still burning top-k slots in
-    /// every search.
-    ///
-    /// # Ordering, and what a crash costs
-    ///
-    /// 1. Purge `META_TABLE` rows (chunked).
-    /// 2. Purge edges.
-    /// 3. Delete the `NAMESPACE_TABLE` row. **Point of no return.**
-    /// 4. Drop the `VectorStore`, then remove the directory.
-    ///
-    /// A crash before (3) leaves a live namespace holding fewer
-    /// memories: ugly, but consistent, and re-running the call finishes
-    /// it. A crash after (3) leaves an orphan directory and orphan FTS
-    /// rows — wasted disk, no wrong answers — and the directory is
-    /// reclaimed by the boot sweep in `startup_validation`.
-    ///
-    /// No crash marker is needed. Namespace ids are never recycled and
-    /// `NAMESPACE_TABLE` is authoritative, so "the row is gone" is
-    /// itself the durable record that the namespace is dead.
-    ///
-    /// # A failure is not the same as "nothing happened"
-    ///
-    /// Step 1 commits in chunks, so an ERROR — not merely a crash — part
-    /// of the way through has already destroyed everything up to that
-    /// point. The error type carries those records for exactly the
-    /// reason the success type does: without them the caller cannot
-    /// clean the indexes, and nothing ever can, because a retry finds
-    /// their `META_TABLE` rows already gone and reports an empty purge.
-    pub fn purge_namespace(
-        &mut self,
-        namespace_id: NamespaceId,
-    ) -> Result<PurgedNamespace, NamespacePurgeError> {
-        let config = match self.meta_store.get_namespace(namespace_id) {
-            Ok(Some(config)) => config,
-            Ok(None) => {
-                return Err(NamespacePurgeError::nothing_destroyed(
-                    StorageError::NamespaceNotFound(namespace_id.get()),
-                ));
-            }
-            Err(e) => return Err(NamespacePurgeError::nothing_destroyed(e)),
-        };
-
-        tracing::info!(
-            namespace = %config.name,
-            namespace_id = namespace_id.get(),
-            "Purging namespace (destructive, irreversible)"
-        );
-
-        let victims = self
-            .meta_store
-            .scan_all()
-            .map_err(NamespacePurgeError::nothing_destroyed)?;
-        let ids: Vec<_> = victims
-            .iter()
-            .filter(|(_, r)| r.namespace_id == namespace_id.get())
-            .map(|(id, _)| *id)
-            .collect();
-        let mut records = Vec::new();
-        let mut edges_removed = 0;
-        let mut peer_counts = std::collections::HashMap::new();
-        for chunk in ids.chunks(PURGE_CHUNK_SIZE) {
-            let result = (|| {
-                let guard = self.meta_store.mutation_guard()?;
-                let result = self.meta_store.commit_graph_effects(
-                    &guard,
-                    namespace_id,
-                    &self.edge_store.load_all_edges()?,
-                    &[],
-                    chunk,
-                    true,
-                    false,
-                )?;
-                // Preserve known committed removals even if materialization fails.
-                records.extend(result.removed);
-                edges_removed += result.edges_removed;
-                peer_counts.extend(result.peer_counts);
-                effects::apply_pending(
-                    &self.meta_store,
-                    &self.edge_store,
-                    Some(&mut self.vector_manager),
-                )
-                .map_err(|source| StorageError::CommittedEffectsPending {
-                    operation_id: result.receipt.operation_id,
-                    source: Box::new(source),
-                })
-            })();
-            if let Err(source) = result {
-                return Err(NamespacePurgeError::partial(records, source));
-            }
-        }
-        let peer_edge_counts = peer_counts
-            .into_iter()
-            .filter(|(id, _)| !ids.contains(id))
-            .collect();
-        let live_removed = records
-            .iter()
-            .filter(|(_, r)| r.phase != DecayPhase::Tombstone)
-            .count();
-        let tombstones_removed = records.len() - live_removed;
-
-        // 3. Configuration row. Point of no return.
-        if let Err(e) = self.meta_store.delete_namespace(namespace_id) {
-            return Err(NamespacePurgeError::partial(records, e));
-        }
-
-        // 4. Vector file. The store must be dropped before the unlink:
-        //    it holds an fs2 exclusive lock and a live mmap.
-        let store = self.vector_manager.remove(namespace_id);
-        drop(store);
-
-        let directory_removed = self.remove_namespace_dir(&config.name);
-
-        tracing::info!(
-            namespace = %config.name,
-            namespace_id = namespace_id.get(),
-            live_removed,
-            tombstones_removed,
-            edges_removed,
-            directory_removed,
-            "Namespace purge complete"
-        );
-
-        Ok(PurgedNamespace {
-            config,
-            records,
-            live_removed,
-            tombstones_removed,
-            edges_removed,
-            peer_edge_counts,
-            directory_removed,
-        })
-    }
-
     /// Remove every edge touching `ids`, and repair the outgoing
     /// `edge_count` of every SURVIVING memory that had an edge into one
     /// of them. Returns the edges removed and the `(peer, new_count)`
@@ -1100,6 +957,7 @@ impl RedbStorageEngine {
     /// committed by the time this runs, so a failure here is wasted disk
     /// to be logged and swept at next boot, not a reason to report the
     /// deletion as failed.
+    #[cfg(test)]
     fn remove_namespace_dir(&self, name: &str) -> bool {
         let dir = match self.namespace_dir(name) {
             Ok(dir) => dir,
@@ -1198,13 +1056,6 @@ impl RedbStorageEngine {
 /// Leading dot on purpose: the sweep skips dotfile directories, so its
 /// own quarantine can never become a candidate for the next sweep.
 const QUARANTINE_DIR_NAME: &str = ".orphaned";
-
-/// How many records one `purge_namespace_records` transaction commits.
-///
-/// Bounds how long a purge holds the redb write lock. Small enough that
-/// a concurrent reader is not stalled for seconds; large enough that a
-/// hundred-thousand-record namespace is not a hundred thousand fsyncs.
-const PURGE_CHUNK_SIZE: usize = 1_000;
 
 // ═══════════════════════════════════════════════════════════════════════
 // StorageEngine Implementation
@@ -1486,48 +1337,21 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Namespaces ──────────────────────────────────────────────────
 
-    /// # The row must never outlive the directory
-    ///
-    /// This used to commit the `NAMESPACE_TABLE` row and only then ask
-    /// `open_or_create` whether the name could be a directory. A
-    /// rejected name therefore left a committed row for a namespace
-    /// whose directory can never be created — and [`Self::open`] step 6
-    /// calls `open_or_create` for **every** row and `?`-propagates, so
-    /// the next boot failed outright. One rejected `create_namespace`
-    /// call wedged the database.
-    ///
-    /// So: validate first, and roll the row back if the vector store
-    /// still refuses. Validation cannot see a directory already flocked
-    /// by another store or a full disk, and both wedge the boot in
-    /// exactly the same way.
+    /// Publish durable namespace vectors before committing its row and receipt.
+    /// The v1 wrapper retains its assigned-ID return shape.
     fn create_namespace(&mut self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
-        self.ensure_available()?;
-        validate_namespace_name(&config.name).map_err(|e| StorageError::InvalidNamespaceName {
-            name: config.name.clone(),
-            reason: e.to_string(),
-        })?;
-
-        let ns_id = self.meta_store.create_namespace(config)?;
-
-        // Open/create the vector file for this namespace.
-        if let Err(e) =
-            self.vector_manager
-                .open_or_create(ns_id, &config.name, config.embedding_dim as usize)
-        {
-            if let Err(rollback) = self.meta_store.delete_namespace(ns_id) {
-                tracing::error!(
-                    namespace = %config.name,
-                    namespace_id = ns_id.get(),
-                    error = %rollback,
-                    "Could not roll back the namespace row after its vector store failed \
-                     to open. The next startup will fail to open this namespace; remove \
-                     the row by hand."
-                );
+        let ctx = MutationContext {
+            scope: MutationScope::Catalog,
+            ..MutationContext::unkeyed(NamespaceId::new(1))
+        };
+        match self.create_namespace_with_receipt(&ctx, config)?.outcome {
+            crate::storage::control::MutationOutcome::NamespaceCreated { namespace_id, .. } => {
+                Ok(namespace_id)
             }
-            return Err(e.into());
+            _ => Err(StorageError::InvalidControl(
+                "create receipt outcome mismatch".into(),
+            )),
         }
-
-        Ok(ns_id)
     }
 
     fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError> {

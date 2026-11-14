@@ -14,6 +14,7 @@ thread_local! {
 /// Ephemeral inputs only; receipts and effects never retain stripped content.
 pub(super) enum RecordMutation<'a> {
     GraphOnly,
+    PurgeChunk(&'a crate::storage::purge::PurgeProgress),
     Inserted(&'a DiskRecord, u32),
     Tombstoned {
         record: &'a DiskRecord,
@@ -88,6 +89,8 @@ pub(crate) fn validate_existing(
                     MutationOutcome::GraphChanged { .. }
                         | MutationOutcome::MemoryInserted { .. }
                         | MutationOutcome::MemoryTombstoned { .. }
+                        | MutationOutcome::NamespacePurgeStarted { .. }
+                        | MutationOutcome::NamespacePurgeAdvanced { .. }
                 ) {
                     return Err(StorageError::InvalidControl(
                         "effects schema missing from adopted store".into(),
@@ -173,6 +176,20 @@ pub(crate) fn validate_existing(
                 && effect.removed_ids.is_empty()
                 && effect.releases.is_empty()
                 && effect.invalidated_ids.contains(&memory_id) => {}
+            MutationOutcome::NamespacePurgeAdvanced {
+                stage,
+                removed,
+                edges_removed,
+                ..
+            } if effect.puts.is_empty()
+                && effect.releases.is_empty()
+                && removed == effect.removed_ids.len() as u64
+                && edges_removed == effect.deletes.len() as u64
+                && (stage == crate::storage::purge::PurgeStage::Deleting
+                    || (removed == 0
+                        && edges_removed == 0
+                        && effect.invalidated_ids.is_empty()
+                        && effect.peer_counts.is_empty())) => {}
             MutationOutcome::GraphChanged {
                 edges_put,
                 edges_removed,
@@ -315,7 +332,7 @@ impl MetadataStore {
             RecordMutation::Inserted(record, _) | RecordMutation::Tombstoned { record, .. } => {
                 invalidated.insert(MemoryId::from_bytes(record.id));
             }
-            RecordMutation::GraphOnly => {}
+            RecordMutation::GraphOnly | RecordMutation::PurgeChunk(_) => {}
         }
         if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
             if *old_phase != DecayPhase::Tombstone {
@@ -478,13 +495,25 @@ impl MetadataStore {
                     crate::storage::tombstone::TombstoneStatus::Tombstoned
                 },
             },
-            RecordMutation::GraphOnly => MutationOutcome::GraphChanged {
-                edges_put: actual_puts.len(),
-                edges_removed: deletes.len(),
-                memories_removed: removed.len(),
-            },
+            RecordMutation::GraphOnly | RecordMutation::PurgeChunk(_) => {
+                MutationOutcome::GraphChanged {
+                    edges_put: actual_puts.len(),
+                    edges_removed: deletes.len(),
+                    memories_removed: removed.len(),
+                }
+            }
         };
-        let receipt = control::record_receipt(&tx, ctx, hash, outcome)?;
+        let receipt = if let RecordMutation::PurgeChunk(progress) = &mutation {
+            super::purge::record_next(
+                &tx,
+                progress,
+                crate::storage::purge::PurgeStage::Deleting,
+                &removed,
+                deletes.len(),
+            )?
+        } else {
+            control::record_receipt(&tx, ctx, hash, outcome)?
+        };
         if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
             if *old_phase != DecayPhase::Tombstone {
                 super::removal_ledger::record_removal(

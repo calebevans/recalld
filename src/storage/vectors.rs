@@ -308,6 +308,10 @@ impl VectorStore {
     /// * `dir` -- directory that will contain the file (created if absent).
     /// * `dim` -- embedding dimensionality for this namespace.
     ///
+    pub(crate) fn relocate_path(&mut self, dir: &Path) {
+        self.path = dir.join("vectors.dat");
+    }
+
     /// On create: writes a 64-byte header and zero vector slots.
     /// On open: validates the header, acquires an exclusive file lock.
     pub fn open(dir: &Path, dim: usize) -> Result<Self> {
@@ -837,6 +841,10 @@ impl VectorManager {
             self.stores.insert(namespace_id, store);
         }
         Ok(self.stores.get_mut(&namespace_id).unwrap())
+    }
+
+    pub(crate) fn install_prepared(&mut self, id: NamespaceId, store: VectorStore) {
+        self.stores.insert(id, store);
     }
 
     /// Get a shared reference to an already-opened store.
