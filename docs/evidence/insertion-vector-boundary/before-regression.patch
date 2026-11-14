@@ -1,0 +1,28 @@
+--- a/src/storage/engine/insertion_tests.rs
++++ b/src/storage/engine/insertion_tests.rs
+@@ -630,3 +630,25 @@
+         crate::model::DecayPhase::Tombstone
+     );
+ }
++
++fn reject_zero_insertion(supplied: bool) {
++    let f = Fixture::new();
++    let mut engine = f.storage.write().unwrap();
++    let mut input = request();
++    input.embedding = supplied.then(|| vec![0.; DIM]);
++    let ctx = context(&engine, "zero");
++    let bytes = payloads(&engine);
++    let before = generation(&engine);
++    let error = engine.insert_memory_with_receipt(&ctx, &input, &[0.; DIM], 123);
++    assert!(error.is_err(), "zero-norm insertion committed (supplied={supplied})");
++    assert_eq!(generation(&engine), before);
++    assert_eq!(payloads(&engine), bytes);
++    assert!(engine.scan_all().unwrap().is_empty());
++    assert!(engine.lookup_insert_replay(&ctx, &input).unwrap().is_none());
++}
++
++#[test]
++fn insertion_rejects_zero_supplied_without_mutation() { reject_zero_insertion(true); }
++
++#[test]
++fn insertion_rejects_zero_generated_without_mutation() { reject_zero_insertion(false); }

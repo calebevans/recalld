@@ -1367,16 +1367,19 @@ mod tests {
         let missing = storage
             .create_memory(
                 namespace,
-                "",
+                "initial valid summary",
                 Some("only retained text"),
                 &[],
-                &[0.0; DIM],
+                &[1., 0., 0., 0.],
                 Some(1.0),
                 None,
             )
             .await
             .unwrap()
             .id;
+        // Model pre-existing content loss through the legacy storage patch;
+        // public insertion now rejects empty summaries at its own boundary.
+        f.storage.read().unwrap().strip_summary(missing).unwrap();
         assert_eq!(f.record(missing).unwrap().created_at, 0);
         let summary = f
             .insert_memory_with(MemorySpec {
@@ -1747,7 +1750,7 @@ mod independent_review_regressions {
                 "retained summary",
                 Some("retained full text"),
                 &["retained".into()],
-                &[0.; 4],
+                &[1., 0., 0., 0.],
                 Some(1.),
                 None,
             )
@@ -1758,19 +1761,8 @@ mod independent_review_regressions {
             storage.get_full_text(id).await.unwrap().as_deref(),
             Some("retained full text")
         );
-        // The storage adapter alone does not run graph/autolink orchestration.
-        let record = f.record(id).unwrap();
-        f.graph
-            .write()
-            .await
-            .add_node(
-                id,
-                crate::model::NamespaceId::new(record.namespace_id),
-                record.phase,
-                record.decay_strength,
-                record.vector_slot,
-            )
-            .unwrap();
+        // Actual insertion now completes graph/index publication itself.
+        assert!(f.graph.read().await.get_node(&id).is_some());
         let sweep = adapter(&f, i64::MAX);
         for phase in [DecayPhase::Summary, DecayPhase::Ghost] {
             let generation = f

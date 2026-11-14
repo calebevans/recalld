@@ -12,6 +12,7 @@ mod passthrough;
 mod prefix;
 pub mod profile;
 mod provider;
+pub mod validation;
 
 mod bedrock;
 

@@ -21,6 +21,7 @@ pub mod engine;
 pub mod error;
 pub mod fsync;
 pub mod indexes;
+pub mod insertion;
 pub mod metadata;
 pub mod offline_snapshot;
 pub(crate) mod ownership;
