@@ -1,0 +1,22 @@
+{
+  "parent": "d94e1452c9c960d7e9d5bcc50159cbeb4642d79e",
+  "hotfix": "b61cb665e3a683ae889361352dd8a66e853339ef",
+  "source_files": [
+    "docs/implementation/native-record-mutations.md",
+    "src/storage/control.rs",
+    "src/storage/engine.rs",
+    "src/storage/engine/native_records.rs",
+    "src/storage/lifecycle_migration.rs",
+    "src/storage/metadata.rs",
+    "src/storage/metadata/effects.rs",
+    "src/storage/metadata/insertion.rs",
+    "src/storage/metadata/native_lifecycle.rs",
+    "src/storage/metadata/native_lifecycle/tests.rs",
+    "src/storage/metadata/native_records.rs",
+    "src/storage/metadata/native_records/tests.rs",
+    "src/storage/mod.rs",
+    "src/storage/native_lifecycle.rs",
+    "src/storage/native_records.rs",
+    "src/storage/validation.rs"
+  ]
+}
