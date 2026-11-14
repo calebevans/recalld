@@ -20,6 +20,10 @@ path = "src/bin/recalld_cli.rs"
 name = "recalld-text-migrate"
 path = "src/bin/recalld_text_migrate.rs"
 
+[[bin]]
+name = "recalld-schema"
+path = "src/bin/recalld_schema.rs"
+
 [lib]
 name = "recalld"
 path = "src/lib.rs"
