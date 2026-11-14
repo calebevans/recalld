@@ -35,13 +35,29 @@ pub struct OfflineSnapshot {
 
 impl OfflineSnapshot {
     pub fn open(source: &Path) -> Result<Self, StorageError> {
+        Self::open_at(source, false)
+    }
+    pub(crate) fn open_import_stage(source: &Path) -> Result<Self, StorageError> {
+        Self::open_at(source, true)
+    }
+    fn open_at(source: &Path, importing: bool) -> Result<Self, StorageError> {
         if !source.is_dir() {
             return Err(StorageError::InvalidPath);
         }
         let owner = StoreOwnership::acquire(source)?;
+        Self::from_owner(owner, importing)
+    }
+    pub(crate) fn open_owned(owner: StoreOwnership) -> Result<Self, StorageError> {
+        Self::from_owner(owner, false)
+    }
+    fn from_owner(owner: StoreOwnership, importing: bool) -> Result<Self, StorageError> {
         let source = &owner.path;
         let source_lock = lock_directory(source)?;
-        super::validation::canonical_files(source)?;
+        if importing {
+            super::validation::validate_import_stage(source)?;
+        } else {
+            super::validation::canonical_files(source)?;
+        }
         let (meta_copy, metadata) = super::validation::inspect_database(&source.join("meta.db"))?;
         let (edges_copy, edges) = super::validation::inspect_database(&source.join("edges.db"))?;
         let read = metadata.begin_read()?;

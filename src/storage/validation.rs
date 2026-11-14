@@ -91,6 +91,21 @@ fn selected_text(path: &Path, read: &redb::ReadTransaction) -> Result<TextStore,
 /// Caller owns/quiesces the store, or supplies an inaccessible staging copy.
 /// Returns the required canonical inventory derived from validated metadata.
 pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageError> {
+    validate_snapshot(path, false)
+}
+
+/// Only the logical importer may inspect its unpublished, explicitly importing
+/// stage. Ordinary inspection/export/backup must not treat partial imports as snapshots.
+pub(crate) fn validate_import_stage(path: &Path) -> Result<HashSet<String>, StorageError> {
+    validate_snapshot(path, true)
+}
+
+fn validate_snapshot(path: &Path, importing: bool) -> Result<HashSet<String>, StorageError> {
+    if !importing && std::fs::symlink_metadata(path.join(".recalld-importing")).is_ok() {
+        return Err(StorageError::RecoveryRequired(
+            "incomplete logical import; resume using its original export".into(),
+        ));
+    }
     recover_text_compaction(path)?;
     for name in ["meta.db", "edges.db", "fulltext.dat"] {
         require_file(&path.join(name))?;
