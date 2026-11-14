@@ -114,6 +114,18 @@ pub trait StorageEngine: Send + Sync {
         Ok(0)
     }
 
+    async fn insert_memory(
+        &self,
+        namespace_id: NamespaceId,
+        input: crate::storage::insertion::InsertMemory,
+        generated_embedding: Vec<f32>,
+    ) -> Result<crate::storage::insertion::InsertResult, StorageError>;
+
+    async fn complete_insertion(
+        &self,
+        receipt: &crate::storage::control::WriteReceipt,
+    ) -> Result<(), StorageError>;
+
     /// Create a new memory record and persist it.
     async fn create_memory(
         &self,

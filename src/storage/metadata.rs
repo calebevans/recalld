@@ -8,11 +8,13 @@
 //! See CS-07 for the full specification.
 
 pub(crate) mod effects;
+mod insertion;
 mod lifecycle_updates;
 mod native_lifecycle;
 pub(crate) mod removal_ledger;
 pub(crate) mod restoration;
 pub(crate) mod text_generation;
+mod tombstone;
 
 use std::collections::HashMap;
 use std::path::Path;

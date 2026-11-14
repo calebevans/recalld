@@ -952,6 +952,12 @@ async fn handle_forget_memories(
                     });
                 }
             }
+            Err(crate::mcp::bridge::BridgeError::PartiallyApplied(detail)) => {
+                // The legacy Vec<bool> cannot encode a partially completed batch.
+                // Preserve receipt/unknown status instead of fabricating per-item
+                // failures with a zero-deleted success-shaped aggregate.
+                return ToolCallResult::error(detail);
+            }
             Err(e) => {
                 for (index, id) in &parsed {
                     results[*index] = json!({

@@ -12,6 +12,13 @@ pub enum StorageError {
     LifecycleConflict(String),
     #[error("CONTENT_UNAVAILABLE")]
     LifecycleContentUnavailable,
+    /// Canonical mutation exists; retry publication, never retry as a new write.
+    #[error("INDEX_NOT_READY commitState=committed ready=false receipt={} cause={source}", serde_json::to_string(receipt).unwrap_or_default())]
+    CommittedMutation {
+        receipt: Box<crate::storage::control::WriteReceipt>,
+        #[source]
+        source: Box<StorageError>,
+    },
 
     /// Invalid lineage, key, version, or generation encoding.
     #[error("invalid mutation context: {0}")]
@@ -75,6 +82,13 @@ pub enum StorageError {
     /// A redb commit error.
     #[error("redb commit error: {0}")]
     RedbCommit(#[from] redb::CommitError),
+
+    /// Provider output failed vector validation; the store remains usable.
+    #[error("EMBEDDING_UNAVAILABLE: invalid provider vector: {0}")]
+    ProviderVectorUnavailable(String),
+
+    #[error("EDGE_CONFLICT: {0}")]
+    EdgeConflict(String),
 
     #[error("invalid storage mutation: {0}")]
     InvalidMutation(String),

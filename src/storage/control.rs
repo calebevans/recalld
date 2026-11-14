@@ -202,6 +202,23 @@ pub enum MutationOutcome {
     LifecyclePolicyMigrated {
         transition: super::lifecycle_migration::PolicyTransition,
     },
+    MemoryTombstoned {
+        #[serde(rename = "memoryId")]
+        memory_id: MemoryId,
+        status: super::tombstone::TombstoneStatus,
+    },
+    MemoryInserted {
+        #[serde(rename = "memoryId")]
+        memory_id: MemoryId,
+        #[serde(rename = "createdAt")]
+        created_at: i64,
+        #[serde(rename = "initialStabilityBits")]
+        initial_stability_bits: u32,
+        #[serde(rename = "embeddingDim")]
+        embedding_dim: u32,
+        #[serde(rename = "edgesPut")]
+        edges_put: usize,
+    },
     GraphChanged {
         edges_put: usize,
         edges_removed: usize,
@@ -312,8 +329,17 @@ pub(crate) fn validate_existing(
     super::canonical_schema::read_state(tx, &state)?;
     for entry in receipts.iter()? {
         let (key, value) = entry?;
-        let (lineage, _, operation) = decode_scope(key.value())?;
+        let (lineage, scope, operation) = decode_scope(key.value())?;
         let stored = validate_receipt(value.value())?;
+        if matches!(
+            stored.receipt.outcome,
+            MutationOutcome::MemoryInserted { .. } | MutationOutcome::MemoryTombstoned { .. }
+        ) && !matches!(scope, MutationScope::Namespace(_))
+        {
+            return Err(StorageError::InvalidControl(
+                "record mutation receipt has catalog scope".into(),
+            ));
+        }
         // Policy receipts require the canonical schema consumer even when the
         // schema table is entirely absent. Legacy decode alone is not proof.
         if matches!(
@@ -481,13 +507,68 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
         MutationOutcome::LifecycleFeedbackApplied { transition } => {
             transition.validate(&stored.receipt, true)?
         }
-        MutationOutcome::LifecyclePolicyMigrated { .. }
+        MutationOutcome::MemoryInserted { .. }
+        | MutationOutcome::MemoryTombstoned { .. }
+        | MutationOutcome::LifecyclePolicyMigrated { .. }
         | MutationOutcome::GraphChanged { .. }
         | MutationOutcome::SchemaMigrated { .. }
         | MutationOutcome::TextGenerationSelected { .. }
         | MutationOutcome::AccessRecorded { .. } => {}
     }
+    if let MutationOutcome::MemoryInserted {
+        memory_id,
+        created_at,
+        edges_put,
+        initial_stability_bits,
+        embedding_dim,
+    } = stored.receipt.outcome
+    {
+        if memory_id == MemoryId::nil()
+            || chrono::DateTime::from_timestamp_millis(created_at).is_none()
+            || edges_put > 2
+            || !(1..=8192).contains(&embedding_dim)
+            || !f32::from_bits(initial_stability_bits).is_finite()
+            || f32::from_bits(initial_stability_bits) <= 0.0
+        {
+            return Err(StorageError::InvalidControl(
+                "invalid insertion receipt".into(),
+            ));
+        }
+    }
+    if matches!(stored.receipt.outcome, MutationOutcome::MemoryTombstoned { memory_id, .. } if memory_id == MemoryId::nil())
+    {
+        return Err(StorageError::InvalidControl(
+            "nil tombstone receipt identity".into(),
+        ));
+    }
     Ok(stored)
+}
+
+/// Lookup before resolving mutable defaults. Operation-specific callers can
+/// reconstruct normalization from a payload-free historical outcome, then use
+/// replay_or_check to verify the complete hash before accepting replay.
+pub(crate) fn keyed_receipt(
+    tx: &WriteTransaction,
+    ctx: &MutationContext,
+) -> Result<Option<StoredReceipt>, StorageError> {
+    ctx.validate()?;
+    let state = read_control(tx)?;
+    if ctx.store_id.is_some_and(|id| id != state.store_id) {
+        return Err(StorageError::StoreLineageMismatch);
+    }
+    let Some(key) = &ctx.idempotency_key else {
+        return Ok(None);
+    };
+    let keys = tx.open_table(KEYS)?;
+    let Some(id) = keys.get(scoped_key(state.store_id, ctx.scope, key.as_bytes()).as_slice())?
+    else {
+        return Ok(None);
+    };
+    let receipts = tx.open_table(RECEIPTS)?;
+    let value = receipts
+        .get(id.value())?
+        .ok_or_else(|| StorageError::InvalidControl("key without receipt".into()))?;
+    validate_receipt(value.value()).map(Some)
 }
 
 /// Lineage precedes replay; matching replay precedes CAS (including after purge).

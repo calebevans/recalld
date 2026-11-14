@@ -8,7 +8,9 @@
 //! See Spec 04 Section 7 for the design rationale.
 
 mod effects;
+mod insertion;
 mod text_compaction;
+mod tombstone;
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -488,6 +490,25 @@ impl RedbStorageEngine {
                     file_offset: record.text_offset,
                     length: record.text_length,
                 })?;
+            }
+        }
+        // Reclaim abandoned staging only after every canonical owner and payload
+        // has passed validation. Never infer ownership from tombstone slots.
+        let namespaces: Vec<_> = self.vector_manager.iter().map(|(id, _)| id).collect();
+        for namespace in namespaces {
+            let store = self
+                .vector_manager
+                .get_mut(namespace)
+                .expect("enumerated namespace");
+            let mut changed = false;
+            for slot in 0..store.slot_count() {
+                if !owners.contains(&(namespace.get(), slot)) && !store.is_free(slot) {
+                    store.free_slot(slot)?;
+                    changed = true;
+                }
+            }
+            if changed {
+                store.sync()?;
             }
         }
         let known_ids: HashSet<MemoryId> = all_records.iter().map(|(id, _)| *id).collect();

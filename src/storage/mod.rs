@@ -23,6 +23,7 @@ pub mod fsync;
 pub mod indexes;
 pub mod lifecycle_migration;
 pub(crate) mod lineage;
+pub mod insertion;
 pub mod metadata;
 pub mod native_lifecycle;
 pub mod offline_snapshot;
@@ -31,6 +32,9 @@ pub(crate) mod restore_journal;
 pub mod schema_migration;
 pub mod text;
 pub mod text_migration;
+pub mod tombstone;
+#[cfg(test)]
+mod tombstone_tests;
 pub(crate) mod validation;
 pub mod vectors;
 
