@@ -264,14 +264,8 @@ pub(crate) fn removed_fields(before: &DiskRecord, after: &DiskRecord) -> u8 {
     mask
 }
 
-/// Shared by actual legacy strip, batch replacement and atomic lifecycle writers.
-pub(crate) fn record_change(
-    tx: &WriteTransaction,
-    at: GenerationRef,
-    before: &DiskRecord,
-    after: &DiskRecord,
-    operation_id: Uuid,
-) -> Result<(), StorageError> {
+/// Include logical phase loss even when the legacy field was already absent.
+pub(crate) fn lifecycle_removed_fields(before: &DiskRecord, after: &DiskRecord) -> u8 {
     let mut mask = removed_fields(before, after);
     if before.phase == DecayPhase::Full
         && after.phase != DecayPhase::Full
@@ -286,6 +280,18 @@ pub(crate) fn record_change(
     {
         mask |= SUMMARY;
     }
+    mask
+}
+
+/// Shared by actual legacy strip, batch replacement and atomic lifecycle writers.
+pub(crate) fn record_change(
+    tx: &WriteTransaction,
+    at: GenerationRef,
+    before: &DiskRecord,
+    after: &DiskRecord,
+    operation_id: Uuid,
+) -> Result<(), StorageError> {
+    let mut mask = lifecycle_removed_fields(before, after);
     let terminal = if after.phase == DecayPhase::Tombstone {
         Some(TerminalKind::Tombstone)
     } else {

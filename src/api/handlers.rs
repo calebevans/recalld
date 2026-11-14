@@ -1862,13 +1862,19 @@ pub async fn trigger_decay_sweep(
         .decay
         .trigger_sweep(req.as_of)
         .await
-        .map_err(|e| AppError::Internal {
-            source: format!("sweep failed: {e}").into(),
-        })?;
+        .map_err(
+            |error| match error.downcast::<crate::storage::StorageError>() {
+                Ok(storage) => AppError::from(*storage),
+                Err(source) => AppError::Internal { source },
+            },
+        )?;
 
     Ok(Json(ApiResponse {
         data: TriggerSweepResponse {
             memories_scanned: result.memories_scanned,
+            stale_skipped: result.stale_skipped,
+            unchanged_skipped: result.unchanged_skipped,
+            exempt_skipped: result.exempt_skipped,
             full_to_summary: result.full_to_summary,
             summary_to_ghost: result.summary_to_ghost,
             deletions: result.deletions,

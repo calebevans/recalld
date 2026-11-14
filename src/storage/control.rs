@@ -193,6 +193,20 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    LifecycleMaterialized {
+        #[serde(rename = "memoryId")]
+        memory_id: MemoryId,
+        #[serde(rename = "fromPhase")]
+        from_phase: crate::model::DecayPhase,
+        #[serde(rename = "toPhase")]
+        to_phase: crate::model::DecayPhase,
+        #[serde(rename = "strengthBits")]
+        strength_bits: u32,
+        #[serde(rename = "decayStrengthBits")]
+        decay_strength_bits: u32,
+        #[serde(rename = "removedFieldsMask")]
+        removed_fields_mask: u8,
+    },
     MemoryTombstoned {
         #[serde(rename = "memoryId")]
         memory_id: MemoryId,
@@ -323,7 +337,9 @@ pub(crate) fn validate_existing(
         let stored = validate_receipt(value.value())?;
         if matches!(
             stored.receipt.outcome,
-            MutationOutcome::MemoryInserted { .. } | MutationOutcome::MemoryTombstoned { .. }
+            MutationOutcome::MemoryInserted { .. }
+                | MutationOutcome::MemoryTombstoned { .. }
+                | MutationOutcome::LifecycleMaterialized { .. }
         ) && !matches!(scope, MutationScope::Namespace(_))
         {
             return Err(StorageError::InvalidControl(
@@ -489,6 +505,36 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
         return Err(StorageError::InvalidControl(
             "nil tombstone receipt identity".into(),
         ));
+    }
+    if let MutationOutcome::LifecycleMaterialized {
+        memory_id,
+        from_phase,
+        to_phase,
+        strength_bits,
+        decay_strength_bits,
+        removed_fields_mask,
+    } = stored.receipt.outcome
+    {
+        use crate::model::DecayPhase::{Full, Ghost, Summary, Tombstone};
+        if memory_id == MemoryId::nil()
+            || from_phase == Tombstone
+            || to_phase == Tombstone
+            || !(from_phase == to_phase
+                || matches!((from_phase, to_phase), (Full, Summary) | (Summary, Ghost)))
+            || [strength_bits, decay_strength_bits].iter().any(|bits| {
+                !f32::from_bits(*bits).is_finite() || !(0.0..=1.0).contains(&f32::from_bits(*bits))
+            })
+            || removed_fields_mask
+                != match (from_phase, to_phase) {
+                    (Full, Summary) => super::metadata::removal_ledger::FULL_TEXT,
+                    (Summary, Ghost) => super::metadata::removal_ledger::SUMMARY,
+                    _ => 0,
+                }
+        {
+            return Err(StorageError::InvalidControl(
+                "invalid lifecycle materialization receipt".into(),
+            ));
+        }
     }
     Ok(stored)
 }

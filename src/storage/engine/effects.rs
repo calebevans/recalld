@@ -61,8 +61,8 @@ impl RedbStorageEngine {
             &self.edge_store,
             Some(&mut self.vector_manager),
         )
-        .map_err(|source| StorageError::CommittedEffectsPending {
-            operation_id: result.receipt.operation_id,
+        .map_err(|source| StorageError::CommittedMutation {
+            receipt: Box::new(result.receipt.clone()),
             source: Box::new(source),
         })?;
         Ok(Some(result))

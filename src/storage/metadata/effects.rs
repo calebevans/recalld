@@ -14,6 +14,10 @@ thread_local! {
 /// Ephemeral inputs only; receipts and effects never retain stripped content.
 pub(super) enum RecordMutation<'a> {
     GraphOnly,
+    LifecyclePatched {
+        before: &'a DiskRecord,
+        after: &'a DiskRecord,
+    },
     Inserted(&'a DiskRecord, u32),
     Tombstoned {
         record: &'a DiskRecord,
@@ -88,6 +92,7 @@ pub(crate) fn validate_existing(
                     MutationOutcome::GraphChanged { .. }
                         | MutationOutcome::MemoryInserted { .. }
                         | MutationOutcome::MemoryTombstoned { .. }
+                        | MutationOutcome::LifecycleMaterialized { .. }
                 ) {
                     return Err(StorageError::InvalidControl(
                         "effects schema missing from adopted store".into(),
@@ -144,6 +149,14 @@ pub(crate) fn validate_existing(
             ));
         }
         match effect.receipt.outcome {
+            MutationOutcome::LifecycleMaterialized { memory_id, .. }
+                if matches!(effect.scope, MutationScope::Namespace(_))
+                    && effect.puts.is_empty()
+                    && effect.deletes.is_empty()
+                    && effect.removed_ids.is_empty()
+                    && effect.releases.is_empty()
+                    && effect.peer_counts.is_empty()
+                    && effect.invalidated_ids == [memory_id] => {}
             MutationOutcome::MemoryTombstoned { memory_id, status }
                 if matches!(effect.scope, MutationScope::Namespace(_))
                     && effect.puts.is_empty()
@@ -312,7 +325,9 @@ impl MetadataStore {
         let mut releases = Vec::new();
         let mut invalidated: std::collections::HashSet<_> = incident_ids.iter().copied().collect();
         match &mutation {
-            RecordMutation::Inserted(record, _) | RecordMutation::Tombstoned { record, .. } => {
+            RecordMutation::Inserted(record, _)
+            | RecordMutation::Tombstoned { record, .. }
+            | RecordMutation::LifecyclePatched { after: record, .. } => {
                 invalidated.insert(MemoryId::from_bytes(record.id));
             }
             RecordMutation::GraphOnly => {}
@@ -463,6 +478,18 @@ impl MetadataStore {
         let mut invalidated_ids: Vec<_> = invalidated.into_iter().collect();
         invalidated_ids.sort();
         let outcome = match &mutation {
+            RecordMutation::LifecyclePatched { before, after } => {
+                MutationOutcome::LifecycleMaterialized {
+                    memory_id: MemoryId::from_bytes(after.id),
+                    from_phase: before.phase,
+                    to_phase: after.phase,
+                    strength_bits: after.strength.to_bits(),
+                    decay_strength_bits: after.decay_strength.to_bits(),
+                    removed_fields_mask: super::removal_ledger::lifecycle_removed_fields(
+                        before, after,
+                    ),
+                }
+            }
             RecordMutation::Inserted(record, embedding_dim) => MutationOutcome::MemoryInserted {
                 memory_id: MemoryId::from_bytes(record.id),
                 created_at: record.created_at,
@@ -485,6 +512,18 @@ impl MetadataStore {
             },
         };
         let receipt = control::record_receipt(&tx, ctx, hash, outcome)?;
+        if let RecordMutation::LifecyclePatched { before, after } = &mutation {
+            super::removal_ledger::record_change(
+                &tx,
+                crate::storage::control::GenerationRef {
+                    store_id: receipt.store_id,
+                    generation: receipt.committed_generation,
+                },
+                before,
+                after,
+                receipt.operation_id,
+            )?;
+        }
         if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
             if *old_phase != DecayPhase::Tombstone {
                 super::removal_ledger::record_removal(
@@ -565,6 +604,14 @@ impl MetadataStore {
         })?;
         crash_point("after_metadata_commit");
         let mut phases = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+        if let RecordMutation::LifecyclePatched { before, after } = &mutation {
+            phases.transition(
+                after.namespace_id,
+                after.vector_slot,
+                before.phase,
+                after.phase,
+            );
+        }
         if let RecordMutation::Inserted(record, _) = &mutation {
             phases.transition(
                 record.namespace_id,
@@ -674,6 +721,34 @@ pub(crate) fn validate_plan(
         {
             return Err(StorageError::InvalidControl(
                 "pending insertion disagrees with canonical record".into(),
+            ));
+        }
+    }
+    if let MutationOutcome::LifecycleMaterialized {
+        memory_id,
+        to_phase,
+        strength_bits,
+        decay_strength_bits,
+        removed_fields_mask,
+        ..
+    } = effect.receipt.outcome
+    {
+        if records
+            .iter()
+            .find(|(id, _)| *id == memory_id)
+            .is_none_or(|(_, r)| {
+                r.phase != to_phase
+                    || r.strength.to_bits() != strength_bits
+                    || r.decay_strength.to_bits() != decay_strength_bits
+                    || effect.scope != MutationScope::Namespace(NamespaceId::new(r.namespace_id))
+                    || (removed_fields_mask & super::removal_ledger::FULL_TEXT != 0
+                        && (r.text_offset != 0 || r.text_length != 0))
+                    || (removed_fields_mask & super::removal_ledger::SUMMARY != 0
+                        && !r.summary.is_empty())
+            })
+        {
+            return Err(StorageError::InvalidControl(
+                "pending lifecycle patch disagrees with canonical record".into(),
             ));
         }
     }
