@@ -100,7 +100,15 @@ cost is explicit; it is not background readiness or automatic online repair.
 
 ## Validation and remaining boundary
 
-Final exact-source validation is recorded in the following documentation commit.
+Validated source: `dd5d2199bddb8370411867153529142a123e7046`, parent `bc01b2e`,
+executed 2026-11-14. This final result update is documentation-only.
+
+| Check | Result |
+| --- | --- |
+| `cargo test --offline --locked --all-features -- --test-threads=2` | 543 passed; 4 existing doctests ignored |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --offline --locked --all-targets --all-features` | Passed with warnings; not warning-free |
+
 Runs use `recalld-ci:1.94`, Rust 1.94.1, `--network none --cpus 2 --memory 4g`,
 `CARGO_BUILD_JOBS=2`, private Cargo/target scratch mounts, and only synthetic
 stores. No home/credentials/host socket/personal data mounts. Logs/caches remain
