@@ -94,8 +94,9 @@ pub trait MetadataStore: Send + Sync {
     async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>>;
     /// Batch load multiple records. Missing IDs are silently skipped.
     async fn get_batch(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>>;
-    /// Scan canonical metadata for query eligibility. Errors must propagate.
-    async fn scan_all(&self) -> Result<Vec<CachedRecord>>;
+    /// Enumerate all namespace members without a candidate/scan cap.
+    /// IDs are discovery only; load canonical records before checking eligibility.
+    async fn list_namespace_memories(&self, namespace_id: NamespaceId) -> Result<Vec<MemoryId>>;
 }
 
 /// RIF processor -- applies retrieval-induced forgetting.
@@ -378,16 +379,22 @@ impl QueryEngine {
         timings.embed_us = stage_start.elapsed().as_micros() as u64;
 
         // Canonical metadata, not cached/index metadata, decides hard eligibility.
-        // ponytail: scan until A1 provides generation-certified filtered views.
+        // ponytail: load every namespace member until A1 supplies certified filtered views.
+        let stage_start = Instant::now();
+        let namespace_ids = self
+            .meta_store
+            .list_namespace_memories(ns_config.id)
+            .await?;
         let eligible_records: HashMap<MemoryId, CachedRecord> = self
             .meta_store
-            .scan_all()
+            .get_batch(&namespace_ids)
             .await?
             .into_iter()
             .filter(|record| Self::passes_hard_filters(record, &query, ns_config.id))
             .map(|record| (record.id, record))
             .collect();
         let eligible_ids: HashSet<MemoryId> = eligible_records.keys().copied().collect();
+        timings.eligibility_us = stage_start.elapsed().as_micros() as u64;
 
         // -- Stage 3: Vector Search + FTS + Entity Recall -----------------
         let fetch_k = match query.query_mode {
@@ -1287,11 +1294,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MetadataStore for StubMetaStore {
-        async fn scan_all(&self) -> Result<Vec<CachedRecord>> {
+        async fn list_namespace_memories(
+            &self,
+            namespace_id: NamespaceId,
+        ) -> Result<Vec<MemoryId>> {
             if self.fail {
                 return Err(SearchError::MetadataError("meta.db unavailable".into()));
             }
-            Ok(self.records.values().cloned().collect())
+            Ok(self
+                .records
+                .values()
+                .filter(|r| r.namespace_id == namespace_id)
+                .map(|r| r.id)
+                .collect())
         }
         async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
             Ok(self.records.get(id).cloned())
@@ -1695,8 +1710,16 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn scan_all(&self) -> Result<Vec<CachedRecord>> {
-            Ok(self.0.clone())
+        async fn list_namespace_memories(
+            &self,
+            namespace_id: NamespaceId,
+        ) -> Result<Vec<MemoryId>> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|r| r.namespace_id == namespace_id)
+                .map(|r| r.id)
+                .collect())
         }
     }
 
@@ -2001,7 +2024,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn canonical_eligibility_failure_is_not_an_empty_success() {
+    async fn canonical_namespace_enumeration_failure_is_not_an_empty_success() {
         let mut engine = search_engine(Vec::new(), &[]);
         engine.meta_store = Arc::new(StubMetaStore {
             fail: true,
@@ -2050,5 +2073,76 @@ mod tests {
             assert!((result.composite_score.unwrap() - expected).abs() < 1e-6);
             assert_eq!(result.score, own_cosine);
         }
+    }
+
+    /// Namespace enumeration must only discover IDs; batch reads decide eligibility.
+    struct NamespaceEligibilityProbe {
+        fail_batch: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl MetadataStore for NamespaceEligibilityProbe {
+        async fn get(&self, _id: &MemoryId) -> Result<Option<CachedRecord>> {
+            unreachable!("eligibility uses batch canonical reads")
+        }
+
+        async fn list_namespace_memories(
+            &self,
+            namespace_id: NamespaceId,
+        ) -> Result<Vec<MemoryId>> {
+            assert_eq!(namespace_id, ns());
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            Ok(vec![mid(1), mid(2), mid(3)])
+        }
+
+        async fn get_batch(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>> {
+            assert_eq!(ids, &[mid(1), mid(2), mid(3)]);
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            if self.fail_batch {
+                return Err(SearchError::MetadataError("canonical read failed".into()));
+            }
+            let mut tombstone = rec(mid(2));
+            tombstone.phase = DecayPhase::Tombstone;
+            // ID 2 was tombstoned and ID 3 disappeared after enumeration.
+            Ok(vec![rec(mid(1)), tombstone])
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eligibility_timing_includes_namespace_enumeration_and_canonical_loading() {
+        let mut engine = search_engine(Vec::new(), &[]);
+        engine.meta_store = Arc::new(NamespaceEligibilityProbe { fail_batch: false });
+        let response = engine
+            .search(query(json!({
+                "queryMode": "metadata_only", "filter": {"minStrength": 0.0}
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .results
+                .iter()
+                .map(|r| r.memory_id)
+                .collect::<Vec<_>>(),
+            vec![mid(1)]
+        );
+        let timings = response.timings.unwrap();
+        assert_eq!(timings.eligibility_us, 5000);
+        assert_eq!(timings.total_us, 5000);
+        assert_eq!(timings.load_metadata_us, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn namespace_canonical_batch_failure_is_not_an_empty_success() {
+        let mut engine = search_engine(Vec::new(), &[]);
+        engine.meta_store = Arc::new(NamespaceEligibilityProbe { fail_batch: true });
+        assert!(matches!(
+            engine
+                .search(query(json!({
+                    "queryMode": "metadata_only", "filter": {"minStrength": 0.0}
+                })))
+                .await,
+            Err(SearchError::MetadataError(_))
+        ));
     }
 }

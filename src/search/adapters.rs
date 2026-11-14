@@ -270,19 +270,16 @@ impl MetadataStore for StorageMetadataAdapter {
         .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
     }
 
-    async fn scan_all(&self) -> Result<Vec<CachedRecord>> {
+    async fn list_namespace_memories(&self, namespace_id: NamespaceId) -> Result<Vec<MemoryId>> {
         let storage = self.storage.clone();
         tokio::task::spawn_blocking(move || {
             let storage_r = storage
                 .read()
                 .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
-            let all = storage_r
-                .scan_all()
-                .map_err(|e| SearchError::MetadataError(e.to_string()))?;
-            Ok(all
-                .iter()
-                .map(|(_id, disk)| CachedRecord::from(disk))
-                .collect())
+            storage_r
+                .meta_store()
+                .memories_in_namespace(namespace_id)
+                .map_err(|e| SearchError::MetadataError(e.to_string()))
         })
         .await
         .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
@@ -526,5 +523,76 @@ impl EntityIndexReader for SharedEntityIndexReader {
                 shared_count,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::DecayPhase;
+    use crate::test_support::{Fixture, MemorySpec};
+
+    #[tokio::test]
+    async fn namespace_enumeration_scopes_ids_and_batch_reads_current_canonical_records() {
+        let fixture = Fixture::new();
+        let namespace = NamespaceId::new(1);
+        let foreign_namespace = fixture.create_namespace("foreign");
+        let live = fixture
+            .insert_memory_in(namespace, &["project/recalld"])
+            .await;
+        let ghost = fixture
+            .insert_memory_with(MemorySpec {
+                phase: DecayPhase::Ghost,
+                decay_strength: 0.2,
+                tags: &["type/ghost"],
+                ..MemorySpec::new(namespace)
+            })
+            .await;
+        let removed = fixture.insert_memory_in(namespace, &[]).await;
+        let foreign = fixture
+            .insert_memory_in(foreign_namespace, &["project/recalld"])
+            .await;
+        let adapter = StorageMetadataAdapter::new(fixture.storage.clone());
+        let mut ids = adapter.list_namespace_memories(namespace).await.unwrap();
+        assert_eq!(
+            ids.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([live, ghost, removed])
+        );
+        assert_eq!(
+            adapter
+                .list_namespace_memories(foreign_namespace)
+                .await
+                .unwrap(),
+            vec![foreign]
+        );
+        assert!(
+            adapter
+                .list_namespace_memories(NamespaceId::new(999))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The batch read must observe canonical state, not treat an enumerated ID as eligible.
+        fixture.tombstone(removed);
+        ids.push(MemoryId::new()); // A missing canonical row is skipped.
+        let records = adapter.get_batch(&ids).await.unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|r| r.namespace_id == namespace));
+        let removed = records.iter().find(|r| r.id == removed).unwrap();
+        assert_eq!(removed.phase, DecayPhase::Tombstone);
+        let ghost = records.iter().find(|r| r.id == ghost).unwrap();
+        assert_eq!(ghost.phase, DecayPhase::Ghost);
+        assert_eq!(ghost.strength, 0.2);
+        assert_eq!(ghost.tags[0].as_str(), "type/ghost");
+        assert_eq!(
+            adapter
+                .list_namespace_memories(namespace)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([live, ghost.id])
+        );
     }
 }
