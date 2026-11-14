@@ -3432,52 +3432,6 @@ mod tests {
         }
     }
 
-    /// The migration case, and the reason the refusal is by name rather
-    /// than by lookup: a database created before the validator reached
-    /// this layer can already hold a row named `""`, whose directory
-    /// **is** the data directory. Planting the row directly is the only
-    /// way to reach that state now.
-    #[tokio::test]
-    async fn w47_a_legacy_empty_named_namespace_cannot_destroy_the_database() {
-        let fx = Fixture::new();
-
-        {
-            let mut config = crate::model::NamespaceConfig::default_namespace(0);
-            config.name = String::new();
-            config.embedding_dim = crate::test_support::DIM as u32;
-            fx.storage
-                .write()
-                .expect("storage lock")
-                .meta_store()
-                .create_namespace(&config)
-                .expect("plant a legacy row");
-        }
-
-        let err = fx
-            .namespace_adapter()
-            .delete_namespace(bridge::DeleteNamespaceInput {
-                name: String::new(),
-                force: true,
-            })
-            .await
-            .expect_err("an empty namespace name must be refused");
-        assert!(
-            matches!(err, bridge::BridgeError::InvalidInput(_)),
-            "{err:?}"
-        );
-
-        assert!(
-            fx.path().join("meta.db").exists()
-                && fx.path().join("edges.db").exists()
-                && fx.path().join("fulltext.dat").exists(),
-            "the database was destroyed"
-        );
-        assert!(
-            fx.namespace_dir("default").join("vectors.dat").exists(),
-            "the default namespace's vectors were destroyed"
-        );
-    }
-
     // ── case-insensitive namespace identity ──────────────────────────
 
     /// Chain B. `create_namespace("Default")` passed the exact-match

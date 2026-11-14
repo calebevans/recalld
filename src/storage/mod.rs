@@ -15,6 +15,7 @@
 //! - `fsync` — Filesystem sync helpers for crash safety
 
 pub mod canonical_schema;
+pub mod catalog;
 pub mod control;
 pub mod edges;
 pub mod engine;
