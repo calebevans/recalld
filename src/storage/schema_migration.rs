@@ -554,6 +554,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_attestation_evidence_is_rejected_without_changing_canonical_files() {
+        use crate::model::schema::{Normalization, PreprocessingIdentity, ProviderKind};
+        for fault in [
+            "missing_operation",
+            "source_gap",
+            "zero_attestations",
+            "unverified_origin",
+        ] {
+            let source = fixture().await;
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("attested");
+            let mut input = options(source.path());
+            let namespace = inspect_schema(source.path()).unwrap().namespaces.remove(0);
+            input.attestations.push(ProfileAttestationInput {
+                namespace_id: namespace.id,
+                namespace_name: namespace.name,
+                descriptor: EmbeddingProfile {
+                    identity_version: 1,
+                    provider_kind: ProviderKind::Ollama,
+                    model_id: "explicit-known-model".into(),
+                    model_revision: None,
+                    dimension: 4,
+                    document_preprocessing: PreprocessingIdentity {
+                        version: "recalld-document-v1".into(),
+                        prefix: "".into(),
+                    },
+                    query_preprocessing: PreprocessingIdentity {
+                        version: "recalld-query-v1".into(),
+                        prefix: "".into(),
+                    },
+                    normalization: Normalization::L2UnitV1,
+                },
+            });
+            let report = migrate_schema(source.path(), &target, &input).unwrap();
+            let receipt = report.receipt.unwrap();
+            assert_eq!(
+                receipt.committed_generation,
+                input.expected_source.generation.next().unwrap()
+            );
+            assert!(inspect_schema(&target).is_ok());
+            {
+                let db = redb::Database::open(target.join("meta.db")).unwrap();
+                let tx = db.begin_write().unwrap();
+                if fault == "zero_attestations" {
+                    let key = control::scoped_key(
+                        receipt.store_id,
+                        MutationScope::Catalog,
+                        receipt.operation_id.as_bytes(),
+                    );
+                    let mut table = tx.open_table(control::RECEIPTS).unwrap();
+                    let mut stored: serde_json::Value =
+                        control::decode(table.get(key.as_slice()).unwrap().unwrap().value())
+                            .unwrap();
+                    stored["receipt"]["outcome"]["attestedNamespaces"] = serde_json::json!(0);
+                    table
+                        .insert(key.as_slice(), control::encode(&stored).unwrap().as_slice())
+                        .unwrap();
+                } else {
+                    let mut table = tx
+                        .open_table(super::super::canonical_schema::SCHEMA)
+                        .unwrap();
+                    let mut state: serde_json::Value =
+                        control::decode(table.get("state").unwrap().unwrap().value()).unwrap();
+                    match fault {
+                        "missing_operation" => {
+                            state.as_object_mut().unwrap().remove("receiptOperationId");
+                        }
+                        "source_gap" => state["source"]["generation"] = serde_json::json!("0"),
+                        _ => state["source"]["storeId"] = serde_json::json!(uuid::Uuid::new_v4()),
+                    }
+                    table
+                        .insert("state", control::encode(&state).unwrap().as_slice())
+                        .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+            let before = std::fs::read(target.join("meta.db")).unwrap();
+            assert!(inspect_schema(&target).is_err(), "{fault}");
+            assert!(RedbStorageEngine::open(&target).is_err(), "{fault}");
+            assert!(
+                MetadataStore::open(&target.join("meta.db")).is_err(),
+                "{fault}"
+            );
+            assert_eq!(
+                std::fs::read(target.join("meta.db")).unwrap(),
+                before,
+                "{fault}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn interrupted_schema_publication_is_absent_or_complete_and_offline() {
         for stop in [
             Stage::Copied,

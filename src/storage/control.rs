@@ -74,6 +74,18 @@ pub struct GenerationRef {
     pub generation: Generation,
 }
 
+/// Validate a generation in its own lineage. Standalone schema builds know only
+/// the active lineage. Restore integration delegates this boundary to
+/// `lineage::permits_origin`, which checks verified ancestor generation bounds.
+/// Unknown ancestry must remain rejected, never inferred from a receipt.
+pub(crate) fn permits_generation_origin(
+    _read: &ReadTransaction,
+    control: &ControlState,
+    origin: GenerationRef,
+) -> Result<bool, StorageError> {
+    Ok(origin.store_id == control.store_id && origin.generation <= control.committed_generation)
+}
+
 /// Versioned separately from the untouched DiskRecord v1 and payload layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
