@@ -25,13 +25,24 @@ pub(crate) fn require_file(path: &Path) -> Result<(), StorageError> {
 
 // redb 2.x writes bookkeeping even on open. Inspect disposable copies and
 // abort repair; source files remain byte-for-byte unchanged.
-fn inspect_database(path: &Path) -> Result<(tempfile::TempDir, redb::Database), StorageError> {
+pub(crate) fn inspect_database(
+    path: &Path,
+) -> Result<(tempfile::TempDir, redb::Database), StorageError> {
+    inspect_database_copy(path, false)
+}
+
+pub(crate) fn inspect_database_copy(
+    path: &Path,
+    recover_copy: bool,
+) -> Result<(tempfile::TempDir, redb::Database), StorageError> {
     require_file(path)?;
     let temp = tempfile::tempdir()?;
     let copy = temp.path().join("inspect.db");
     std::fs::copy(path, &copy)?;
     let mut builder = redb::Builder::new();
-    builder.set_repair_callback(|session| session.abort());
+    if !recover_copy {
+        builder.set_repair_callback(|session| session.abort());
+    }
     let mut db = builder.open(copy)?;
     if !db.check_integrity()? {
         return Err(StorageError::RecoveryRequired(format!(
@@ -40,6 +51,41 @@ fn inspect_database(path: &Path) -> Result<(tempfile::TempDir, redb::Database), 
         )));
     }
     Ok((temp, db))
+}
+
+/// Canonical text preflight on a disposable metadata copy. This precedes any
+/// writable canonical open; pending graph effects are deliberately not inspected.
+pub(crate) fn preflight_text(path: &Path) -> Result<(), StorageError> {
+    // An unclean process exit may require redb free-list recovery. Perform it
+    // only on the disposable copy before touching the original database.
+    let (_copy, metadata) = inspect_database_copy(&path.join("meta.db"), true)?;
+    let read = metadata.begin_read()?;
+    if let Some(control) = super::control::validate_existing(&read)? {
+        super::lineage::ensure_serving(&read, &control)?;
+    }
+    let text = selected_text(path, &read)?;
+    let records = read.open_table(META_TABLE)?;
+    for row in records.iter()? {
+        let (_, bytes) = row?;
+        let record = DiskRecord::from_bytes(bytes.value())?;
+        if record.text_offset != 0 || record.text_length != 0 {
+            text.read(TextRef {
+                file_offset: record.text_offset,
+                length: record.text_length,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn selected_text(path: &Path, read: &redb::ReadTransaction) -> Result<TextStore, StorageError> {
+    match super::metadata::text_generation::read_selection(read)? {
+        Some(descriptor) => {
+            super::text::generation::validate_rejection_gate(path, descriptor.store_id)?;
+            TextStore::open_generation(path, &descriptor, false)
+        }
+        None => TextStore::open_read_only(&path.join("fulltext.dat")),
+    }
 }
 
 /// Caller owns/quiesces the store, or supplies an inaccessible staging copy.
@@ -93,7 +139,10 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
             VectorStore::open(&dir, config.embedding_dim as usize)?,
         );
     }
-    let text = TextStore::open_read_only(&path.join("fulltext.dat"))?;
+    if let Some(descriptor) = super::metadata::text_generation::read_selection(&read)? {
+        inventory.insert(descriptor.filename);
+    }
+    let text = selected_text(path, &read)?;
     let records = read.open_table(META_TABLE)?;
     let mut ids = HashSet::new();
     let mut owners = HashSet::new();

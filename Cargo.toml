@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "recalld-cli"
 path = "src/bin/recalld_cli.rs"
 
+[[bin]]
+name = "recalld-text-migrate"
+path = "src/bin/recalld_text_migrate.rs"
+
 [lib]
 name = "recalld"
 path = "src/lib.rs"

@@ -181,7 +181,7 @@ pub struct SweepResult {
     /// Memories where connection bonus prevented a phase transition
     /// that raw R alone would have triggered.
     pub saved_by_connection_bonus: u64,
-    /// Whether fulltext.dat compaction was triggered.
+    /// Whether text compaction succeeded, including an empty generation selection.
     pub compaction_triggered: bool,
     /// Wall-clock duration of the entire sweep.
     pub duration: Duration,
@@ -641,11 +641,7 @@ impl DecaySweepRunner {
             })
             .await;
             match compaction_result {
-                Ok(Ok(cr)) => {
-                    if cr.entries_removed > 0 {
-                        result.compaction_triggered = true;
-                    }
-                }
+                Ok(Ok(_)) => result.compaction_triggered = true,
                 Ok(Err(e)) => {
                     error!(error = %e, "fulltext.dat compaction failed");
                 }
@@ -1415,6 +1411,54 @@ mod tests {
         assert_eq!(f.record(disabled).unwrap().last_accessed_at, 0);
     }
 
+    #[tokio::test]
+    async fn empty_successful_compaction_is_reported() {
+        let fixture = crate::test_support::Fixture::new();
+        let id = fixture
+            .insert_memory_with(crate::test_support::MemorySpec {
+                phase: DecayPhase::Ghost,
+                summary: "",
+                ..crate::test_support::MemorySpec::new(crate::model::NamespaceId::new(1))
+            })
+            .await;
+        let before = fixture
+            .storage
+            .read()
+            .unwrap()
+            .meta_store()
+            .text_selection()
+            .unwrap()
+            .unwrap();
+
+        // No text was ever appended. Deleting the expired ghost still selects
+        // a fresh empty generation and must report that maintenance commit.
+        let result = DecaySweepRunner::execute_sweep_at(
+            &SweepConfig::default(),
+            &DecayConfig::default(),
+            &ActivationConfig::default(),
+            &fixture.storage,
+            &fixture.graph,
+            &fixture.cache,
+            1.0,
+            Some(1_000_000 * 86_400_000),
+        )
+        .await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.deletions, 1);
+        assert!(fixture.record(id).is_none());
+        let after = fixture
+            .storage
+            .read()
+            .unwrap()
+            .meta_store()
+            .text_selection()
+            .unwrap()
+            .unwrap();
+        assert_ne!(before.id, after.id);
+        assert_eq!(before.sealed_length, after.sealed_length);
+        assert!(result.compaction_triggered);
+    }
+
     /// An engine holding one live, Full-phase memory.
     fn engine_with_one_memory() -> (tempfile::TempDir, RedbStorageEngine, MemoryId) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1625,8 +1669,8 @@ mod independent_review_regressions {
                     .unwrap()
                     .committed_generation
                     .get(),
-                generation + 1,
-                "sweep must commit strength, phase and content once, without a preliminary strength write"
+                generation + 1 + u64::from(result.compaction_triggered),
+                "one lifecycle commit plus any separate text-compaction commit"
             );
         }
         assert_eq!(f.record(id).unwrap().phase, DecayPhase::Ghost);
@@ -1704,7 +1748,7 @@ mod independent_review_regressions {
                     .unwrap()
                     .committed_generation
                     .get(),
-                generation + 1
+                generation + 1 + u64::from(result.compaction_triggered)
             );
             assert_eq!(
                 f.graph.read().await.get_node(&id).unwrap().decay_phase,

@@ -83,6 +83,8 @@ pub struct ControlState {
     pub committed_generation: Generation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removal_ledger_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_lineage_version: Option<u32>,
 }
 
 impl ControlState {
@@ -181,6 +183,14 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    TextGenerationSelected {
+        #[serde(rename = "generationId")]
+        generation_id: Uuid,
+        #[serde(rename = "formatVersion")]
+        format_version: u16,
+        #[serde(rename = "entriesKept")]
+        entries_kept: u64,
+    },
     AccessRecorded {
         #[serde(rename = "memoryId")]
         memory_id: MemoryId,
@@ -259,14 +269,24 @@ pub(crate) fn validate_existing(
             .ok_or_else(|| StorageError::InvalidControl("missing control state".into()))?
             .value(),
     )?;
+    let ancestry = super::lineage::read_lineage(tx, &state)?;
     for entry in receipts.iter()? {
         let (key, value) = entry?;
         let (lineage, _, operation) = decode_scope(key.value())?;
         let stored = validate_receipt(value.value())?;
-        if lineage != state.store_id
+        let permitted_origin = if lineage == state.store_id {
+            stored.receipt.committed_generation <= state.committed_generation
+        } else {
+            ancestry.as_ref().is_some_and(|a| {
+                a.permits(GenerationRef {
+                    store_id: lineage,
+                    generation: stored.receipt.committed_generation,
+                })
+            })
+        };
+        if !permitted_origin
             || stored.receipt.store_id != lineage
             || operation != stored.receipt.operation_id.as_bytes()
-            || stored.receipt.committed_generation > state.committed_generation
         {
             return Err(StorageError::InvalidControl(
                 "receipt identity/generation disagrees with control".into(),
@@ -277,7 +297,10 @@ pub(crate) fn validate_existing(
         let (key, value) = entry?;
         let (lineage, scope, client_key) = decode_scope(key.value())?;
         let (receipt_lineage, receipt_scope, _) = decode_scope(value.value())?;
-        if lineage != state.store_id
+        if (lineage != state.store_id
+            && !ancestry
+                .as_ref()
+                .is_some_and(|a| a.ancestors.iter().any(|r| r.store_id == lineage)))
             || lineage != receipt_lineage
             || scope != receipt_scope
             || client_key.is_empty()
@@ -328,6 +351,7 @@ pub(crate) fn initialize(tx: &WriteTransaction) -> Result<(), StorageError> {
             store_id: Uuid::new_v4(),
             committed_generation: Generation::default(),
             removal_ledger_version: None,
+            restore_lineage_version: None,
         };
         tx.open_table(CONTROL)?
             .insert("state", encode(&state)?.as_slice())?;
