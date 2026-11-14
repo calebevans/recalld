@@ -124,6 +124,13 @@ impl MetadataStore {
         if native_lifecycle_only && (!path.is_file() || path.metadata()?.len() == 0) {
             return Err(StorageError::InvalidPath);
         }
+        if let Some(parent) = path.parent() {
+            if std::fs::symlink_metadata(parent.join(".recalld-importing")).is_ok() {
+                return Err(StorageError::RecoveryRequired(
+                    "incomplete logical import; resume using its original export".into(),
+                ));
+            }
+        }
         // redb's writable open can change bookkeeping. Reject historical mode
         // on a disposable copy even for callers bypassing the engine.
         if path.try_exists()? && path.metadata()?.len() > 0 {

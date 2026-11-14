@@ -27,6 +27,7 @@ pub mod lifecycle_migration;
 pub(crate) mod lineage;
 pub mod metadata;
 pub mod native_lifecycle;
+pub mod logical_export;
 pub mod offline_snapshot;
 pub(crate) mod ownership;
 pub mod purge;

@@ -22,6 +22,10 @@ pub(crate) struct CapturedSnapshot {
     pub namespace_counter: u32,
     pub receipts: Rows,
     pub keys: Rows,
+    /// None preserves absence; Some(empty) preserves the initialized schema.
+    /// Raw values retain the original immutable completed progress encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_progress: Option<Rows>,
 }
 
 /// Layouts whose canonical tables have explicit consumers. Native owned open
@@ -44,6 +48,9 @@ pub(crate) fn validate_inventory(read: &redb::ReadTransaction) -> Result<(), Sto
         "canonical_schema",
         "effects_schema",
         "mutation_effects",
+        "logical_import_progress",
+        "namespace_purge_schema",
+        "namespace_purge_progress",
     ];
     if read.list_tables()?.any(|t| !known.contains(&t.name()))
         || read
@@ -105,6 +112,14 @@ pub(crate) fn capture(path: &Path) -> Result<CapturedSnapshot, StorageError> {
         namespace_counter,
         receipts: rows(control::RECEIPTS)?,
         keys: rows(control::KEYS)?,
+        purge_progress: if read
+            .list_tables()?
+            .any(|table| table.name() == purge::PROGRESS.name())
+        {
+            Some(rows(purge::PROGRESS)?)
+        } else {
+            None
+        },
     })
 }
 
@@ -166,6 +181,8 @@ pub(crate) fn reconcile(
     let mut ancestors = BTreeMap::new();
     let mut merged = BTreeMap::<[u8; 36], ledger::RemovalEntry>::new();
     let mut sources = Vec::new();
+    let mut purge_rows = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    let mut has_purge_schema = false;
     for source in std::iter::once(snapshot).chain(target) {
         for origin in std::iter::once(source.control.generation_ref()).chain(
             source
@@ -177,6 +194,17 @@ pub(crate) fn reconcile(
                 .entry(origin.store_id)
                 .and_modify(|g: &mut Generation| *g = (*g).max(origin.generation))
                 .or_insert(origin.generation);
+        }
+        if let Some(rows) = &source.purge_progress {
+            has_purge_schema = true;
+            for (key, bytes) in rows {
+                if purge_rows.get(key).is_some_and(|old| old != bytes) {
+                    return Err(StorageError::InvalidControl(
+                        "conflicting completed purge history".into(),
+                    ));
+                }
+                purge_rows.insert(key.clone(), bytes.clone());
+            }
         }
         sources.push(LedgerSource {
             source: source.control.generation_ref(),
@@ -200,6 +228,23 @@ pub(crate) fn reconcile(
             } else {
                 merged.insert(k, entry.clone());
             }
+        }
+    }
+    let mut retired = BTreeMap::<u32, String>::new();
+    for bytes in purge_rows.values() {
+        let progress: crate::storage::purge::PurgeProgress = control::decode(bytes)?;
+        if progress.stage != crate::storage::purge::PurgeStage::Complete {
+            return Err(StorageError::RecoveryRequired(
+                "unfinished namespace purge cannot be restored".into(),
+            ));
+        }
+        if retired
+            .insert(progress.namespace_id.get(), progress.name)
+            .is_some()
+        {
+            return Err(StorageError::InvalidControl(
+                "conflicting retired namespace identities".into(),
+            ));
         }
     }
     if ancestors.contains_key(&new_store_id) || new_store_id.is_nil() {
@@ -270,6 +315,13 @@ pub(crate) fn reconcile(
             mask |= entry.removed_fields_mask;
             terminal = terminal.max(entry.terminal_kind);
         }
+        if retired.contains_key(&record.namespace_id)
+            && (terminal != Some(TerminalKind::HardDelete) || mask != ledger::ALL)
+        {
+            return Err(StorageError::RecoveryRequired(
+                "retired namespace record lacks hard-delete ledger proof".into(),
+            ));
+        }
         if terminal.is_some() {
             removals.insert(id);
             if record.phase != DecayPhase::Tombstone {
@@ -334,6 +386,17 @@ pub(crate) fn reconcile(
         *edge_counts.entry(edge.source).or_default() += 1;
     }
     for ns in &namespaces {
+        if let Some(name) = retired.get(&ns.id.get()) {
+            if name != &ns.name {
+                return Err(StorageError::InvalidControl(
+                    "retired namespace identity disagrees with snapshot".into(),
+                ));
+            }
+            // This is the private, validated stage. The original target/archive
+            // is untouched; publication occurs only after final validation.
+            std::fs::remove_dir_all(stage.join(&ns.name))?;
+            continue;
+        }
         let mut vectors = crate::storage::vectors::VectorStore::open(
             &stage.join(&ns.name),
             ns.embedding_dim as usize,
@@ -363,6 +426,12 @@ pub(crate) fn reconcile(
     let descriptor = text.seal(new_store_id, text_id, 2)?;
     crate::storage::text::generation::write_rejection_gate(stage, &descriptor)?;
     let tx = db.begin_write()?;
+    // A completed import checkpoint is derived retry state for the old copy.
+    // Full canonical validation precedes this private fork; never carry its
+    // destination/export identity into the newly restored lineage.
+    tx.delete_table(TableDefinition::<&str, &[u8]>::new(
+        "logical_import_progress",
+    ))?;
     let mut control = snapshot.control.clone();
     control.store_id = new_store_id;
     control.committed_generation = Generation::default().next()?;
@@ -375,6 +444,19 @@ pub(crate) fn reconcile(
     if let Some(target) = target {
         merge_rows(&tx, control::RECEIPTS, &target.receipts)?;
         merge_rows(&tx, control::KEYS, &target.keys)?;
+    }
+    if has_purge_schema {
+        tx.open_table(purge::SCHEMA)?.insert("version", 1)?;
+        let mut table = tx.open_table(purge::PROGRESS)?;
+        for (key, bytes) in &purge_rows {
+            table.insert(key.as_slice(), bytes.as_slice())?;
+        }
+    }
+    {
+        let mut table = tx.open_table(NAMESPACE_TABLE)?;
+        for namespace in retired.keys() {
+            table.remove(*namespace)?;
+        }
     }
     tx.delete_table(META_TABLE)?;
     tx.delete_multimap_table(TAG_INDEX)?;
