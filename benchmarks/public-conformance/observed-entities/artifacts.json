@@ -1,0 +1,15 @@
+{
+  "artifacts": [
+    {
+      "bytes": 1175358,
+      "file": "validated-c425a5d.tgz",
+      "harnessCommit": "364203421a57fd4a93dd20149d89d7ae997ccafb",
+      "outputHashesVerified": 164,
+      "sha256": "c17faf190d8e39bf5a8368b43eca849d8044f7f9225b8c22014248a78516c856",
+      "sourceCommit": "c425a5d4df158e2659ecfa674ea9b422e5e9dc2b",
+      "sourceHashesVerified": 182,
+      "sourcePath": "/tmp/recalld-public-conformance-7lgc6nhu",
+      "targetedHashesVerified": 4
+    }
+  ]
+}

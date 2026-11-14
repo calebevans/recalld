@@ -1,0 +1,67 @@
+{
+  "sourceCommit": "1d52153db6520d9b64e568f281557441b11f0ff3",
+  "checks": [
+    {
+      "ref": "9ebe082",
+      "commit": "9ebe08242290f811ad98d250b055ec96d49dee0f",
+      "kind": "required",
+      "ancestor": true
+    },
+    {
+      "ref": "74c9bfb",
+      "commit": "74c9bfbff86a29635ecfafa7914c51f9527dad68",
+      "kind": "required",
+      "ancestor": true
+    },
+    {
+      "ref": "fb7ae7e",
+      "commit": "fb7ae7edf5a228dcb29824334b7eaeddc9327530",
+      "kind": "required",
+      "ancestor": true
+    },
+    {
+      "ref": "6c0aa74",
+      "commit": "6c0aa74b9164bcb624b26f9c4b42af874ecf8347",
+      "kind": "required",
+      "ancestor": true
+    },
+    {
+      "ref": "2788645",
+      "commit": "27886458a5da4f2c7940253e8c0fc66467d26990",
+      "kind": "required",
+      "ancestor": true
+    },
+    {
+      "ref": "98179a4",
+      "commit": "98179a4458b6c3c232df1d997ba31afe29551b31",
+      "kind": "required",
+      "ancestor": true
+    },
+    {
+      "ref": "aeab9e68e749e4e178576c2283a6173c11611a31",
+      "commit": "aeab9e68e749e4e178576c2283a6173c11611a31",
+      "kind": "excluded",
+      "ancestor": false
+    },
+    {
+      "ref": "impl/catalog-receipts",
+      "commit": "d4f756c148b7ed817e0ff0b1d452846fece96c16",
+      "kind": "excluded",
+      "ancestor": false
+    },
+    {
+      "ref": "impl/deletion-aware-restore",
+      "commit": "4abc959ddd5ba65fa8c2ee7b69e575dd56ec1257",
+      "kind": "excluded",
+      "ancestor": false
+    },
+    {
+      "ref": "impl/logical-export",
+      "commit": "7892b8e03a709e6b42236831d9010cdae6d22885",
+      "kind": "excluded",
+      "ancestor": false
+    }
+  ],
+  "baseForReview": "74c9bfbff86a29635ecfafa7914c51f9527dad68",
+  "additionalRequiredParent": "9ebe082"
+}

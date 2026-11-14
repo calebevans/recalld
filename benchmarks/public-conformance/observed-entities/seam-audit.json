@@ -1,0 +1,22 @@
+{
+  "changedFiles": [
+    "docs/implementation/entity-rebuild-labels.md",
+    "src/derived_completion.rs",
+    "src/search/entity_index.rs",
+    "src/system.rs"
+  ],
+  "entityParent": "7fb27693dca69866eb616ba2ae27e41293d44cca",
+  "previousReportTip": "098a182a88d9b9bafd3ba685b41a9d05fd6656ee",
+  "previousValidatedRuntime": "525558a9e0a45d6ef82f5f8d2b09e9bd3de2e44f",
+  "sourceCommit": "c425a5d4df158e2659ecfa674ea9b422e5e9dc2b",
+  "unchangedObservedFiles": {
+    "src/api/adapters.rs": true,
+    "src/api/handlers.rs": true,
+    "src/daemon/observed_join_tests.rs": true,
+    "src/decay/observation.rs": true,
+    "src/mcp/bridge_adapters.rs": true,
+    "src/search/pipeline.rs": true,
+    "src/search/strength_tests.rs": true,
+    "src/storage/control.rs": true
+  }
+}

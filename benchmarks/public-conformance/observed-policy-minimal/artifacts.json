@@ -1,0 +1,15 @@
+{
+  "artifacts": [
+    {
+      "bytes": 1117125,
+      "file": "validated-424ea7a.tgz",
+      "harnessCommit": "364203421a57fd4a93dd20149d89d7ae997ccafb",
+      "outputHashesVerified": 164,
+      "sha256": "f9ca29f64294c3bcdd043ba5bd07d55645f4ad71e5e25e92d05f6b0c9454b2d4",
+      "sourceCommit": "424ea7a3baf94c765f03ed751eef78dc0c029203",
+      "sourceHashesVerified": 170,
+      "sourcePath": "/tmp/recalld-public-conformance-frkabglm",
+      "targetedHashesVerified": 4
+    }
+  ]
+}

@@ -176,6 +176,7 @@ def host(args):
         'fixtureVersion': args.fixture_version, 'fixturePath': FIXTURES[args.fixture_version],
         'fixtureSha256': source['sourceFilesSha256'][FIXTURES[args.fixture_version]], 'protocolVersion': PROTOCOL, 'contractVersion': 'legacy-v1',
         'clock': 'actual wall clock; no public manual clock', 'snapshots': 'A1 interfaces unavailable',
+        'validationTestThreads': args.test_threads,
         'seed': 7, 'freshReplaysPerTransport': 3, 'transports': ['stdio', 'http-mcp', 'rest'],
         'limits': 'network none; 2 CPUs; 4 GiB; 2 build jobs', 'status': 'preparing'}
     command = ['docker', 'run', '--rm', '--network', 'none', '--cpus', '2', '--memory', '4g',
@@ -197,6 +198,8 @@ cargo clippy --offline --locked --all-targets --all-features > /work/output/clip
 cargo build --offline --locked --bin recalld > /work/output/build.log 2>&1
 python3 scripts/public-conformance.py --inside --fixture-version FIXTURE_VERSION
 '''.replace('FIXTURE_VERSION', str(args.fixture_version))]
+    if args.test_threads is not None:
+        command[command.index(image['Id']):command.index(image['Id'])] = ['--env', f'RUST_TEST_THREADS={args.test_threads}']
     manifest['containerCommand'] = command
     save(output / 'manifest.json', manifest)
     try:
@@ -736,7 +739,10 @@ def main():
     parser.add_argument('--cache', type=Path)
     parser.add_argument('--build-cache', type=Path)
     parser.add_argument('--image', default='recalld-ci:1.94')
+    parser.add_argument('--test-threads', type=int, help='Rust test concurrency; recorded in manifest, does not alter replay count')
     args = parser.parse_args()
+    if args.test_threads is not None and args.test_threads < 1:
+        parser.error('--test-threads must be positive')
     if args.source_root and not args.source_commit:
         parser.error('--source-root requires --source-commit to freeze the runtime')
     inside(args.fixture_version) if args.inside else host(args)

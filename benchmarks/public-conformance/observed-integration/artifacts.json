@@ -1,0 +1,35 @@
+{
+  "artifacts": [
+    {
+      "bytes": 837885,
+      "file": "failed-980f8a5.tgz",
+      "harnessCommit": "364203421a57fd4a93dd20149d89d7ae997ccafb",
+      "outputHashesVerified": 10,
+      "sha256": "27d20fc1bf21cb5c27e302ef04f99b126e82de5def3a7d3c31370a401f8880bd",
+      "sourceCommit": "980f8a570dd4237885ddb3326c6172bc463c9aec",
+      "sourceHashesVerified": 182,
+      "sourcePath": "/tmp/recalld-public-conformance-t1rd6yh9"
+    },
+    {
+      "bytes": 1169500,
+      "file": "validated-3deecca.tgz",
+      "harnessCommit": "364203421a57fd4a93dd20149d89d7ae997ccafb",
+      "outputHashesVerified": 164,
+      "sha256": "5c2ca536e846e29268911a6a8e38057dca1d4bbb9fb31bbfffe326fe04c42b8f",
+      "sourceCommit": "3deecca70beaa8b63cee836419f77e6c9abeb11d",
+      "sourceHashesVerified": 182,
+      "sourcePath": "/tmp/recalld-public-conformance-xk1eh_my"
+    },
+    {
+      "bytes": 1175533,
+      "file": "validated-525558a.tgz",
+      "harnessCommit": "364203421a57fd4a93dd20149d89d7ae997ccafb",
+      "outputHashesVerified": 164,
+      "sha256": "b6607c478183bf4b6f0d6b8257891f5c4b42d349e74271aed0dece70f3276398",
+      "sourceCommit": "525558a9e0a45d6ef82f5f8d2b09e9bd3de2e44f",
+      "sourceHashesVerified": 182,
+      "sourcePath": "/tmp/recalld-public-conformance-wh0alhy7",
+      "targetedHashesVerified": 4
+    }
+  ]
+}

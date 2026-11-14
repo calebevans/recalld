@@ -1,0 +1,425 @@
+diff --git a/docs/implementation/entity-rebuild-labels.md b/docs/implementation/entity-rebuild-labels.md
+new file mode 100644
+index 0000000..d55709e
+--- /dev/null
++++ b/docs/implementation/entity-rebuild-labels.md
+@@ -0,0 +1,62 @@
++# Canonical entity rebuild parity
++
++Parents are PR45 `fb7ae7edf5a228dcb29824334b7eaeddc9327530`, PR35
++`852221e`, and updated PR40 `e7fd455`. PR45 supplies actual derived completion
++and its publication boundary; PR35 supplies namespace-partitioned, idempotent
++postings; PR40 supplies authoritative `CachedRecord.entities`. No insertion,
++maintenance, Observed, catalog or evaluation branch is added as a parent.
++
++Startup and `DerivedCompletion::complete` build their fresh entity views through
++one `EntityIndex::from_records` function. It uses the shared disk-to-cache
++conversion rather than reparsing tags, excludes Ghost/Tombstone records, and
++passes the canonical namespace and UUID to the existing index. Entity-key
++normalization, alias weighting and UUID tie order are unchanged. Rebuilding
++replaces the complete view, so overwritten labels, authoritative empty lists and
++deleted records cannot leave old postings behind. Existing publication locks and
++effects acknowledgement still determine when the completed view becomes usable.
++
++Canonical schema entities retain exact UTF-8, order and duplicates in the cache
++conversion; the index intentionally normalizes and deduplicates matching keys.
++Schema-less records still use the legacy retained-tag parser. Canonical
++`LegacyRetainedOnly` provenance is unchanged: rebuilding cannot recover names
++lost by legacy tag encoding.
++
++## Proof scope
++
++The schema-v2 regression feeds encoded/decoded canonical records into the actual
++shared production rebuild function. It covers UTF-8, duplicate/alias count
++idempotence, conflicting retained tags, empty labels, namespace isolation,
++replacement/disappearance, removed phases and unchanged canonical bytes and
++provenance. It does not admit schema-v2 serving or invent a native write.
++
++Separate tests run real legacy `Recalld` startup/reopen and real pending-deletion
++`DerivedCompletion` over isolated storage. They check namespace counts, stale
++posting removal, repeated completion, another canonical deletion, and successful
++effects acknowledgement. Full native write/reopen/publication proof remains a
++dependency on the schema-aware writer and readiness join.
++
++## Remaining consumers
++
++A4 filter and hydration paths remain a separate consumer slice: they need full
++canonical entity/topic/emotion labels and provenance without weakening legacy
++hard-filter validation. Feynman's store/link canonical-count follow-up must
++preserve accepted raw legacy input names and use canonical labels for native
++records; legacy tags are never a complete substitute. Those owners have been
++notified. This change does not enable public v2 or claim full serving coherence.
++
++## Validation
++
++With the shared function still using the old tag parser, the focused rebuild run
++fails its canonical-label regression (four indexed records instead of three);
++three other rebuild tests pass. With the canonical cache conversion, all four
++rebuild tests pass inside `cargo test --locked --offline --features bench`:
++**639 library + 1 CLI tests passed**, zero failures, four existing ignored
++doctests, normal parallel execution. `cargo fmt --all --check` and all-target,
++all-feature Clippy pass with existing warnings.
++
++Runtime: `recalld-ci:1.94`, `RUSTUP_TOOLCHAIN=1.94.1`, network none, 2 CPUs,
++4 GiB, 2 Cargo jobs, private copied cargo/target caches; no home, credentials or
++socket mounts. Logs retained outside commits in
++`/tmp/recalld-implementation/entity-rebuild-labels/.validation/`:
++`before.log`, `all-tests.log`, `fmt-check.log`, `clippy.log`. This is correctness
++validation, not a performance, full native writer or serving-readiness claim.
+diff --git a/src/derived_completion.rs b/src/derived_completion.rs
+index 3eea5b3..80fc94e 100644
+--- a/src/derived_completion.rs
++++ b/src/derived_completion.rs
+@@ -50,7 +50,7 @@ impl DerivedCompletion {
+                 let records = storage.scan_all()?;
+                 let mut next_graph = RelationshipGraph::with_capacity(records.len());
+                 let mut next_vectors = FlatVectorIndex::new(vectors.dimensions());
+-                let mut next_entities = EntityIndex::with_capacity(records.len());
++                let next_entities = EntityIndex::from_records(&records);
+                 fts.clear().map_err(|e| failed(e.to_string()))?;
+                 for (id, record) in &records {
+                     let ns = NamespaceId::new(record.namespace_id);
+@@ -95,11 +95,6 @@ impl DerivedCompletion {
+                     };
+                     fts.add(ns, *id, &record.summary, text.as_deref(), &tags)
+                         .map_err(|e| failed(e.to_string()))?;
+-                    next_entities.add(
+-                        ns,
+-                        *id,
+-                        &crate::model::parse_structured_tags(&record.tags).entities,
+-                    );
+                 }
+                 let edges = storage.load_all_edges()?;
+                 let count = edges.len();
+@@ -147,6 +142,65 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn entity_rebuild_online_completion_replaces_stale_namespace_postings() {
++        let fx = Fixture::new();
++        let local = NamespaceId::new(1);
++        let foreign = fx.create_namespace("foreign");
++        let live = fx.insert_memory_in(local, &["entity/alice"]).await;
++        let peer = fx
++            .insert_memory_in(foreign, &["entity/alice", "entity/bob"])
++            .await;
++        let dead = fx.insert_memory_in(local, &["entity/dead"]).await;
++        {
++            let mut index = fx.entity_index.write().await;
++            index.add(local, live, &["stale".into()]);
++            index.add(local, dead, &["dead".into()]);
++        }
++        // Real canonical deletion dirties every view and requires completion.
++        fx.storage.write().unwrap().delete_memory(dead).unwrap();
++        let query = vec!["Alice".into(), "Bob".into()];
++        for _ in 0..2 {
++            publisher(&fx).complete().await.unwrap();
++            let index = fx.entity_index.read().await;
++            assert_eq!(index.len(), 2);
++            assert_eq!(
++                index.find_by_entities(local, &query, MemoryId::new()),
++                vec![(live, 1)]
++            );
++            assert_eq!(
++                index.find_by_entities(foreign, &query, MemoryId::new()),
++                vec![(peer, 2)]
++            );
++            assert!(
++                index
++                    .find_by_entities(local, &["stale".into(), "dead".into()], MemoryId::new())
++                    .is_empty()
++            );
++            assert!(
++                fx.storage
++                    .read()
++                    .unwrap()
++                    .meta_store()
++                    .effects_stamp()
++                    .is_ok()
++            );
++        }
++        fx.storage.write().unwrap().delete_memory(live).unwrap();
++        publisher(&fx).complete().await.unwrap();
++        let index = fx.entity_index.read().await;
++        assert_eq!(index.len(), 1);
++        assert!(
++            index
++                .find_by_entities(local, &query, MemoryId::new())
++                .is_empty()
++        );
++        assert_eq!(
++            index.find_by_entities(foreign, &query, MemoryId::new()),
++            vec![(peer, 2)]
++        );
++    }
++
+     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+     async fn online_completion_retries_failure_and_rejects_late_stale_cache_refill() {
+         let fx = Fixture::new();
+diff --git a/src/search/entity_index.rs b/src/search/entity_index.rs
+index 0a03f13..4494194 100644
+--- a/src/search/entity_index.rs
++++ b/src/search/entity_index.rs
+@@ -1,7 +1,7 @@
+ //! Namespace-partitioned entity postings with complete per-memory replacement.
+ use std::collections::{HashMap, HashSet};
+ 
+-use crate::model::{MemoryId, NamespaceId};
++use crate::model::{CachedRecord, DecayPhase, DiskRecord, MemoryId, NamespaceId};
+ 
+ /// Derived entity index. Callers provide the complete accepted entity list;
+ /// legacy tags are not a lossless representation of multiword/Unicode names.
+@@ -23,6 +23,20 @@ impl EntityIndex {
+         }
+     }
+ 
++    /// Build a fresh view for startup or committed-effect completion. Callers
++    /// publish only after their existing canonical/readiness checks succeed.
++    pub(crate) fn from_records(records: &[(MemoryId, DiskRecord)]) -> Self {
++        let mut index = Self::with_capacity(records.len());
++        for (id, record) in records {
++            if matches!(record.phase, DecayPhase::Ghost | DecayPhase::Tombstone) {
++                continue;
++            }
++            let cached = CachedRecord::from(record);
++            index.add(cached.namespace_id, *id, &cached.entities);
++        }
++        index
++    }
++
+     /// Replace this namespace/UUID's complete postings. Repeating an update is
+     /// idempotent; empty (or wholly unindexable) entities remove old postings.
+     pub fn add(&mut self, namespace_id: NamespaceId, memory_id: MemoryId, entities: &[String]) {
+@@ -139,6 +153,159 @@ mod tests {
+         MemoryId::from_bytes(bytes)
+     }
+ 
++    // Codec-only canonical fixture: no schema-v2 serving or writer admission.
++    fn canonical_record(
++        n: u8,
++        namespace: NamespaceId,
++        entities: &[&str],
++    ) -> (MemoryId, DiskRecord) {
++        use crate::model::schema::{LabelProvenance, RecordSchemaV2, VectorReference};
++        let id = mid(n);
++        let mut record = DiskRecord {
++            version: 1,
++            schema: None,
++            id: *id.as_bytes(),
++            namespace_id: namespace.get(),
++            created_at: 0,
++            last_accessed_at: 0,
++            phase: DecayPhase::Full,
++            strength: 1.0,
++            decay_strength: 1.0,
++            stability: 1.0,
++            difficulty: 5.0,
++            is_permastore: 0,
++            vector_slot: 0,
++            edge_count: 0,
++            summary: "fixture".into(),
++            tags: vec![crate::model::Tag::new("entity/retained-only").unwrap()],
++            access_history: vec![],
++            text_offset: 0,
++            text_length: 0,
++        };
++        let mut schema = RecordSchemaV2::from_legacy(
++            &record,
++            0,
++            Some(VectorReference {
++                slot: 0,
++                allocation_epoch: Default::default(),
++                sha256: [0; 32],
++            }),
++        );
++        schema.labels.entities = entities.iter().map(|s| (*s).to_owned()).collect();
++        schema.labels.provenance = LabelProvenance::NativeV2;
++        record.version = 2;
++        record.schema = Some(schema);
++        let decoded = DiskRecord::from_bytes(&record.encode().unwrap()).unwrap();
++        (id, decoded)
++    }
++
++    #[test]
++    fn entity_rebuild_uses_canonical_labels_and_replaces_the_complete_view() {
++        let other = NamespaceId::new(2);
++        let mut records = vec![
++            canonical_record(1, ns(), &["Dr. John Smith", "JOHN SMITH", "José", "José"]),
++            canonical_record(2, other, &["José"]),
++            canonical_record(3, ns(), &[]), // retained tags are NOT a fallback
++            canonical_record(4, ns(), &["日本語"]),
++        ];
++        let before: Vec<_> = records.iter().map(|(_, r)| r.encode().unwrap()).collect();
++        let query = vec!["John Smith".into(), "José".into(), "José".into()];
++        for _ in 0..3 {
++            let index = EntityIndex::from_records(&records);
++            assert_eq!(index.len(), 3);
++            assert_eq!(
++                index.find_by_entities(ns(), &query, mid(0)),
++                vec![(mid(1), 3)]
++            );
++            assert_eq!(
++                index.find_by_entities(other, &query, mid(0)),
++                vec![(mid(2), 1)]
++            );
++            assert_eq!(
++                index.find_by_entities(ns(), &["日本語".into()], mid(0)),
++                vec![(mid(4), 1)]
++            );
++            assert!(
++                index
++                    .find_by_entities(ns(), &["retained-only".into()], mid(0))
++                    .is_empty()
++            );
++        }
++        assert_eq!(
++            records
++                .iter()
++                .map(|(_, r)| r.encode().unwrap())
++                .collect::<Vec<_>>(),
++            before
++        );
++
++        // Replacement and disappearance must remove old keys and old UUIDs,
++        // while authoritative empty does not recover the conflicting tag.
++        records[0] = canonical_record(1, ns(), &["Alice's"]);
++        records[1] = canonical_record(2, other, &[]);
++        records.pop();
++        let replacement = EntityIndex::from_records(&records);
++        assert_eq!(replacement.len(), 1);
++        assert!(
++            replacement
++                .find_by_entities(ns(), &query, mid(0))
++                .is_empty()
++        );
++        assert!(
++            replacement
++                .find_by_entities(other, &query, mid(0))
++                .is_empty()
++        );
++        assert!(
++            replacement
++                .find_by_entities(ns(), &["日本語".into()], mid(0))
++                .is_empty()
++        );
++        assert_eq!(
++            replacement.find_by_entities(ns(), &["Alice".into()], mid(0)),
++            vec![(mid(1), 1)]
++        );
++    }
++
++    #[test]
++    fn entity_rebuild_preserves_retained_only_provenance_and_excludes_removed_records() {
++        use crate::model::schema::LabelProvenance;
++        let (id, mut legacy) = canonical_record(1, ns(), &[]);
++        legacy.version = 1;
++        legacy.schema = None;
++        let mut retained = canonical_record(2, ns(), &["retained-only"]);
++        retained.1.schema.as_mut().unwrap().labels.provenance = LabelProvenance::LegacyRetainedOnly;
++        let mut ghost = canonical_record(3, ns(), &[]);
++        ghost.1.phase = DecayPhase::Ghost;
++        let mut tombstone = canonical_record(4, ns(), &[]);
++        tombstone.1.phase = DecayPhase::Tombstone;
++        tombstone.1.schema.as_mut().unwrap().vector = None;
++        let records = vec![(id, legacy), retained, ghost, tombstone];
++        let bytes: Vec<_> = records.iter().map(|(_, r)| r.encode().unwrap()).collect();
++        let index = EntityIndex::from_records(&records);
++        assert_eq!(index.len(), 2);
++        assert_eq!(
++            index.find_by_entities(ns(), &["retained-only".into()], mid(0)),
++            vec![(mid(1), 1), (mid(2), 1)]
++        );
++        assert!(
++            index
++                .find_by_entities(ns(), &["José".into()], mid(0))
++                .is_empty()
++        );
++        assert_eq!(
++            records[1].1.schema.as_ref().unwrap().labels.provenance,
++            LabelProvenance::LegacyRetainedOnly
++        );
++        assert_eq!(
++            records
++                .iter()
++                .map(|(_, r)| r.encode().unwrap())
++                .collect::<Vec<_>>(),
++            bytes
++        );
++    }
++
+     #[test]
+     fn add_and_find() {
+         let mut idx = EntityIndex::new();
+diff --git a/src/system.rs b/src/system.rs
+index 8951a76..35d1211 100644
+--- a/src/system.rs
++++ b/src/system.rs
+@@ -617,20 +617,8 @@ impl Recalld {
+         };
+ 
+         // -- Step 6c: Build entity index from scanned records ----------
+-        // Legacy tags expose only retained labels, not the full accepted names.
+-        // Structured-label schema integration must replace this fallback on v2 reads.
+         let entity_index = {
+-            let mut idx = EntityIndex::with_capacity(all_records.len());
+-            for (memory_id, record) in &all_records {
+-                let entities = crate::model::parse_structured_tags(&record.tags).entities;
+-                if !entities.is_empty() {
+-                    idx.add(
+-                        crate::model::NamespaceId::new(record.namespace_id),
+-                        *memory_id,
+-                        &entities,
+-                    );
+-                }
+-            }
++            let idx = EntityIndex::from_records(&all_records);
+             tracing::info!(memories = idx.len(), "entity index built");
+             Arc::new(RwLock::new(idx))
+         };
+@@ -1651,23 +1639,27 @@ mod tests {
+                 .await;
+             (fx.close(), other, local_id, foreign_id)
+         };
+-        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+-        let index = system.entity_index().read().await;
+-        assert_eq!(index.len(), 2);
+-        let query = vec!["Alice".into(), "Bob".into()];
+-        assert_eq!(
+-            index.find_by_entities(ns(), &query, MemoryId::new()),
+-            vec![(local_id, 1)]
+-        );
+-        assert_eq!(
+-            index.find_by_entities(other, &query, MemoryId::new()),
+-            vec![(foreign_id, 2)]
+-        );
+-        // This fixture claims fidelity only for labels retained in legacy tags.
+-        assert!(
+-            index
+-                .find_by_entities(ns(), &["José".into()], MemoryId::new())
+-                .is_empty()
+-        );
++        for _ in 0..2 {
++            let system = Recalld::new(offline_config(dir.path())).await.unwrap();
++            let index = system.entity_index().read().await;
++            assert_eq!(index.len(), 2);
++            let query = vec!["Alice".into(), "Bob".into()];
++            assert_eq!(
++                index.find_by_entities(ns(), &query, MemoryId::new()),
++                vec![(local_id, 1)]
++            );
++            assert_eq!(
++                index.find_by_entities(other, &query, MemoryId::new()),
++                vec![(foreign_id, 2)]
++            );
++            // This fixture claims fidelity only for labels retained in legacy tags.
++            assert!(
++                index
++                    .find_by_entities(ns(), &["José".into()], MemoryId::new())
++                    .is_empty()
++            );
++            drop(index);
++            system.shutdown().await.unwrap();
++        }
+     }
+ }

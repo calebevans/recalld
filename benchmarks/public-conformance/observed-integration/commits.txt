@@ -1,0 +1,41 @@
+commit 525558a9e0a45d6ef82f5f8d2b09e9bd3de2e44f
+Merge: 3deecca e7fd455
+Author:     Caleb Evans <calebdevans@pm.me>
+AuthorDate: Sat Nov 14 04:47:33 2026 -0800
+Commit:     Caleb Evans <calebdevans@pm.me>
+CommitDate: Sat Nov 14 04:47:33 2026 -0800
+
+    Merge canonical entity cache correction into validation join
+
+commit 3deecca70beaa8b63cee836419f77e6c9abeb11d
+Author:     Caleb Evans <calebdevans@pm.me>
+AuthorDate: Sat Nov 14 04:43:12 2026 -0800
+Commit:     Caleb Evans <calebdevans@pm.me>
+CommitDate: Sat Nov 14 04:43:12 2026 -0800
+
+    Adapt integration fixtures and diagnostic recorder to observed join
+
+commit 980f8a570dd4237885ddb3326c6172bc463c9aec
+Author:     Caleb Evans <calebdevans@pm.me>
+AuthorDate: Sat Nov 14 04:39:09 2026 -0800
+Commit:     Caleb Evans <calebdevans@pm.me>
+CommitDate: Sat Nov 14 04:40:39 2026 -0800
+
+    test: build strength fixtures through lifecycle migration
+
+commit 95263aff203684b74794e54ba3070178acd73f11
+Author:     Caleb Evans <calebdevans@pm.me>
+AuthorDate: Sat Nov 14 04:31:26 2026 -0800
+Commit:     Caleb Evans <calebdevans@pm.me>
+CommitDate: Sat Nov 14 04:40:31 2026 -0800
+
+    Require canonical schema for lifecycle policy receipts
+
+commit cbb030e299936c60c9e674da31eb013609d037f6
+Merge: 75882c3 3b590fb
+Author:     Caleb Evans <calebdevans@pm.me>
+AuthorDate: Sat Nov 14 04:40:11 2026 -0800
+Commit:     Caleb Evans <calebdevans@pm.me>
+CommitDate: Sat Nov 14 04:40:11 2026 -0800
+
+    Merge observed consumer join into isolated integration validation
