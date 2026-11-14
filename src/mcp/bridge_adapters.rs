@@ -875,7 +875,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
 
         // Generate full embedding (summary + full_text + tags for max surface).
         let raw_embedding = match &input.embedding {
-            Some(emb) => emb.clone(),
+            Some(emb) => emb.clone().into(),
             None => {
                 let mut embed_text = match &input.full_text {
                     Some(ft) => format!(
@@ -888,19 +888,24 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 if !merged_tags.is_empty() {
                     embed_text = format!("{} {}", embed_text, merged_tags.join(" "));
                 }
-                self.embedding
-                    .embed(&embed_text)
-                    .await
-                    .map_err(|e| match e {
-                        crate::embedding::EmbeddingError::TextTooLong { .. } => {
-                            bridge::BridgeError::InvalidInput(e.to_string())
-                        }
-                        _ => bridge::BridgeError::Unavailable(e.to_string()),
-                    })?
+                crate::embedding::runtime::generate(
+                    self.embedding.as_ref(),
+                    &ns_config,
+                    &embed_text,
+                )
+                .await
+                .map_err(|e| match e {
+                    crate::embedding::EmbeddingError::TextTooLong { .. } => {
+                        bridge::BridgeError::InvalidInput(e.to_string())
+                    }
+                    _ => bridge::BridgeError::Unavailable(e.to_string()),
+                })?
             }
         };
 
-        let mut embedding = raw_embedding.clone();
+        crate::embedding::runtime::check_namespace(&ns_config, raw_embedding.profile.as_ref())
+            .map_err(|e| bridge::BridgeError::Unavailable(e.to_string()))?;
+        let mut embedding = raw_embedding.values.clone();
         crate::storage::insertion::normalize_embedding(
             &mut embedding,
             ns_config.embedding_dim,
@@ -2698,6 +2703,72 @@ mod tests {
             supersedes: None,
             check_duplicates: None,
         }
+    }
+
+    #[tokio::test]
+    async fn native_profile_mcp_store_rejects_runtime_dimension_before_provider_and_writes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Provider(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for Provider {
+            async fn embed(&self, _: &str) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![1., 0., 0., 0.])
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            fn model_name(&self) -> &str {
+                "fixture"
+            }
+            fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+                let mut profile = crate::embedding::runtime::tests::profile();
+                profile.dimension = 8;
+                Some(profile)
+            }
+        }
+        let fixture = Fixture::new();
+        let mut adapter = fixture.storage_adapter();
+        let calls = Arc::new(AtomicUsize::new(0));
+        adapter.embedding = Arc::new(Provider(calls.clone()));
+        let mut input = store_input("profile probe", "default", vec![]);
+        input.embedding = None;
+        let before = fixture
+            .storage
+            .read()
+            .unwrap()
+            .control_state()
+            .unwrap()
+            .committed_generation;
+        let error = adapter.store_memory(input).await.unwrap_err();
+        assert!(
+            matches!(error, bridge::BridgeError::Unavailable(_)),
+            "{error}"
+        );
+        assert_eq!(
+            crate::daemon::protocol::DaemonRpcError::from(&error).code,
+            -32008
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture
+                .storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation,
+            before
+        );
+        assert!(
+            fixture
+                .storage
+                .read()
+                .unwrap()
+                .scan_all()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

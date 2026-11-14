@@ -25,7 +25,7 @@ impl DerivedCompletion {
         &self,
         ctx: crate::storage::control::MutationContext,
         input: crate::storage::insertion::InsertMemory,
-        generated_embedding: Vec<f32>,
+        generated_embedding: crate::embedding::runtime::GeneratedEmbedding,
         sampled_at: i64,
     ) -> Result<crate::storage::insertion::InsertResult, StorageError> {
         let gate = publication_gate(&self.storage).await?;
@@ -33,10 +33,11 @@ impl DerivedCompletion {
         let storage = self.storage.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
-            let receipt = storage.insert_memory_with_receipt(
+            let receipt = storage.insert_memory_with_profile(
                 &ctx,
                 &input,
-                &generated_embedding,
+                &generated_embedding.values,
+                generated_embedding.profile.as_ref(),
                 sampled_at,
             )?;
             let id = crate::storage::insertion::inserted_id(&receipt)?;
@@ -237,7 +238,7 @@ mod tests {
             .committed_generation;
         *fx.vector_index.write().await = FlatVectorIndex::new(DIM + 1);
         let error = match publisher(&fx)
-            .insert(ctx.clone(), input.clone(), vec![], 123)
+            .insert(ctx.clone(), input.clone(), vec![].into(), 123)
             .await
         {
             Ok(_) => panic!("wrong-width derived rebuild succeeded"),
@@ -263,7 +264,7 @@ mod tests {
         );
         *fx.vector_index.write().await = FlatVectorIndex::new(DIM);
         let replay = publisher(&fx)
-            .insert(ctx, input, vec![f32::NAN], i64::MAX)
+            .insert(ctx, input, vec![f32::NAN].into(), i64::MAX)
             .await
             .unwrap();
         assert!(replay.receipt.replayed);

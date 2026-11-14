@@ -22,6 +22,17 @@ impl RedbStorageEngine {
         generated_embedding: &[f32],
         sampled_at: i64,
     ) -> Result<WriteReceipt, StorageError> {
+        self.insert_memory_with_profile(ctx, input, generated_embedding, None, sampled_at)
+    }
+
+    pub(crate) fn insert_memory_with_profile(
+        &mut self,
+        ctx: &MutationContext,
+        input: &InsertMemory,
+        generated_embedding: &[f32],
+        profile: Option<&crate::model::schema::EmbeddingProfile>,
+        sampled_at: i64,
+    ) -> Result<WriteReceipt, StorageError> {
         self.ensure_available()?;
         let edges = self.edge_store.load_all_edges()?;
         let vectors = &mut self.vector_manager;
@@ -33,6 +44,7 @@ impl RedbStorageEngine {
             input,
             sampled_at,
             embedding,
+            profile,
             &edges,
             |namespace, record, normalized| {
                 let store = vectors
