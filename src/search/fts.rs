@@ -5,7 +5,7 @@
 //! and BM25 scoring. Namespaces are distinguished by a `namespace_id`
 //! column in the `id_map` table rather than separate index instances.
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use rusqlite::OptionalExtension;
 
@@ -25,6 +25,31 @@ pub enum FtsError {
     /// The memory ID bytes were invalid.
     #[error("invalid memory ID bytes")]
     InvalidMemoryId,
+
+    #[error("nonfinite FTS score")]
+    NonfiniteScore,
+}
+
+pub const MAX_FTS_EXAMINED: usize = 12_800;
+
+/// Counts describe the ordered source rows consumed, including a cap lookahead.
+/// `exhausted` is true only after observing end-of-stream. At the work ceiling
+/// it remains false even if the last consumed row happened to be the last match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FtsCoverage {
+    pub examined: usize,
+    pub eligible: usize,
+    pub admitted: usize,
+    pub pages: usize,
+    pub exhausted: bool,
+    pub candidate_limited: bool,
+    pub budget_exhausted: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct EligibleFtsResults {
+    pub matches: Vec<(MemoryId, f32)>,
+    pub coverage: FtsCoverage,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +235,74 @@ impl FtsIndex {
             }
         }
 
+        Ok(out)
+    }
+
+    /// Refill logical pages of `k` rows from one score-descending/UUID-ascending
+    /// SQLite cursor. The statement pins the SQLite read view for every page;
+    /// neither concurrent writes nor f32 score rounding can shift boundaries.
+    /// Canonical membership must come from the caller's eligibility evaluation.
+    /// This pins FTS only, not the cross-store generation owned by A1.
+    pub fn search_eligible(
+        &self,
+        namespace_id: NamespaceId,
+        query: &str,
+        k: usize,
+        eligible_ids: &HashSet<MemoryId>,
+    ) -> Result<EligibleFtsResults, FtsError> {
+        let safe_query = escape_query(query);
+        let mut out = EligibleFtsResults::default();
+        if safe_query.is_empty() {
+            out.coverage.exhausted = true;
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.memory_id, -bm25(fts_content, 5.0, 1.0, 2.0) AS score
+             FROM fts_content JOIN id_map m ON m.rowid = fts_content.rowid
+             WHERE fts_content MATCH ?1 AND m.namespace_id = ?2
+             ORDER BY score DESC, m.memory_id ASC LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![
+            safe_query,
+            namespace_id.get(),
+            MAX_FTS_EXAMINED as i64
+        ])?;
+        // A live cursor is SQLite's native stable paging mechanism. Keep it
+        // open across all logical pages rather than re-running OFFSET queries.
+        'pages: while out.coverage.examined < MAX_FTS_EXAMINED {
+            out.coverage.pages += 1;
+            for _ in 0..k.max(1).min(MAX_FTS_EXAMINED - out.coverage.examined) {
+                let Some(row) = rows.next()? else {
+                    out.coverage.exhausted = true;
+                    break 'pages;
+                };
+                out.coverage.examined += 1;
+                let bytes: Vec<u8> = row.get(0)?;
+                let id =
+                    MemoryId::from_bytes(bytes.try_into().map_err(|_| FtsError::InvalidMemoryId)?);
+                let raw_score: f64 = row.get(1)?;
+                let score = raw_score as f32;
+                if !score.is_finite() {
+                    return Err(FtsError::NonfiniteScore);
+                }
+                let eligible = eligible_ids.contains(&id);
+                out.coverage.eligible += usize::from(eligible);
+                if out.matches.len() == k {
+                    // One charged lookahead proves unseen source candidates.
+                    // Never read beyond the examination budget to prove EOF.
+                    out.coverage.candidate_limited = true;
+                    break 'pages;
+                }
+                if eligible {
+                    out.matches
+                        .push((id, if score == 0.0 { 0.0 } else { score }));
+                }
+            }
+        }
+        out.coverage.admitted = out.matches.len();
+        out.coverage.budget_exhausted =
+            !out.coverage.exhausted && out.coverage.examined == MAX_FTS_EXAMINED;
+        out.coverage.candidate_limited |= out.coverage.budget_exhausted;
         Ok(out)
     }
 
@@ -612,6 +705,184 @@ mod tests {
                 vec![ids[0], ids[1]]
             );
             assert_eq!(results[0].1, results[1].1);
+        }
+    }
+    fn fixed_id(n: usize) -> MemoryId {
+        MemoryId::from_bytes((n as u128).to_be_bytes())
+    }
+
+    #[test]
+    fn eligible_refill_orders_ties_and_distinguishes_cap_from_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = FtsIndex::new(dir.path()).unwrap();
+        // Deliberately insert backwards. The first 100 sorted rows are rejected.
+        for n in (1..=106).rev() {
+            index
+                .add(test_ns_id(), fixed_id(n), "keyword", None, &[])
+                .unwrap();
+        }
+        let eligible = (101..=106).map(fixed_id).collect();
+        let result = index
+            .search_eligible(test_ns_id(), "keyword", 5, &eligible)
+            .unwrap();
+        assert_eq!(
+            result.matches.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (101..=105).map(fixed_id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.coverage,
+            FtsCoverage {
+                examined: 106,
+                eligible: 6,
+                admitted: 5,
+                pages: 22,
+                exhausted: false,
+                candidate_limited: true,
+                budget_exhausted: false,
+            }
+        );
+        // Upserts cannot duplicate a candidate or change an equal-score boundary.
+        index
+            .add(test_ns_id(), fixed_id(101), "keyword", None, &[])
+            .unwrap();
+        assert_eq!(
+            index
+                .search_eligible(test_ns_id(), "keyword", 5, &eligible)
+                .unwrap()
+                .matches,
+            result.matches
+        );
+        for k in [6, 7] {
+            let full = index
+                .search_eligible(test_ns_id(), "keyword", k, &eligible)
+                .unwrap();
+            assert_eq!(full.matches.len(), 6);
+            assert_eq!(full.coverage.examined, 106);
+            assert!(full.coverage.exhausted);
+            assert!(!full.coverage.candidate_limited);
+            assert!(!full.coverage.budget_exhausted);
+        }
+        let empty = index
+            .search_eligible(test_ns_id_2(), "keyword", 5, &eligible)
+            .unwrap();
+        assert_eq!(empty.coverage.examined, 0);
+        assert!(empty.coverage.exhausted);
+    }
+
+    #[test]
+    fn eligible_refill_budget_boundary_never_claims_exhaustive_underfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = FtsIndex::new(dir.path()).unwrap();
+        for n in 1..=MAX_FTS_EXAMINED + 1 {
+            index
+                .add(test_ns_id(), fixed_id(n), "keyword", None, &[])
+                .unwrap();
+        }
+        for target in [MAX_FTS_EXAMINED, MAX_FTS_EXAMINED + 1] {
+            let result = index
+                .search_eligible(
+                    test_ns_id(),
+                    "keyword",
+                    100,
+                    &HashSet::from([fixed_id(target)]),
+                )
+                .unwrap();
+            assert_eq!(
+                result.matches.len(),
+                usize::from(target == MAX_FTS_EXAMINED)
+            );
+            assert_eq!(result.coverage.examined, MAX_FTS_EXAMINED);
+            assert_eq!(result.coverage.pages, 128);
+            assert!(result.coverage.budget_exhausted);
+            assert!(result.coverage.candidate_limited);
+            assert!(!result.coverage.exhausted);
+        }
+        index.remove(fixed_id(MAX_FTS_EXAMINED + 1)).unwrap();
+        let exact = index
+            .search_eligible(test_ns_id(), "keyword", 100, &HashSet::new())
+            .unwrap();
+        assert!(exact.coverage.budget_exhausted); // No uncharged EOF probe.
+        assert!(!exact.coverage.exhausted);
+        index.remove(fixed_id(MAX_FTS_EXAMINED)).unwrap();
+        let ended = index
+            .search_eligible(test_ns_id(), "keyword", 100, &HashSet::new())
+            .unwrap();
+        assert_eq!(ended.coverage.examined, MAX_FTS_EXAMINED - 1);
+        assert!(ended.coverage.exhausted);
+        assert!(!ended.coverage.budget_exhausted);
+        assert!(!ended.coverage.candidate_limited);
+    }
+
+    #[test]
+    fn eligible_refill_rejects_corrupt_ids_and_sqlite_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = FtsIndex::new(dir.path()).unwrap();
+        index
+            .add(test_ns_id(), fixed_id(1), "keyword", None, &[])
+            .unwrap();
+        index
+            .conn
+            .execute("UPDATE id_map SET memory_id = X'01'", [])
+            .unwrap();
+        assert!(matches!(
+            index.search_eligible(test_ns_id(), "keyword", 100, &HashSet::new()),
+            Err(FtsError::InvalidMemoryId)
+        ));
+        index.conn.execute("DROP TABLE id_map", []).unwrap();
+        assert!(matches!(
+            index.search_eligible(test_ns_id(), "keyword", 100, &HashSet::new()),
+            Err(FtsError::Sqlite(_))
+        ));
+    }
+    #[test]
+    fn refill_cursor_does_not_mix_namespace_views_during_concurrent_writes() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let index = FtsIndex::new(dir.path()).unwrap();
+        for n in 1..=2000 {
+            let ns = if n <= 1000 {
+                test_ns_id()
+            } else {
+                test_ns_id_2()
+            };
+            index.add(ns, fixed_id(n), "keyword", None, &[]).unwrap();
+        }
+        // Each atomic update swaps the entire namespace membership. Every valid
+        // pinned result has exactly 1,000 rows and exactly one eligible terminal.
+        let barrier = Arc::new(Barrier::new(2));
+        let finished = Arc::new(AtomicBool::new(false));
+        let writer_barrier = barrier.clone();
+        let writer_finished = finished.clone();
+        let path = dir.path().join("fts.db");
+        let writer = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            writer_barrier.wait();
+            let mut writes = 0;
+            while !writer_finished.load(Ordering::Acquire) || writes == 0 {
+                conn.execute("UPDATE id_map SET namespace_id = CASE WHEN namespace_id = ?1 THEN ?2 ELSE ?1 END",
+                    rusqlite::params![test_ns_id().get(), test_ns_id_2().get()]).unwrap();
+                writes += 1;
+            }
+            writes
+        });
+        barrier.wait();
+        let eligible = HashSet::from([fixed_id(1000), fixed_id(2000)]);
+        let results: Vec<_> = (0..20)
+            .map(|_| index.search_eligible(test_ns_id(), "keyword", 100, &eligible))
+            .collect();
+        finished.store(true, Ordering::Release);
+        assert!(writer.join().unwrap() > 0);
+        for result in results {
+            let result = result.unwrap();
+            assert_eq!(result.coverage.examined, 1000);
+            assert_eq!(result.coverage.eligible, 1);
+            assert_eq!(result.coverage.admitted, 1);
+            assert_eq!(result.coverage.pages, 11);
+            assert!(result.coverage.exhausted);
+            assert!(eligible.contains(&result.matches[0].0));
         }
     }
 }

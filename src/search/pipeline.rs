@@ -13,6 +13,7 @@ use tracing::{debug, instrument, warn};
 use super::error::{Result, SearchError};
 use super::query::{QueryMode, SearchFilter, SearchQuery};
 use super::response::{MemoryResponse, SearchResponse, SearchResult, StageTimings};
+use super::{EligibleFtsResults, FtsCoverage};
 use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConfig, NamespaceId};
 
 #[path = "semantics.rs"]
@@ -21,8 +22,8 @@ mod semantics;
 #[path = "semantics_tests.rs"]
 mod semantics_tests;
 pub use semantics::{
-    RetrievalSemantics, SemanticsDiagnostics, SemanticsResponse, UnresolvedReason, VersionMode,
-    VersionStatus,
+    FtsAvailability, FtsDiagnostics, RetrievalSemantics, SemanticsDiagnostics, SemanticsResponse,
+    UnresolvedReason, VersionMode, VersionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,20 @@ pub struct ScoredResult {
 pub trait FtsIndexRegistry: Send + Sync {
     /// Search the namespace's FTS index for the top-K keyword matches.
     fn search(&self, namespace_id: NamespaceId, query: &str, k: usize) -> Result<Vec<FtsResult>>;
+
+    /// Stable eligible refill. Unsupported adapters fail explicitly in v2;
+    /// a legacy top-K call cannot certify exhaustion or refill coverage.
+    fn search_eligible(
+        &self,
+        _namespace_id: NamespaceId,
+        _query: &str,
+        _k: usize,
+        _eligible_ids: &HashSet<MemoryId>,
+    ) -> Result<EligibleFtsResults> {
+        Err(SearchError::Internal(
+            "eligible FTS search unavailable".into(),
+        ))
+    }
 }
 
 /// A single result from FTS5 keyword search.
@@ -475,7 +490,13 @@ impl QueryEngine {
             self.run_vector_search(&query_embedding, ns_config.id, fetch_k, &eligible_ids)?;
         timings.vector_search_us = vector_search_us;
 
-        let (fts_results, fts_search_us) = self.run_fts_search(&query, ns_config.id, fetch_k)?;
+        let (fts_results, fts_search_us) = self.run_fts_search(
+            &query,
+            ns_config.id,
+            fetch_k,
+            &eligible_ids,
+            &mut diagnostics,
+        )?;
         timings.fts_search_us = fts_search_us;
         if semantics != RetrievalSemantics::V1
             && (scored_candidates.iter().any(|r| !r.score.is_finite())
@@ -714,14 +735,44 @@ impl QueryEngine {
         query: &SearchQuery,
         namespace_id: NamespaceId,
         fetch_k: usize,
+        eligible_ids: &HashSet<MemoryId>,
+        diagnostics: &mut SemanticsDiagnostics,
     ) -> Result<(Vec<FtsResult>, u64)> {
         let stage_start = Instant::now();
         let fts_text = query.fts_query.as_ref().or(query.text.as_ref());
         let results = match fts_text {
-            Some(text) if query.query_mode != QueryMode::MetadataOnly => self
-                .fts_index
-                .search(namespace_id, text, fetch_k)
-                .unwrap_or_default(),
+            Some(text) if query.query_mode != QueryMode::MetadataOnly => {
+                if diagnostics.semantics == RetrievalSemantics::V1 {
+                    match self.fts_index.search(namespace_id, text, fetch_k) {
+                        Ok(results) => {
+                            diagnostics.fts.availability = FtsAvailability::Available;
+                            // Legacy top-K has no exhaustion/examination evidence.
+                            results
+                        }
+                        Err(error) => {
+                            diagnostics.fts.availability = FtsAvailability::Unavailable;
+                            warn!(%error, "legacy FTS fallback: channel unavailable");
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    // Fail the query on FTS errors. Degraded partial serving is
+                    // optional and requires A1 readiness for independent views.
+                    let results = self.fts_index.search_eligible(
+                        namespace_id,
+                        text,
+                        fetch_k,
+                        eligible_ids,
+                    )?;
+                    diagnostics.fts.availability = FtsAvailability::Available;
+                    diagnostics.fts.coverage = Some(results.coverage);
+                    results
+                        .matches
+                        .into_iter()
+                        .map(|(memory_id, score)| FtsResult { memory_id, score })
+                        .collect()
+                }
+            }
             _ => Vec::new(),
         };
         Ok((results, stage_start.elapsed().as_micros() as u64))
@@ -1841,6 +1892,22 @@ mod tests {
     impl FtsIndexRegistry for SearchFixture {
         fn search(&self, _ns: NamespaceId, _q: &str, _k: usize) -> Result<Vec<FtsResult>> {
             Ok(Vec::new())
+        }
+
+        fn search_eligible(
+            &self,
+            _ns: NamespaceId,
+            _q: &str,
+            _k: usize,
+            _eligible: &HashSet<MemoryId>,
+        ) -> Result<EligibleFtsResults> {
+            Ok(EligibleFtsResults {
+                matches: Vec::new(),
+                coverage: FtsCoverage {
+                    exhausted: true,
+                    ..Default::default()
+                },
+            })
         }
     }
 

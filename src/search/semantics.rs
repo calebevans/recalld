@@ -41,6 +41,22 @@ pub enum VersionStatus {
     Unresolved(UnresolvedReason),
 }
 
+/// Observed operation outcome, not an A1 readiness/generation certificate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FtsAvailability {
+    #[default]
+    NotRequested,
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Default)]
+pub struct FtsDiagnostics {
+    pub availability: FtsAvailability,
+    /// Present only for successful v2 refill. Legacy top-K coverage is unknown.
+    pub coverage: Option<FtsCoverage>,
+}
+
 /// Aggregate failures never contain rejected/foreign IDs. Per-ID fields are
 /// restricted to returned results. This is not full v2 coverage/readiness.
 #[derive(Debug)]
@@ -48,6 +64,7 @@ pub struct SemanticsDiagnostics {
     pub semantics: RetrievalSemantics,
     /// True when v2 forces RIF off; false preserves the configured legacy engine.
     pub rif_off: bool,
+    pub fts: FtsDiagnostics,
     pub supersession_edges_examined: usize,
     pub unresolved: BTreeMap<UnresolvedReason, usize>,
     pub graph: GraphWork,
@@ -62,6 +79,7 @@ impl SemanticsDiagnostics {
         Self {
             semantics,
             rif_off: semantics != RetrievalSemantics::V1,
+            fts: FtsDiagnostics::default(),
             supersession_edges_examined: 0,
             unresolved: BTreeMap::new(),
             graph: GraphWork::default(),
