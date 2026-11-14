@@ -1,0 +1,57 @@
+{
+  "runtimeCommit": "98179a4458b6c3c232df1d997ba31afe29551b31",
+  "checks": {
+    "required37": {
+      "commit": "89e0cf3bd75c263b6e246733800fc3057e9f9735",
+      "ancestor": true
+    },
+    "required28": {
+      "commit": "f02212764ce83d129bbc4461195e9b986d72f080",
+      "ancestor": true
+    },
+    "required39": {
+      "commit": "cdee36e51520a9dde72984bec9a99be06a71435f",
+      "ancestor": true
+    },
+    "excluded17": {
+      "commit": "1a634006023cfab6e277a1ebe8503b5e3de4e40a",
+      "ancestor": false
+    },
+    "excludedNamespaceBatch": {
+      "commit": "0e58f3b3dd36e2d74dfd5f97bfb522ba96c6efe8",
+      "ancestor": false
+    },
+    "excludedCombined": {
+      "commit": "aeab9e68e749e4e178576c2283a6173c11611a31",
+      "ancestor": false
+    },
+    "excludedCompaction": {
+      "commit": "838cafce3c15fd4c859f88b765598737b8d01b39",
+      "ancestor": false
+    },
+    "excludedEntities": {
+      "commit": "852221e7bafa32dbea8024d0353c7e3ff4e85c78",
+      "ancestor": false
+    },
+    "excludedLedger": {
+      "commit": "214d7195c89620c3a276da781b889ee88ecf7369",
+      "ancestor": false
+    },
+    "excludedSchema": {
+      "commit": "439111853d0bb7beaa1ec400f5e0eb164d45641a",
+      "ancestor": false
+    },
+    "excludedReceipts": {
+      "commit": "8b013e77a8f34d1eb383b62827b9fe8e64275791",
+      "ancestor": false
+    },
+    "excludedOldFix": {
+      "commit": "c9e7d3dc9cddd2f9d3dc08c8169df3942225c82b",
+      "ancestor": false
+    },
+    "excludedEvidence": {
+      "commit": "b2dad0f4b78f4adbfde1af44fe6893185306d0ae",
+      "ancestor": false
+    }
+  }
+}

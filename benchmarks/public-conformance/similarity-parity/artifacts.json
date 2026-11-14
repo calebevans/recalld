@@ -1,0 +1,10 @@
+{
+  "baseline-aeab9e6.tgz": {
+    "sha256": "2e70779619dfe80e553fd2887c8daad5f185686c72c4657f9591e6b73398a675",
+    "bytes": 974100
+  },
+  "corrected-c9e7d3d.tgz": {
+    "sha256": "c80ec215c58d4ba73fa5d155a7551699b8a8289da630d81daf14d7ec4a4a9db1",
+    "bytes": 1024258
+  }
+}

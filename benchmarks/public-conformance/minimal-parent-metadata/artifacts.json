@@ -1,0 +1,14 @@
+{
+  "f7-validation-attempt.tgz": {
+    "sha256": "669222229ac318fff2bdf01b2be36d584efd37017d983218c6f799fcfe95f30b",
+    "bytes": 647612
+  },
+  "metadata-development.tgz": {
+    "sha256": "266b318715020943236a4d188f2a9e40f518acd5020d42a3b4428d509b76d388",
+    "bytes": 625236
+  },
+  "validated-98179a4.tgz": {
+    "sha256": "92414849cefd4fc5e16409d120733f7c9f19de25beeb6d8004d26d2590c5a143",
+    "bytes": 950553
+  }
+}
