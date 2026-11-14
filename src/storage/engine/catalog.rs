@@ -166,6 +166,148 @@ mod tests {
     }
 
     #[test]
+    fn catalog_receipt_scope_forgery_fails_startup_without_changing_source() {
+        use crate::storage::control::{KEYS, RECEIPTS, scoped_key};
+
+        fn files(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            let mut snapshot = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    snapshot.extend(files(&path));
+                } else {
+                    snapshot.insert(path.clone(), std::fs::read(path).unwrap());
+                }
+            }
+            snapshot
+        }
+
+        let mut accepted = Vec::new();
+        for keyed in [false, true] {
+            for mode in [
+                "create_namespace_scope",
+                "update_catalog_scope",
+                "update_wrong_id",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let mut e = RedbStorageEngine::open(root.path()).unwrap();
+                let mut ctx = context(&e, "receipt", MutationScope::Catalog);
+                if !keyed {
+                    ctx.idempotency_key = None;
+                }
+                let create = e
+                    .create_namespace_with_receipt(&ctx, &config("scope"))
+                    .unwrap();
+                let id = created(&create);
+                let (receipt, wrong_scope) = if mode == "create_namespace_scope" {
+                    (create, MutationScope::Namespace(id))
+                } else {
+                    ctx = context(&e, "policy", MutationScope::Namespace(id));
+                    if !keyed {
+                        ctx.idempotency_key = None;
+                    }
+                    let policy = NamespacePolicy::from(&e.get_namespace(id).unwrap().unwrap());
+                    let receipt = e
+                        .update_namespace_policy_with_receipt(&ctx, &policy)
+                        .unwrap();
+                    let scope = if mode == "update_catalog_scope" {
+                        MutationScope::Catalog
+                    } else {
+                        MutationScope::Namespace(NamespaceId::new(id.get() + 1))
+                    };
+                    (receipt, scope)
+                };
+                drop(e);
+
+                // Move the receipt AND its retry-key reference consistently: ordinary
+                // key-link validation must not mask the outcome/scope mismatch.
+                let db = redb::Database::open(root.path().join("meta.db")).unwrap();
+                let tx = db.begin_write().unwrap();
+                let old = scoped_key(receipt.store_id, ctx.scope, receipt.operation_id.as_bytes());
+                let new = scoped_key(
+                    receipt.store_id,
+                    wrong_scope,
+                    receipt.operation_id.as_bytes(),
+                );
+                {
+                    let mut receipts = tx.open_table(RECEIPTS).unwrap();
+                    let value = receipts
+                        .remove(old.as_slice())
+                        .unwrap()
+                        .unwrap()
+                        .value()
+                        .to_vec();
+                    receipts.insert(new.as_slice(), value.as_slice()).unwrap();
+                    if let Some(key) = &ctx.idempotency_key {
+                        let mut keys = tx.open_table(KEYS).unwrap();
+                        keys.remove(
+                            scoped_key(receipt.store_id, ctx.scope, key.as_bytes()).as_slice(),
+                        )
+                        .unwrap();
+                        keys.insert(
+                            scoped_key(receipt.store_id, wrong_scope, key.as_bytes()).as_slice(),
+                            new.as_slice(),
+                        )
+                        .unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+                drop(db);
+                let before = files(root.path());
+                match RedbStorageEngine::open(root.path()) {
+                    Err(StorageError::InvalidControl(message)) => {
+                        assert_eq!(message, "catalog receipt outcome disagrees with key scope");
+                        assert_eq!(files(root.path()), before, "{mode}, keyed={keyed}");
+                    }
+                    Err(error) => {
+                        panic!("unexpected rejection for {mode}, keyed={keyed}: {error:?}")
+                    }
+                    Ok(_) => accepted.push(format!("{mode}, keyed={keyed}")),
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "accepted forged catalog receipts: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_receipt_scopes_remain_valid_after_namespace_purge() {
+        for keyed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut e = RedbStorageEngine::open(root.path()).unwrap();
+            let mut create_ctx = context(&e, "create", MutationScope::Catalog);
+            if !keyed {
+                create_ctx.idempotency_key = None;
+            }
+            let create = e
+                .create_namespace_with_receipt(&create_ctx, &config("gone"))
+                .unwrap();
+            let id = created(&create);
+            let mut update_ctx = context(&e, "update", MutationScope::Namespace(id));
+            if !keyed {
+                update_ctx.idempotency_key = None;
+            }
+            let policy = NamespacePolicy::from(&e.get_namespace(id).unwrap().unwrap());
+            let update = e
+                .update_namespace_policy_with_receipt(&update_ctx, &policy)
+                .unwrap();
+            e.purge_namespace(id).unwrap();
+            drop(e);
+            let e = RedbStorageEngine::open(root.path()).unwrap();
+            assert!(e.get_namespace(id).unwrap().is_none());
+            for (receipt, scope) in [(create, create_ctx.scope), (update, update_ctx.scope)] {
+                assert_eq!(
+                    e.lookup_operation(receipt.store_id, scope, receipt.operation_id)
+                        .unwrap(),
+                    Some(receipt)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn catalog_create_replays_before_cas_and_filesystem_and_never_reuses_ids() {
         let root = tempfile::tempdir().unwrap();
         let mut e = RedbStorageEngine::open(root.path()).unwrap();

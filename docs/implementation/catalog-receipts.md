@@ -72,8 +72,12 @@ New payload-free outcomes are `NamespaceCreated {namespaceId,createdAt}` and
 `NamespacePolicyUpdated {namespaceId}`. receiptVersion stays1; old decoders
 reject unknown mandatory outcomes, and the inherited selected-text fence still
 rejects old readers/writers. Validation rejects zero IDs and invalid creation
-times. Future joins must preserve all graph/text/schema/access/feedback outcome
-variants rather than replace the match table with one branch's variants.
+times. Startup also requires creation receipts under Catalog scope and policy
+update receipts under Namespace scope with the same namespace ID as the outcome.
+This is a relationship between retained evidence, not a namespace-existence
+check: valid receipts remain readable after purge. Future joins must preserve all
+graph/text/schema/access/feedback outcome variants rather than replace the match
+table with one branch's variants.
 
 Validation results and fault coverage are supplied with the final handoff.
 
@@ -110,3 +114,23 @@ Raw logs and scratch diagnostic patch:
 `/tmp/recalld-implementation/catalog-validation`. The diagnostic copy is
 `/tmp/recalld-implementation/catalog-lock-diagnostics/source`, separate from
 this implementation branch. No exhaustive crash/power-loss or readiness claim.
+
+## Scope validation regression (child of 756b22e)
+
+Before the fix, the new startup regression accepted all six forged cases:
+creation under Namespace scope, policy update under Catalog scope, and policy
+update under another namespace ID, each with and without a retry key. Keyed
+fixtures move both receipt and retry-key reference consistently, isolating the
+missing outcome/scope check from the existing key-link validation.
+
+The fixed regression requires the specific scope rejection and compares all
+store files byte-for-byte after failed startup. A second regression reopens valid
+creation/update receipts after namespace purge, with and without retry keys.
+The catalog filter passes 11 tests. Older outcome validation is unchanged.
+The final normal-parallel `cargo test --offline --locked --all-features` passes
+629 library tests and 1 CLI test, with 4 doctests ignored. Formatting check and
+all-feature/all-target Clippy pass with warnings. Runs use the same isolated
+offline Rust 1.94.1 Docker configuration above. This passing run does not resolve
+the earlier catalog-parent flock failure or establish its cause.
+Raw before/focused/full/fmt/Clippy logs are retained outside the source tree at
+`/tmp/recalld-implementation/catalog-receipt-scope-validation`.
