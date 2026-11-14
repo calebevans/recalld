@@ -23,6 +23,20 @@ impl McpStorageAdapter {
         &self,
         input: BatchInput,
     ) -> Result<BatchOutcome, bridge::BridgeError> {
+        let completion = self.batch_completion();
+        let work = completion
+            .accept_work(None)
+            .map_err(super::map_mutation_error)?;
+        let result = self.run_batch_accepted(input, &work).await;
+        completion.finish_known_work(work);
+        result
+    }
+
+    async fn run_batch_accepted(
+        &self,
+        input: BatchInput,
+        work: &crate::storage::work::WorkTicket,
+    ) -> Result<BatchOutcome, bridge::BridgeError> {
         // Prepare the entire ordered caller intent before policy/default reads.
         let prepared = batches::prepare(&input)?;
         let plans: Vec<_> = prepared.iter().map(|item| item.plan.clone()).collect();
@@ -30,10 +44,17 @@ impl McpStorageAdapter {
         let kind = input.kind;
         let parent = input.batch_operation_id;
         let storage = self.storage.clone();
+        let worker = work
+            .child()
+            .map_err(|e| super::map_mutation_error(e.into()))?;
         let reserved=tokio::task::spawn_blocking(move||{
             let storage=storage.read().map_err(|e|StorageError::RecoveryRequired(e.to_string()))?;
-            let store_id=storage.meta_store().control_state()?.store_id;
-            Ok::<_,StorageError>((store_id,storage.meta_store().reserve_or_resume_batch(&ctx,kind,&plans,parent)))
+            let result=(|| {
+                let store_id=storage.meta_store().control_state()?.store_id;
+                Ok::<_,StorageError>((store_id,storage.meta_store().reserve_or_resume_batch_with_work(&ctx,kind,&plans,parent,Some(&worker))))
+            })();
+            storage.meta_store().finish_work(worker);
+            result
         }).await.map_err(|e|bridge::BridgeError::PartiallyApplied(format!("batch reservation worker outcome unknown; resubmit the same full request and key after recovery: {e}")))?
             .map_err(super::map_mutation_error)?;
         let (store_id, reserved) = reserved;
@@ -73,7 +94,12 @@ impl McpStorageAdapter {
         let mut outcome = outcome_from_progress(&progress, &prepared, self.timezone)?;
         // A previous attempt may have committed a child but failed publication.
         // Replay never calls a provider or allocates another payload/identity.
-        if self.batch_completion().complete().await.is_err() {
+        if self
+            .batch_completion()
+            .complete_with_work(Some(work))
+            .await
+            .is_err()
+        {
             mark_unready(&mut outcome);
             return Ok(outcome);
         }
@@ -84,6 +110,9 @@ impl McpStorageAdapter {
             let child = progress.child(index).ok_or_else(|| {
                 bridge::BridgeError::Internal("pending batch item has no reservation".into())
             })?;
+            let item_work = work
+                .child()
+                .map_err(|e| super::map_mutation_error(e.into()))?;
             let result = if let Some(input) = &prepared.store {
                 let mut input = input.clone();
                 input.namespace = progress.items[index]
@@ -92,7 +121,7 @@ impl McpStorageAdapter {
                     .unwrap()
                     .namespace_name
                     .clone();
-                self.store_memory_reserved(input, Some(child.clone()))
+                self.store_memory_reserved_with_work(input, Some(child.clone()), Some(&item_work))
                     .await
                     .map(|(stored, receipt)| {
                         (
@@ -102,7 +131,7 @@ impl McpStorageAdapter {
                     })
             } else if let Some(id) = prepared.forget {
                 self.batch_completion()
-                    .forget_reserved(child.clone(), id)
+                    .forget_reserved_with_work(child.clone(), id, Some(&item_work))
                     .await
                     .map(|receipt| {
                         let result = forget_result(id, &receipt);
@@ -114,6 +143,7 @@ impl McpStorageAdapter {
                     "pending item has no prepared input".into(),
                 ));
             };
+            self.batch_completion().finish_known_work(item_work);
             match result {
                 Ok((receipt, result)) => {
                     outcome.items[index].status = BatchStatus::Ok;
@@ -165,12 +195,20 @@ impl McpStorageAdapter {
                             final_error = error.clone();
                         }
                         let storage = self.storage.clone();
+                        let worker = work
+                            .child()
+                            .map_err(|e| super::map_mutation_error(e.into()))?;
                         let finalized = tokio::task::spawn_blocking(move || {
-                            storage
+                            let storage = storage
                                 .read()
-                                .map_err(|e| StorageError::RecoveryRequired(e.to_string()))?
-                                .meta_store()
-                                .finalize_batch_error(&child, final_error)
+                                .map_err(|e| StorageError::RecoveryRequired(e.to_string()))?;
+                            let result = storage.meta_store().finalize_batch_error_with_work(
+                                &child,
+                                final_error,
+                                Some(&worker),
+                            );
+                            storage.meta_store().finish_work(worker);
+                            result
                         })
                         .await;
                         match finalized {
@@ -231,7 +269,11 @@ impl McpStorageAdapter {
                 }
             }
         }
-        if self.batch_completion().complete().await.is_ok()
+        if self
+            .batch_completion()
+            .complete_with_work(Some(work))
+            .await
+            .is_ok()
             && super::effects_stamp(&self.storage).await.is_ok()
         {
             // Another matching caller may have committed while this caller's
@@ -416,6 +458,272 @@ mod tests {
             .unwrap()
             .committed_generation
             .get()
+    }
+
+    fn tracker(f: &Fixture) -> crate::storage::work::WorkTracker {
+        f.storage.read().unwrap().meta_store().work_tracker()
+    }
+    fn deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(10)
+    }
+
+    struct PausedProvider {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::embedding::EmbeddingProvider for PausedProvider {
+        async fn embed(&self, _: &str) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(vec![1., 0., 0., 0.])
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn model_name(&self) -> &str {
+            "synthetic-work-gate"
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_work_close_before_entry_rejects_before_reservation_or_provider() {
+        let f = Fixture::new();
+        let mut adapter = f.storage_adapter();
+        let calls = Arc::new(AtomicUsize::new(0));
+        adapter.embedding = Arc::new(PausedProvider {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            calls: calls.clone(),
+        });
+        let input = request(&f, "closed", vec![json!({"summary":"never staged"})]);
+        let before = generation(&f);
+        let tracker = tracker(&f);
+        let lease = tracker.close_and_drain(deadline()).unwrap();
+        let error = adapter.mutate_batch(input).await.unwrap_err();
+        assert!(error.to_string().contains("admission is closed"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(generation(&f), before);
+        assert_eq!(
+            f.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .pending_batch_items()
+                .unwrap(),
+            0
+        );
+        let store = f.storage.read().unwrap();
+        let frozen = store.meta_store().freeze_metadata(lease).unwrap();
+        assert_eq!(
+            frozen.generation(),
+            store.control_state().unwrap().generation_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_work_accepted_provider_and_graph_descendants_finish_during_close() {
+        let f = Fixture::new();
+        let mut adapter = f.storage_adapter();
+        Arc::make_mut(&mut adapter.config).graph.autolink_enabled = true;
+        Arc::make_mut(&mut adapter.config).graph.temporal_window_ms = 0;
+        assert!(
+            adapter
+                .mutate_batch(request(&f, "seed", vec![item()]))
+                .await
+                .unwrap()
+                .all_ready()
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        adapter.embedding = Arc::new(PausedProvider {
+            entered: entered.clone(),
+            release: release.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let input = request(
+            &f,
+            "closing",
+            vec![
+                json!({"summary":"second generated", "checkDuplicates":false}),
+                json!({"summary":"runtime invalid vector","embedding":[0.,0.,0.,0.],"checkDuplicates":false}),
+            ],
+        );
+        let task = tokio::spawn(async move { adapter.mutate_batch(input).await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
+        let tracker = tracker(&f);
+        assert!(tracker.status().pending > 0);
+        assert_eq!(
+            f.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .pending_batch_items()
+                .unwrap(),
+            2
+        );
+        let closing = tracker.clone();
+        let drain = tokio::task::spawn_blocking(move || closing.close_and_drain(deadline()));
+        tracker.wait_until_closed();
+        assert!(!drain.is_finished());
+        release.notify_one();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(
+            (outcome.succeeded, outcome.failed, outcome.unresolved),
+            (1, 1, 0),
+            "{outcome:?}"
+        );
+        assert!(outcome.items[0].ready);
+        assert_eq!(
+            outcome.bookkeeping_receipts.len(),
+            1,
+            "runtime rejection must finalize as an accepted descendant"
+        );
+        let lease = drain.await.unwrap().unwrap();
+        assert_eq!(tracker.status().pending, 0);
+        let edges = f.persisted_edges();
+        assert_eq!(
+            edges.len(),
+            1,
+            "optional graph publication must not silently fail when closing"
+        );
+        for id in [edges[0].source, edges[0].target] {
+            let outgoing = edges.iter().filter(|edge| edge.source == id).count() as u16;
+            assert_eq!(f.edge_count(id), outgoing);
+            // A safe cache miss is allowed. Bound cache hits must agree with
+            // canonical counts even if an older insertion refill arrived late.
+            if let Some(cached) = f.cache.get(id).await {
+                assert_eq!(cached.edge_count, outgoing);
+            }
+            assert!(f.graph.read().await.has_typed_edge_between_ids(
+                &edges[0].source,
+                &edges[0].target,
+                edges[0].edge_type
+            ));
+        }
+        let store = f.storage.read().unwrap();
+        assert!(store.meta_store().pending_effects().unwrap().is_empty());
+        let frozen = store.meta_store().freeze_metadata(lease).unwrap();
+        assert_eq!(
+            frozen.generation(),
+            store.control_state().unwrap().generation_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_work_cancelled_provider_stays_unresolved_and_reopen_keeps_payload_pending() {
+        let f = Fixture::new();
+        let mut adapter = f.storage_adapter();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        adapter.embedding = Arc::new(PausedProvider {
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let input = request(
+            &f,
+            "cancelled",
+            vec![json!({"summary":"caller payload required","checkDuplicates":false})],
+        );
+        let task = tokio::spawn(async move { adapter.mutate_batch(input).await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
+        let tracker = tracker(&f);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(tracker.status().unresolved > 0);
+        assert!(tracker.close_and_drain(std::time::Instant::now()).is_err());
+        let dir = f.close();
+        let engine = crate::storage::RedbStorageEngine::open(dir.path()).unwrap();
+        let meta = engine.meta_store();
+        assert_eq!(meta.work_tracker().status().pending, 0);
+        assert_eq!(meta.pending_batch_items().unwrap(), 1);
+        let lease = meta.work_tracker().close_and_drain(deadline()).unwrap();
+        let error = meta.freeze_metadata(lease).err().unwrap();
+        assert!(error.to_string().contains("matching caller resubmission"));
+    }
+
+    #[tokio::test]
+    async fn batch_work_terminal_errors_freeze_and_lifetime_scan_checks_each_manifest() {
+        let f = Fixture::new();
+        let adapter = f.storage_adapter();
+        for index in 0..3 {
+            let result = adapter
+                .mutate_batch(request(
+                    &f,
+                    &format!("invalid-{index}"),
+                    vec![json!({"summary":false})],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(result.failed, 1);
+            assert_eq!(result.unresolved, 0);
+        }
+        let store = f.storage.read().unwrap();
+        let meta = store.meta_store();
+        assert_eq!(meta.pending_batch_items().unwrap(), 0);
+        let mut checks = 0;
+        let stopped = meta.pending_batch_items_checked(|| {
+            checks += 1;
+            if checks == 3 {
+                return Err(crate::storage::work::WorkError::Deadline {
+                    pending: 0,
+                    unresolved: 0,
+                }
+                .into());
+            }
+            Ok(())
+        });
+        assert!(stopped.is_err());
+        assert_eq!(
+            checks, 3,
+            "deadline callback must run between lifetime rows"
+        );
+        let before = meta.control_state().unwrap().generation_ref();
+        let frozen = meta
+            .freeze_metadata(meta.work_tracker().close_and_drain(deadline()).unwrap())
+            .unwrap();
+        assert_eq!(frozen.generation(), before);
+    }
+
+    #[tokio::test]
+    async fn batch_work_reserved_forget_finishes_with_accepted_parent_during_close() {
+        let f = Fixture::new();
+        let adapter = f.storage_adapter();
+        let inserted = adapter
+            .mutate_batch(request(&f, "forget-seed", vec![item()]))
+            .await
+            .unwrap();
+        let id =
+            crate::storage::insertion::inserted_id(inserted.items[0].receipt.as_ref().unwrap())
+                .unwrap();
+        let mut input = request(&f, "forget-closing", vec![json!(id.to_string())]);
+        input.kind = BatchKind::Forget;
+        let completion = adapter.batch_completion();
+        let work = completion.accept_work(None).unwrap();
+        let tracker = tracker(&f);
+        let closing = tracker.clone();
+        let drain = tokio::task::spawn_blocking(move || closing.close_and_drain(deadline()));
+        tracker.wait_until_closed();
+        let result = adapter.run_batch_accepted(input, &work).await.unwrap();
+        assert!(result.all_ready(), "{result:?}");
+        assert!(
+            !drain.is_finished(),
+            "root remains accepted until final consumer return"
+        );
+        completion.finish_known_work(work);
+        let lease = drain.await.unwrap().unwrap();
+        let store = f.storage.read().unwrap();
+        assert_eq!(
+            store.get_record(id).unwrap().unwrap().phase,
+            crate::model::DecayPhase::Tombstone
+        );
+        assert!(store.meta_store().freeze_metadata(lease).is_ok());
     }
 
     #[tokio::test]
@@ -764,6 +1072,9 @@ mod tests {
                     usize::from(stage == 2)
                 );
             }
+            let tracker = tracker(&f);
+            assert!(tracker.status().unresolved > 0);
+            assert!(tracker.close_and_drain(std::time::Instant::now()).is_err());
             drop(adapter);
             let dir = f.close();
             let engine = crate::storage::RedbStorageEngine::open(dir.path()).unwrap();
@@ -772,6 +1083,10 @@ mod tests {
                 .lookup_batch(store_id, parent)
                 .unwrap()
                 .unwrap();
+            assert!(engine.meta_store().pending_batch_items().unwrap() > 0);
+            let tracker = engine.meta_store().work_tracker();
+            let lease = tracker.close_and_drain(deadline()).unwrap();
+            assert!(engine.meta_store().freeze_metadata(lease).is_err());
             if stage == 3 {
                 assert!(
                     matches!(&progress.items[0].state,BatchItemState::Ok{receipt} if Some(receipt.operation_id)==outcome.items[0].operation_id)
@@ -836,6 +1151,18 @@ mod tests {
         assert_eq!(generation(&f), before + 1);
         assert!(f.storage.read().unwrap().scan_all().unwrap().is_empty());
         assert!(first.items[0].retryable);
+        let tracker = tracker(&f);
+        assert_eq!(tracker.status().pending, 0);
+        let lease = tracker.close_and_drain(deadline()).unwrap();
+        assert!(
+            f.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .freeze_metadata(lease)
+                .is_err()
+        );
+        assert!(tracker.status().admission_open);
         let complete = adapter.mutate_batch(input.clone()).await.unwrap();
         assert!(complete.all_ready());
         let replay = adapter.mutate_batch(input).await.unwrap();

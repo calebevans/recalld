@@ -801,6 +801,17 @@ impl McpStorageAdapter {
         child: Option<crate::storage::batch::BatchChild>,
     ) -> Result<(bridge::StoredMemory, crate::storage::control::WriteReceipt), StoreWriteError>
     {
+        self.store_memory_reserved_with_work(input, child, None)
+            .await
+    }
+
+    pub(crate) async fn store_memory_reserved_with_work(
+        &self,
+        input: bridge::StoreInput,
+        child: Option<crate::storage::batch::BatchChild>,
+        work: Option<&crate::storage::work::WorkTicket>,
+    ) -> Result<(bridge::StoredMemory, crate::storage::control::WriteReceipt), StoreWriteError>
+    {
         // This is shared by direct single writes and reserved batch children.
         // Validate before replay normalization, provider work or payload staging.
         let (merged_tags, canonical_input) = crate::mcp::batches::canonical_input(&input)
@@ -808,12 +819,23 @@ impl McpStorageAdapter {
         if let Some(child) = child.clone() {
             let canonical = canonical_input.clone();
             let storage = self.storage.clone();
+            let worker = work
+                .map(|p| p.child())
+                .transpose()
+                .map_err(crate::storage::StorageError::from)?;
             let replay = tokio::task::spawn_blocking(move || {
-                storage
+                let storage = storage
                     .read()
-                    .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?
-                    .meta_store()
-                    .lookup_insert_child(&child, &canonical)
+                    .map_err(|e| crate::storage::StorageError::RecoveryRequired(e.to_string()))?;
+                let result = storage.meta_store().lookup_insert_child_with_work(
+                    &child,
+                    &canonical,
+                    worker.as_ref(),
+                );
+                if let Some(worker) = worker {
+                    storage.meta_store().finish_work(worker);
+                }
+                result
             })
             .await
             .map_err(|e| bridge::BridgeError::Internal(e.to_string()))??;
@@ -966,7 +988,7 @@ impl McpStorageAdapter {
             entities: self.entity_index.clone(),
         };
         let inserted = completion
-            .insert_reserved(
+            .insert_reserved_with_work(
                 child.as_ref().map(|c| c.context()).unwrap_or_else(|| {
                     crate::storage::control::MutationContext::unkeyed(ns_config.id)
                 }),
@@ -974,6 +996,7 @@ impl McpStorageAdapter {
                 raw_embedding,
                 now,
                 child.clone(),
+                work,
             )
             .await?;
         let receipt = inserted.receipt;
@@ -1003,7 +1026,7 @@ impl McpStorageAdapter {
             let threshold = self.config.graph.auto_link_threshold as f32;
             let max_links = self.config.graph.max_auto_links;
 
-            if let Err(e) = crate::graph::perform_autolink(
+            if let Err(e) = crate::graph::perform_autolink_with_work(
                 memory_id,
                 ns_config.id,
                 &embedding,
@@ -1014,6 +1037,7 @@ impl McpStorageAdapter {
                 &self.graph,
                 &self.storage,
                 &self.cache,
+                work,
             )
             .await
             {
@@ -1027,7 +1051,7 @@ impl McpStorageAdapter {
             let entities = input.entities.clone();
             if !entities.is_empty() {
                 let max_entity_links = self.config.graph.max_entity_links;
-                let _ = crate::graph::perform_entity_link(
+                let _ = crate::graph::perform_entity_link_with_work(
                     memory_id,
                     ns_config.id,
                     &entities,
@@ -1036,6 +1060,7 @@ impl McpStorageAdapter {
                     &self.graph,
                     &self.storage,
                     &self.cache,
+                    work,
                 )
                 .await;
 
@@ -1068,7 +1093,7 @@ impl McpStorageAdapter {
                     .collect();
 
                 if !recent_memories.is_empty() {
-                    if let Err(e) = crate::graph::perform_temporal_link(
+                    if let Err(e) = crate::graph::perform_temporal_link_with_work(
                         memory_id,
                         ns_config.id,
                         now,
@@ -1078,6 +1103,7 @@ impl McpStorageAdapter {
                         &self.graph,
                         &self.storage,
                         &self.cache,
+                        work,
                     )
                     .await
                     {
@@ -1091,12 +1117,13 @@ impl McpStorageAdapter {
             }
         }
 
-        completion.complete().await.map_err(|source| {
-            crate::storage::StorageError::CommittedMutation {
+        completion
+            .complete_with_work(work)
+            .await
+            .map_err(|source| crate::storage::StorageError::CommittedMutation {
                 receipt: Box::new(receipt.clone()),
                 source: Box::new(source),
-            }
-        })?;
+            })?;
         self.cache.insert(memory_id, record.clone()).await;
         Ok((
             bridge::StoredMemory {

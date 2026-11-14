@@ -1,0 +1,113 @@
+{
+  "capture": "post-run executables named in raw cargo Running lines; each run kept a separate immutable source and private target, with no switch-back",
+  "runs": [
+    {
+      "executables": {
+        "/work/target/debug/deps/recalld-7025a4141187b374": {
+          "bytes": 328577672,
+          "logs": [
+            "work-tests.log"
+          ],
+          "sha256": "01bcee8e4b8d3190a628b8d351ee931f25a892fe435534297fe89faff24a03ca"
+        }
+      },
+      "root": "/tmp/recalld-accepted-test-g8o6ohxe",
+      "sourceCommit": "9b6c7eca79625766ac5bf118ebf5856922431e83",
+      "sourceSwitchedWithinRun": false,
+      "targetRoot": "/tmp/recalld-accepted-test-g8o6ohxe/target",
+      "targetSeededFromPreviousCompletedCache": true
+    },
+    {
+      "executables": {
+        "/work/target/debug/deps/recalld-27bbb81e23f12ff5": {
+          "bytes": 6908736,
+          "logs": [
+            "full-tests.log"
+          ],
+          "sha256": "836dbd677a8a7aaeb8635088b793eb686ce341cc858088c261bd5988cc38febe"
+        },
+        "/work/target/debug/deps/recalld-7025a4141187b374": {
+          "bytes": 328617256,
+          "logs": [
+            "completion-tests.log",
+            "full-tests.log",
+            "work-tests.log"
+          ],
+          "sha256": "fa62991d61b04102f1003642e82569f402cf93f04808a7120b4b79f69c7bae5a"
+        },
+        "/work/target/debug/deps/recalld_cli-16a6b9f5f1a3f682": {
+          "bytes": 6357952,
+          "logs": [
+            "full-tests.log"
+          ],
+          "sha256": "032967153e2426fb7c9da75e1ea1e2d1f334d25c94c67d954e4af2dc57ee4c0d"
+        },
+        "/work/target/debug/deps/recalld_text_migrate-b3ddbfaa472dba30": {
+          "bytes": 6358032,
+          "logs": [
+            "full-tests.log"
+          ],
+          "sha256": "914d80fb2c7ef46808f012b6fc1fc2a44c1834f27145278d415816439382317a"
+        },
+        "/work/target/debug/deps/text_migration_cli-c242142a48e76014": {
+          "bytes": 242585280,
+          "logs": [
+            "full-tests.log"
+          ],
+          "sha256": "dc8a480b25f520b7b0c669e7234e3778f50939d5a69de45bc3c6c9fbe9526ace"
+        }
+      },
+      "root": "/tmp/recalld-accepted-test-3059j5g6",
+      "sourceCommit": "b627cd50c91bdbee8786b0c581c0a4348e265892",
+      "sourceSwitchedWithinRun": false,
+      "targetRoot": "/tmp/recalld-accepted-test-3059j5g6/target",
+      "targetSeededFromPreviousCompletedCache": true
+    },
+    {
+      "executables": {
+        "/work/target/debug/deps/recalld-27bbb81e23f12ff5": {
+          "bytes": 6908736,
+          "logs": [
+            "full-tests.log"
+          ],
+          "sha256": "836dbd677a8a7aaeb8635088b793eb686ce341cc858088c261bd5988cc38febe"
+        },
+        "/work/target/debug/deps/recalld-7025a4141187b374": {
+          "bytes": 328617288,
+          "logs": [
+            "completion-tests.log",
+            "full-tests.log",
+            "work-tests.log"
+          ],
+          "sha256": "f3a455806e26553e86f8e53afce1079245d5571232e9475a400ba195538828a8"
+        },
+        "/work/target/debug/deps/recalld_cli-16a6b9f5f1a3f682": {
+          "bytes": 6357952,
+          "logs": [
+            "full-tests.log"
+          ],
+          "sha256": "032967153e2426fb7c9da75e1ea1e2d1f334d25c94c67d954e4af2dc57ee4c0d"
+        },
+        "/work/target/debug/deps/recalld_text_migrate-b3ddbfaa472dba30": {
+          "bytes": 6358032,
+          "logs": [
+            "full-tests.log"
+          ],
+          "sha256": "914d80fb2c7ef46808f012b6fc1fc2a44c1834f27145278d415816439382317a"
+        },
+        "/work/target/debug/deps/text_migration_cli-c242142a48e76014": {
+          "bytes": 242585312,
+          "logs": [
+            "full-tests.log"
+          ],
+          "sha256": "ae7e776c11ee21d555e7f73710f2a1567f18dab0e9543d7f3e50ed3a56547b10"
+        }
+      },
+      "root": "/tmp/recalld-accepted-test-wjgq37hv",
+      "sourceCommit": "50e0c5e0d42bcdafa24acb9a9c267c5d3318fe85",
+      "sourceSwitchedWithinRun": false,
+      "targetRoot": "/tmp/recalld-accepted-test-wjgq37hv/target",
+      "targetSeededFromPreviousCompletedCache": true
+    }
+  ]
+}

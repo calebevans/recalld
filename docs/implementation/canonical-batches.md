@@ -80,7 +80,7 @@ submitted as smaller independent batches, not silently split under one key.
 | Normal startup | Valid unfinished manifests survive; payload-free pending work is not auto-executed. Canonical effects use existing recovery before resubmission. |
 | Strict offline inventory/backup | Reject unfinished manifests explicitly. Completed physical metadata copies retain both tables/receipts. |
 | Logical export 49 `faf0f81`, restore and schema migration | No allowlist-only adoption. Existing unknown-table rejection remains until an ancestry-aware consumer explicitly preserves complete progress and reconciles origin/target receipts. Feynman owns the independent compatibility follow-up. |
-| Accepted-work tracker/freeze | `pending_batch_items()` counts unresolved canonical slots. Halley must consume this at the real transitive completion join; this branch does not claim that join exists. |
+| Accepted-work tracker/freeze | The [batch/accepted-work join](batch-accepted-work.md) carries actual batch descendants and rejects durable pending slots at metadata capture; no whole-core readiness claim. |
 | Native insertion/tombstone | Existing ordinary tail receives `None`; reserved legacy children use `Some(BatchChild)`. Preserve Pascal's native proof/token arms at the later join. |
 
 The admission guard remains the parent engine/metadata availability gate, not a

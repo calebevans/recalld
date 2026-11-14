@@ -4,21 +4,23 @@ use crate::storage::edges::PersistedEdge;
 impl MetadataStore {
     pub(crate) fn tombstone_with_effects(
         &self,
+        guard: &MutationGuard<'_>,
         ctx: &MutationContext,
         id: MemoryId,
         existing_edges: &[PersistedEdge],
     ) -> Result<WriteReceipt, StorageError> {
-        self.tombstone_reserved_with_effects(ctx, id, existing_edges, None)
+        self.tombstone_reserved_with_effects(guard, ctx, id, existing_edges, None)
     }
 
     pub(crate) fn tombstone_reserved_with_effects(
         &self,
+        guard: &MutationGuard<'_>,
         ctx: &MutationContext,
         id: MemoryId,
         existing_edges: &[PersistedEdge],
         child: Option<&crate::storage::batch::BatchChild>,
     ) -> Result<WriteReceipt, StorageError> {
-        let guard = self.mutation_guard()?;
+        guard.check(self)?;
         self.ensure_available()?;
         ctx.validate()?;
         let MutationScope::Namespace(namespace) = ctx.scope else {
@@ -91,7 +93,7 @@ impl MetadataStore {
                 .insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
         }
         self.finish_record_effects(
-            &guard,
+            guard,
             tx,
             ctx,
             hash,

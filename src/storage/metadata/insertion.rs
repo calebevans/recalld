@@ -14,12 +14,13 @@ impl MetadataStore {
         replay_insert(&tx, ctx, input)
     }
 
-    pub(crate) fn lookup_insert_child(
+    pub(crate) fn lookup_insert_child_with_work(
         &self,
         child: &crate::storage::batch::BatchChild,
         input: &InsertMemory,
+        parent: Option<&WorkTicket>,
     ) -> Result<Option<WriteReceipt>, StorageError> {
-        let _guard = self.mutation_guard()?;
+        let _guard = self.mutation_guard_with_work(parent)?;
         let tx = self.db.begin_write()?;
         let hash = input.request_hash(
             &child.context(),
@@ -39,6 +40,7 @@ impl MetadataStore {
     /// of that reserved slot before this transaction resolves.
     pub(crate) fn insert_with_effects(
         &self,
+        guard: &MutationGuard<'_>,
         ctx: &MutationContext,
         input: &InsertMemory,
         sampled_at: i64,
@@ -47,6 +49,7 @@ impl MetadataStore {
         stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord, &[f32]) -> Result<(), StorageError>,
     ) -> Result<WriteReceipt, StorageError> {
         self.insert_reserved_with_effects(
+            guard,
             ctx,
             input,
             sampled_at,
@@ -59,6 +62,7 @@ impl MetadataStore {
 
     pub(crate) fn insert_reserved_with_effects(
         &self,
+        guard: &MutationGuard<'_>,
         ctx: &MutationContext,
         input: &InsertMemory,
         sampled_at: i64,
@@ -67,7 +71,7 @@ impl MetadataStore {
         child: Option<&crate::storage::batch::BatchChild>,
         stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord, &[f32]) -> Result<(), StorageError>,
     ) -> Result<WriteReceipt, StorageError> {
-        let guard = self.mutation_guard()?;
+        guard.check(self)?;
         ctx.validate()?;
         if ctx.contract_version != 1 {
             return Err(StorageError::InvalidMutationContext(
@@ -228,7 +232,7 @@ impl MetadataStore {
             });
         }
         self.finish_record_effects(
-            &guard,
+            guard,
             tx,
             ctx,
             hash,
@@ -300,6 +304,7 @@ mod schema_tests {
         };
         assert!(matches!(
             store.insert_with_effects(
+                &store.mutation_guard().unwrap(),
                 &MutationContext::unkeyed(config.id),
                 &input,
                 123,
