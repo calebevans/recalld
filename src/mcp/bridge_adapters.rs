@@ -559,6 +559,7 @@ impl bridge::SearchPipeline for McpSearchAdapter {
 
 /// Adapts `RedbStorageEngine` + subsystems to the MCP `StorageEngine` trait.
 pub struct McpStorageAdapter {
+    clock: Arc<dyn crate::time::Clock>,
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
     cache: Arc<CacheManager>,
     embedding: Arc<dyn EmbeddingProvider>,
@@ -584,6 +585,7 @@ impl McpStorageAdapter {
         timezone: chrono_tz::Tz,
     ) -> Self {
         Self {
+            clock: Arc::new(crate::time::SystemClock),
             storage,
             cache,
             embedding,
@@ -594,6 +596,12 @@ impl McpStorageAdapter {
             config,
             timezone,
         }
+    }
+
+    /// Use the system instance's clock (or an isolated manual clock).
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Borrow this adapter's out-of-storage indexes for
@@ -845,7 +853,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
             None
         };
 
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = self.clock.now_millis();
         // Over-long tags cannot reach this point: the shared request
         // validator bounds every tag and reserves the `entity/` /
         // `topic/` / `emotion/` prefix out of the label limits. A drop
@@ -1319,116 +1327,32 @@ impl bridge::StorageEngine for McpStorageAdapter {
         id: MemoryId,
         quality: u8,
     ) -> Result<bridge::ReinforceResult, bridge::BridgeError> {
-        // Step 1: Read the current record.
-        let record = {
-            let storage = self.storage.clone();
-            tokio::task::spawn_blocking(move || {
-                let storage_r = storage.read().map_err(|e| {
-                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-                })?;
-                storage_r
-                    .get_record(id)
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
-                    .ok_or_else(|| bridge::BridgeError::NotFound(format!("memory {id} not found")))
-            })
-            .await
-            .map_err(|e| {
-                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
-            })??
-        };
-
-        // Tombstoned memories cannot be reinforced.
-        if record.phase == DecayPhase::Tombstone {
-            return Err(bridge::BridgeError::NotFound(format!(
-                "memory {id} has been deleted (tombstoned)"
-            )));
-        }
-
-        let phase = record.phase;
-
-        // Step 2: Look up the namespace's decay rate multiplier.
-        let ns_decay_multiplier = {
-            let storage = self.storage.clone();
-            let ns_id = record.namespace_id;
-            let global_multiplier = self.config.decay.decay_rate_multiplier;
-            tokio::task::spawn_blocking(move || {
-                let storage_r = storage.read().map_err(|e| {
-                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-                })?;
-                let multiplier = storage_r
-                    .get_namespace(NamespaceId::new(ns_id))
-                    .ok()
-                    .flatten()
-                    .and_then(|ns| ns.decay_rate_multiplier)
-                    .unwrap_or(global_multiplier as f32);
-                Ok::<f32, bridge::BridgeError>(multiplier)
-            })
-            .await
-            .map_err(|e| {
-                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
-            })??
-        };
-
-        // Step 3: Compute elapsed days since last access.
-        let now = chrono::Utc::now().timestamp_millis();
-        let elapsed_millis = (now - record.last_accessed_at).max(0) as f64;
-        let elapsed_days = (elapsed_millis / 86_400_000.0) as f32;
-
-        // Step 4: Use FSRS to compute new stability based on quality rating.
-        let decay_config = crate::decay::DecayConfig::default();
-        let engine = crate::decay::FsrsEngine::new(&decay_config);
-        let new_stability =
-            engine.review_stability(record.stability, elapsed_days, quality, ns_decay_multiplier);
-
-        // Step 5: Compute new retrievability (just reinforced = 1.0).
-        let new_strength = 1.0_f32;
-        let is_permastore =
-            record.is_permastore != 0 || new_stability >= decay_config.permastore_threshold;
-
-        // Step 6: Persist the updated decay state and access event.
-        {
-            let storage = self.storage.clone();
-            tokio::task::spawn_blocking(move || {
-                let storage_r = storage.read().map_err(|e| {
-                    bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
-                })?;
-                storage_r
-                    .update_decay_state(
-                        id,
-                        phase,
-                        new_strength,
-                        new_strength,
-                        new_stability,
-                        is_permastore,
-                    )
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?;
-                storage_r
-                    .update_access(id, now, crate::model::AccessKind::ManualReinforcement)
-                    .map_err(|e| bridge::BridgeError::Storage(e.to_string()))
-            })
-            .await
-            .map_err(|e| {
-                bridge::BridgeError::Internal(format!("blocking task join error: {e}"))
-            })??;
-        }
-
-        // Step 7: Update cache.
-        if let Some(existing) = self.cache.get(id).await {
-            let mut updated = (*existing).clone();
-            updated.stability = new_stability;
-            updated.strength = new_strength;
-            updated.decay_strength = new_strength;
-            updated.is_permastore = is_permastore;
-            updated.last_accessed_at = now;
-            self.cache.insert(id, updated).await;
-        }
-
+        let outcome = crate::decay::storage_adapter::reinforce(
+            self.storage.clone(),
+            id,
+            quality,
+            self.config.decay.decay_rate_multiplier,
+            self.clock.now_millis(),
+        )
+        .await;
+        // The first storage write may have committed even if the second failed.
+        self.cache.invalidate(id).await;
+        let plan = outcome.map_err(|e| {
+            use crate::decay::lifecycle::LifecycleError;
+            match e {
+                LifecycleError::NotFound | LifecycleError::ContentUnavailable => {
+                    bridge::BridgeError::NotFound(e.to_string())
+                }
+                LifecycleError::InvalidInput(_) => bridge::BridgeError::InvalidInput(e.to_string()),
+                LifecycleError::Storage(_) => bridge::BridgeError::Storage(e.to_string()),
+            }
+        })?;
         Ok(bridge::ReinforceResult {
             id: id.to_string(),
-            strength: new_strength,
-            stability: new_stability,
-            phase: format!("{:?}", phase),
-            is_permastore,
+            strength: plan.strength,
+            stability: plan.stability,
+            phase: format!("{:?}", plan.phase),
+            is_permastore: plan.is_permastore,
         })
     }
 
@@ -1832,6 +1756,13 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                 decay_rate_multiplier,
             };
 
+            crate::decay::lifecycle::resolve_policy(
+                &ns_config,
+                &crate::decay::DecayConfig::default(),
+                1.0,
+            )
+            .map_err(|e| bridge::BridgeError::InvalidInput(e.to_string()))?;
+
             let mut storage_w = storage.write().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
             })?;
@@ -2075,6 +2006,8 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
         };
 
+        // The blocking closure has released storage before graph/index cleanup.
+        // Keep this order: sweep publication acquires graph before storage.
         let purged = match outcome {
             Ok(purged) => purged,
             Err(failure) => {
