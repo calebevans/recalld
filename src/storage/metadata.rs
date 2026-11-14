@@ -8,6 +8,7 @@
 //! See CS-07 for the full specification.
 
 mod lifecycle_updates;
+pub(crate) mod removal_ledger;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -93,9 +94,14 @@ impl MetadataStore {
 
         // Inspect additive canonical state before any create/adoption transaction.
         // Partial or future layouts must never be repaired into a new lineage.
+        let pristine;
         {
             let read = db.begin_read()?;
-            if control::validate_existing(&read)?.is_some() {
+            pristine = read.list_tables()?.next().is_none()
+                && read.list_multimap_tables()?.next().is_none();
+            let control = control::validate_existing(&read)?;
+            removal_ledger::read_export(&read, control.as_ref())?;
+            if control.is_some() {
                 // An adopted store must retain its canonical tables. Do not
                 // recreate records, namespaces or the never-reused ID counter.
                 read.open_table(META_TABLE)?;
@@ -114,6 +120,7 @@ impl MetadataStore {
             let _ = write_txn.open_table(INDEX_TABLE)?;
             let _ = write_txn.open_multimap_table(TAG_INDEX)?;
             let _ = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+            removal_ledger::initialize(&write_txn, pristine)?;
             write_txn.commit()?;
         }
 
@@ -180,6 +187,7 @@ impl MetadataStore {
     {
         let _publication = self.mutation_guard()?;
         let old_phase;
+        let before;
         let key = id.as_bytes().as_slice();
 
         let write_txn = self.db.begin_write()?;
@@ -193,12 +201,20 @@ impl MetadataStore {
             };
 
             old_phase = record.phase;
+            before = record.clone();
             f(&mut record)?;
 
             table.insert(key, record.to_bytes().as_slice())?;
             record
         };
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        removal_ledger::record_change(
+            &write_txn,
+            state.generation_ref(),
+            &before,
+            &record,
+            uuid::Uuid::new_v4(),
+        )?;
         self.commit(write_txn)?;
 
         if old_phase != record.phase {
@@ -233,6 +249,7 @@ impl MetadataStore {
         let value = record.to_bytes();
 
         let write_txn = self.db.begin_write()?;
+        removal_ledger::ensure_insertable(&write_txn, id)?;
         {
             // 1. Insert into primary table (reject duplicates).
             let mut meta = write_txn.open_table(META_TABLE)?;
@@ -533,7 +550,16 @@ impl MetadataStore {
             let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             ns_idx.remove(deleted_record.namespace_id, key)?;
         }
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        removal_ledger::record_removal(
+            &write_txn,
+            state.generation_ref(),
+            deleted_record.namespace_id,
+            id,
+            Some(removal_ledger::TerminalKind::HardDelete),
+            removal_ledger::ALL,
+            uuid::Uuid::new_v4(),
+        )?;
         self.commit(write_txn)?;
 
         // 4. Remove from in-memory phase bitmap.
@@ -605,7 +631,16 @@ impl MetadataStore {
             let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             ns_idx.remove(record.namespace_id, key)?;
         }
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        removal_ledger::record_removal(
+            &write_txn,
+            state.generation_ref(),
+            old_namespace_id,
+            id,
+            Some(removal_ledger::TerminalKind::Tombstone),
+            removal_ledger::ALL,
+            uuid::Uuid::new_v4(),
+        )?;
         self.commit(write_txn)?;
 
         // Update phase bitmap: remove from old phase.
@@ -1024,6 +1059,8 @@ impl MetadataStore {
         }
         let write_txn = self.db.begin_write()?;
         let mut transitions = Vec::new();
+        let state = control::advance_generation(&write_txn)?;
+        let operation_id = uuid::Uuid::new_v4();
         {
             let mut table = write_txn.open_table(META_TABLE)?;
             let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
@@ -1056,6 +1093,13 @@ impl MetadataStore {
                 if record.phase == DecayPhase::Tombstone {
                     namespaces.remove(record.namespace_id, key)?;
                 }
+                removal_ledger::record_change(
+                    &write_txn,
+                    state.generation_ref(),
+                    &old,
+                    record,
+                    operation_id,
+                )?;
                 table.insert(key, record.to_bytes().as_slice())?;
                 transitions.push((
                     record.namespace_id,
@@ -1065,7 +1109,6 @@ impl MetadataStore {
                 ));
             }
         }
-        control::advance_generation(&write_txn)?;
         self.commit(write_txn)?;
         let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
         for (ns, slot, from, to) in transitions {
@@ -1463,7 +1506,19 @@ impl MetadataStore {
                 ns_idx.remove(ns, key)?;
             }
         }
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        let operation_id = uuid::Uuid::new_v4();
+        for (id, record) in chunk {
+            removal_ledger::record_removal(
+                &write_txn,
+                state.generation_ref(),
+                record.namespace_id,
+                *id,
+                Some(removal_ledger::TerminalKind::HardDelete),
+                removal_ledger::ALL,
+                operation_id,
+            )?;
+        }
         self.commit(write_txn)?;
         Ok(())
     }
@@ -1588,7 +1643,21 @@ impl MetadataStore {
                 outcomes.push(TombstoneOutcome::Tombstoned(existing));
             }
         }
-        control::advance_generation(&write_txn)?;
+        let state = control::advance_generation(&write_txn)?;
+        let operation_id = uuid::Uuid::new_v4();
+        for outcome in &outcomes {
+            if let TombstoneOutcome::Tombstoned(record) = outcome {
+                removal_ledger::record_removal(
+                    &write_txn,
+                    state.generation_ref(),
+                    record.namespace_id,
+                    MemoryId::from_bytes(record.id),
+                    Some(removal_ledger::TerminalKind::Tombstone),
+                    removal_ledger::ALL,
+                    operation_id,
+                )?;
+            }
+        }
         self.commit(write_txn)?;
 
         // Phase bitmaps only after the commit: a bitmap update rolled
