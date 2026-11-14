@@ -42,7 +42,8 @@ The native effect tail keeps the actual `&MutationGuard` and final optional
 adds no native serving activation, public whole-store CAS, contract2, shared
 readiness, generation-targeted barrier, whole-core snapshot or frozen clock/RNG
 claim. A4 batch result version 1 only negotiates the existing envelope. Feynman
-owns the separate ancestry-aware offline preservation consumer.
+owns the separate ancestry-aware offline preservation consumer, now frozen at
+`3b0aded`; it is not an ancestor of this tracker slice.
 
 Final combined validation passed **43 batch + 14 tracker/metadata + 9 coordinator
 focused checks, 744 library tests and 1 CLI test**. Four doctests were ignored;
