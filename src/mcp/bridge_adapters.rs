@@ -343,7 +343,22 @@ impl bridge::SearchPipeline for McpSearchAdapter {
         limit: usize,
         min_score: Option<f32>,
         _same_namespace: bool,
+        namespace: Option<&str>,
     ) -> Result<Vec<bridge::SearchHit>, bridge::BridgeError> {
+        let namespace = namespace.map(str::to_owned);
+        if let Some(namespace) = namespace {
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || {
+                let storage = storage
+                    .read()
+                    .map_err(|e| bridge::BridgeError::Internal(e.to_string()))?;
+                storage
+                    .assert_memory_namespace(id, &namespace)
+                    .map_err(bridge::BridgeError::from)
+            })
+            .await
+            .map_err(|e| bridge::BridgeError::Internal(e.to_string()))??;
+        }
         let results = self
             .query_engine
             .similar(id, limit)
@@ -1089,13 +1104,20 @@ impl bridge::StorageEngine for McpStorageAdapter {
     async fn get_memory(
         &self,
         id: MemoryId,
+        namespace: Option<&str>,
     ) -> Result<Option<bridge::MemoryRecord>, bridge::BridgeError> {
+        let namespace = namespace.map(str::to_owned);
         let storage = self.storage.clone();
         let tz = self.timezone;
         tokio::task::spawn_blocking(move || {
             let storage_r = storage.read().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
             })?;
+            if let Some(namespace) = namespace.as_deref() {
+                storage_r
+                    .assert_memory_namespace(id, namespace)
+                    .map_err(bridge::BridgeError::from)?;
+            }
 
             let disk_record = storage_r
                 .get_record(id)
@@ -1166,7 +1188,12 @@ impl bridge::StorageEngine for McpStorageAdapter {
         .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
     }
 
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, bridge::BridgeError> {
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, bridge::BridgeError> {
+        let namespace = namespace.map(str::to_owned);
         // Tombstone-based deletion: strip content from the record but
         // preserve the graph node and edges so relationship chains
         // remain intact for spreading activation traversal.
@@ -1182,6 +1209,11 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 let mut storage_w = storage.write().map_err(|e| {
                     bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
                 })?;
+                if let Some(namespace) = namespace.as_deref() {
+                    storage_w
+                        .assert_memory_namespace(id, namespace)
+                        .map_err(bridge::BridgeError::from)?;
+                }
 
                 let existing = storage_w
                     .get_record(id)
@@ -1318,14 +1350,22 @@ impl bridge::StorageEngine for McpStorageAdapter {
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<bridge::ReinforceResult, bridge::BridgeError> {
+        let namespace = namespace.map(str::to_owned);
         // Step 1: Read the current record.
         let record = {
             let storage = self.storage.clone();
+            let namespace = namespace.clone();
             tokio::task::spawn_blocking(move || {
                 let storage_r = storage.read().map_err(|e| {
                     bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
                 })?;
+                if let Some(namespace) = namespace.as_deref() {
+                    storage_r
+                        .assert_memory_namespace(id, namespace)
+                        .map_err(bridge::BridgeError::from)?;
+                }
                 storage_r
                     .get_record(id)
                     .map_err(|e| bridge::BridgeError::Storage(e.to_string()))?
@@ -1392,6 +1432,11 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 let storage_r = storage.read().map_err(|e| {
                     bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
                 })?;
+                if let Some(namespace) = namespace.as_deref() {
+                    storage_r
+                        .assert_memory_namespace(id, namespace)
+                        .map_err(bridge::BridgeError::from)?;
+                }
                 storage_r
                     .update_decay_state(
                         id,
@@ -2864,7 +2909,7 @@ mod tests {
         );
         assert_eq!(fx.entity_index.read().await.len(), 1);
 
-        assert!(adapter.delete_memory(id).await.expect("delete"));
+        assert!(adapter.delete_memory(id, None).await.expect("delete"));
 
         assert!(
             fx.fts_index.lock().await.is_empty().expect("fts"),

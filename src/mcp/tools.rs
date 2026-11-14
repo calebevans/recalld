@@ -641,6 +641,7 @@ fn get_memory_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "namespace": {"type": "string", "description": "Optional assertion of the record's namespace. Mismatch fails before effects; omitted uses the record scope, regardless of session default. Null is invalid."},
                 "id": {
                     "type": "string",
                     "description": "Memory UUID"
@@ -658,6 +659,11 @@ fn get_memory_def() -> ToolInfo {
 }
 
 async fn handle_get_memory(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
+    let namespace = match args::parse_namespace_assertion(&arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+
     let id_str = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return ToolCallResult::error("Missing required parameter: id"),
@@ -669,7 +675,7 @@ async fn handle_get_memory(bridge: &McpBridge, arguments: serde_json::Value) -> 
     };
     let id = crate::model::MemoryId::from_uuid(uuid);
 
-    match bridge.storage.get_memory(id).await {
+    match bridge.storage.get_memory(id, namespace).await {
         Ok(Some(record)) => match ToolCallResult::json(&record) {
             Ok(r) => r,
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
@@ -695,6 +701,7 @@ fn reinforce_memory_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "namespace": {"type": "string", "description": "Optional assertion of the record's namespace. Mismatch fails before effects; omitted uses the record scope, regardless of session default. Null is invalid."},
                 "id": {
                     "type": "string",
                     "description": "Memory UUID to reinforce"
@@ -722,6 +729,11 @@ async fn handle_reinforce_memory(
     bridge: &McpBridge,
     arguments: serde_json::Value,
 ) -> ToolCallResult {
+    let namespace = match args::parse_namespace_assertion(&arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+
     let id_str = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return ToolCallResult::error("Missing required parameter: id"),
@@ -738,7 +750,11 @@ async fn handle_reinforce_memory(
         Err(e) => return ToolCallResult::error(e.to_string()),
     };
 
-    match bridge.storage.reinforce_memory(id, quality).await {
+    match bridge
+        .storage
+        .reinforce_memory(id, quality, namespace)
+        .await
+    {
         Ok(result) => match ToolCallResult::json(&result) {
             Ok(r) => r,
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
@@ -771,6 +787,7 @@ fn forget_memory_def() -> ToolInfo {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "namespace": {"type": "string", "description": "Optional assertion of the record's namespace. Mismatch fails before effects; omitted uses the record scope, regardless of session default. Null is invalid."},
                 "id": {
                     "type": "string",
                     "description": "Memory UUID to forget. The memory moves to the \
@@ -790,6 +807,11 @@ fn forget_memory_def() -> ToolInfo {
 }
 
 async fn handle_forget_memory(bridge: &McpBridge, arguments: serde_json::Value) -> ToolCallResult {
+    let namespace = match args::parse_namespace_assertion(&arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+
     let id_str = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return ToolCallResult::error("Missing required parameter: id"),
@@ -801,7 +823,7 @@ async fn handle_forget_memory(bridge: &McpBridge, arguments: serde_json::Value) 
     };
     let id = crate::model::MemoryId::from_uuid(uuid);
 
-    match bridge.storage.delete_memory(id).await {
+    match bridge.storage.delete_memory(id, namespace).await {
         Ok(deleted) => {
             let response = json!({
                 "id": id_str,
@@ -1005,7 +1027,7 @@ fn find_similar_memories_def() -> ToolInfo {
                 },
                 "namespace": {
                     "type": ["string", "null"],
-                    "description": "Namespace for \"scan\" mode; omitted or null uses the configured session default, then \"default\". Ignored in \"single\" mode, which uses the source record namespace."
+                    "description": "Scan scope (omitted/null uses session default); in single mode an optional assertion against the source record namespace, checked before effects. Omit for record scope; null is invalid in single mode."
                 },
                 "limit": {
                     "type": "integer",
@@ -1078,6 +1100,11 @@ async fn handle_find_similar_single(
     bridge: &McpBridge,
     arguments: &serde_json::Value,
 ) -> ToolCallResult {
+    let namespace = match args::parse_namespace_assertion(arguments) {
+        Ok(value) => value,
+        Err(e) => return ToolCallResult::error(e.to_string()),
+    };
+
     let args::FindSimilarArgs {
         id,
         limit,
@@ -1098,7 +1125,7 @@ async fn handle_find_similar_single(
 
     match bridge
         .search
-        .find_similar(id, limit, min_score, same_namespace)
+        .find_similar(id, limit, min_score, same_namespace, namespace)
         .await
     {
         Ok(hits) => {
@@ -2046,6 +2073,7 @@ mod tests {
             _: usize,
             _: Option<f32>,
             _: bool,
+            _namespace: Option<&str>,
         ) -> Result<Vec<crate::mcp::bridge::SearchHit>, crate::mcp::bridge::BridgeError> {
             refuse!()
         }
@@ -2071,6 +2099,7 @@ mod tests {
         async fn get_memory(
             &self,
             _: crate::model::MemoryId,
+            _namespace: Option<&str>,
         ) -> Result<Option<crate::mcp::bridge::MemoryRecord>, crate::mcp::bridge::BridgeError>
         {
             refuse!()
@@ -2078,6 +2107,7 @@ mod tests {
         async fn delete_memory(
             &self,
             _: crate::model::MemoryId,
+            _namespace: Option<&str>,
         ) -> Result<bool, crate::mcp::bridge::BridgeError> {
             refuse!()
         }
@@ -2091,6 +2121,7 @@ mod tests {
             &self,
             _: crate::model::MemoryId,
             _: u8,
+            _namespace: Option<&str>,
         ) -> Result<crate::mcp::bridge::ReinforceResult, crate::mcp::bridge::BridgeError> {
             refuse!()
         }
@@ -2742,7 +2773,14 @@ mod tests {
             };
             if let Some(namespace) = properties.get("namespace") {
                 assert!(namespace.get("default").is_none(), "{}", def.name);
-                assert_eq!(namespace["type"], json!(["string", "null"]));
+                let expected_type = if ["get_memory", "reinforce_memory", "forget_memory"]
+                    .contains(&def.name.as_str())
+                {
+                    json!("string")
+                } else {
+                    json!(["string", "null"])
+                };
+                assert_eq!(namespace["type"], expected_type, "{}", def.name);
             }
         }
         let schema = create_namespace_def().input_schema;

@@ -357,10 +357,17 @@ pub async fn create_memory(
 pub async fn get_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(scope): Query<MemoryScopeQuery>,
 ) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
+    if let Some(namespace) = scope.namespace.as_deref() {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
 
     let record = state
         .cache
@@ -403,15 +410,25 @@ pub async fn get_memory(
 pub async fn delete_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(scope): Query<MemoryScopeQuery>,
 ) -> Result<Json<ApiResponse<DeleteResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
+    if let Some(namespace) = scope.namespace.as_deref() {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
 
     // Read record first for entity index cleanup (Issue 14)
     let existing_record = state.storage.get_record(memory_id).await;
 
-    let existed = state.storage.delete_memory(memory_id).await?;
+    let existed = state
+        .storage
+        .delete_memory(memory_id, scope.namespace.as_deref())
+        .await?;
     if existed {
         state.cache.remove(memory_id).await;
         state.search.remove_from_index(memory_id).await;
@@ -466,13 +483,24 @@ pub async fn reinforce_memory(
 
     let memory_id = parse_memory_id(&id)?;
 
+    let namespace = crate::mcp::args::parse_namespace_assertion(&req).map_err(argument_error)?;
+    if let Some(namespace) = namespace {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
     let quality = crate::mcp::args::parse_quality(&req).map_err(argument_error)?;
 
     let updated = state
         .decay
-        .reinforce(memory_id, quality)
+        .reinforce(memory_id, quality, namespace)
         .await
         .map_err(|e| {
+            let e = match e.downcast::<crate::storage::StorageError>() {
+                Ok(error) => return AppError::from(*error),
+                Err(error) => error,
+            };
             if e.to_string().contains("not found") {
                 AppError::NotFound {
                     resource: "memory",
@@ -875,15 +903,23 @@ pub async fn find_similar(
 
     let memory_id = parse_memory_id(&id)?;
 
-    // Load source memory to get namespace
+    if let Some(namespace) = req.namespace.as_deref() {
+        state
+            .storage
+            .assert_memory_namespace(memory_id, namespace)
+            .await?;
+    }
+
+    // The source scope is canonical, never a session default or cached namespace.
     let source = state
-        .cache
-        .get_or_load(memory_id, state.storage.as_ref())
+        .storage
+        .get_record(memory_id)
         .await
         .ok_or_else(|| AppError::NotFound {
             resource: "memory",
             id: id.clone(),
         })?;
+    let source_namespace = NamespaceId::new(source.namespace_id);
 
     let source_embedding =
         state
@@ -897,14 +933,14 @@ pub async fn find_similar(
 
     let ns_name = state
         .namespaces
-        .name_for(source.namespace_id)
+        .name_for(source_namespace)
         .unwrap_or_else(|| "default".to_string());
 
     // Search using source embedding, requesting limit+1 to account
     // for the source memory appearing in its own results.
     let search_query = SearchQuery {
         query: QueryInput::Vector(source_embedding),
-        namespace_id: source.namespace_id,
+        namespace_id: source_namespace,
         namespace_name: ns_name,
         k: limit + 1,
         include_tags: vec![],

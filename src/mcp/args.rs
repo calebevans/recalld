@@ -899,6 +899,31 @@ pub fn parse_recall_input(obj: &Value, default_namespace: &str) -> Result<Recall
     })
 }
 
+/// Parse an opt-in by-ID assertion. Only omission disables the assertion.
+pub fn parse_namespace_assertion(obj: &Value) -> Result<Option<&str>, ArgError> {
+    let Some(value) = obj.get("namespace") else {
+        return Ok(None);
+    };
+    let name = value.as_str().ok_or_else(|| {
+        ArgError::new(
+            "namespace",
+            "namespace assertion must be a string; omit it to use the record scope",
+        )
+    })?;
+    crate::model::validation::validate_namespace_name(name)
+        .map_err(|e| ArgError::new("namespace", e.to_string()))?;
+    Ok(Some(name))
+}
+
+/// Deserialize a present namespace assertion; serde default handles omission.
+pub fn deserialize_namespace_assertion<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+    crate::model::validation::validate_namespace_name(&name).map_err(serde::de::Error::custom)?;
+    Ok(Some(name))
+}
+
 /// A parsed `find_similar_memories` call in `single` mode.
 pub struct FindSimilarArgs {
     /// The memory to find neighbours of.

@@ -127,11 +127,18 @@ pub const ERR_TOO_LARGE: i32 = -32005;
 /// RPC error code: the operation failed after destroying something.
 pub const ERR_PARTIALLY_APPLIED: i32 = -32006;
 
+/// RPC error code: an explicit namespace assertion failed.
+pub const ERR_NAMESPACE_MISMATCH: i32 = -32007;
+
 // ── BridgeError conversion ───────────────────────────────────────────
 
 impl From<&BridgeError> for DaemonRpcError {
     fn from(e: &BridgeError) -> Self {
         match e {
+            BridgeError::NamespaceMismatch(msg) => DaemonRpcError {
+                code: ERR_NAMESPACE_MISMATCH,
+                message: msg.clone(),
+            },
             BridgeError::NotFound(msg) => DaemonRpcError {
                 code: ERR_NOT_FOUND,
                 message: msg.clone(),
@@ -168,6 +175,7 @@ impl DaemonRpcError {
     /// Converts this RPC error into the corresponding `BridgeError` variant.
     pub fn into_bridge_error(self) -> BridgeError {
         match self.code {
+            ERR_NAMESPACE_MISMATCH => BridgeError::NamespaceMismatch(self.message),
             ERR_NOT_FOUND => BridgeError::NotFound(self.message),
             ERR_INVALID_INPUT => BridgeError::InvalidInput(self.message),
             ERR_STORAGE => BridgeError::Storage(self.message),

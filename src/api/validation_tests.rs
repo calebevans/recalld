@@ -338,3 +338,244 @@ async fn http_duplicate_coverage_reports_caps_missing_vectors_and_empty_samples(
         );
     }
 }
+
+// Run the actual HTTP router and MCP dispatch against the same canonical fixture.
+async fn scope_request(app: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned())),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_assertions_reject_wrong_namespace_before_access_search_or_mutation() {
+    let f = Fixture::new();
+    let other = f.create_namespace("other");
+    let id = f.insert_memory().await;
+    // Deliberately spoof cached scope. The guard must use disk, not cache.
+    let mut cached = crate::model::CachedRecord::from(&f.record(id).unwrap());
+    cached.id = id;
+    cached.namespace_id = other;
+    f.cache.insert(id, cached).await;
+    let before = format!("{:?}", f.record(id));
+    let (app, mut bridge) = fixture_clients(&f);
+    bridge.storage = Arc::new(f.storage_adapter());
+    bridge.default_namespace = "other".into();
+    for namespace in ["other", "missing"] {
+        for (method, suffix) in [
+            ("GET", ""),
+            ("DELETE", ""),
+            ("POST", "/reinforce"),
+            ("POST", "/similar"),
+        ] {
+            let path = if suffix == "/similar" {
+                format!("/similar/{id}")
+            } else if method == "POST" {
+                format!("/memories/{id}{suffix}")
+            } else {
+                format!("/memories/{id}?namespace={namespace}")
+            };
+            let (status, body) =
+                scope_request(&app, method, &path, json!({"namespace":namespace})).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{method} {path}: {body}");
+            assert_eq!(body["error"], "NAMESPACE_MISMATCH");
+            assert_eq!(before, format!("{:?}", f.record(id)));
+        }
+        for tool in [
+            "get_memory",
+            "reinforce_memory",
+            "forget_memory",
+            "find_similar_memories",
+        ] {
+            let result = crate::mcp::tools::dispatch_tool(
+                &bridge,
+                tool,
+                json!({"id":id.to_string(), "namespace":namespace}),
+            )
+            .await;
+            assert_eq!(result.is_error, Some(true), "{tool}");
+            assert!(
+                serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("NAMESPACE_MISMATCH")
+            );
+            assert_eq!(before, format!("{:?}", f.record(id)));
+        }
+    }
+    // Assertion input cannot silently become omission, even if a valid record exists.
+    for value in [
+        Value::Null,
+        json!(42),
+        json!(false),
+        json!([]),
+        json!(""),
+        json!("bad space"),
+    ] {
+        for tool in [
+            "get_memory",
+            "reinforce_memory",
+            "forget_memory",
+            "find_similar_memories",
+        ] {
+            let result = crate::mcp::tools::dispatch_tool(
+                &bridge,
+                tool,
+                json!({"id":id.to_string(), "namespace":value}),
+            )
+            .await;
+            assert_eq!(result.is_error, Some(true), "{tool}: {value}");
+        }
+        for suffix in ["reinforce", "similar"] {
+            let (status, _) = scope_request(
+                &app,
+                "POST",
+                &if suffix == "similar" {
+                    format!("/similar/{id}")
+                } else {
+                    format!("/memories/{id}/{suffix}")
+                },
+                json!({"namespace":value}),
+            )
+            .await;
+            assert!(status.is_client_error(), "{suffix}: {value}");
+        }
+    }
+    assert_eq!(before, format!("{:?}", f.record(id)));
+    // Unknown IDs stay not found, rather than revealing/inferring a namespace.
+    let missing = crate::model::MemoryId::new();
+    let (status, _) = scope_request(
+        &app,
+        "GET",
+        &format!("/memories/{missing}?namespace=other"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Retained tombstones still have canonical scope to assert.
+    f.tombstone(id);
+    let (status, _) = scope_request(
+        &app,
+        "DELETE",
+        &format!("/memories/{id}?namespace=other"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_assertions_preserve_record_scope_despite_wrong_session_default() {
+    for asserted in [false, true] {
+        let f = Fixture::new();
+        f.create_namespace("other");
+        let records = f.create_namespace("records");
+        let id = f.insert_memory_in(records, &[]).await;
+        let (app, mut bridge) = fixture_clients(&f);
+        bridge.storage = Arc::new(f.storage_adapter());
+        bridge.default_namespace = "other".into();
+        let mut arguments = json!({"id":id.to_string()});
+        if asserted {
+            arguments["namespace"] = json!("RECORDS");
+        }
+        for tool in ["get_memory", "reinforce_memory", "forget_memory"] {
+            let result = crate::mcp::tools::dispatch_tool(&bridge, tool, arguments.clone()).await;
+            assert_ne!(result.is_error, Some(true), "{tool}: {result:?}");
+        }
+        assert_eq!(
+            f.record(id).unwrap().phase,
+            crate::model::DecayPhase::Tombstone
+        );
+        let id = f.insert_memory_in(records, &[]).await;
+        let suffix = if asserted { "?namespace=RECORDS" } else { "" };
+        let (status, body) =
+            scope_request(&app, "GET", &format!("/memories/{id}{suffix}"), json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["namespace"], "records");
+        assert!(!f.record(id).unwrap().access_history.is_empty());
+        let body = if asserted {
+            json!({"namespace":"RECORDS"})
+        } else {
+            json!({})
+        };
+        let (status, body) =
+            scope_request(&app, "POST", &format!("/memories/{id}/reinforce"), body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = scope_request(
+            &app,
+            "DELETE",
+            &format!("/memories/{id}{suffix}"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            f.record(id).unwrap().phase,
+            crate::model::DecayPhase::Tombstone
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_assertions_similarity_uses_canonical_source_scope_with_stale_cache() {
+    use crate::search::VectorIndex;
+    let f = Fixture::new();
+    let local = crate::model::NamespaceId::new(1);
+    let other = f.create_namespace("other");
+    let mut ids = vec![];
+    for namespace in [local, local, other] {
+        let id = f
+            .insert_memory_with(crate::test_support::MemorySpec {
+                embedding: Some(&[1.0, 0.0, 0.0, 0.0]),
+                ..crate::test_support::MemorySpec::new(namespace)
+            })
+            .await;
+        f.vector_index
+            .write()
+            .await
+            .add(
+                id,
+                &[1.0, 0.0, 0.0, 0.0],
+                crate::search::VectorMetadata {
+                    namespace_id: namespace,
+                    decay_phase: crate::model::DecayPhase::Full.as_u8(),
+                    tags: vec![],
+                },
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    let mut cached = crate::model::CachedRecord::from(&f.record(ids[0]).unwrap());
+    cached.id = ids[0];
+    cached.namespace_id = other;
+    f.cache.insert(ids[0], cached).await;
+    let (_, mut bridge) = fixture_clients(&f);
+    bridge.default_namespace = "other".into();
+    for namespace in [None, Some("default")] {
+        let mut args = json!({"id":ids[0].to_string()});
+        if let Some(namespace) = namespace {
+            args["namespace"] = json!(namespace);
+        }
+        let result = crate::mcp::tools::dispatch_tool(&bridge, "find_similar_memories", args).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let wire = serde_json::to_value(result).unwrap();
+        let data: Value =
+            serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(data["count"], 1);
+        assert_eq!(data["memories"][0]["id"], ids[1].to_string());
+    }
+}

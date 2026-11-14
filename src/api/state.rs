@@ -117,7 +117,18 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<CachedRecord, StorageError>;
 
     /// Delete a memory by ID. Returns `true` if it existed.
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, StorageError>;
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, StorageError>;
+
+    /// Verify a by-ID namespace assertion against canonical metadata before effects.
+    async fn assert_memory_namespace(
+        &self,
+        id: MemoryId,
+        namespace: &str,
+    ) -> Result<(), StorageError>;
 
     /// Retrieve a single memory's DiskRecord by ID.
     ///
@@ -284,6 +295,7 @@ pub trait FsrsEngine: Send + Sync {
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<ReinforceResult, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Whether the decay sweep thread is still alive.

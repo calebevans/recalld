@@ -915,14 +915,12 @@ impl QueryEngine {
     pub async fn similar(&self, id: MemoryId, k: usize) -> Result<Vec<SearchResult>> {
         let k = k.clamp(1, SearchQuery::MAX_USER_LIMIT);
 
-        let record = match self.cache.get(&id) {
-            Some(r) => r,
-            None => self
-                .meta_store
-                .get(&id)
-                .await?
-                .ok_or(SearchError::MemoryNotFound(id))?,
-        };
+        // By-ID scope comes from the canonical record, even if its cache entry is stale.
+        let record = self
+            .meta_store
+            .get(&id)
+            .await?
+            .ok_or(SearchError::MemoryNotFound(id))?;
 
         // Load the source memory's embedding from the vector index.
         let source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {

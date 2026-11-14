@@ -435,7 +435,29 @@ impl state::StorageEngine for StorageEngineAdapter {
         .flatten()
     }
 
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, crate::storage::StorageError> {
+    async fn assert_memory_namespace(
+        &self,
+        id: MemoryId,
+        namespace: &str,
+    ) -> Result<(), crate::storage::StorageError> {
+        let storage = self.storage.clone();
+        let namespace = namespace.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let storage = storage.read().map_err(|e| {
+                crate::storage::StorageError::Io(std::io::Error::other(e.to_string()))
+            })?;
+            storage.assert_memory_namespace(id, &namespace)
+        })
+        .await
+        .map_err(|e| crate::storage::StorageError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, crate::storage::StorageError> {
+        let namespace = namespace.map(str::to_owned);
         let storage = self.storage.clone();
 
         // Perform read, tombstone check, tombstone, and free_vector_slot
@@ -456,6 +478,9 @@ impl state::StorageEngine for StorageEngineAdapter {
                 ))
             })?;
 
+            if let Some(namespace) = namespace.as_deref() {
+                storage_w.assert_memory_namespace(id, namespace)?;
+            }
             // Check if the record exists and is not already tombstoned.
             let existing_record = match storage_w.get_record(id)? {
                 Some(r) => r,
@@ -1127,7 +1152,9 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<state::ReinforceResult, Box<dyn std::error::Error + Send + Sync>> {
+        let namespace = namespace.map(str::to_owned);
         // Step 1: Read the current record.
         let record = {
             let storage = self.storage.clone();
@@ -1190,24 +1217,31 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         // Step 6: Persist the updated decay state and access event.
         {
             let storage = self.storage.clone();
-            tokio::task::spawn_blocking(move || {
-                let storage_r = storage
-                    .read()
-                    .map_err(|e| format!("storage lock poisoned: {e}"))?;
-                storage_r
-                    .update_decay_state(
-                        id,
-                        phase,
-                        new_strength,
-                        new_strength,
-                        new_stability,
-                        is_permastore,
-                    )
-                    .map_err(|e| e.to_string())?;
-                storage_r
-                    .update_access(id, now, crate::model::AccessKind::ManualReinforcement)
-                    .map_err(|e| e.to_string())
-            })
+            tokio::task::spawn_blocking(
+                move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    let storage_r = storage
+                        .read()
+                        .map_err(|e| format!("storage lock poisoned: {e}"))?;
+                    if let Some(namespace) = namespace.as_deref() {
+                        storage_r
+                            .assert_memory_namespace(id, namespace)
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    }
+                    storage_r
+                        .update_decay_state(
+                            id,
+                            phase,
+                            new_strength,
+                            new_strength,
+                            new_stability,
+                            is_permastore,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    storage_r
+                        .update_access(id, now, crate::model::AccessKind::ManualReinforcement)
+                        .map_err(|e| e.into())
+                },
+            )
             .await
             .map_err(|e| format!("blocking task join error: {e}"))??;
         }
@@ -1506,7 +1540,7 @@ mod tests {
         let fx = Fixture::new();
         let id = indexed_memory(&fx).await;
 
-        assert!(adapter(&fx).delete_memory(id).await.expect("delete"));
+        assert!(adapter(&fx).delete_memory(id, None).await.expect("delete"));
 
         assert!(
             fx.fts_index.lock().await.is_empty().expect("fts"),
@@ -1540,7 +1574,7 @@ mod tests {
         let id = indexed_memory(&fx).await;
         let adapter = adapter(&fx);
 
-        assert!(adapter.delete_memory(id).await.expect("first delete"));
+        assert!(adapter.delete_memory(id, None).await.expect("first delete"));
 
         // Re-index it, so a second pass through the cleanup would be
         // visible rather than idempotent by accident.
@@ -1551,7 +1585,10 @@ mod tests {
             .expect("fts add");
 
         assert!(
-            !adapter.delete_memory(id).await.expect("second delete"),
+            !adapter
+                .delete_memory(id, None)
+                .await
+                .expect("second delete"),
             "an already-tombstoned memory must report false"
         );
         assert!(
