@@ -129,3 +129,49 @@ Validation records follow after the exact source is frozen. All tests use
 synthetic temporary stores in offline Docker. Process exits and synthetic I/O
 faults establish these boundaries only; they are not power-loss proof or a
 performance promotion result.
+
+## Validation and handoff — 2026-11-14
+
+Implementation commit: `5eb0e23`. Validated source/merge:
+`75fe92d670148ed21de16f3b4a61e2cb89dde70d`. Its second parent is updated core45
+`fb7ae7e`, which includes ownership fix `2788645` and schema/snapshot ownership
+`6c0aa74`. The ownership merge was clean; it does not add unrelated integration
+ancestry. This evidence-only documentation update does not change tested source.
+
+Validation used `recalld-ci:1.94`, `RUSTUP_TOOLCHAIN=1.94.1`,
+`CARGO_BUILD_JOBS=2`, `--network none --cpus 2 --memory 4g`. Mounts were this
+worktree and its separate scratch cargo/target directories only.
+
+* `cargo fmt --all -- --check`: passed.
+* `cargo test --offline --all-features`: **640 library tests + 1 CLI integration
+  test passed**, zero failures; four pre-existing documentation examples ignored.
+* `cargo clippy --offline --all-features --all-targets`: finished successfully
+  with warnings (370 library warnings, 381 in library-test mode including
+  duplicates). This is not a warning-clean claim.
+* Focused `cargo test --offline --all-features insertion` before the ownership
+  parent update: **14 passed**. Those tests also passed in the final full run.
+* An additional `--test offline_eval` invocation reported that no such target
+  exists on this minimal parent; its only integration target is
+  `text_migration_cli`. No offline-evaluation result is claimed here.
+
+The 14 insertion proofs cover replay before mutable policy/current-clock/CAS and
+allocation, caller option/float identity, cross-operation key conflict,
+concurrent identical keys, no-mutation validation, canonical explicit links,
+stale missing targets and retained structural tombstones, schema gating,
+receipt numeric validation, effect failure/reopen ownership, pure malformed
+pending-plan preflight without changing the original DB, synthetic uncertain
+successful commit and receipt reconciliation, and real process exits at payload
+sync, before/after metadata commit, edge commit and canonical acknowledgement.
+Actual HTTP storage-adapter and daemon dispatch tests induce a real derived
+vector rebuild failure after canonical commit and verify committed/not-ready
+receipt errors. The online coordinator test repairs all views with the same
+receipt/generation and keeps unrelated cached candidates.
+
+Logs remain uncommitted under `.validation/`: `final-tests.log`,
+`final-clippy.log`, `final-fmt.log`, `insertion-final.log`, `offline-eval.log`.
+Earlier exploratory logs include the corrected keyed-test fixture omission;
+only the final source and results above are the handoff evidence. No personal
+store/daemon, provider credentials, networked runtime tests, push or deployment
+was used. Dependent tombstone work may generalize the internal
+`CommittedInsertion` variant to `CommittedMutation` without changing this wire
+shape or dropping receipts.
