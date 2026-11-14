@@ -652,3 +652,125 @@ async fn v2_rejects_nonfinite_canonical_and_graph_sources() {
             .is_err()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuilt_reciprocal_edges_each_contribute_and_survive_engine_recall() {
+    use crate::graph::{SpreadingActivationConfig, query::expand, rebuild_from_storage};
+    use crate::storage::PersistedEdge;
+    let config = SpreadingActivationConfig::default();
+    let mut records = vec![rec(mid(1)), rec(mid(2))];
+    for record in &mut records {
+        record.strength = 0.9;
+    }
+    let eligible: HashMap<_, _> = records.iter().map(|r| (r.id, r.clone())).collect();
+    let edges = [
+        PersistedEdge {
+            source: mid(1),
+            target: mid(2),
+            edge_type: EdgeType::Associative,
+            weight: 0.01,
+            auto_created: false,
+            created_at: 0,
+        },
+        PersistedEdge {
+            source: mid(2),
+            target: mid(1),
+            edge_type: EdgeType::Associative,
+            weight: 0.8,
+            auto_created: false,
+            created_at: 0,
+        },
+    ];
+    let expected = 0.9 * (0.01 + 0.8) * (config.s_max - 3.0_f32.ln()) * config.hop_decay * 0.9;
+    assert!(expected > config.output_threshold);
+    let mut reference = None;
+    for order in [[0, 1], [1, 0]] {
+        let (engine, graph) = graph_engine(records.clone(), &[(mid(1), 1.0)], &[]);
+        {
+            let mut graph = graph.write().await;
+            assert_eq!(
+                rebuild_from_storage(&mut graph, order.into_iter().map(|i| edges[i].clone())),
+                2
+            );
+        }
+        let expansion = expand(&*graph.read().await, &[(mid(1), 1.0)], ns(), 1, &eligible).unwrap();
+        assert_eq!(expansion.hits.len(), 1);
+        assert_eq!((expansion.hits[0].id, expansion.hits[0].depth), (mid(2), 1));
+        assert!((expansion.hits[0].activation - expected).abs() < 1e-6);
+        assert_eq!(expansion.work.expanded_states, 1);
+        assert_eq!(expansion.work.examined_edges, 2);
+        assert!(!expansion.work.edge_limit);
+        assert!(!expansion.work.state_limit);
+        if let Some(bits) = reference {
+            assert_eq!(expansion.hits[0].activation.to_bits(), bits);
+        }
+        reference = Some(expansion.hits[0].activation.to_bits());
+        let response = engine
+            .search_with_semantics(
+                query(serde_json::json!({
+                    "text":"q", "graphDepth":1
+                })),
+                current(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result_ids(&response.response), vec![mid(1), mid(2)]);
+        assert_eq!(response.diagnostics.graph_depths[&mid(2)], 1);
+        assert_eq!(response.diagnostics.graph.examined_edges, 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuilt_reciprocal_edge_ties_use_uuid_and_charge_each_adjacency() {
+    use crate::graph::{SpreadingActivationConfig, query::expand, rebuild_from_storage};
+    use crate::storage::PersistedEdge;
+    let config = SpreadingActivationConfig::default();
+    let mut records = vec![rec(mid(1)), rec(mid(2)), rec(mid(3))];
+    for record in &mut records {
+        record.strength = 0.9;
+    }
+    let eligible: HashMap<_, _> = records.iter().map(|r| (r.id, r.clone())).collect();
+    let mut edges = Vec::new();
+    for target in [mid(3), mid(2)] {
+        for (source, target, weight) in [(mid(1), target, 0.1), (target, mid(1), 0.8)] {
+            edges.push(PersistedEdge {
+                source,
+                target,
+                edge_type: EdgeType::Associative,
+                weight,
+                auto_created: false,
+                created_at: 0,
+            });
+        }
+    }
+    for reverse in [false, true] {
+        if reverse {
+            edges.reverse();
+        }
+        let (_, graph) = graph_engine(records.clone(), &[], &[]);
+        assert_eq!(
+            rebuild_from_storage(&mut *graph.write().await, edges.clone().into_iter()),
+            4
+        );
+        let expansion = expand(
+            &*graph.read().await,
+            &[(mid(1), 1.0), (mid(1), 0.5)],
+            ns(),
+            1,
+            &eligible,
+        )
+        .unwrap();
+        assert_eq!(
+            expansion.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![mid(2), mid(3)]
+        );
+        let expected = 0.9 * (0.1 + 0.8) * (config.s_max - 5.0_f32.ln()) * config.hop_decay * 0.9;
+        assert!((expansion.hits[0].activation - expected).abs() < 1e-6);
+        assert_eq!(
+            expansion.hits[0].activation.to_bits(),
+            expansion.hits[1].activation.to_bits()
+        );
+        assert_eq!(expansion.work.expanded_states, 1); // Duplicate seed is not reinjected.
+        assert_eq!(expansion.work.examined_edges, 4); // Both stored directions count.
+    }
+}

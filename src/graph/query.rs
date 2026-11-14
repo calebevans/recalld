@@ -156,17 +156,28 @@ pub fn expand(
                 if !edge.weight.is_finite() {
                     return Err("nonfinite graph edge");
                 }
-                edges.push((neighbor, edge.edge_type.as_u8(), edge.weight));
+                edges.push((
+                    neighbor,
+                    edge.edge_type.as_u8(),
+                    source.memory_id,
+                    target.memory_id,
+                    edge.weight,
+                ));
             }
             if node.degree() > remaining {
                 // Do not admit an insertion-order-dependent partial adjacency list.
                 result.work.edge_limit = true;
                 break 'layers;
             }
-            edges.sort_by_key(|&(neighbor, kind, _)| (neighbor, kind));
-            edges.dedup_by_key(|edge| (edge.0, edge.1));
+            // Rebuild can load reciprocal stored edges even though add_edge
+            // rejects them. Deduplicate the directed identity, not the neighbor:
+            // A->B and B->A both contribute when spreading from A.
+            edges.sort_by_key(|&(neighbor, kind, source, target, _)| {
+                (neighbor, kind, source, target)
+            });
+            edges.dedup_by_key(|edge| (edge.0, edge.1, edge.2, edge.3));
             let fan = (config.s_max - (node.degree() as f32 + 1.0).ln()).max(0.0);
-            for (neighbor, kind, weight) in edges {
+            for (neighbor, kind, _, _, weight) in edges {
                 if seed_ids.contains(&neighbor) {
                     continue;
                 }

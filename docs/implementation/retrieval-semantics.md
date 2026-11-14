@@ -26,7 +26,7 @@ Diagnostics expose aggregate unresolved/work limits, returned-ID version statuse
 
 Executed in `recalld-ci:1.94` with Rust 1.94.1, `--network none --cpus 2 --memory 4g`, `CARGO_BUILD_JOBS=2`, and dedicated cargo/target scratch directories. No host home, credentials, daemon socket or personal data mounts.
 
-- `cargo test --locked --offline --all-targets --features bench --quiet`: **526 passed**, zero failed (17 added tests); both binary targets compiled with zero tests.
+- `cargo test --locked --offline --all-targets --features bench --quiet`: **528 passed**, zero failed (19 added tests); both binary targets compiled with zero tests.
 - Rustfmt checks passed for every changed Rust file.
 - `cargo clippy --locked --offline --all-targets --features bench` completed with repository warnings; no warnings-as-errors clean claim.
 
@@ -39,3 +39,12 @@ A1 must still supply coherent canonical/graph/index views, publication readiness
 Also remaining: stable eligible FTS refill and explicit degraded-channel handling; complete channel coverage/provenance/explanations; namespace-partitioned entity publication; lifecycle-clock/strength policy integration; synchronous observation receipts and production read-only conformance; transport versioning; and A5/A6 full-pipeline latency/RSS, quality and replay gates. Per-hop canonical reads and bounded graph work have not established a performance gate. No ranking/RIF experiment or default lifecycle promotion is authorized by these tests.
 
 A5’s 2026-11-14 paired characterization of parent PR #17 found substantial namespace-loading overhead (median process-p95 ratios about 1.24x/1.22x at 1k and 2.85x at 10k; eligibility accounted for 67–70% of engine time at 10k). This diagnostic shared-host study is not a formal release-gate test. Correctness remains required, performance promotion remains unapproved, and the canonical batch-read optimization needs its own paired remeasurement. This semantics2 branch has no performance promotion claim.
+
+
+## Reciprocal-edge rebuild correction
+
+Follow-up on `35291e0`: normal graph insertion rejects same-type reciprocal edges, but startup rebuild loads stored `A -> B` and `B -> A` independently. The prior `(neighbor, type)` deduplication discarded one direction while fan attenuation and examination counts included both. For weights 0.01/0.8 and canonical strengths 0.9, depth-one expansion incorrectly omitted B instead of producing activation about 0.4435503.
+
+Deduplication now uses the stored directed `(source UUID, target UUID, type)` identity, matching the persistent edge key. Neighbor UUID/type order is retained, with source/target UUIDs breaking reciprocal ties. Every inspected adjacency still consumes examination work before deduplication; existing fan attenuation, thresholds, layer limits and seed handling are unchanged. This is a semantics2 correctness fix, not a change to legacy activation or graph mutation.
+
+Two regressions load actual persisted-edge fixtures through `rebuild_from_storage`: both insertion orders match the directed-edge oracle and return B through the engine; equal-activation reciprocal neighbors retain UUID ordering, duplicate seeds do not reinject, and all directed adjacency examinations are counted. The all-target suite also retains the existing 400-state and 12,800-edge ceiling tests. Validation uses the same isolated offline Rust 1.94.1 container settings above. This focused fix is based directly on `35291e0`; apply it to the semantics PR before updating FTS/diagnostics children.
