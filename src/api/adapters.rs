@@ -452,7 +452,11 @@ impl state::StorageEngine for StorageEngineAdapter {
         .map_err(|e| crate::storage::StorageError::Io(std::io::Error::other(e.to_string())))?
     }
 
-    async fn delete_memory(&self, id: MemoryId, namespace: Option<&str>) -> Result<bool, crate::storage::StorageError> {
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, crate::storage::StorageError> {
         crate::derived_completion::DerivedCompletion {
             storage: self.storage.clone(),
             cache: self.cache.clone(),

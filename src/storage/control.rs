@@ -399,7 +399,9 @@ pub(crate) fn validate_existing(
             | MutationOutcome::NamespacePurgeAdvanced { namespace_id, .. } => {
                 scope == MutationScope::Namespace(*namespace_id)
             }
-            MutationOutcome::MemoryInserted { .. } | MutationOutcome::MemoryTombstoned { .. } | MutationOutcome::LifecycleMaterialized { .. } => {
+            MutationOutcome::MemoryInserted { .. }
+            | MutationOutcome::MemoryTombstoned { .. }
+            | MutationOutcome::LifecycleMaterialized { .. } => {
                 matches!(scope, MutationScope::Namespace(_))
             }
             _ => true,
@@ -695,7 +697,13 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
         | MutationOutcome::SchemaMigrated { .. }
         | MutationOutcome::TextGenerationSelected { .. }
         | MutationOutcome::LifecyclePolicyMigrated { .. } => {}
-        MutationOutcome::MemoryInserted { .. } | MutationOutcome::MemoryTombstoned { .. } | MutationOutcome::LifecycleMaterialized { .. } | MutationOutcome::NamespaceCreated { .. } | MutationOutcome::NamespacePolicyUpdated { .. } | MutationOutcome::NamespacePurgeStarted { .. } | MutationOutcome::NamespacePurgeAdvanced { .. } => {}
+        MutationOutcome::MemoryInserted { .. }
+        | MutationOutcome::MemoryTombstoned { .. }
+        | MutationOutcome::LifecycleMaterialized { .. }
+        | MutationOutcome::NamespaceCreated { .. }
+        | MutationOutcome::NamespacePolicyUpdated { .. }
+        | MutationOutcome::NamespacePurgeStarted { .. }
+        | MutationOutcome::NamespacePurgeAdvanced { .. } => {}
     }
     Ok(stored)
 }

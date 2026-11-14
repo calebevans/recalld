@@ -490,8 +490,8 @@ async fn http_forget_error_carries_committed_receipt_and_503() {
         fixture.entity_index.clone(),
         fixture.graph.clone(),
     );
-    let response =
-        crate::api::AppError::from(adapter.delete_memory(id, None).await.unwrap_err()).into_response();
+    let response = crate::api::AppError::from(adapter.delete_memory(id, None).await.unwrap_err())
+        .into_response();
     assert_eq!(
         response.status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE

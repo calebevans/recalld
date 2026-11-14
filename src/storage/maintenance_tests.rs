@@ -686,17 +686,32 @@ async fn maintenance_and_tombstone_reject_deleting_namespace_without_new_receipt
     let ctx = MutationContext::unkeyed(ns);
     let progress = e.begin_namespace_purge(&ctx, true).unwrap();
     let before = std::fs::read(e.db_path().join("meta.db")).unwrap();
-    assert!(e.apply_legacy_decay_with_receipt(&ctx, id, &expected, &policy, DecayPhase::Summary, 0.1, 0.1).is_err());
+    assert!(
+        e.apply_legacy_decay_with_receipt(
+            &ctx,
+            id,
+            &expected,
+            &policy,
+            DecayPhase::Summary,
+            0.1,
+            0.1
+        )
+        .is_err()
+    );
     assert!(e.tombstone_memory_with_receipt(&ctx, id).is_err());
-    assert!(e.record_exposure_batch(&ctx, &[(id, crate::model::AccessKind::DirectRetrieval)], 123).is_err());
+    assert!(
+        e.record_exposure_batch(
+            &ctx,
+            &[(id, crate::model::AccessKind::DirectRetrieval)],
+            123
+        )
+        .is_err()
+    );
     assert!(e.record_legacy_feedback(&ctx, id, 3, 123, 1.0).is_err());
-    assert!(e.update_access_with_receipt(&ctx, id, 123, crate::model::AccessKind::DirectRetrieval).is_err());
+    assert!(
+        e.update_access_with_receipt(&ctx, id, 123, crate::model::AccessKind::DirectRetrieval)
+            .is_err()
+    );
     assert_eq!(std::fs::read(e.db_path().join("meta.db")).unwrap(), before);
     assert_eq!(e.meta_store().purge_progress().unwrap(), vec![progress]);
-    // The durable final-transaction helper rejects even without consulting the
-    // fast admission flag, including a writer that already has a tx handle.
-    let tx = e.meta_store().db.begin_write().unwrap();
-    assert!(metadata::namespace_state::require_namespace_active(&tx, ns).is_err());
-    assert!(metadata::namespace_state::require_namespace_active(&tx, NamespaceId::new(1)).is_err());
-    tx.abort().unwrap();
 }

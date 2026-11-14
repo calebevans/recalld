@@ -11,17 +11,25 @@ fn offline_text_migration_cli_publishes_only_fresh_gated_destination() {
     // public raw-store constructor is needed by production callers.
     let db = redb::Database::create(source.join("meta.db")).unwrap();
     let tx = db.begin_write().unwrap();
-    tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("memories")).unwrap();
-    tx.open_table(redb::TableDefinition::<u32, &[u8]>::new("namespaces")).unwrap();
+    tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("memories"))
+        .unwrap();
+    tx.open_table(redb::TableDefinition::<u32, &[u8]>::new("namespaces"))
+        .unwrap();
     tx.commit().unwrap();
     drop(db);
     let db = redb::Database::create(source.join("edges.db")).unwrap();
     let tx = db.begin_write().unwrap();
-    tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("edges_forward")).unwrap();
-    tx.open_table(redb::TableDefinition::<&[u8], ()>::new("edges_reverse")).unwrap();
+    tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("edges_forward"))
+        .unwrap();
+    tx.open_table(redb::TableDefinition::<&[u8], ()>::new("edges_reverse"))
+        .unwrap();
     tx.commit().unwrap();
     drop(db);
-    std::fs::write(source.join("fulltext.dat"), recalld::storage::text::TextLogHeader::new().as_bytes()).unwrap();
+    std::fs::write(
+        source.join("fulltext.dat"),
+        recalld::storage::text::TextLogHeader::new().as_bytes(),
+    )
+    .unwrap();
     let engine = RedbStorageEngine::open(&source).unwrap();
     let lineage = engine.control_state().unwrap().store_id;
     drop(engine);
@@ -39,7 +47,12 @@ fn offline_text_migration_cli_publishes_only_fresh_gated_destination() {
     assert_eq!(report["storeId"], lineage.to_string());
     assert_eq!(std::fs::read(source.join("meta.db")).unwrap(), before);
     let gate = std::fs::read(target.join("fulltext.dat")).unwrap();
-    assert!(recalld::storage::text::TextLogHeader::read_from_bytes(&gate[..16]).unwrap().validate().is_err());
+    assert!(
+        recalld::storage::text::TextLogHeader::read_from_bytes(&gate[..16])
+            .unwrap()
+            .validate()
+            .is_err()
+    );
     assert_eq!(
         RedbStorageEngine::open(&target).unwrap().count().unwrap(),
         0

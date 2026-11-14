@@ -1337,7 +1337,11 @@ impl bridge::StorageEngine for McpStorageAdapter {
         Observed { value, receipts }.finish(check_read_admission(&self.storage, stamp).await)
     }
 
-    async fn delete_memory(&self, id: MemoryId, namespace: Option<&str>) -> Result<bool, bridge::BridgeError> {
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, bridge::BridgeError> {
         crate::derived_completion::DerivedCompletion {
             storage: self.storage.clone(),
             cache: self.cache.clone(),

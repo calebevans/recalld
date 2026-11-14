@@ -68,14 +68,20 @@ impl DerivedCompletion {
 
     /// Legacy bool adapter. Resolve namespace and commit under one store guard;
     /// each batch caller invokes this in order, with independent child commits.
-    pub async fn forget(&self, id: crate::model::MemoryId, namespace: Option<&str>) -> Result<bool, StorageError> {
+    pub async fn forget(
+        &self,
+        id: crate::model::MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, StorageError> {
         let namespace = namespace.map(str::to_owned);
         let gate = publication_gate(&self.storage).await?;
         let lease = gate.read_owned().await;
         let storage = self.storage.clone();
         let receipt = tokio::task::spawn_blocking(move || {
             let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
-            if let Some(namespace) = namespace.as_deref() { storage.assert_memory_namespace(id, namespace)?; }
+            if let Some(namespace) = namespace.as_deref() {
+                storage.assert_memory_namespace(id, namespace)?;
+            }
             let Some(record) = storage.get_record(id)? else {
                 return Ok(None);
             };
@@ -301,7 +307,12 @@ mod tests {
             panic!()
         };
         assert_eq!(receipt.committed_generation, before.next().unwrap());
-        assert!(fx.storage_adapter().get_memory(memory_id, false, None).await.is_err());
+        assert!(
+            fx.storage_adapter()
+                .get_memory(memory_id, false, None)
+                .await
+                .is_err()
+        );
         assert_eq!(
             fx.storage
                 .read()

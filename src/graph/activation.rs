@@ -626,7 +626,8 @@ fn spreading_activation_resolved(
         };
 
         // Terminal identities neither receive nor relay activation.
-        if (records.is_none() && matches!(node.decay_phase, DecayPhase::Ghost | DecayPhase::Tombstone))
+        if (records.is_none()
+            && matches!(node.decay_phase, DecayPhase::Ghost | DecayPhase::Tombstone))
             || (records.is_some() && canonical_strength(node).is_none())
         {
             continue;
@@ -679,7 +680,11 @@ fn spreading_activation_resolved(
             }
 
             // Terminal identities neither receive nor relay activation.
-            if (records.is_none() && matches!(neighbor.decay_phase, DecayPhase::Ghost | DecayPhase::Tombstone))
+            if (records.is_none()
+                && matches!(
+                    neighbor.decay_phase,
+                    DecayPhase::Ghost | DecayPhase::Tombstone
+                ))
                 || (records.is_some() && canonical_strength(neighbor).is_none())
             {
                 continue;

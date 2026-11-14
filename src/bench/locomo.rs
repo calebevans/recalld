@@ -1278,22 +1278,32 @@ pub(super) async fn store_single_memory(
         vectors: harness.system.vector_index().clone(),
         fts: harness.system.fts_index().clone(),
         entities: harness.system.entity_index().clone(),
-    }.insert(
+    }
+    .insert(
         crate::storage::control::MutationContext::unkeyed(ns_config.id),
         crate::storage::insertion::InsertMemory {
-            id: Some(memory_id), summary: summary.into(), full_text: full_text.map(str::to_owned),
-            tags, embedding: None, initial_stability: Some(ns_config.initial_stability),
-            created_at: Some(timestamp_ms), parent_id: None, supersedes,
+            id: Some(memory_id),
+            summary: summary.into(),
+            full_text: full_text.map(str::to_owned),
+            tags,
+            embedding: None,
+            initial_stability: Some(ns_config.initial_stability),
+            created_at: Some(timestamp_ms),
+            parent_id: None,
+            supersedes,
         },
-        embedding.clone().into(), timestamp_ms,
-    ).await?;
+        embedding.clone().into(),
+        timestamp_ms,
+    )
+    .await?;
     if result.record.is_none() {
         return Err(crate::storage::StorageError::CommittedMutation {
             receipt: Box::new(result.receipt),
             source: Box::new(crate::storage::StorageError::InvalidMutation(
                 "committed benchmark insertion lacks its record".into(),
             )),
-        }.into());
+        }
+        .into());
     }
 
     let entities = llm_entities.to_vec();

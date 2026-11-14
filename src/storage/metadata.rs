@@ -12,8 +12,8 @@ pub(crate) mod effects;
 mod insertion;
 mod lifecycle_updates;
 pub(crate) mod namespace_state;
-pub(crate) mod purge;
 mod observation;
+pub(crate) mod purge;
 pub(crate) mod removal_ledger;
 pub(crate) mod restoration;
 pub(crate) mod text_generation;
@@ -583,10 +583,7 @@ impl MetadataStore {
             if record.phase == DecayPhase::Tombstone {
                 return Err(StorageError::NotFound(id.into_inner()));
             }
-            namespace_state::require_namespace_active(
-                &tx,
-                NamespaceId::new(record.namespace_id),
-            )?;
+            namespace_state::require_namespace_active(&tx, NamespaceId::new(record.namespace_id))?;
             record.last_accessed_at = timestamp;
             if record.access_history.len() >= ACCESS_HISTORY_MAX {
                 record.access_history.remove(0);
@@ -855,7 +852,11 @@ impl MetadataStore {
     /// Performs a read-modify-write in a single redb write transaction.
     /// Does not update any secondary indexes (edge_count is not indexed).
     #[cfg(test)]
-    pub(crate) fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
+    pub(crate) fn update_edge_count(
+        &self,
+        id: MemoryId,
+        edge_count: u16,
+    ) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.update_record(&id, |record| {
             record.edge_count = edge_count;
@@ -1307,7 +1308,10 @@ impl MetadataStore {
     /// - `StorageError::DuplicateName` if a namespace with this name
     ///   already exists.
     #[cfg(test)]
-    pub(crate) fn create_namespace(&self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
+    pub(crate) fn create_namespace(
+        &self,
+        config: &NamespaceConfig,
+    ) -> Result<NamespaceId, StorageError> {
         let ctx = MutationContext {
             scope: MutationScope::Catalog,
             ..MutationContext::unkeyed(NamespaceId::new(1))
@@ -1403,7 +1407,10 @@ impl MetadataStore {
     /// Only removes the config entry. Memory cleanup is the caller's
     /// responsibility. The namespace ID is never recycled.
     #[cfg(test)]
-    pub(crate) fn delete_namespace(&self, id: NamespaceId) -> Result<NamespaceConfig, StorageError> {
+    pub(crate) fn delete_namespace(
+        &self,
+        id: NamespaceId,
+    ) -> Result<NamespaceConfig, StorageError> {
         self.ensure_available()?;
         let _publication = self.mutation_guard()?;
         let write_txn = self.db.begin_write()?;
@@ -1682,7 +1689,10 @@ impl MetadataStore {
     /// which would build a cycle in the free list and underflow
     /// `live_count`.
     #[cfg(test)]
-    pub(crate) fn batch_tombstone(&self, ids: &[MemoryId]) -> Result<Vec<TombstoneOutcome>, StorageError> {
+    pub(crate) fn batch_tombstone(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<Vec<TombstoneOutcome>, StorageError> {
         self.ensure_available()?;
         let _publication = self.mutation_guard()?;
         if ids.is_empty() {

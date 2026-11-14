@@ -142,9 +142,14 @@ impl MetadataStore {
         // Concrete namespace configuration is the v1 policy snapshot; no invented
         // policy revision or public CAS token. Global config is caller-owned/frozen.
         {
-            let current = match namespace_state::require_namespace_active(tx, NamespaceId::new(record.namespace_id)) {
+            let current = match namespace_state::require_namespace_active(
+                tx,
+                NamespaceId::new(record.namespace_id),
+            ) {
                 Ok(config) => config,
-                Err(StorageError::NamespaceNotFound(_)) => return Ok(StagedPatch::Skipped(DecaySkip::Stale)),
+                Err(StorageError::NamespaceNotFound(_)) => {
+                    return Ok(StagedPatch::Skipped(DecaySkip::Stale));
+                }
                 Err(error) => return Err(error),
             };
             if current.id != namespace.id
