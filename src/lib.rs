@@ -30,6 +30,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod decay;
+pub(crate) mod derived_completion;
 pub mod embedding;
 pub mod error;
 pub mod graph;

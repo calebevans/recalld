@@ -43,17 +43,20 @@ impl DaemonServer {
             system.graph().clone(),
             tz,
         ));
-        let storage: Arc<dyn BridgeStorageEngine> = Arc::new(McpStorageAdapter::new(
-            system.storage().clone(),
-            system.cache().clone(),
-            system.embedding().clone(),
-            system.vector_index().clone(),
-            system.fts_index().clone(),
-            system.entity_index().clone(),
-            system.graph().clone(),
-            std::sync::Arc::new(system.config().clone()),
-            tz,
-        ));
+        let storage: Arc<dyn BridgeStorageEngine> = Arc::new(
+            McpStorageAdapter::new(
+                system.storage().clone(),
+                system.cache().clone(),
+                system.embedding().clone(),
+                system.vector_index().clone(),
+                system.fts_index().clone(),
+                system.entity_index().clone(),
+                system.graph().clone(),
+                std::sync::Arc::new(system.config().clone()),
+                tz,
+            )
+            .with_clock(system.clock().clone()),
+        );
         let namespaces: Arc<dyn NamespaceRegistry> = Arc::new(McpNamespaceAdapter::new(
             system.storage().clone(),
             system.cache().clone(),

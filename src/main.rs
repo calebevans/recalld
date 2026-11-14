@@ -432,14 +432,17 @@ async fn run_serve(
             system.fts_index().clone(),
             system.entity_index().clone(),
         ));
-        let storage: Arc<dyn recalld::api::StorageEngine> = Arc::new(StorageEngineAdapter::new(
-            system.storage().clone(),
-            system.cache().clone(),
-            system.vector_index().clone(),
-            system.fts_index().clone(),
-            system.entity_index().clone(),
-            system.graph().clone(),
-        ));
+        let storage: Arc<dyn recalld::api::StorageEngine> = Arc::new(
+            StorageEngineAdapter::new(
+                system.storage().clone(),
+                system.cache().clone(),
+                system.vector_index().clone(),
+                system.fts_index().clone(),
+                system.entity_index().clone(),
+                system.graph().clone(),
+            )
+            .with_clock(system.clock().clone()),
+        );
         let cache: Arc<dyn recalld::api::RecordCache> =
             Arc::new(RecordCacheAdapter::new(system.cache().clone()));
         let graph: Arc<dyn recalld::api::RelationshipGraph> =
@@ -451,13 +454,21 @@ async fn run_serve(
                 system.cache().clone(),
                 Arc::new(system.config().clone()),
             ));
-        let decay: Arc<dyn recalld::api::FsrsEngine> = Arc::new(FsrsEngineAdapter::new(
-            system.storage().clone(),
-            system.cache().clone(),
-            system.graph().clone(),
-            Arc::new(system.config().clone()),
-            true,
-        ));
+        let decay: Arc<dyn recalld::api::FsrsEngine> = Arc::new(
+            FsrsEngineAdapter::new(
+                system.storage().clone(),
+                system.cache().clone(),
+                system.graph().clone(),
+                Arc::new(system.config().clone()),
+                true,
+            )
+            .with_indexes(
+                system.vector_index().clone(),
+                system.fts_index().clone(),
+                system.entity_index().clone(),
+            )
+            .with_clock(system.clock().clone()),
+        );
         let namespaces: Arc<dyn recalld::api::NamespaceRegistry> =
             Arc::new(NamespaceRegistryAdapter::new(system.storage().clone()));
         let metrics: Arc<dyn recalld::api::MetricsCollector> = Arc::new(NoopMetricsCollector);
@@ -555,17 +566,20 @@ fn create_direct_mcp_bridge(
         system.graph().clone(),
         tz,
     ));
-    let storage: Arc<dyn recalld::mcp::bridge::StorageEngine> = Arc::new(McpStorageAdapter::new(
-        system.storage().clone(),
-        system.cache().clone(),
-        system.embedding().clone(),
-        system.vector_index().clone(),
-        system.fts_index().clone(),
-        system.entity_index().clone(),
-        system.graph().clone(),
-        std::sync::Arc::new(system.config().clone()),
-        tz,
-    ));
+    let storage: Arc<dyn recalld::mcp::bridge::StorageEngine> = Arc::new(
+        McpStorageAdapter::new(
+            system.storage().clone(),
+            system.cache().clone(),
+            system.embedding().clone(),
+            system.vector_index().clone(),
+            system.fts_index().clone(),
+            system.entity_index().clone(),
+            system.graph().clone(),
+            std::sync::Arc::new(system.config().clone()),
+            tz,
+        )
+        .with_clock(system.clock().clone()),
+    );
     let namespaces: Arc<dyn recalld::mcp::bridge::NamespaceRegistry> =
         Arc::new(McpNamespaceAdapter::new(
             system.storage().clone(),

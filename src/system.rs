@@ -197,6 +197,7 @@ pub enum SystemState {
 /// Only one `Recalld` instance should exist per process. The
 /// exclusive file locks on storage files enforce this at the OS level.
 pub struct Recalld {
+    clock: Arc<dyn crate::time::Clock>,
     // -- Configuration ------------------------------------------------
     config: Arc<RecalldConfig>,
 
@@ -258,6 +259,15 @@ impl Recalld {
     /// Resources acquired before the failure are cleaned up by normal
     /// `Drop` behavior.
     pub async fn new(config: RecalldConfig) -> Result<Self> {
+        Self::with_clock(config, Arc::new(crate::time::SystemClock)).await
+    }
+
+    /// Construct an isolated instance with a shared lifecycle clock.
+    /// Search-pipeline exposure clock injection is a separate A2 handoff.
+    pub async fn with_clock(
+        config: RecalldConfig,
+        clock: Arc<dyn crate::time::Clock>,
+    ) -> Result<Self> {
         let config = Arc::new(config);
         let (shutdown_tx, _) = watch::channel(false);
         let drain_notify = Arc::new(Notify::new());
@@ -277,6 +287,16 @@ impl Recalld {
             tracing::info!("storage engine opened");
             Arc::new(std::sync::RwLock::new(engine))
         };
+
+        let effects_rebuild = storage
+            .read()
+            .map_err(|e| RecalldError::Init {
+                step: "effects_rebuild",
+                message: e.to_string(),
+                source: None,
+            })?
+            .meta_store()
+            .needs_effects_rebuild();
 
         // -- Step 2: Scan all records once, reuse for graph / FTS / entity index
         let all_records = {
@@ -324,9 +344,17 @@ impl Recalld {
 
             // After CS-23, graph::PersistedEdge == storage::PersistedEdge
             // (with created_at: u64). Pass them directly -- no field mapping needed.
+            let expected_edges = persisted_edges.len();
             let edge_count =
                 graph::rebuild_from_storage(&mut rel_graph, persisted_edges.into_iter());
 
+            if effects_rebuild && edge_count != expected_edges {
+                return Err(RecalldError::Init {
+                    step: "effects_graph_rebuild",
+                    message: "graph did not accept all canonical edges".into(),
+                    source: None,
+                });
+            }
             let stats = rel_graph.stats();
             tracing::info!(
                 nodes = stats.node_count,
@@ -349,6 +377,7 @@ impl Recalld {
             };
             // No external eviction listener for now.
             let mgr = CacheManager::new(cache_cfg, None);
+            mgr.bind_storage(&storage);
             tracing::info!("cache manager initialized");
             Arc::new(mgr)
         };
@@ -434,6 +463,13 @@ impl Recalld {
                     VectorLoadStats::default()
                 }
             };
+            if effects_rebuild && (stats.dim_mismatch + stats.unreadable + stats.missing > 0) {
+                return Err(RecalldError::Init {
+                    step: "effects_vector_rebuild",
+                    message: "vector rebuild incomplete; effects remain pending".into(),
+                    source: None,
+                });
+            }
             let elapsed = started.elapsed();
 
             if stats.dim_mismatch > 0 {
@@ -494,7 +530,14 @@ impl Recalld {
             // fts.db file), populate it from all records in redb storage.
             // Also handles the case where fts.db exists but is empty
             // (e.g., previous crash during first migration).
-            if is_new || fts.is_empty().unwrap_or(true) {
+            if effects_rebuild {
+                fts.clear().map_err(|e| RecalldError::Init {
+                    step: "effects_fts_clear",
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
+                })?;
+            }
+            if effects_rebuild || is_new || fts.is_empty().unwrap_or(true) {
                 if !all_records.is_empty() {
                     let storage_r = storage.read().map_err(|e| RecalldError::Init {
                         step: "fts_migration",
@@ -506,6 +549,9 @@ impl Recalld {
                         "migrating records to FTS5 index"
                     );
                     for (memory_id, record) in &all_records {
+                        if record.phase == DecayPhase::Tombstone {
+                            continue;
+                        }
                         let namespace_id = crate::model::NamespaceId::new(record.namespace_id);
                         let tag_strings: Vec<String> =
                             record.tags.iter().map(|t| t.to_string()).collect();
@@ -515,23 +561,28 @@ impl Recalld {
                                 file_offset: record.text_offset,
                                 length: record.text_length,
                             };
-                            storage_r.get_text(text_ref).ok().flatten()
+                            storage_r
+                                .get_text(text_ref)
+                                .map_err(|e| RecalldError::Init {
+                                    step: "fts_text",
+                                    message: e.to_string(),
+                                    source: Some(Box::new(e)),
+                                })?
                         } else {
                             None
                         };
-                        if let Err(e) = fts.add(
+                        fts.add(
                             namespace_id,
                             *memory_id,
                             &record.summary,
                             full_text.as_deref(),
                             &tag_strings,
-                        ) {
-                            tracing::warn!(
-                                memory_id = %memory_id,
-                                %e,
-                                "failed to index record in FTS5 during migration"
-                            );
-                        }
+                        )
+                        .map_err(|e| RecalldError::Init {
+                            step: "fts_rebuild",
+                            message: e.to_string(),
+                            source: Some(Box::new(e)),
+                        })?;
                     }
                     drop(storage_r);
                     tracing::info!(indexed = all_records.len(), "FTS5 migration complete");
@@ -577,6 +628,21 @@ impl Recalld {
             tracing::info!(memories = idx.len(), "entity index built");
             Arc::new(RwLock::new(idx))
         };
+        // All startup graph/vector/FTS/entity/cache construction has completed.
+        storage
+            .read()
+            .map_err(|e| RecalldError::Init {
+                step: "effects_ack",
+                message: e.to_string(),
+                source: None,
+            })?
+            .meta_store()
+            .acknowledge_rebuilt_effects()
+            .map_err(|e| RecalldError::Init {
+                step: "effects_ack",
+                message: e.to_string(),
+                source: Some(Box::new(e)),
+            })?;
 
         // -- Step 7: Create QueryEngine -------------------------------
         let query_engine = {
@@ -642,6 +708,16 @@ impl Recalld {
                 config.decay.decay_rate_multiplier,
             ) {
                 Ok(runner) => {
+                    let runner =
+                        runner.with_completion(crate::derived_completion::DerivedCompletion {
+                            storage: storage.clone(),
+                            cache: cache.clone(),
+                            graph: graph.clone(),
+                            vectors: vector_index.clone(),
+                            fts: fts_index.clone(),
+                            entities: entity_index.clone(),
+                        });
+                    let runner = runner.with_clock(clock.clone());
                     let handle = runner.start();
                     tracing::info!("decay sweep runner started");
                     (Some(runner), Some(handle))
@@ -683,7 +759,7 @@ impl Recalld {
                     default_difficulty: 5.0,
                     phase_thresholds: crate::model::namespace::PhaseThresholds::default(),
                     permastore_threshold: 1500.0,
-                    created_at: chrono::Utc::now().timestamp_millis(),
+                    created_at: clock.now_millis(),
                     desired_retention: 0.9,
                     decay_rate_multiplier: None,
                 };
@@ -711,6 +787,7 @@ impl Recalld {
         tracing::info!("Recalld initialized");
 
         Ok(Self {
+            clock,
             config,
             storage,
             graph,
@@ -728,6 +805,11 @@ impl Recalld {
             inflight_count,
             state: SystemState::Ready,
         })
+    }
+
+    /// Shared clock for creation, feedback and sweeps in this instance.
+    pub fn clock(&self) -> &Arc<dyn crate::time::Clock> {
+        &self.clock
     }
 
     // -- Accessor methods ---------------------------------------------
@@ -765,6 +847,23 @@ impl Recalld {
     /// Access the flat vector index.
     pub fn vector_index(&self) -> &Arc<RwLock<FlatVectorIndex>> {
         &self.vector_index
+    }
+
+    /// Retry publication of committed effects without restarting. Errors leave
+    /// query admission closed; canonical application failures require reopen.
+    pub async fn complete_pending_effects(
+        &self,
+    ) -> std::result::Result<(), crate::storage::StorageError> {
+        crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
+        }
+        .complete()
+        .await
     }
 
     /// Access the FTS5 full-text search index.
@@ -977,6 +1076,251 @@ mod tests {
         config.embedding.dimensions = DIM;
         config.decay.disable_sweep = true;
         config
+    }
+
+    #[tokio::test]
+    async fn effects_block_cached_queries_and_reopen_rebuilds_deleted_fts_rows() {
+        let fx = Fixture::new();
+        let live = fx.insert_memory().await;
+        let dead = fx.insert_memory().await;
+        let dir = fx.close();
+        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+        let record = system
+            .storage
+            .read()
+            .unwrap()
+            .get_record(dead)
+            .unwrap()
+            .unwrap();
+        let ns = crate::model::NamespaceId::new(record.namespace_id);
+        system
+            .cache
+            .insert(dead, crate::model::CachedRecord::from(&record))
+            .await;
+        system.storage.write().unwrap().delete_memory(dead).unwrap();
+        assert!(
+            system.query_engine.get_memory(dead).await.is_err(),
+            "cached deleted record must not bypass admission"
+        );
+        assert!(system.query_engine.similar(dead, 5).await.is_err());
+        let query =
+            serde_json::from_value(serde_json::json!({"text":"fixture", "namespace":"default"}))
+                .unwrap();
+        assert!(system.query_engine.search(query).await.is_err());
+        assert!(
+            system
+                .storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .needs_effects_rebuild()
+        );
+        {
+            use crate::api::adapters::*;
+            let state = crate::api::AppState::new(
+                Arc::new(SearchPipelineAdapter::new(
+                    system.query_engine.clone(),
+                    system.embedding.clone(),
+                    system.vector_index.clone(),
+                    system.fts_index.clone(),
+                    system.entity_index.clone(),
+                )),
+                Arc::new(StorageEngineAdapter::new(
+                    system.storage.clone(),
+                    system.cache.clone(),
+                    system.vector_index.clone(),
+                    system.fts_index.clone(),
+                    system.entity_index.clone(),
+                    system.graph.clone(),
+                )),
+                Arc::new(RecordCacheAdapter::new(system.cache.clone())),
+                Arc::new(RelationshipGraphAdapter::new(
+                    system.graph.clone(),
+                    system.vector_index.clone(),
+                    system.entity_index.clone(),
+                    system.storage.clone(),
+                    system.cache.clone(),
+                    system.config.clone(),
+                )),
+                Arc::new(FsrsEngineAdapter::new(
+                    system.storage.clone(),
+                    system.cache.clone(),
+                    system.graph.clone(),
+                    system.config.clone(),
+                    false,
+                )),
+                Arc::new(NamespaceRegistryAdapter::new(system.storage.clone())),
+                Arc::new(NoopMetricsCollector),
+            );
+            use tower::ServiceExt;
+            let response = crate::api::router(state, &crate::api::ApiConfig::default())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/memories/{dead}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "HTTP cache must not return deleted content or a false 404"
+            );
+        }
+        drop(system);
+        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+        assert!(
+            !system
+                .storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .needs_effects_rebuild()
+        );
+        assert!(
+            system
+                .query_engine
+                .get_memory(dead)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(system.vector_index.read().await.get_vector(dead).is_none());
+        assert!(!system.graph.read().await.contains(&dead));
+        let hits = system
+            .fts_index
+            .lock()
+            .await
+            .search(ns, "fixture", 10)
+            .unwrap();
+        assert!(hits.iter().all(|hit| hit.0 != dead));
+        assert!(hits.iter().any(|hit| hit.0 == live));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_mcp_cached_consumers_block_then_recover_online() {
+        use crate::mcp::bridge::{SearchPipeline, StorageEngine as McpStorage};
+        use crate::mcp::bridge_adapters::{McpSearchAdapter, McpStorageAdapter};
+        let fx = Fixture::new();
+        let live = fx.insert_memory().await;
+        let dead = fx.insert_memory().await;
+        let dir = fx.close();
+        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+        let search = McpSearchAdapter::new(
+            system.query_engine.clone(),
+            system.embedding.clone(),
+            system.storage.clone(),
+            system.graph.clone(),
+            chrono_tz::UTC,
+        );
+        let adapter = McpStorageAdapter::new(
+            system.storage.clone(),
+            system.cache.clone(),
+            system.embedding.clone(),
+            system.vector_index.clone(),
+            system.fts_index.clone(),
+            system.entity_index.clone(),
+            system.graph.clone(),
+            system.config.clone(),
+            chrono_tz::UTC,
+        );
+        let stale = crate::model::CachedRecord::from(
+            &system
+                .storage
+                .read()
+                .unwrap()
+                .get_record(dead)
+                .unwrap()
+                .unwrap(),
+        );
+        system.cache.insert(dead, stale.clone()).await;
+        system.storage.write().unwrap().delete_memory(dead).unwrap();
+        assert!(search.find_similar(live, 5, None, true).await.is_err());
+        assert!(adapter.get_memory(dead).await.is_err());
+        assert!(adapter.get_memory(live).await.is_err());
+        system.complete_pending_effects().await.unwrap();
+        system.cache.insert(dead, stale).await;
+        assert!(
+            system
+                .query_engine
+                .get_memory(dead)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(adapter.get_memory(dead).await.unwrap().is_none());
+        assert!(adapter.get_memory(live).await.unwrap().is_some());
+        assert!(search.find_similar(live, 5, None, true).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn online_completion_crash_reopen_preserves_receipt_and_deleted_content() {
+        const CHILD: &str = "RECALLD_ONLINE_COMPLETION_CHILD";
+        if let Ok(path) = std::env::var(CHILD) {
+            let system = Recalld::new(offline_config(std::path::Path::new(&path)))
+                .await
+                .unwrap();
+            let dead = system.storage.read().unwrap().scan_all().unwrap()[0].0;
+            system.storage.write().unwrap().delete_memory(dead).unwrap();
+            system.complete_pending_effects().await.unwrap();
+            panic!("child did not exit at crash point");
+        }
+        let fx = Fixture::new();
+        let dead = fx.insert_memory().await;
+        let dir = fx.close();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("system::tests::online_completion_crash_reopen_preserves_receipt_and_deleted_content")
+            .arg("--exact").arg("--nocapture")
+            .env(CHILD, dir.path()).env("RECALLD_TEST_EFFECT_CRASH", "before_online_derived_ack")
+            .output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(91),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt = {
+            let storage = RedbStorageEngine::open(dir.path()).unwrap();
+            let pending = storage.meta_store().pending_effects().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].canonical_applied);
+            pending[0].receipt.clone()
+        };
+        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+        assert!(
+            system
+                .storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .pending_effects()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            system
+                .query_engine
+                .get_memory(dead)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(system.fts_index.lock().await.is_empty().unwrap());
+        assert!(system.vector_index.read().await.get_vector(dead).is_none());
+        system.complete_pending_effects().await.unwrap();
+        assert_eq!(
+            system
+                .storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .control_state()
+                .unwrap()
+                .committed_generation,
+            receipt.committed_generation
+        );
     }
 
     // ── the regression ───────────────────────────────────────────────
