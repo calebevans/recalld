@@ -1,0 +1,56 @@
+{
+  "base": "75882c3d8e2f00a632ad5c76c6261b4cf1a5b023",
+  "canonicalEntityParent": "e7fd45573b7ba2de4fd216a208f7981a0a8c8c2d",
+  "canonicalEntityRecordDiffFromParent": "Only existing consumer lifecycle field, lifecycle hydration and PartialEq derive differ; entity selection is unchanged from e7fd455.",
+  "canonicalEntityRecordMatchesParent": false,
+  "consumerParent": "3b590fb28c84bb2aa2d8afaac66e34556d7da6a6",
+  "fixtureOrigin": "62dbd44df2c097681613900e23fccdbd0dbf14b3",
+  "guardOrigin": "65edaa36a446789e7918e756c624025b1a91b6a7",
+  "minimalShippingPreview": {
+    "mergeBase58And57": "fb7ae7edf5a228dcb29824334b7eaeddc9327530",
+    "needsFixture": "62dbd44df2c097681613900e23fccdbd0dbf14b3 plus by-ID synthetic read overlay; no forged persisted policy or native exposure",
+    "parents": [
+      "3b590fb28c84bb2aa2d8afaac66e34556d7da6a6",
+      "65edaa36a446789e7918e756c624025b1a91b6a7",
+      "e7fd45573b7ba2de4fd216a208f7981a0a8c8c2d"
+    ],
+    "status": "read-only text merge preview only; no minimal composition compiled yet",
+    "textMergeConflicts58And57": {
+      "src/storage/control.rs": 2
+    }
+  },
+  "readme": "Control adds ExposureScope and the requested schema receipt guard/test; catalog and restored ancestry validation retained. Native preflight source files checked by blob equality.",
+  "sourceCommit": "525558a9e0a45d6ef82f5f8d2b09e9bd3de2e44f",
+  "unchangedFromIntegrationBase": {
+    "src/graph/activation.rs": {
+      "baseBlob": "69ee22b9c6122397ebe00ccf40b2041b021f996f",
+      "equal": true,
+      "sourceBlob": "69ee22b9c6122397ebe00ccf40b2041b021f996f"
+    },
+    "src/storage/canonical_schema.rs": {
+      "baseBlob": "675aa143f48ec3e758c2d504943740963372eb20",
+      "equal": true,
+      "sourceBlob": "675aa143f48ec3e758c2d504943740963372eb20"
+    },
+    "src/storage/lifecycle_migration.rs": {
+      "baseBlob": "c4db867d2c8171b62a8039398e5351a1d79ab904",
+      "equal": true,
+      "sourceBlob": "c4db867d2c8171b62a8039398e5351a1d79ab904"
+    },
+    "src/storage/lineage.rs": {
+      "baseBlob": "4b937bf2cfc8d013e3c9a998129a1c4556300354",
+      "equal": true,
+      "sourceBlob": "4b937bf2cfc8d013e3c9a998129a1c4556300354"
+    },
+    "src/storage/metadata/removal_ledger.rs": {
+      "baseBlob": "426f09c28535cd169144d2cdd2d614e044bd3ba5",
+      "equal": true,
+      "sourceBlob": "426f09c28535cd169144d2cdd2d614e044bd3ba5"
+    },
+    "src/storage/metadata/restoration.rs": {
+      "baseBlob": "34a2e8a4f391f6dc6d252af7e6a999dd8868c22d",
+      "equal": true,
+      "sourceBlob": "34a2e8a4f391f6dc6d252af7e6a999dd8868c22d"
+    }
+  }
+}
