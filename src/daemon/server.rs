@@ -551,6 +551,49 @@ mod tests {
     /// is exercised, which never reaches any of these.
     struct Unused;
 
+    #[tokio::test]
+    async fn actual_daemon_insertion_dispatch_keeps_committed_failure_distinct_from_success() {
+        use crate::storage::StorageEngine as _;
+        let fx = crate::test_support::Fixture::new();
+        *fx.vector_index.write().await =
+            crate::search::FlatVectorIndex::new(crate::test_support::DIM + 1);
+        let error = dispatch(
+            &Unused,
+            &fx.storage_adapter(),
+            &Unused,
+            &Unused,
+            "store_memory",
+            serde_json::json!({
+                "summary":"daemon committed insertion", "namespace":"default", "tags":[],
+                "embedding":[1.,0.,0.,0.], "checkDuplicates":false
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, BridgeError::PartiallyApplied(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("commitState=committed"));
+        assert!(message.contains("ready=false"));
+        let pending = fx
+            .storage
+            .read()
+            .unwrap()
+            .meta_store()
+            .pending_effects()
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(message.contains(&pending[0].receipt.operation_id.to_string()));
+        assert_eq!(fx.storage.read().unwrap().scan_all().unwrap().len(), 1);
+        assert!(
+            fx.storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .effects_stamp()
+                .is_err()
+        );
+    }
+
     #[async_trait::async_trait]
     impl SearchPipeline for Unused {
         async fn search(&self, _: SearchInput) -> Result<SearchResponse, BridgeError> {
