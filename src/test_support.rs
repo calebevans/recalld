@@ -220,6 +220,7 @@ impl Fixture {
     pub(crate) async fn insert_memory_with(&self, spec: MemorySpec<'_>) -> MemoryId {
         let id = MemoryId::new();
         let mut record = crate::model::DiskRecord {
+            schema: None,
             version: crate::model::DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: spec.namespace.get(),
@@ -381,6 +382,7 @@ impl crate::mcp::bridge::SearchPipeline for StubBridge {
         _: usize,
         _: Option<f32>,
         _: bool,
+        _record_access: bool,
     ) -> Result<Vec<crate::mcp::bridge::SearchHit>, crate::mcp::bridge::BridgeError> {
         unreachable!("the handler was expected to reject its arguments before searching")
     }
@@ -405,6 +407,7 @@ impl crate::mcp::bridge::StorageEngine for StubBridge {
     async fn get_memory(
         &self,
         _: MemoryId,
+        _record_access: bool,
     ) -> Result<Option<crate::mcp::bridge::MemoryRecord>, crate::mcp::bridge::BridgeError> {
         unreachable!("the handler was expected to reject its arguments before reading")
     }

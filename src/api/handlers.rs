@@ -350,25 +350,36 @@ pub async fn create_memory(
 pub async fn get_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(options): Query<GetMemoryQuery>,
 ) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
 
-    let record = state
-        .cache
-        .get_or_load(memory_id, state.storage.as_ref())
-        .await
-        .ok_or_else(|| AppError::NotFound {
-            resource: "memory",
-            id: id.clone(),
-        })?;
+    let record = if options.record_access {
+        state
+            .cache
+            .get_or_load(memory_id, state.storage.as_ref())
+            .await
+    } else {
+        state
+            .storage
+            .get_record(memory_id)
+            .await
+            .map(|r| std::sync::Arc::new(crate::model::CachedRecord::from(&r)))
+    }
+    .ok_or_else(|| AppError::NotFound {
+        resource: "memory",
+        id: id.clone(),
+    })?;
 
     // Record access for decay tracking
-    state
-        .decay
-        .record_access(memory_id, AccessKind::DirectRetrieval)
-        .await;
+    if options.record_access {
+        state
+            .decay
+            .record_access(memory_id, AccessKind::DirectRetrieval)
+            .await;
+    }
 
     let ns_name = state
         .namespaces
@@ -471,16 +482,7 @@ pub async fn reinforce_memory(
         .decay
         .reinforce(memory_id, req.quality)
         .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                AppError::NotFound {
-                    resource: "memory",
-                    id: id.clone(),
-                }
-            } else {
-                AppError::Internal { source: e }
-            }
-        })?;
+        .map_err(|e| feedback_error(e, &id))?;
 
     let took = start.elapsed().as_micros() as u64;
 
@@ -494,6 +496,25 @@ pub async fn reinforce_memory(
         },
         took_us: Some(took),
     }))
+}
+
+/// Preserve typed lifecycle outcomes instead of classifying display strings.
+fn feedback_error(error: Box<dyn std::error::Error + Send + Sync>, id: &str) -> AppError {
+    use crate::decay::lifecycle::LifecycleError;
+    match error.downcast_ref::<LifecycleError>() {
+        Some(LifecycleError::ContentUnavailable) => AppError::Conflict {
+            message: error.to_string(),
+        },
+        Some(LifecycleError::NotFound) => AppError::NotFound {
+            resource: "memory",
+            id: id.into(),
+        },
+        Some(LifecycleError::InvalidInput(_)) => AppError::BadRequest {
+            message: error.to_string(),
+            field: None,
+        },
+        _ => AppError::Internal { source: error },
+    }
 }
 
 /// GET /memories -- list memories with filtering and pagination.
@@ -800,6 +821,7 @@ pub async fn search_memories(
     };
 
     let search_query = SearchQuery {
+        record_access: req.record_access,
         query: query_input.unwrap_or(QueryInput::Text(String::new())),
         namespace_id: ns.id,
         namespace_name: ns.name.clone(),
@@ -875,14 +897,22 @@ pub async fn find_similar(
     let memory_id = parse_memory_id(&id)?;
 
     // Load source memory to get namespace
-    let source = state
-        .cache
-        .get_or_load(memory_id, state.storage.as_ref())
-        .await
-        .ok_or_else(|| AppError::NotFound {
-            resource: "memory",
-            id: id.clone(),
-        })?;
+    let source = if req.record_access {
+        state
+            .cache
+            .get_or_load(memory_id, state.storage.as_ref())
+            .await
+    } else {
+        state
+            .storage
+            .get_record(memory_id)
+            .await
+            .map(|r| std::sync::Arc::new(crate::model::CachedRecord::from(&r)))
+    }
+    .ok_or_else(|| AppError::NotFound {
+        resource: "memory",
+        id: id.clone(),
+    })?;
 
     let source_embedding =
         state
@@ -902,6 +932,7 @@ pub async fn find_similar(
     // Search using source embedding, requesting limit+1 to account
     // for the source memory appearing in its own results.
     let search_query = SearchQuery {
+        record_access: req.record_access,
         query: QueryInput::Vector(source_embedding),
         namespace_id: source.namespace_id,
         namespace_name: ns_name,
@@ -1033,8 +1064,20 @@ pub async fn create_namespace(
             req.decay_rate_multiplier,
         )
         .await
-        .map_err(|_e| AppError::Conflict {
-            message: format!("namespace '{}' already exists", req.name),
+        .map_err(|e| {
+            if matches!(
+                e.downcast_ref::<crate::decay::lifecycle::LifecycleError>(),
+                Some(crate::decay::lifecycle::LifecycleError::InvalidInput(_))
+            ) {
+                AppError::BadRequest {
+                    message: e.to_string(),
+                    field: None,
+                }
+            } else {
+                AppError::Conflict {
+                    message: format!("namespace '{}' already exists", req.name),
+                }
+            }
         })?;
 
     let response = NamespaceResponse {
@@ -1785,4 +1828,72 @@ pub async fn trigger_decay_sweep(
         },
         took_us: Some(result.duration.as_micros() as u64),
     }))
+}
+
+#[cfg(test)]
+mod lifecycle_error_tests {
+    use super::*;
+    use crate::api::FsrsEngine as _;
+    use crate::model::DecayPhase;
+    use crate::test_support::{Fixture, MemorySpec};
+    use axum::response::IntoResponse;
+
+    /// Exercise the handler's mapping with real adapter errors, including terminal content.
+    #[tokio::test]
+    async fn feedback_handler_maps_terminal_missing_and_invalid_inputs_by_type() {
+        let f = Fixture::new();
+        let adapter = crate::api::adapters::FsrsEngineAdapter::new(
+            f.storage.clone(),
+            f.cache.clone(),
+            f.graph.clone(),
+            std::sync::Arc::new(crate::config::RecalldConfig::default()),
+            false,
+        );
+        for phase in [
+            DecayPhase::Ghost,
+            DecayPhase::Tombstone,
+            DecayPhase::Summary,
+        ] {
+            let id = f
+                .insert_memory_with(MemorySpec {
+                    phase: if phase == DecayPhase::Tombstone {
+                        DecayPhase::Full
+                    } else {
+                        phase
+                    },
+                    summary: "",
+                    ..MemorySpec::new(NamespaceId::new(1))
+                })
+                .await;
+            if phase == DecayPhase::Tombstone {
+                f.tombstone(id);
+            }
+            let error = adapter.reinforce(id, 3).await.unwrap_err();
+            let response = feedback_error(error, &id.to_string()).into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "CONFLICT");
+            assert_eq!(f.record(id).unwrap().phase, phase);
+            assert_eq!(f.record(id).unwrap().last_accessed_at, 0);
+        }
+        let missing = MemoryId::new();
+        let error = adapter.reinforce(missing, 3).await.unwrap_err();
+        assert_eq!(
+            feedback_error(error, &missing.to_string())
+                .into_response()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let id = f.insert_memory().await;
+        let error = adapter.reinforce(id, 0).await.unwrap_err();
+        assert_eq!(
+            feedback_error(error, &id.to_string())
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

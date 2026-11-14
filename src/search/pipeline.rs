@@ -18,8 +18,15 @@ use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConf
 
 #[path = "diagnostics.rs"]
 mod diagnostics;
+#[path = "strength.rs"]
+mod strength;
+use strength::StrengthContext;
+pub use strength::StrengthDiagnostics;
 #[path = "semantics.rs"]
 mod semantics;
+#[cfg(test)]
+#[path = "strength_tests.rs"]
+mod strength_tests;
 pub use diagnostics::{
     ChannelDiagnostics, ChannelParticipation, ResultProvenance, RetrievalChannel,
 };
@@ -163,6 +170,29 @@ pub trait AccessRecorder: Send + Sync {
 /// identifying RIF competitors. In production, this wraps an
 /// `Arc<tokio::sync::RwLock<RelationshipGraph>>`.
 pub trait GraphReader: Send + Sync {
+    /// Canonical same-scope live donor strengths, independent of query filters.
+    fn connection_bonuses(
+        &self,
+        _strengths: &HashMap<MemoryId, f32>,
+    ) -> Result<HashMap<MemoryId, f32>> {
+        Err(SearchError::Internal(
+            "canonical connection bonus unavailable".into(),
+        ))
+    }
+
+    /// Legacy PQSA formulas with canonical projected strength/phase inputs.
+    fn spreading_activation_canonical(
+        &self,
+        _seeds: &[(MemoryId, f32)],
+        _namespace: NamespaceId,
+        _depth: u8,
+        _records: &HashMap<MemoryId, CachedRecord>,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        Err(SearchError::Internal(
+            "canonical graph spreading unavailable".into(),
+        ))
+    }
+
     /// Internal v2 structural read. Unsupported adapters must fail, never prove currentness.
     fn supersession_links(
         &self,
@@ -330,6 +360,9 @@ const FTS_ONLY_RATE: f32 = 0.3;
 /// Holds `Arc` references to all subsystems. Cheap to clone, safe to
 /// share across request handlers.
 pub struct QueryEngine {
+    clock: Arc<dyn crate::time::Clock>,
+    decay_policy: crate::decay::DecayConfig,
+    decay_multiplier: f64,
     /// Resolves namespace names to configs.
     namespace_resolver: Arc<dyn NamespaceResolver>,
     /// Per-namespace embedding providers.
@@ -367,6 +400,9 @@ impl QueryEngine {
         access_recorder: Arc<dyn AccessRecorder>,
     ) -> Self {
         Self {
+            clock: Arc::new(crate::time::SystemClock),
+            decay_policy: crate::decay::DecayConfig::default(),
+            decay_multiplier: 1.0,
             namespace_resolver,
             embedding_providers,
             vector_indexes,
@@ -439,6 +475,8 @@ impl QueryEngine {
         }
         query.validate()?;
         let ns_config = self.namespace_resolver.resolve(&query.namespace).await?;
+        let mut strength_context = StrengthContext::pin(self, &ns_config, query.record_access)?;
+        diagnostics.strength = Some(strength_context.diagnostics);
         timings.parse_us = stage_start.elapsed().as_micros() as u64;
 
         // -- Stage 2: Embed ----------------------------------------------
@@ -472,10 +510,9 @@ impl QueryEngine {
             .meta_store
             .list_namespace_memories(ns_config.id)
             .await?;
-        let eligible_records: HashMap<MemoryId, CachedRecord> = self
-            .meta_store
-            .get_batch(&namespace_ids)
-            .await?
+        let mut namespace_records = self.meta_store.get_batch(&namespace_ids).await?;
+        strength_context.project_namespace(&mut namespace_records, self.graph.as_ref())?;
+        let eligible_records: HashMap<MemoryId, CachedRecord> = namespace_records
             .into_iter()
             .filter(|record| Self::passes_hard_filters(record, &query, ns_config.id))
             .map(|record| (record.id, record))
@@ -655,6 +692,7 @@ impl QueryEngine {
                 &eligible_records,
                 &mut diagnostics,
                 &mut timings,
+                Some(&strength_context),
             )
             .await?;
             total_matches = candidates.len();
@@ -662,8 +700,15 @@ impl QueryEngine {
             // -- Stage 4b: Graph Expansion ------------------------------------
             {
                 let stage_start = Instant::now();
-                self.expand_graph_candidates(&mut candidates, ns_config.id, query.graph_depth)
-                    .await?;
+                self.expand_graph_candidates(
+                    &mut candidates,
+                    ns_config.id,
+                    query.graph_depth,
+                    query.record_access,
+                    Some(&strength_context),
+                    &eligible_records,
+                )
+                .await?;
                 timings.graph_expansion_us = stage_start.elapsed().as_micros() as u64;
             }
 
@@ -699,8 +744,14 @@ impl QueryEngine {
             timings.rank_us = stage_start.elapsed().as_micros() as u64;
 
             // -- Stage 8c: Supersedes Resolution ------------------------------
-            self.resolve_supersedes(&mut candidates, &query, &query_entities, ns_config.id)
-                .await;
+            self.resolve_supersedes(
+                &mut candidates,
+                &query,
+                &query_entities,
+                ns_config.id,
+                Some(&strength_context),
+            )
+            .await?;
 
             candidates.sort_by(|a, b| {
                 b.composite_score
@@ -723,7 +774,9 @@ impl QueryEngine {
         timings.total_us = pipeline_start.elapsed().as_micros() as u64;
         let query_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
 
-        self.record_accesses_async(&candidates);
+        if query.record_access {
+            self.record_accesses_async(&candidates);
+        }
 
         let response = SearchResponse {
             results,
@@ -836,6 +889,9 @@ impl QueryEngine {
         candidates: &mut Vec<Candidate>,
         namespace_id: NamespaceId,
         graph_depth: u8,
+        record_access: bool,
+        context: Option<&StrengthContext>,
+        eligible: &HashMap<MemoryId, CachedRecord>,
     ) -> Result<()> {
         if graph_depth == 0 || candidates.is_empty() {
             return Ok(());
@@ -850,9 +906,17 @@ impl QueryEngine {
             return Ok(());
         }
 
-        let activated = self
-            .graph
-            .spreading_activation(&seeds, namespace_id, graph_depth);
+        let activated = if context.is_some_and(StrengthContext::explicit) {
+            self.graph.spreading_activation_canonical(
+                &seeds,
+                namespace_id,
+                graph_depth,
+                eligible,
+            )?
+        } else {
+            self.graph
+                .spreading_activation(&seeds, namespace_id, graph_depth)
+        };
 
         let existing_ids: std::collections::HashSet<MemoryId> =
             candidates.iter().map(|c| c.record.id).collect();
@@ -866,7 +930,11 @@ impl QueryEngine {
             let load_ids: Vec<MemoryId> = new_ids.iter().map(|(mid, _)| *mid).collect();
             let activation_map: std::collections::HashMap<MemoryId, f32> =
                 new_ids.into_iter().collect();
-            let expand_records = self.load_records(&load_ids).await?;
+            let expand_records = if context.is_some() {
+                self.strength_records(&load_ids, context).await?
+            } else {
+                self.load_records(&load_ids, record_access).await?
+            };
 
             for record in expand_records {
                 let activation = activation_map.get(&record.id).copied().unwrap_or(0.0);
@@ -972,7 +1040,8 @@ impl QueryEngine {
         query: &SearchQuery,
         query_entities: &[String],
         namespace_id: NamespaceId,
-    ) {
+        context: Option<&StrengthContext>,
+    ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
 
         // -- Plan: which candidates are superseded, and by what. Nothing is
@@ -989,7 +1058,7 @@ impl QueryEngine {
             .collect();
 
         if planned.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Several superseded candidates can share one replacement; it
@@ -1017,9 +1086,12 @@ impl QueryEngine {
         // query's filters before letting it displace anything.
         let mut injected: Vec<Candidate> = Vec::with_capacity(to_load.len());
         if !to_load.is_empty() {
-            let records = match self.meta_store.get_batch(&to_load).await {
+            let records = match self.strength_records(&to_load, context).await {
                 Ok(records) => records,
                 Err(e) => {
+                    if context.is_some_and(StrengthContext::explicit) {
+                        return Err(e);
+                    }
                     // Without the replacements there is nothing to put in
                     // the originals' place, so the originals stay.
                     warn!(
@@ -1027,7 +1099,7 @@ impl QueryEngine {
                         count = to_load.len(),
                         "failed to load supersedes replacements; keeping the superseded memories in the results"
                     );
-                    return;
+                    return Ok(());
                 }
             };
 
@@ -1078,31 +1150,47 @@ impl QueryEngine {
             .collect();
 
         candidates.extend(injected);
+        Ok(())
     }
 
     /// Retrieve a single memory by ID.
     #[instrument(skip(self))]
     pub async fn get_memory(&self, id: MemoryId) -> Result<Option<MemoryResponse>> {
-        let record = match self.cache.get(&id) {
+        self.get_memory_with_access(id, true).await
+    }
+
+    pub async fn get_memory_with_access(
+        &self,
+        id: MemoryId,
+        record_access: bool,
+    ) -> Result<Option<MemoryResponse>> {
+        let canonical = self.meta_store.get(&id).await?;
+        if let Some(record) = &canonical {
+            strength::require_legacy_helper(record)?;
+        }
+        let record = match record_access.then(|| self.cache.get(&id)).flatten() {
             Some(r) => r,
-            None => match self.meta_store.get(&id).await? {
+            None => match canonical {
                 Some(r) => r,
                 None => return Ok(None),
             },
         };
 
-        // Record access (fire-and-forget).
-        let recorder = Arc::clone(&self.access_recorder);
-        let access_id = id;
-        tokio::spawn(async move {
-            if let Err(e) = recorder
-                .record_access(access_id, AccessKind::DirectRetrieval)
-                .await
-            {
-                warn!("failed to record access for {access_id:?}: {e}");
-            }
-        });
+        strength::require_legacy_helper(&record)?;
 
+        // Preserve legacy fire-and-forget only when access is permitted.
+        if record_access {
+            let recorder = Arc::clone(&self.access_recorder);
+            let access_id = id;
+            tokio::spawn(async move {
+                if let Err(e) = recorder
+                    .record_access(access_id, AccessKind::DirectRetrieval)
+                    .await
+                {
+                    warn!("failed to record access for {access_id:?}: {e}");
+                }
+            });
+        }
         Ok(Some(MemoryResponse {
             id: record.id,
             namespace: String::new(), // Resolved by API layer from namespace_id
@@ -1128,16 +1216,29 @@ impl QueryEngine {
     /// Find the K most similar memories to a given memory.
     #[instrument(skip(self))]
     pub async fn similar(&self, id: MemoryId, k: usize) -> Result<Vec<SearchResult>> {
+        self.similar_with_access(id, k, true).await
+    }
+
+    pub async fn similar_with_access(
+        &self,
+        id: MemoryId,
+        k: usize,
+        record_access: bool,
+    ) -> Result<Vec<SearchResult>> {
         let k = k.clamp(1, SearchQuery::MAX_USER_LIMIT);
 
-        let record = match self.cache.get(&id) {
+        let canonical = self
+            .meta_store
+            .get(&id)
+            .await?
+            .ok_or(SearchError::MemoryNotFound(id))?;
+        strength::require_legacy_helper(&canonical)?;
+        let record = match record_access.then(|| self.cache.get(&id)).flatten() {
             Some(r) => r,
-            None => self
-                .meta_store
-                .get(&id)
-                .await?
-                .ok_or(SearchError::MemoryNotFound(id))?,
+            None => canonical,
         };
+
+        strength::require_legacy_helper(&record)?;
 
         // Load the source memory's embedding from the vector index.
         let source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
@@ -1157,7 +1258,10 @@ impl QueryEngine {
             .collect();
 
         let result_ids: Vec<MemoryId> = filtered.iter().map(|s| s.memory_id).collect();
-        let records = self.load_records(&result_ids).await?;
+        let records = self.meta_store.get_batch(&result_ids).await?;
+        for record in &records {
+            strength::require_legacy_helper(record)?;
+        }
 
         // Build a lookup map so we can iterate `filtered` (which preserves
         // descending similarity order from the vector search) instead of
@@ -1202,7 +1306,7 @@ impl QueryEngine {
             .iter()
             .map(|r| (r.memory_id, AccessKind::AssociativeRetrieval))
             .collect();
-        if !accesses.is_empty() {
+        if record_access && !accesses.is_empty() {
             let recorder = Arc::clone(&self.access_recorder);
             tokio::spawn(async move {
                 if let Err(e) = recorder.record_access_batch(&accesses).await {
@@ -1219,7 +1323,10 @@ impl QueryEngine {
     // =====================================================================
 
     /// Load records for a batch of MemoryIds, checking RAM cache first.
-    async fn load_records(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>> {
+    async fn load_records(&self, ids: &[MemoryId], use_cache: bool) -> Result<Vec<CachedRecord>> {
+        if !use_cache {
+            return self.meta_store.get_batch(ids).await;
+        }
         let mut results = Vec::with_capacity(ids.len());
         let mut cache_misses = Vec::new();
 
@@ -1330,8 +1437,8 @@ impl QueryEngine {
 
     /// Compute effective retrievability for a memory.
     ///
-    /// Uses the pre-computed decay_strength which already includes the
-    /// connection bonus from spreading activation.
+    /// Uses canonical materialized effective R for legacy lifecycle, or the
+    /// operation-local A3 projection for explicit-feedback lifecycle.
     fn compute_effective_r(record: &CachedRecord) -> f32 {
         record.decay_strength.clamp(0.0, 1.0)
     }
@@ -1600,6 +1707,7 @@ mod tests {
     /// A Full-phase, strong, untagged record in namespace 1.
     pub(super) fn rec(id: MemoryId) -> CachedRecord {
         CachedRecord {
+            lifecycle: None,
             id,
             namespace_id: ns(),
             created_at: 1_700_000_000_000,
@@ -1673,8 +1781,15 @@ mod tests {
 
         let mut candidates = vec![candidate(rec(old), 0.8)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(ids(&candidates), vec![new]);
         assert!(candidates[0].composite_score >= 0.8);
@@ -1690,8 +1805,15 @@ mod tests {
 
         let mut candidates = vec![candidate(rec(old), 0.8), candidate(rec(new), 0.9)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(ids(&candidates), vec![new]);
     }
@@ -1709,8 +1831,15 @@ mod tests {
 
         let mut candidates = vec![candidate(rec(old), 0.8)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(ids(&candidates), vec![old]);
     }
@@ -1726,8 +1855,15 @@ mod tests {
 
         let mut candidates = vec![candidate(rec(old), 0.8)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(ids(&candidates), vec![old]);
     }
@@ -1748,8 +1884,10 @@ mod tests {
                 &query(json!({"text": "q", "includeGhosts": true})),
                 &[],
                 ns(),
+                None,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(ids(&candidates), vec![new]);
     }
@@ -1769,8 +1907,15 @@ mod tests {
 
         let mut candidates = vec![candidate(rec(old), 0.8)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(ids(&candidates), vec![old]);
     }
@@ -1821,8 +1966,9 @@ mod tests {
 
             let mut candidates = vec![candidate(original, 0.8)];
             engine
-                .resolve_supersedes(&mut candidates, &query(q), &[], ns())
-                .await;
+                .resolve_supersedes(&mut candidates, &query(q), &[], ns(), None)
+                .await
+                .unwrap();
 
             assert_eq!(ids(&candidates), vec![old], "{label}");
         }
@@ -1839,8 +1985,15 @@ mod tests {
 
         let mut candidates = vec![candidate(rec(old), 0.8)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(ids(&candidates), vec![old]);
     }
@@ -1855,8 +2008,15 @@ mod tests {
 
         let mut candidates = vec![candidate(rec(old), 0.8)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(ids(&candidates), vec![old]);
     }
@@ -1875,8 +2035,15 @@ mod tests {
 
         let mut candidates = vec![candidate(rec(old_a), 0.5), candidate(rec(old_b), 0.85)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(ids(&candidates), vec![new]);
         assert!(candidates[0].composite_score >= 0.85);
@@ -2200,7 +2367,7 @@ mod tests {
                 }
                 engine.resolve_supersedes(&mut candidates, &query(json!({"text": "q",
                     "timeRangeStart": 1_699_999_999_000i64, "timeRangeEnd": 1_700_000_001_000i64
-                })), &[], ns()).await;
+                })), &[], ns(), None).await.unwrap();
                 candidates
                     .sort_by(|a, b| b.composite_score.partial_cmp(&a.composite_score).unwrap());
                 assert_eq!(candidates[0].record.id, mid(100));
@@ -2219,8 +2386,9 @@ mod tests {
         let mut candidates = vec![candidate(rec(mid(1)), 0.9), candidate(rec(mid(2)), 0.1)];
         engine.apply_filters(&mut candidates, &q, &[], ns());
         engine
-            .resolve_supersedes(&mut candidates, &q, &[], ns())
-            .await;
+            .resolve_supersedes(&mut candidates, &q, &[], ns(), None)
+            .await
+            .unwrap();
         assert_eq!(ids(&candidates), vec![mid(2)]);
         assert_eq!(candidates[0].composite_score, 0.9);
         assert_eq!(candidates[0].raw_vector_score, None);
@@ -2228,8 +2396,15 @@ mod tests {
         // A newly discovered terminal has no independent metadata-channel score.
         let mut candidates = vec![candidate(rec(mid(1)), 0.01)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(candidates[0].composite_score, 0.01);
     }
 
@@ -2253,8 +2428,15 @@ mod tests {
         let engine = engine(graph, meta);
         let mut candidates = vec![candidate(rec(mid(1)), 0.9), candidate(rec(mid(2)), 0.1)];
         engine
-            .resolve_supersedes(&mut candidates, &query(json!({"text": "q"})), &[], ns())
-            .await;
+            .resolve_supersedes(
+                &mut candidates,
+                &query(json!({"text": "q"})),
+                &[],
+                ns(),
+                None,
+            )
+            .await
+            .unwrap();
         // Legacy fallback keeps the original; stale terminal metadata cannot leak it.
         assert_eq!(ids(&candidates), vec![mid(1)]);
     }

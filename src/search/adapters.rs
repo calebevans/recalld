@@ -3,7 +3,7 @@
 //! Each adapter struct wraps a concrete subsystem type and implements
 //! the corresponding DI trait from `pipeline.rs`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,6 +25,50 @@ use super::pipeline::{
     RifProcessor, RifSuppression, ScoredResult, VectorIndexRegistry,
 };
 use super::{EntityIndex, FlatVectorIndex, FtsIndex, SearchFilter, VectorIndex};
+
+// Explicit offline harness adapter. Ordinary storage open still rejects schema
+// v2. Snapshot ownership pins canonical files; this adapter has no write API.
+#[async_trait]
+impl NamespaceResolver for crate::storage::offline_snapshot::OfflineSnapshot {
+    async fn resolve(&self, name: &str) -> Result<NamespaceConfig> {
+        self.namespaces()
+            .iter()
+            .find(|ns| ns.name == name)
+            .cloned()
+            .ok_or_else(|| SearchError::NamespaceNotFound(name.into()))
+    }
+}
+
+#[async_trait]
+impl MetadataStore for crate::storage::offline_snapshot::OfflineSnapshot {
+    async fn get(&self, id: &MemoryId) -> Result<Option<CachedRecord>> {
+        self.record(*id)
+            .map(|item| item.map(|item| CachedRecord::from(&item.record)))
+            .map_err(|e| SearchError::MetadataError(e.to_string()))
+    }
+    async fn get_batch(&self, ids: &[MemoryId]) -> Result<Vec<CachedRecord>> {
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(record) = self.get(id).await? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+    async fn list_namespace_memories(&self, namespace: NamespaceId) -> Result<Vec<MemoryId>> {
+        // ponytail: complete offline scan; a serving adapter must use A1's
+        // certified namespace view. No claim of online enumeration performance.
+        let mut ids = Vec::new();
+        self.for_each_record(|item| {
+            if item.record.namespace_id == namespace.get() {
+                ids.push(MemoryId::from_bytes(item.record.id));
+            }
+            Ok(())
+        })
+        .map_err(|e| SearchError::MetadataError(e.to_string()))?;
+        Ok(ids)
+    }
+}
 
 // ── NamespaceResolver ──────────────────────────────────────────────
 
@@ -380,19 +424,27 @@ impl RifProcessor for RifProcessorAdapter {
 
 /// Adapts `RedbStorageEngine` to `AccessRecorder`.
 pub struct StorageAccessRecorder {
+    clock: Arc<dyn crate::time::Clock>,
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
 }
 
 impl StorageAccessRecorder {
     pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            clock: Arc::new(crate::time::SystemClock),
+        }
+    }
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
 #[async_trait]
 impl AccessRecorder for StorageAccessRecorder {
     async fn record_access(&self, id: MemoryId, kind: AccessKind) -> Result<()> {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = self.clock.now_millis();
         let storage = self.storage.clone();
         tokio::task::spawn_blocking(move || {
             let storage_r = storage
@@ -407,7 +459,7 @@ impl AccessRecorder for StorageAccessRecorder {
     }
 
     async fn record_access_batch(&self, accesses: &[(MemoryId, AccessKind)]) -> Result<()> {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = self.clock.now_millis();
         let storage = self.storage.clone();
         let accesses = accesses.to_vec();
         tokio::task::spawn_blocking(move || {
@@ -440,6 +492,46 @@ impl SharedGraphReader {
 }
 
 impl GraphReader for SharedGraphReader {
+    fn connection_bonuses(
+        &self,
+        strengths: &HashMap<MemoryId, f32>,
+    ) -> Result<HashMap<MemoryId, f32>> {
+        let graph = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.graph.read())
+        });
+        let config = crate::graph::activation::ActivationConfig::default();
+        Ok(strengths
+            .keys()
+            .map(|&id| {
+                (
+                    id,
+                    crate::graph::activation::connection_bonus_with_strengths(
+                        id, &graph, &config, strengths,
+                    ),
+                )
+            })
+            .collect())
+    }
+
+    fn spreading_activation_canonical(
+        &self,
+        seeds: &[(MemoryId, f32)],
+        namespace: NamespaceId,
+        depth: u8,
+        records: &HashMap<MemoryId, CachedRecord>,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        let graph = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.graph.read())
+        });
+        Ok(crate::graph::activation::spreading_activation_with_records(
+            &graph,
+            seeds,
+            namespace,
+            &spreading_config(depth),
+            records,
+        ))
+    }
+
     fn supersession_links(
         &self,
         id: MemoryId,
@@ -493,21 +585,7 @@ impl GraphReader for SharedGraphReader {
         let graph = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.graph.read())
         });
-        let mut config = crate::graph::activation::SpreadingActivationConfig::default();
-        match graph_depth {
-            2 => {
-                config.max_budget = 200;
-                config.firing_threshold = 0.02;
-                config.output_threshold = 0.015;
-            }
-            3 => {
-                config.max_budget = 400;
-                config.hop_decay = 0.85;
-                config.firing_threshold = 0.015;
-                config.output_threshold = 0.01;
-            }
-            _ => {}
-        }
+        let config = spreading_config(graph_depth);
         crate::graph::activation::spreading_activation(&graph, seeds, namespace_id, &config)
     }
 
@@ -565,6 +643,25 @@ impl EntityIndexReader for SharedEntityIndexReader {
             })
             .collect())
     }
+}
+
+fn spreading_config(graph_depth: u8) -> crate::graph::activation::SpreadingActivationConfig {
+    let mut config = crate::graph::activation::SpreadingActivationConfig::default();
+    match graph_depth {
+        2 => {
+            config.max_budget = 200;
+            config.firing_threshold = 0.02;
+            config.output_threshold = 0.015;
+        }
+        3 => {
+            config.max_budget = 400;
+            config.hop_decay = 0.85;
+            config.firing_threshold = 0.015;
+            config.output_threshold = 0.01;
+        }
+        _ => {}
+    }
+    config
 }
 
 #[cfg(test)]

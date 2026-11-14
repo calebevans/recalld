@@ -220,6 +220,12 @@ fn default_namespace() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
+    /// False forbids retrieval-attributable writes; omission preserves v1 behavior.
+    #[serde(
+        rename = "recordAccess",
+        default = "crate::search::default_record_access"
+    )]
+    pub record_access: bool,
     /// Natural-language query text. The server generates an
     /// embedding from this for similarity search.
     #[serde(default)]
@@ -356,6 +362,7 @@ mod tests {
     /// A `MemoryResponse` as every read endpoint produces it.
     fn response() -> MemoryResponse {
         let record = CachedRecord {
+            lifecycle: None,
             id: MemoryId::new(),
             namespace_id: crate::model::NamespaceId::new(1),
             created_at: 0,

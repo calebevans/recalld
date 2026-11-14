@@ -197,6 +197,7 @@ pub enum SystemState {
 /// Only one `Recalld` instance should exist per process. The
 /// exclusive file locks on storage files enforce this at the OS level.
 pub struct Recalld {
+    clock: Arc<dyn crate::time::Clock>,
     // -- Configuration ------------------------------------------------
     config: Arc<RecalldConfig>,
 
@@ -258,6 +259,15 @@ impl Recalld {
     /// Resources acquired before the failure are cleaned up by normal
     /// `Drop` behavior.
     pub async fn new(config: RecalldConfig) -> Result<Self> {
+        Self::with_clock(config, Arc::new(crate::time::SystemClock)).await
+    }
+
+    /// Construct an isolated instance with a shared lifecycle clock.
+    /// Search-pipeline exposure clock injection is a separate A2 handoff.
+    pub async fn with_clock(
+        config: RecalldConfig,
+        clock: Arc<dyn crate::time::Clock>,
+    ) -> Result<Self> {
         let config = Arc::new(config);
         let (shutdown_tx, _) = watch::channel(false);
         let drain_notify = Arc::new(Notify::new());
@@ -601,7 +611,7 @@ impl Recalld {
             let rif_proc: Arc<dyn crate::search::RifProcessor> =
                 Arc::new(RifProcessorAdapter::new(rif_engine.clone(), graph.clone()));
             let access_rec: Arc<dyn crate::search::AccessRecorder> =
-                Arc::new(StorageAccessRecorder::new(storage.clone()));
+                Arc::new(StorageAccessRecorder::new(storage.clone()).with_clock(clock.clone()));
 
             let engine = QueryEngine::new(
                 ns_resolver,
@@ -614,6 +624,11 @@ impl Recalld {
                 graph_reader,
                 rif_proc,
                 access_rec,
+            )
+            .with_lifecycle_inputs(
+                clock.clone(),
+                DecayConfig::default(),
+                config.decay.decay_rate_multiplier,
             );
             tracing::info!("query engine initialized");
             Arc::new(engine)
@@ -642,6 +657,7 @@ impl Recalld {
                 config.decay.decay_rate_multiplier,
             ) {
                 Ok(runner) => {
+                    let runner = runner.with_clock(clock.clone());
                     let handle = runner.start();
                     tracing::info!("decay sweep runner started");
                     (Some(runner), Some(handle))
@@ -675,6 +691,7 @@ impl Recalld {
 
             if !has_default {
                 let ns_config = crate::model::NamespaceConfig {
+                    schema: None,
                     id: crate::model::NamespaceId::UNSET,
                     name: crate::model::constants::DEFAULT_NAMESPACE_NAME.to_string(),
                     embedding_dim: config.embedding.dimensions as u32,
@@ -682,7 +699,7 @@ impl Recalld {
                     default_difficulty: 5.0,
                     phase_thresholds: crate::model::namespace::PhaseThresholds::default(),
                     permastore_threshold: 1500.0,
-                    created_at: chrono::Utc::now().timestamp_millis(),
+                    created_at: clock.now_millis(),
                     desired_retention: 0.9,
                     decay_rate_multiplier: None,
                 };
@@ -710,6 +727,7 @@ impl Recalld {
         tracing::info!("Recalld initialized");
 
         Ok(Self {
+            clock,
             config,
             storage,
             graph,
@@ -727,6 +745,11 @@ impl Recalld {
             inflight_count,
             state: SystemState::Ready,
         })
+    }
+
+    /// Shared clock for creation, feedback and sweeps in this instance.
+    pub fn clock(&self) -> &Arc<dyn crate::time::Clock> {
+        &self.clock
     }
 
     // -- Accessor methods ---------------------------------------------
