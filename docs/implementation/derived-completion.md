@@ -91,5 +91,12 @@ refills, unavailable duplicate advisories, and a child process exiting after
 all online views publish but before acknowledgement followed by reopen.
 These process-crash checks do **not** establish power-loss durability.
 
-Exact source commit and final suite/fmt/Clippy results are recorded below after
-validation completes. Full A1/A3 storage/lifecycle contracts remain incomplete.
+Validated source commit: `ad7b8f8d65e650bdfa0b57f757b2dd9b8e9cc555`. `cargo test --offline`: **550 passed**, no failures; **4 ignored doctests**. `cargo fmt --all -- --check`: passed. `cargo clippy --offline --all-targets`: passed with warnings (277 for lib-test, including inherited large-error/style warnings); this is not a warning-free claim. Logs remain in this worktree's untracked `.validation/tests.log` and `.validation/clippy.log`. No source changes followed these checks; this final validation entry is documentation only.
+
+Independent lifecycle review: original graph-race synthetic probe fails on
+`862ff28`; the return-type-adapted probe passes on atomic `e0187fc` (1 passed,
+558 filtered), after source review of parent fix `745ca69` and its atomic helper
+integration. It proves this intervening saving-edge case, not all-writer graph
+atomicity. Evidence is being preserved separately in the research worktree.
+
+Full A1/A3 storage/lifecycle contracts remain incomplete.
