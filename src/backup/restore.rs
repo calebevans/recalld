@@ -194,12 +194,25 @@ fn read_manifest(backup_path: &Path) -> Result<BackupManifest, RestoreError> {
     let mut archive = ZipArchive::new(file)?;
 
     // Find manifest file.
-    let mut manifest_file = archive
+    let manifest_file = archive
         .by_name("backup_manifest.json")
         .map_err(|_| RestoreError::InvalidArchive("missing backup_manifest.json".to_string()))?;
 
+    let limit = super::manifest::MAX_MANIFEST_BYTES;
+    if manifest_file.size() > limit {
+        return Err(RestoreError::ManifestError(
+            "manifest exceeds 16 MiB limit".into(),
+        ));
+    }
     let mut contents = String::new();
-    manifest_file.read_to_string(&mut contents)?;
+    manifest_file
+        .take(limit + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > limit {
+        return Err(RestoreError::ManifestError(
+            "manifest exceeds 16 MiB limit".into(),
+        ));
+    }
 
     serde_json::from_str(&contents).map_err(|e| RestoreError::ManifestError(e.to_string()))
 }
@@ -426,6 +439,7 @@ fn extract_backup(
     {
         return Err(invalid("manifest contains a noncanonical namespace file"));
     }
+    super::schema_manifest::validate_manifest_snapshot(data_dir, manifest)?;
     Ok(())
 }
 
@@ -489,6 +503,27 @@ mod tests {
         let files = canonical_files(&source).unwrap();
         let manifest = generate_manifest(&source, &files).unwrap();
         (source, manifest)
+    }
+
+    // Deliberately bypass production generation for semantically corrupt but
+    // checksum-consistent archives. Production generation now rejects these.
+    pub(super) fn checksum_valid_manifest(
+        source: &Path,
+        mut manifest: BackupManifest,
+    ) -> BackupManifest {
+        manifest.total_size_bytes = 0;
+        for entry in &mut manifest.files {
+            let bytes = fs::read(source.join(&entry.name)).unwrap();
+            entry.size_bytes = bytes.len() as u64;
+            entry.crc32 = crc32fast::hash(&bytes);
+            if entry.sha256.is_some() {
+                entry.sha256 = Some(
+                    super::super::schema_manifest::sha256_file(&source.join(&entry.name)).unwrap(),
+                );
+            }
+            manifest.total_size_bytes += entry.size_bytes;
+        }
+        manifest
     }
 
     fn archive(root: &Path, source: &Path, manifest: &BackupManifest) -> PathBuf {
@@ -565,12 +600,7 @@ mod tests {
         assert!(RedbStorageEngine::open(&source).is_err());
         assert_eq!(fs::read(source.join("meta.db")).unwrap(), metadata_before);
         // Recompute every manifest checksum/size: rejection must be semantic.
-        let files: Vec<_> = manifest
-            .files
-            .iter()
-            .map(|f| source.join(&f.name))
-            .collect();
-        let forged_manifest = generate_manifest(&source, &files).unwrap();
+        let forged_manifest = checksum_valid_manifest(&source, manifest);
         let archive = archive(root.path(), &source, &forged_manifest);
         let target = root.path().join("target");
         fs::create_dir(&target).unwrap();
@@ -834,12 +864,7 @@ mod tests {
             assert!(canonical_files(&source).is_err());
             assert_eq!(fs::read(source.join("meta.db")).unwrap(), source_before);
             // Use a checksum-valid archive to isolate semantic validation.
-            let files: Vec<_> = manifest
-                .files
-                .iter()
-                .map(|f| source.join(&f.name))
-                .collect();
-            let manifest = generate_manifest(&source, &files).unwrap();
+            let manifest = checksum_valid_manifest(&source, manifest);
             let archive = archive(root.path(), &source, &manifest);
             let target = root.path().join("target");
             fs::create_dir(&target).unwrap();
@@ -1236,103 +1261,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_restore_terminal_ledger_survives_tombstone() {
-        let root = tempfile::tempdir().unwrap();
-        let (target, manifest) = fixture(root.path());
-        let backup = archive(root.path(), &target, &manifest);
-        let mut engine = RedbStorageEngine::open(&target).unwrap();
-        let (id, original) = engine.scan_all().unwrap().remove(0);
-        let ns = crate::model::NamespaceId::new(original.namespace_id);
-        engine.tombstone_memory(id).unwrap();
-        engine.sync().unwrap();
-        drop(engine);
-        restore_from_backup(retained_options(&backup, &target))
-            .await
-            .unwrap();
-        let mut engine = RedbStorageEngine::open(&target).unwrap();
-        let record = engine.get_record(id).unwrap().unwrap();
-        assert_eq!(record.phase, DecayPhase::Tombstone);
-        assert!(record.summary.is_empty() && record.tags.is_empty());
-        assert_eq!((record.text_offset, record.text_length), (0, 0));
-        assert!(
-            engine
-                .vector_manager()
-                .get(ns)
-                .unwrap()
-                .is_free(original.vector_slot)
-        );
-        let fts = crate::search::FtsIndex::new(&target).unwrap();
-        assert!(fts.search(ns, "backup fixture", 10).unwrap().is_empty());
-        let mut reused = original;
-        assert!(
-            engine
-                .insert_memory(id, ns, &mut reused, &[1.; 4], Some("resurrect"))
-                .is_err()
-        );
-        let snapshot = engine.meta_store().control_state().unwrap();
-        assert_eq!(
-            snapshot.committed_generation.get(),
-            1,
-            "rejected UUID reuse cannot write"
-        );
-    }
-
-    #[tokio::test]
-    async fn retained_restore_completed_purge_requires_offline_progress_consumer() {
-        fn files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
-            fn visit(
-                root: &Path,
-                path: &Path,
-                out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
-            ) {
-                for entry in fs::read_dir(path).unwrap() {
-                    let path = entry.unwrap().path();
-                    if path.is_dir() {
-                        visit(root, &path, out);
-                    } else {
-                        out.insert(
-                            path.strip_prefix(root).unwrap().to_owned(),
-                            fs::read(path).unwrap(),
-                        );
-                    }
-                }
+    async fn retained_restore_terminal_ledger_survives_tombstone_and_namespace_purge() {
+        for purge in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (target, manifest) = fixture_with_namespace(
+                root.path(),
+                &[1., 2., 3., 4.],
+                if purge { "retired" } else { "default" },
+            );
+            let backup = archive(root.path(), &target, &manifest);
+            let mut engine = RedbStorageEngine::open(&target).unwrap();
+            let (id, original) = engine.scan_all().unwrap().remove(0);
+            let ns = crate::model::NamespaceId::new(original.namespace_id);
+            engine.tombstone_memory(id).unwrap();
+            if purge {
+                engine.purge_namespace(ns).unwrap();
             }
-            let mut result = std::collections::BTreeMap::new();
-            visit(root, root, &mut result);
-            result
+            engine.sync().unwrap();
+            drop(engine);
+            restore_from_backup(retained_options(&backup, &target))
+                .await
+                .unwrap();
+            let mut engine = RedbStorageEngine::open(&target).unwrap();
+            if purge {
+                assert!(engine.get_record(id).unwrap().is_none());
+            } else {
+                let record = engine.get_record(id).unwrap().unwrap();
+                assert_eq!(record.phase, DecayPhase::Tombstone);
+                assert!(record.summary.is_empty() && record.tags.is_empty());
+                assert_eq!((record.text_offset, record.text_length), (0, 0));
+            }
+            if purge {
+                assert!(engine.vector_manager().get(ns).is_none());
+                assert!(engine.get_namespace(ns).unwrap().is_none());
+                assert!(!target.join("retired").exists());
+            } else {
+                assert!(
+                    engine
+                        .vector_manager()
+                        .get(ns)
+                        .unwrap()
+                        .is_free(original.vector_slot)
+                );
+            }
+            let fts = crate::search::FtsIndex::new(&target).unwrap();
+            assert!(fts.search(ns, "backup fixture", 10).unwrap().is_empty());
+            let mut reused = original;
+            assert!(
+                engine
+                    .insert_memory(id, ns, &mut reused, &[1.; 4], Some("resurrect"))
+                    .is_err()
+            );
+            let snapshot = engine.meta_store().control_state().unwrap();
+            assert_eq!(
+                snapshot.committed_generation.get(),
+                1,
+                "rejected UUID reuse cannot write"
+            );
         }
-        let root = tempfile::tempdir().unwrap();
-        let (target, manifest) = fixture_with_namespace(root.path(), &[1., 2., 3., 4.], "retired");
-        let backup = archive(root.path(), &target, &manifest);
-        let mut engine = RedbStorageEngine::open(&target).unwrap();
-        let (id, record) = engine.scan_all().unwrap().remove(0);
-        let namespace = crate::model::NamespaceId::new(record.namespace_id);
-        engine.purge_namespace(namespace).unwrap();
-        assert!(engine.get_record(id).unwrap().is_none());
-        assert_eq!(
-            engine.meta_store().purge_progress().unwrap()[0].stage,
-            crate::storage::purge::PurgeStage::Complete
-        );
-        engine.sync().unwrap();
-        drop(engine);
-        let before = files(&target);
-        let archive_before = fs::read(&backup).unwrap();
-        // This guard slice deliberately rejects durable purge history until the
-        // offline consumer can merge complete progress with target receipts and
-        // preserve origin identities. The dependent child restores the positive
-        // no-resurrection case; allowlisting or dropping progress is not enough.
-        let error = restore_from_backup(retained_options(&backup, &target))
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported canonical restore tables"),
-            "{error}"
-        );
-        assert_eq!(files(&target), before);
-        assert_eq!(fs::read(&backup).unwrap(), archive_before);
-        assert!(!root.path().join("source.recalld-restore-pending").exists());
     }
 
     #[tokio::test]
@@ -1463,3 +1449,7 @@ mod tests {
 #[cfg(test)]
 #[path = "schema_restore_tests.rs"]
 mod schema_tests;
+
+#[cfg(test)]
+#[path = "purge_offline_tests.rs"]
+mod purge_offline_tests;

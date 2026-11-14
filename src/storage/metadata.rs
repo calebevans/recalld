@@ -7,6 +7,7 @@
 //!
 //! See CS-07 for the full specification.
 
+pub(crate) mod batch;
 mod catalog;
 pub(crate) mod effects;
 mod insertion;
@@ -91,6 +92,9 @@ pub struct MetadataStore {
     pub(crate) fail_effect_application: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) fail_purge_child_commit: std::sync::atomic::AtomicBool,
+    /// Store-local lost-ack probes: 1 reservation, 2 rejection, 3 child.
+    #[cfg(test)]
+    pub(crate) fail_batch_commit: std::sync::atomic::AtomicU8,
     // Lock order: engine gate -> publication -> redb -> phase_index.
     // Hold across commit and bitmap publication, including direct callers.
     publication: std::sync::RwLock<()>,
@@ -108,6 +112,13 @@ impl MetadataStore {
     /// - Creates all tables on first open.
     /// - Loads or rebuilds the phase index from persisted bitmaps.
     pub(crate) fn open(path: &Path) -> Result<Self, StorageError> {
+        if let Some(parent) = path.parent() {
+            if std::fs::symlink_metadata(parent.join(".recalld-importing")).is_ok() {
+                return Err(StorageError::RecoveryRequired(
+                    "incomplete logical import; resume using its original export".into(),
+                ));
+            }
+        }
         // redb's writable open can change bookkeeping. Reject historical mode
         // on a disposable copy even for callers bypassing the engine.
         if path.try_exists()? && path.metadata()?.len() > 0 {
@@ -178,6 +189,8 @@ impl MetadataStore {
             fail_effect_application: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_purge_child_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_batch_commit: std::sync::atomic::AtomicU8::new(0),
             publication: std::sync::RwLock::new(()),
             phase_index: std::sync::RwLock::new(PhaseIndex::new()),
         };

@@ -81,8 +81,20 @@ pub(crate) fn validate_existing(
         let p: PurgeProgress = control::decode(bytes.value())?;
         crate::model::validation::validate_namespace_name(&p.name)
             .map_err(|_| invalid("invalid name lease"))?;
+        // Active progress belongs to the current writer. Completed immutable
+        // history may survive a restore fork only under its verified bound.
+        let permitted_origin = crate::storage::lineage::permits_origin(
+            tx,
+            state,
+            control::GenerationRef {
+                store_id: p.store_id,
+                generation: p.last_receipt.committed_generation,
+            },
+        )? && (p.store_id == state.store_id
+            || p.stage == PurgeStage::Complete);
         if p.version != 1
-            || p.store_id != state.store_id
+            || !permitted_origin
+            || p.start_receipt.store_id != p.store_id
             || p.namespace_id.is_unset()
             || p.start_receipt.replayed
             || p.last_receipt.replayed
@@ -569,6 +581,7 @@ impl MetadataStore {
                 true,
                 false,
                 super::effects::RecordMutation::PurgeChunk(p),
+                None,
             )?;
             return Ok(Some(result));
         }

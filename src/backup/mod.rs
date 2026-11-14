@@ -7,6 +7,7 @@
 mod archive;
 pub mod manifest;
 pub mod restore;
+pub mod schema_manifest;
 
 use std::path::{Path, PathBuf};
 

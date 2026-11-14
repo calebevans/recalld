@@ -28,16 +28,29 @@ impl DerivedCompletion {
         generated_embedding: Vec<f32>,
         sampled_at: i64,
     ) -> Result<crate::storage::insertion::InsertResult, StorageError> {
+        self.insert_reserved(ctx, input, generated_embedding, sampled_at, None)
+            .await
+    }
+
+    pub(crate) async fn insert_reserved(
+        &self,
+        ctx: crate::storage::control::MutationContext,
+        input: crate::storage::insertion::InsertMemory,
+        generated_embedding: Vec<f32>,
+        sampled_at: i64,
+        child: Option<crate::storage::batch::BatchChild>,
+    ) -> Result<crate::storage::insertion::InsertResult, StorageError> {
         let gate = publication_gate(&self.storage).await?;
         let lease = gate.read_owned().await;
         let storage = self.storage.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
-            let receipt = storage.insert_memory_with_receipt(
+            let receipt = storage.insert_memory_reserved(
                 &ctx,
                 &input,
                 &generated_embedding,
                 sampled_at,
+                child.as_ref(),
             )?;
             let id = crate::storage::insertion::inserted_id(&receipt)?;
             let record = storage
@@ -120,6 +133,31 @@ impl DerivedCompletion {
                 ..
             }
         ))
+    }
+
+    pub(crate) async fn forget_reserved(
+        &self,
+        child: crate::storage::batch::BatchChild,
+        id: crate::model::MemoryId,
+    ) -> Result<crate::storage::control::WriteReceipt, StorageError> {
+        let gate = publication_gate(&self.storage).await?;
+        let lease = gate.read_owned().await;
+        let storage = self.storage.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            storage.tombstone_memory_reserved(&child.context(), id, Some(&child))
+        })
+        .await
+        .map_err(|e| failed(format!("batch forget worker outcome unknown: {e}")))?;
+        drop(lease);
+        let receipt = result?;
+        self.complete()
+            .await
+            .map_err(|source| StorageError::CommittedMutation {
+                receipt: Box::new(receipt.clone()),
+                source: Box::new(source),
+            })?;
+        Ok(receipt)
     }
 
     /// Retrying is safe: no receipt is acknowledged until every view is ready.

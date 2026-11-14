@@ -1,0 +1,27 @@
+diff --git a/src/storage/control.rs b/src/storage/control.rs
+index 5d4af71..2e35cb7 100644
+--- a/src/storage/control.rs
++++ b/src/storage/control.rs
+@@ -718,7 +718,9 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
+         | MutationOutcome::NamespaceCreated { .. }
+         | MutationOutcome::NamespacePolicyUpdated { .. }
+         | MutationOutcome::NamespacePurgeStarted { .. }
+-        | MutationOutcome::NamespacePurgeAdvanced { .. } => {}
++        | MutationOutcome::NamespacePurgeAdvanced { .. }
++        | MutationOutcome::BatchReserved { .. }
++        | MutationOutcome::BatchItemRejected { .. } => {}
+     }
+     Ok(stored)
+ }
+diff --git a/src/storage/metadata/lifecycle_updates.rs b/src/storage/metadata/lifecycle_updates.rs
+index 0c11754..1e36df0 100644
+--- a/src/storage/metadata/lifecycle_updates.rs
++++ b/src/storage/metadata/lifecycle_updates.rs
+@@ -286,6 +286,7 @@ impl MetadataStore {
+                 before: &before,
+                 after: &after,
+             },
++            None,
+         )
+         .map(|result| DecayMutationResult::Committed(result.receipt))
+     }

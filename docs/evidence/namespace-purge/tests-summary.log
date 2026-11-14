@@ -1,0 +1,19 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.48s
+test derived_completion::tests::actual_namespace_purge_returns_with_admission_open ... ok
+test storage::purge_tests::purge_actual_completion_resumes_accepted_work_and_reopens_all_views_without_restart ... ok
+test storage::purge_tests::purge_actual_consumer_publication_failure_retains_completion_receipt_then_retries ... ok
+test storage::purge_tests::purge_empty_final_unknown_keeps_lease_until_durable_cleanup_then_reopens ... ok
+test storage::purge_tests::purge_force_precondition_uses_canonical_rows_and_changes_nothing_on_rejection ... ok
+test storage::purge_tests::purge_actual_transport_retains_current_child_receipt_and_unknown_operation ... ok
+test storage::purge_tests::purge_multichunk_reopens_automatically_and_replays_before_cas_without_name_reuse_damage ... ok
+test storage::purge_tests::purge_malformed_progress_fails_disposable_preflight_without_source_change ... ok
+test storage::purge_tests::purge_offline_snapshot_backup_and_schema_migration_preserve_completed_history ... ok
+test storage::purge_tests::purge_process_child ... ok
+test storage::purge_tests::purge_unknown_child_reconciles_reserved_id_and_never_repeats_removal ... ok
+test storage::purge_tests::purge_process_boundaries_recover_start_chunk_edges_and_directory_cleanup ... ok
+test result: ok. 698 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 100.29s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s

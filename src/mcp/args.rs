@@ -705,6 +705,25 @@ pub fn reject_client_markup(field: &str, text: &str) -> Result<(), ArgError> {
 /// `checkDuplicates`, and finally the shared content limits from
 /// [`validate_legacy_memory_input`](crate::model::validation::validate_legacy_memory_input).
 pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreInput, ArgError> {
+    let input = parse_store_input_fields(item, default_namespace)?;
+    validate_legacy_memory_input(MemoryInputRef {
+        summary: &input.summary,
+        full_text: input.full_text.as_deref(),
+        tags: &input.tags,
+        entities: &input.entities,
+        topics: &input.topics,
+        emotions: &input.emotions,
+    })
+    .map_err(|e| ArgError::new(e.field().unwrap_or(""), e.to_string()))?;
+    Ok(input)
+}
+
+/// Parse unchanged caller fields for batch identity, before representation
+/// admission. Never use this as permission to normalize or execute a write.
+pub(crate) fn parse_store_input_fields(
+    item: &Value,
+    default_namespace: &str,
+) -> Result<StoreInput, ArgError> {
     if !item.is_object() {
         return Err(ArgError::new(
             "",
@@ -731,7 +750,7 @@ pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreI
     let supersedes = opt_uuid(item, "supersedes")?;
     let check_duplicates = opt_bool(item, "checkDuplicates")?;
 
-    validate_legacy_memory_input(MemoryInputRef {
+    crate::model::validation::validate_memory_input(MemoryInputRef {
         summary: &summary,
         full_text: full_text.as_deref(),
         tags: &tags,

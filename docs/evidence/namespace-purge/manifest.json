@@ -1,0 +1,85 @@
+{
+  "runtime": "f6e4d9263fe2d96fca16282eed47b1251ad5398b",
+  "parents": [
+    "dad8465f5b7e5d70f823d3f9b429b725401b12f7",
+    "d4f756c148b7ed817e0ff0b1d452846fece96c16"
+  ],
+  "join_correction": "97f0fd9",
+  "validation": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo test --offline --all-features",
+      "cargo clippy --offline --all-features --all-targets"
+    ],
+    "exit_codes": [
+      0,
+      0,
+      0
+    ],
+    "library_passed": 698,
+    "cli_passed": 1,
+    "failed": 0,
+    "doctests_ignored": 4,
+    "clippy_library_warnings": 411,
+    "clippy_test_warnings_including_duplicates": 431
+  },
+  "environment": {
+    "image": "recalld-ci:1.94",
+    "image_id": "sha256:daefdc9cbe9b0f39b1fc29d975148b3b10adc1bd4309f9ca1be8abd36ed811ef",
+    "RUSTUP_TOOLCHAIN": "1.94.1",
+    "CARGO_BUILD_JOBS": 2,
+    "network": "none",
+    "cpus": 2,
+    "memory": "4g",
+    "mounts": [
+      "assigned namespace-purge worktree:/work",
+      "separate copied scratch cargo:/cargo",
+      "separate copied scratch target:/target"
+    ],
+    "target_preparation": "cargo clean --offline -p recalld after copying cache"
+  },
+  "source_files_sha256": {
+    "src/derived_completion.rs": "9b3edd75c811e2e80c7a4a238d61549b404ab88a1f67ab1a2fa29111c5a34559",
+    "src/mcp/bridge_adapters.rs": "fef3bb974bd6fb7d73b8c31c27312d524d6f46c8edf4d99739f319eccde3a43d",
+    "src/storage/control.rs": "131b6b5216360976b89bf12adb90305f1f16c4d92637d0284443c7df4d99599e",
+    "src/storage/engine.rs": "1dc19695ea6d3e302a357ef76557b016b4a6d5b84bfc9b36ebbaa1beb3e913a7",
+    "src/storage/engine/purge.rs": "b806b050355c877ecabb949d486068c359f696f3867534f4c06ab4931ac73f37",
+    "src/storage/metadata.rs": "fabf446150f45a0017a66a17d6e094367f3bdfda3f7364ab34438efd866ca9e2",
+    "src/storage/metadata/effects.rs": "4918385d427cbd45630e5b5fc846fcf518b348a82b39d50d2b50e076f6c6f710",
+    "src/storage/metadata/insertion.rs": "e29e1366dba6b114918e2a9b77a04290c88f0b041e66812e5932f4cae8a269b2",
+    "src/storage/metadata/namespace_state.rs": "f75e8d5db777bd16cb5214872e0bed303d6671e1b775fadedad4dcd918ff583b",
+    "src/storage/metadata/purge.rs": "3daff8b8b2d2c32800b314ee5f3472af86beb513c5502ac7dce8770cca43713b",
+    "src/storage/mod.rs": "23faf0b2358c3c891af22b920198b3abad789b13fcfd6ed750dabdd842409646",
+    "src/storage/purge.rs": "a880d97617163830a8097d61f515f3185e602e6adccb3f991fdcf2425c254720",
+    "src/storage/purge_tests.rs": "abaacff1bfc888a4523da1039f91fbc2a817a67749cc69691c00b7abcefafa31",
+    "src/storage/validation.rs": "d11878e553124bec03aafaefdcc2f1ced501092bdacf3c71168ff85d8e0de7d1"
+  },
+  "retained_artifacts_sha256": {
+    "README.md": "b5b6318adc661a3eff3b6623e92b216aea8a87f62a614c5ba5006c96c3030ec7",
+    "child-identity.log": "428a6cd82dceaae45548ee3f89e593d01c83694ea29baf328b411e079bfc8278",
+    "clippy-summary.log": "6f6d9355b1c2ea1432f3011752d73b0b2249fe6a06fc0d3e6135ffbc4d7bebbd",
+    "parent-join-failures.log": "f6bb7e54fcad257de951474b5142ab62c299d867b7a3513342aee47904d7520e",
+    "tests-summary.log": "09cdc235e8f0f3baf41d4592667d3c78e5f012f66522edb09af87120df21cf31"
+  },
+  "full_validation_logs_sha256": {
+    "final-command.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "final-tests.log": "96cfcc1f9293f88ecfd6a3cb443e6f778303f75ac54dc2dc851160083d17fce7",
+    "final-clippy.log": "81fd9a474bb0d2884fa02d792727aae08338ae6650e50eea60e40ad094bc15ee",
+    "parent-tests.log": "9ee26aa299da562a5a3640be77642ab29022bb352c85aa816f0b38dd0f4e59f3",
+    "parent-fixes.log": "a16f6fd704e79c7e451d2c58710ae3d24736b1302c62529f0062276bc7483270",
+    "purge-tests.log": "2f8b96f23b2fbba0f8b8eb689571ef7c6b248557079b68a24f3cb856fae281a5",
+    "purge-tests-2.log": "ba8d2e4009c15b15754ea2da91fa3c1a9a50913757ff480aa287de3426a4942d",
+    "purge-tests-3.log": "50299f1d820b8341ea6a0e87489d1cd86c158c4cc3410ae22005c58eddc91cfa",
+    "purge-tests-4.log": "4d00839813685fee951f08c3cce2c5e85e7adfd426ed69c7dfdeca21d0f56371",
+    "purge-child-error.log": "247089af31e9fd788c922c219d7bee48184b313c1727ea309f7d85eaaca2f0a7"
+  },
+  "limits": [
+    "synthetic temporary stores only",
+    "process exit tests, not power loss",
+    "no offline_eval target in this minimal parent",
+    "published logical export faf0f81 and newer lineage-changing restore reject new tables until actual consumer integration",
+    "entry admission is not a query lease or all-writer barrier",
+    "native serving and public whole-store CAS remain gated"
+  ]
+}

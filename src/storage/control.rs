@@ -211,6 +211,17 @@ pub struct ExposureOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
 pub enum MutationOutcome {
+    BatchReserved {
+        batch_kind: super::batch::BatchKind,
+        item_count: u32,
+        caller_hash: [u8; 32],
+        resolution_hash: [u8; 32],
+    },
+    BatchItemRejected {
+        batch_operation_id: Uuid,
+        index: u32,
+        error: super::batch::BatchError,
+    },
     LifecycleMaterialized {
         #[serde(rename = "memoryId")]
         memory_id: MemoryId,
@@ -365,6 +376,7 @@ pub(crate) fn validate_existing(
             ));
         }
         super::metadata::purge::validate_existing(tx, None)?;
+        super::metadata::batch::validate_existing(tx, None)?;
         return Ok(None);
     }
     if !present.iter().all(|p| *p) {
@@ -393,7 +405,9 @@ pub(crate) fn validate_existing(
         let (lineage, scope, operation) = decode_scope(key.value())?;
         let stored = validate_receipt(value.value())?;
         let scope_matches = match &stored.receipt.outcome {
-            MutationOutcome::NamespaceCreated { .. } => scope == MutationScope::Catalog,
+            MutationOutcome::NamespaceCreated { .. }
+            | MutationOutcome::BatchReserved { .. }
+            | MutationOutcome::BatchItemRejected { .. } => scope == MutationScope::Catalog,
             MutationOutcome::NamespacePolicyUpdated { namespace_id }
             | MutationOutcome::NamespacePurgeStarted { namespace_id, .. }
             | MutationOutcome::NamespacePurgeAdvanced { namespace_id, .. } => {
@@ -476,6 +490,7 @@ pub(crate) fn validate_existing(
         }
     }
     super::metadata::purge::validate_existing(tx, Some(&state))?;
+    super::metadata::batch::validate_existing(tx, Some(&state))?;
     Ok(Some(state))
 }
 
@@ -703,7 +718,9 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
         | MutationOutcome::NamespaceCreated { .. }
         | MutationOutcome::NamespacePolicyUpdated { .. }
         | MutationOutcome::NamespacePurgeStarted { .. }
-        | MutationOutcome::NamespacePurgeAdvanced { .. } => {}
+        | MutationOutcome::NamespacePurgeAdvanced { .. }
+        | MutationOutcome::BatchReserved { .. }
+        | MutationOutcome::BatchItemRejected { .. } => {}
     }
     Ok(stored)
 }
