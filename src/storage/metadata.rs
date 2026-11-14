@@ -9,6 +9,7 @@
 
 mod lifecycle_updates;
 pub(crate) mod removal_ledger;
+pub(crate) mod text_generation;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -97,6 +98,7 @@ impl MetadataStore {
         let pristine;
         {
             let read = db.begin_read()?;
+            text_generation::read_selection(&read)?;
             pristine = read.list_tables()?.next().is_none()
                 && read.list_multimap_tables()?.next().is_none();
             let control = control::validate_existing(&read)?;

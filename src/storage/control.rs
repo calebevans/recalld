@@ -181,6 +181,14 @@ impl MutationContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MutationOutcome {
+    TextGenerationSelected {
+        #[serde(rename = "generationId")]
+        generation_id: Uuid,
+        #[serde(rename = "formatVersion")]
+        format_version: u16,
+        #[serde(rename = "entriesKept")]
+        entries_kept: u64,
+    },
     AccessRecorded {
         #[serde(rename = "memoryId")]
         memory_id: MemoryId,
