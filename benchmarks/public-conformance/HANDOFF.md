@@ -4,8 +4,9 @@ The executed baseline is commit `c9b4d42`, runtime `03d9b4d`, with immutable
 [report](REPORT.md), [final evidence](evidence.tgz) and
 [failed attempts](development-attempts.tgz). Later read-only documentation/test
 alignment in this branch does not retroactively change that measured runtime.
-Current source-selection support is a follow-up; it has separate boundary-test
-evidence and has not yet run the combined production candidate.
+Source-selection support has separate boundary-test evidence. The later
+[combined-runtime replay](combined-aeab9e6/REPORT.md) records the supplied frozen
+candidate and fixture revision2 separately from this original baseline.
 
 ## Exact baseline limits
 
@@ -135,7 +136,7 @@ commit drift and unsupported workspace/path dependencies.
 
 A read-only frozen snapshot of aligned branch
 `669a28b8d3b3ad4461c9c8cd32eb2f1d639ad360` selected126 files and explicitly
-excluded five legacy data files. No new combined runtime has been executed.
+excluded five legacy data files. At that source-selection checkpoint, no combined runtime had been executed.
 [Validation log, command, source hashes and snapshot inventory](source-selection-validation.tgz),
 SHA-256 `bff04242200361b91a9da45309d64c82ec18e73cc953b1dd28fd2a66d421060c`.
 The old final/failed-conformance archives remain byte-for-byte unchanged.

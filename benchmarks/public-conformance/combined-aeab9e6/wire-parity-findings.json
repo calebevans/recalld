@@ -1,0 +1,452 @@
+{
+  "derivation": "Post-run wire inspection of fixture-v2 raw trace.jsonl; no rerun or modified raw outputs",
+  "runtime": "aeab9e68e749e4e178576c2283a6173c11611a31",
+  "wireParityPassed": false,
+  "scopedRunnerConformancePassed": true,
+  "findings": [
+    {
+      "episode": "http-mcp-1",
+      "step": 102,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6270-7771-8272-534ec822bab6",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-1",
+      "step": 104,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6270-7771-8272-534ec822bab6",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-1",
+      "step": 106,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6270-7771-8272-534ec822bab6",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-1",
+      "step": 198,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6270-7771-8272-534ec822bab6",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-2",
+      "step": 102,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6875-7680-a5c7-89b94db5ba7f",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-2",
+      "step": 104,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6875-7680-a5c7-89b94db5ba7f",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-2",
+      "step": 106,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6875-7680-a5c7-89b94db5ba7f",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-2",
+      "step": 198,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6875-7680-a5c7-89b94db5ba7f",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-3",
+      "step": 102,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6e96-70f2-aa3a-b384450d6ef0",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-3",
+      "step": 104,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6e96-70f2-aa3a-b384450d6ef0",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-3",
+      "step": 106,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6e96-70f2-aa3a-b384450d6ef0",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "http-mcp-3",
+      "step": 198,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-6e96-70f2-aa3a-b384450d6ef0",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "rest-1",
+      "step": 48,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-746d-7701-8e30-e1afe3d916eb",
+          "score": 0.0
+        },
+        {
+          "id": "01a1d9aa-7471-7d21-b6c0-7577b7085819",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-1",
+      "step": 50,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-746d-7701-8e30-e1afe3d916eb",
+          "score": 0.0
+        },
+        {
+          "id": "01a1d9aa-7471-7d21-b6c0-7577b7085819",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-1",
+      "step": 52,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-746d-7701-8e30-e1afe3d916eb",
+          "score": 0.0
+        },
+        {
+          "id": "01a1d9aa-7471-7d21-b6c0-7577b7085819",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-1",
+      "step": 98,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-7471-7d21-b6c0-7577b7085819",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-2",
+      "step": 48,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-7a57-7fb2-a5fd-32e8c42a1704",
+          "score": 0.0
+        },
+        {
+          "id": "01a1d9aa-7a5b-71f2-8bab-02baf209d3aa",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-2",
+      "step": 50,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-7a57-7fb2-a5fd-32e8c42a1704",
+          "score": 0.0
+        },
+        {
+          "id": "01a1d9aa-7a5b-71f2-8bab-02baf209d3aa",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-2",
+      "step": 52,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-7a57-7fb2-a5fd-32e8c42a1704",
+          "score": 0.0
+        },
+        {
+          "id": "01a1d9aa-7a5b-71f2-8bab-02baf209d3aa",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-2",
+      "step": 98,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-7a5b-71f2-8bab-02baf209d3aa",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-3",
+      "step": 48,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-806e-7943-89e5-38e8f65858c0",
+          "score": 0.0
+        },
+        {
+          "id": "01a1d9aa-8072-7bb2-b192-8972030d695b",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-3",
+      "step": 50,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-806e-7943-89e5-38e8f65858c0",
+          "score": 0.0
+        },
+        {
+          "id": "01a1d9aa-8072-7bb2-b192-8972030d695b",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-3",
+      "step": 52,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-806e-7943-89e5-38e8f65858c0",
+          "score": 0.0
+        },
+        {
+          "id": "01a1d9aa-8072-7bb2-b192-8972030d695b",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "rest-3",
+      "step": 98,
+      "kind": "similarity-minScore-not-enforced",
+      "requestedMinScore": 0.1,
+      "hits": [
+        {
+          "id": "01a1d9aa-8072-7bb2-b192-8972030d695b",
+          "score": 0.0
+        }
+      ]
+    },
+    {
+      "episode": "stdio-1",
+      "step": 51,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-54d2-7130-b902-2481f7b3a937",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-1",
+      "step": 52,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-54d2-7130-b902-2481f7b3a937",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-1",
+      "step": 53,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-54d2-7130-b902-2481f7b3a937",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-1",
+      "step": 99,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-54d2-7130-b902-2481f7b3a937",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-2",
+      "step": 51,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-5953-72f1-9091-644e93d8c70d",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-2",
+      "step": 52,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-5953-72f1-9091-644e93d8c70d",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-2",
+      "step": 53,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-5953-72f1-9091-644e93d8c70d",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-2",
+      "step": 99,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-5953-72f1-9091-644e93d8c70d",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-3",
+      "step": 51,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-5dd6-7c92-a72b-bd95cc32bf76",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-3",
+      "step": 52,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-5dd6-7c92-a72b-bd95cc32bf76",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-3",
+      "step": 53,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-5dd6-7c92-a72b-bd95cc32bf76",
+          "namespace": ""
+        }
+      ]
+    },
+    {
+      "episode": "stdio-3",
+      "step": 99,
+      "kind": "similarity-empty-namespace",
+      "hits": [
+        {
+          "id": "01a1d9aa-5dd6-7c92-a72b-bd95cc32bf76",
+          "namespace": ""
+        }
+      ]
+    }
+  ]
+}

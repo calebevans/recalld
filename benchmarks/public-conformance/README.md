@@ -24,7 +24,7 @@ python3 scripts/public-conformance.py \
 
 The supervisor copies tracked Rust files under Cargo source/test/example/bench
 roots, declared custom targets and build scripts, the three fixed Cargo inputs,
-and this checkout's four fixed harness inputs. `--source-root` selects a separate
+and this checkout's five fixed harness inputs. `--source-root` selects a separate
 runtime checkout and requires `--source-commit`; the harness/fixture/recipe/tests
 still come from this checkout. Each manifest records both commits and every
 file's origin and hash. Existing evidence remains pinned to its original source.
@@ -116,3 +116,27 @@ subsequent combined parent with the independent vector fix. No full A6 completio
 
 See [handoff and frozen-state controls plan](HANDOFF.md) for the combined-runtime
 rerun sequence and the boundary between this diagnostic and future A6 controls.
+
+## Combined runtime and fixture revision 2
+
+The [combined-runtime report](combined-aeab9e6/REPORT.md) retains the unchanged
+fixture-v1 replay on frozen `aeab9e6` separately from the declared fixture-v2
+extension. Both use legacy API contract v1 and MCP protocol2025-06-18.
+
+Select the extension with `--fixture-version 2` and the same explicit runtime
+root/commit. `fixture-v2.json` adds a fifth synthetic source, copper, with vector
+[0.8,0.6,0,0], while preserving the original four embedding inputs. It tests
+by-ID similarity on stdio MCP, HTTP MCP and REST, plus embedding-only REST
+search. MCP recall still requires text; no MCP embedding-only path is claimed.
+Three read repetitions before mutation and one after restart check the expected
+neighbor, source/foreign exclusion, ranks and no embedding-provider calls.
+Wrong namespace assertions, wrong vector dimensions and zero vectors must reject
+without public/durable changes. Fixture revision2 additionally requires strict
+wrong-type quality rejection. Actual clock and file-hash limitations still apply.
+
+The supervisor now executes `cargo test --offline --locked --all-features --lib
+--bins --tests --examples -j 1`, including declared migration CLI and example
+unit tests. Serial test linking avoids overlapping large linker jobs within the
+4GiB cap; other build commands retain the two-job ceiling. Doctests remain
+outside this command. No core source, private ingestion or performance workload
+is introduced by this extension.

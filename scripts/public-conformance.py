@@ -20,7 +20,8 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = 'benchmarks/public-conformance/fixture.json'
-HARNESS_INPUTS = [FIXTURE, 'scripts/public-conformance.py',
+FIXTURES = {1: FIXTURE, 2: 'benchmarks/public-conformance/fixture-v2.json'}
+HARNESS_INPUTS = [*FIXTURES.values(), 'scripts/public-conformance.py',
                   'scripts/public-conformance.Dockerfile', 'scripts/test_public_conformance.py']
 CARGO_INPUTS = ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml']
 LEGACY_DATA = {f'src/bench/data/{name}.json' for name in
@@ -172,7 +173,8 @@ def host(args):
     manifest = {'manifestVersion': 1, 'track': 'public-v1-characterization',
         **source, 'dirtyPatchSha256': sha(output / 'source.patch'),
         'imageId': image['Id'], 'imageDigests': image.get('RepoDigests', []),
-        'fixtureSha256': source['sourceFilesSha256'][FIXTURE], 'protocolVersion': PROTOCOL, 'contractVersion': 'legacy-v1',
+        'fixtureVersion': args.fixture_version, 'fixturePath': FIXTURES[args.fixture_version],
+        'fixtureSha256': source['sourceFilesSha256'][FIXTURES[args.fixture_version]], 'protocolVersion': PROTOCOL, 'contractVersion': 'legacy-v1',
         'clock': 'actual wall clock; no public manual clock', 'snapshots': 'A1 interfaces unavailable',
         'seed': 7, 'freshReplaysPerTransport': 3, 'transports': ['stdio', 'http-mcp', 'rest'],
         'limits': 'network none; 2 CPUs; 4 GiB; 2 build jobs', 'status': 'preparing'}
@@ -190,11 +192,11 @@ cat /sys/fs/cgroup/cpu.max > /work/output/cgroup-cpu.txt
 cat /sys/fs/cgroup/memory.max > /work/output/cgroup-memory.txt
 cargo metadata --offline --locked --no-deps --format-version 1 > /work/output/cargo-targets.json
 cargo fmt --all -- --check > /work/output/fmt.log 2>&1
-cargo test --offline --locked --lib --all-features > /work/output/tests.log 2>&1
+cargo test --offline --locked --all-features --lib --bins --tests --examples -j 1 > /work/output/tests.log 2>&1
 cargo clippy --offline --locked --all-targets --all-features > /work/output/clippy.log 2>&1
 cargo build --offline --locked --bin recalld > /work/output/build.log 2>&1
-python3 scripts/public-conformance.py --inside
-''']
+python3 scripts/public-conformance.py --inside --fixture-version FIXTURE_VERSION
+'''.replace('FIXTURE_VERSION', str(args.fixture_version))]
     manifest['containerCommand'] = command
     save(output / 'manifest.json', manifest)
     try:
@@ -395,7 +397,8 @@ warm_file_enabled = false
         memory = payload.pop('id', None)
         paths = {'store_memory': ('POST', '/memories'), 'create_namespace': ('POST', '/namespaces'),
             'recall_memories': ('POST', '/search'), 'reinforce_memory': ('POST', f'/memories/{memory}/reinforce'),
-            'forget_memory': ('DELETE', f'/memories/{memory}')}
+            'forget_memory': ('DELETE', f'/memories/{memory}'),
+            'find_similar_memories': ('POST', f'/similar/{memory}')}
         if action == 'get_memory':
             flag = str(payload.get('recordAccess', True)).lower()
             method, path, payload = 'GET', f'/memories/{memory}?recordAccess={flag}', None
@@ -429,6 +432,67 @@ def durable(files):
     # SQLite's WAL-index read marks are coordination state, not durable content.
     # Preserve the complete hashes in read-window.json; exclude only this sidecar.
     return {name: digest for name, digest in files.items() if name != 'fts.db-shm'}
+
+
+def vector_window(client, fixture, ids, mappings, output, phase):
+    """Actual public vector paths; no private index injection or provider bypass stub."""
+    extension = fixture['extension']
+    source = ids[extension['similaritySource']]
+    neighbor = ids[extension['expectedNeighbor']]
+    repeats = extension['initialRepeats'] if phase == 'initial' else extension['restartRepeats']
+    before = {name: client.get(memory) for name, memory in ids.items()}
+    files_before = files_at(client.directory / 'data')
+    provider_before = (output / 'embedding-requests.jsonl').read_text().splitlines()
+    results, rejected = [], []
+    for _ in range(repeats):
+        response = client.good('find_similar_memories', {'id': source, 'namespace': 'default',
+            'recordAccess': False, 'limit': 20, 'minScore': 0.1})
+        hits = response['hits'] if client.mode == 'rest' else response['memories']
+        returned = [h['memory']['id'] if client.mode == 'rest' else h['id'] for h in hits]
+        assert returned and returned[0] == neighbor and source not in returned
+        assert ids['foreign'] not in returned and len(returned) == len(set(returned))
+        assert all(before[next(name for name, memory in ids.items() if memory == i)]['namespace'] == 'default'
+                   for i in returned)
+        if phase == 'restart':
+            assert ids['birch'] not in returned
+        result = {'similarityRanks': [mappings[i][0] for i in returned],
+            'similarityWireNamespaces': [h['memory']['namespace'] if client.mode == 'rest' else h['namespace'] for h in hits]}
+        if client.mode == 'rest':
+            status, response, _ = client.http('POST', '/search', {'embedding': extension['vectorQuery'],
+                'namespace': 'default', 'recordAccess': False, 'limit': 20})
+            assert status == 200, (status, response)
+            returned = [h['memory']['id'] for h in response['hits']]
+            assert returned[:2] == [source, neighbor] and ids['foreign'] not in returned
+            assert all(h['memory']['namespace'] == 'default' for h in response['hits'])
+            if phase == 'restart':
+                assert ids['birch'] not in returned
+            result['vectorOnlyRanks'] = [mappings[i][0] for i in returned]
+        results.append(result)
+    ok, response = client.call('find_similar_memories', {'id': source, 'namespace': 'foreign',
+        'recordAccess': False, 'limit': 20})
+    assert not ok, response
+    rejected.append('foreign-namespace-assertion')
+    if client.mode == 'rest':
+        for name, vector in [('wrong-dimension', [1, 0]), ('zero-norm', [0, 0, 0, 0])]:
+            status, response, _ = client.http('POST', '/search', {'embedding': vector,
+                'namespace': 'default', 'recordAccess': False, 'limit': 20})
+            assert 400 <= status < 500, (status, response)
+            rejected.append(name)
+    time.sleep(.2)  # diagnostic quiet window; not A1 readiness
+    after = {name: client.get(memory) for name, memory in ids.items()}
+    files_after = files_at(client.directory / 'data')
+    provider_after = (output / 'embedding-requests.jsonl').read_text().splitlines()
+    save(client.out / f'vector-window-{phase}.json', {'fixtureVersion': 2, 'before': before,
+        'after': after, 'filesBefore': files_before, 'filesAfter': files_after,
+        'excludedFromDurableComparison': ['fts.db-shm'], 'quietMs': 200,
+        'providerRequestCountBefore': len(provider_before), 'providerRequestCountAfter': len(provider_after),
+        'results': results, 'rejectedCases': rejected})
+    assert before == after and durable(files_before) == durable(files_after), 'vector/similar false reads changed state'
+    assert provider_before == provider_after, 'explicit vectors/similarity invoked embedding provider'
+    assert all(r == results[0] for r in results), 'repeated vector/similarity ranks changed'
+    return {'similarityCalls': repeats, 'vectorOnlyCalls': repeats if client.mode == 'rest' else 0,
+        'rejectedCases': rejected, 'publicAndDurableStateUnchanged': True, 'embeddingProviderCalls': 0,
+        **results[0]}
 
 
 def episode(mode, repeat, fixture, stub_port, output):
@@ -472,6 +536,7 @@ def episode(mode, repeat, fixture, stub_port, output):
             'excludedFromDurableComparison': ['fts.db-shm']})
         assert before == after, 'false reads changed public records'
         assert durable(disk_before) == durable(disk_after), 'false reads changed durable files'
+        vector_initial = vector_window(client, fixture, ids, mappings, output, 'initial') if fixture['fixtureVersion'] == 2 else None
         bad_inputs = [('store_memory', {'summary': 7}),
             ('store_memory', {'summary': 'fixture-miss'}),
             ('store_memory', {'summary': 'amber', 'tags': 'wrong-type'}),
@@ -493,6 +558,8 @@ def episode(mode, repeat, fixture, stub_port, output):
         changed = durable(files_before) != durable(files_after)
         save(out / 'malformed-quality.json', {'accepted': ok, 'response': result,
             'before': prior, 'after': updated, 'filesBefore': files_before, 'filesAfter': files_after})
+        if fixture['fixtureVersion'] == 2:
+            assert not ok and not changed and prior == updated, 'fixture v2 requires strict quality rejection'
         if ok or changed or prior != updated:
             violations.append({'case': 'present-string-quality', 'accepted': ok, 'durableFilesChanged': changed})
         stability = client.get(ids['amber'])['stability']
@@ -515,6 +582,7 @@ def episode(mode, repeat, fixture, stub_port, output):
         assert before_restart == after_restart, 'public state changed across restart'
         assert client.recall() == ranks_before_restart
         assert ids['birch'] not in client.recall()
+        vector_restart = vector_window(client, fixture, ids, mappings, output, 'restart') if fixture['fixtureVersion'] == 2 else None
         summary = {'transport': mode, 'replay': repeat, 'freshSources': len(ids),
             'falseReadPublicStateUnchanged': True, 'falseReadDurableFilesUnchanged': True,
             'defaultScopeMatchesExplicit': True, 'rejectedRequestsWithoutDurableFileChanges': len(bad_inputs),
@@ -524,15 +592,19 @@ def episode(mode, repeat, fixture, stub_port, output):
             'normalizedRanks': [mappings[i][0] for i in ranks],
             'normalizedRanksAfterDeleteAndRestart': [mappings[i][0] for i in ranks_before_restart], 'knownConformanceViolations': violations,
             'semanticQuality': 'not measured'}
+        if fixture['fixtureVersion'] == 2:
+            summary['fixtureVersion'] = 2
+            summary['vectorWindows'] = {'initial': vector_initial, 'restart': vector_restart}
         save(out / 'summary.json', summary)
         return summary
     finally:
         client.stop()
 
 
-def inside():
+def inside(fixture_version):
     assert Path('/.dockerenv').is_file() and ROOT == Path('/work/source')
-    fixture = json.loads((ROOT / FIXTURE).read_text())
+    fixture = json.loads((ROOT / FIXTURES[fixture_version]).read_text())
+    assert fixture['fixtureVersion'] == fixture_version
     assert fixture['profile'] == {'model': 'public-fixture-v1', 'dimensions': 4,
                                   'documentPrefix': '', 'queryPrefix': ''}
     assert coverage(['a', 'b'], {'a': ['s'], 'b': ['s']}, ['s', 't']) == .5
@@ -559,7 +631,7 @@ def inside():
         assert len(misses) == 9 and all(r['status'] == 400 and
             json.loads(r['requestBody'])['input'] == ['fixture-miss'] for r in misses)
         assert len(requests) > len(misses), 'no successful fixture embeddings'
-        save(output / 'summary.json', {'status': 'characterization-complete', 'episodes': summaries,
+        save(output / 'summary.json', {'status': 'characterization-complete', 'fixtureVersion': fixture_version, 'episodes': summaries,
             'conformancePassed': not any(s['knownConformanceViolations'] for s in summaries),
             'embeddingRequests': len(requests), 'expectedFailClosedMisses': len(misses), 'freshReplaysPerTransport': 3,
             'claim': 'public-v1 diagnostic; no v2/A1/A6 completion'})
@@ -571,6 +643,7 @@ def inside():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--fixture-version', type=int, choices=sorted(FIXTURES), default=1, help='fixture revision; both use legacy API v1')
     parser.add_argument('--source-root', type=Path, help='runtime Git checkout; harness stays here')
     parser.add_argument('--source-commit', help='require exact clean runtime HEAD and copied bytes')
     parser.add_argument('--source-input', action='append', default=[], help='additional exact tracked runtime file; repeat for assets')
@@ -580,7 +653,7 @@ def main():
     args = parser.parse_args()
     if args.source_root and not args.source_commit:
         parser.error('--source-root requires --source-commit to freeze the runtime')
-    inside() if args.inside else host(args)
+    inside(args.fixture_version) if args.inside else host(args)
 
 
 if __name__ == '__main__':
