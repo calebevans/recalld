@@ -70,6 +70,11 @@ pub fn create_archive(
     // Add backup_manifest.json.
     let manifest_json = serde_json::to_string_pretty(manifest)
         .map_err(|e| BackupError::ManifestFailed(e.to_string()))?;
+    if manifest_json.len() as u64 > super::manifest::MAX_MANIFEST_BYTES {
+        return Err(BackupError::ManifestFailed(
+            "manifest exceeds 16 MiB limit".into(),
+        ));
+    }
 
     zip.start_file("backup_manifest.json", options)
         .map_err(|e| BackupError::ArchiveCreationFailed(std::io::Error::other(e)))?;
