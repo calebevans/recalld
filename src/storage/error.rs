@@ -8,9 +8,9 @@ use crate::model::error::DecodeError;
 /// Errors from storage operations (metadata, vectors, text, edges).
 #[derive(Debug, Error)]
 pub enum StorageError {
-    /// Canonical insertion exists; retry publication, never retry as a new write.
+    /// Canonical mutation exists; retry publication, never retry as a new write.
     #[error("INDEX_NOT_READY commitState=committed ready=false receipt={} cause={source}", serde_json::to_string(receipt).unwrap_or_default())]
-    CommittedInsertion {
+    CommittedMutation {
         receipt: Box<crate::storage::control::WriteReceipt>,
         #[source]
         source: Box<StorageError>,

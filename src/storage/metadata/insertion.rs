@@ -192,7 +192,7 @@ impl MetadataStore {
             &[],
             false,
             false,
-            Some((&record, config.embedding_dim)),
+            effects::RecordMutation::Inserted(&record, config.embedding_dim),
         )
         .map(|result| result.receipt)
     }

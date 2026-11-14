@@ -1,35 +1,10 @@
-//! Removing memories from the indexes that storage cannot reach.
-//!
-//! Deleting a memory is two jobs. Storage owns one of them — the
-//! meta.db record, the vector slot, the edge rows — and returns.
-//! The other job is the four indexes that live outside storage: the
-//! FTS5 database, the in-memory `FlatVectorIndex`, the entity index and
-//! the relationship graph. Nothing in `storage/` holds a handle to any
-//! of them, so every delete path has to do that half itself.
-//!
-//! There are three such paths — the MCP tool, the HTTP endpoint, and
-//! now namespace deletion — and until this module existed they were
-//! three hand-written copies of the same six steps. Two of them agreed;
-//! the HTTP one had quietly stopped after the cache invalidation, so an
-//! HTTP-deleted memory kept a live vector-index entry (burning a top-k
-//! slot in every search and looking like a valid autolink target), kept
-//! its FTS row (which survives restart forever), and kept a graph node
-//! reporting full strength, propping up its neighbours' decay
-//! resistance.
-//!
-//! One implementation is the fix for that; a comment telling the next
-//! author to keep three copies in step is not.
-//!
-//! # Best-effort by design
-//!
-//! Every step here runs after the storage-side removal has already
-//! committed. There is nothing to roll back to, so a failure is warned
-//! about and the remaining steps still run: a wedged FTS connection must
-//! not be the reason the vector index keeps serving a deleted memory.
+//! Best-effort cleanup for legacy namespace purge. Canonical forget uses the
+//! durable effects/completion path; this remaining purge helper cannot promise
+//! atomicity or derived readiness after failures.
 
 use crate::cache::CacheManager;
 use crate::graph::SharedGraph;
-use crate::model::{DecayPhase, DiskRecord, MemoryId, NamespaceId};
+use crate::model::{DiskRecord, MemoryId, NamespaceId};
 use crate::search::{EntityIndex, FlatVectorIndex, FtsIndex};
 
 /// Borrowed handles to the four out-of-storage indexes, plus the cache.
@@ -44,18 +19,6 @@ pub(crate) struct IndexHandles<'a> {
     pub entity_index: &'a tokio::sync::RwLock<EntityIndex>,
     /// Relationship graph.
     pub graph: &'a SharedGraph,
-}
-
-/// What to do with each memory's graph node.
-pub(crate) enum GraphAction {
-    /// Keep the node and its edges, set its phase to Tombstone. For
-    /// `forget_memory`: the record survives, so relationship chains
-    /// stay traversable.
-    MarkTombstoned,
-    /// Remove the node and every edge incident to it, with no bridging.
-    /// For namespace deletion: the record is gone, so a node pointing at
-    /// it would be a dangling reference.
-    RemoveNode,
 }
 
 /// How to reach the FTS rows.
@@ -74,7 +37,7 @@ pub(crate) struct IndexPurgeCounts {
     pub fts_removed: usize,
     /// Vector-index entries deleted.
     pub vector_entries_removed: usize,
-    /// Graph nodes removed. Always 0 for [`GraphAction::MarkTombstoned`].
+    /// Graph nodes removed.
     pub graph_nodes_removed: usize,
 }
 
@@ -91,7 +54,6 @@ pub(crate) async fn purge_from_indexes(
     handles: &IndexHandles<'_>,
     records: &[(MemoryId, DiskRecord)],
     fts: FtsAction,
-    graph: GraphAction,
 ) -> IndexPurgeCounts {
     let mut counts = IndexPurgeCounts::default();
 
@@ -166,18 +128,9 @@ pub(crate) async fn purge_from_indexes(
     {
         let mut graph_w = handles.graph.write().await;
         for id in &ids {
-            match graph {
-                GraphAction::MarkTombstoned => {
-                    // Err means the node is not in the graph, which is
-                    // not a problem: there is nothing left to mark.
-                    let _ = graph_w.update_node_state(*id, DecayPhase::Tombstone, 0.0);
-                }
-                GraphAction::RemoveNode => {
-                    if graph_w.contains(id) {
-                        graph_w.remove_memory(*id);
-                        counts.graph_nodes_removed += 1;
-                    }
-                }
+            if graph_w.contains(id) {
+                graph_w.remove_memory(*id);
+                counts.graph_nodes_removed += 1;
             }
         }
     }

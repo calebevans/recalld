@@ -42,7 +42,7 @@ impl DerivedCompletion {
             let id = crate::storage::insertion::inserted_id(&receipt)?;
             let record = storage
                 .get_record(id)
-                .map_err(|source| StorageError::CommittedInsertion {
+                .map_err(|source| StorageError::CommittedMutation {
                     receipt: Box::new(receipt.clone()),
                     source: Box::new(source),
                 })?
@@ -59,11 +59,59 @@ impl DerivedCompletion {
         let result = result?;
         self.complete()
             .await
-            .map_err(|source| StorageError::CommittedInsertion {
+            .map_err(|source| StorageError::CommittedMutation {
                 receipt: Box::new(result.receipt.clone()),
                 source: Box::new(source),
             })?;
         Ok(result)
+    }
+
+    /// Legacy bool adapter. Resolve namespace and commit under one store guard;
+    /// each batch caller invokes this in order, with independent child commits.
+    pub async fn forget(&self, id: crate::model::MemoryId) -> Result<bool, StorageError> {
+        let gate = publication_gate(&self.storage).await?;
+        let lease = gate.read_owned().await;
+        let storage = self.storage.clone();
+        let receipt = tokio::task::spawn_blocking(move || {
+            let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            let Some(record) = storage.get_record(id)? else {
+                return Ok(None);
+            };
+            // Preserve a clean legacy no-op. A pending prior forget must still
+            // produce a receipt and finish publication, never claim ready here.
+            if record.phase == DecayPhase::Tombstone
+                && !storage.meta_store().needs_effects_rebuild()
+            {
+                return Ok(None);
+            }
+            let ctx = crate::storage::control::MutationContext::unkeyed(NamespaceId::new(
+                record.namespace_id,
+            ));
+            storage.tombstone_memory_with_receipt(&ctx, id).map(Some)
+        })
+        .await
+        .map_err(|e| {
+            failed(format!(
+                "forget worker outcome unknown; reconcile before retry: {e}"
+            ))
+        })?;
+        drop(lease);
+        let Some(receipt) = receipt? else {
+            return Ok(false);
+        };
+        self.complete()
+            .await
+            .map_err(|source| StorageError::CommittedMutation {
+                receipt: Box::new(receipt.clone()),
+                source: Box::new(source),
+            })?;
+        Ok(matches!(
+            receipt.outcome,
+            crate::storage::control::MutationOutcome::MemoryTombstoned {
+                status: crate::storage::tombstone::TombstoneStatus::Tombstoned,
+                ..
+            }
+        ))
     }
 
     /// Retrying is safe: no receipt is acknowledged until every view is ready.
@@ -243,7 +291,7 @@ mod tests {
             Ok(_) => panic!("wrong-width derived rebuild succeeded"),
             Err(error) => error,
         };
-        let StorageError::CommittedInsertion { receipt, .. } = error else {
+        let StorageError::CommittedMutation { receipt, .. } = error else {
             panic!("{error}")
         };
         let MutationOutcome::MemoryInserted { memory_id, .. } = receipt.outcome else {

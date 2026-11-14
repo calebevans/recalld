@@ -28,6 +28,9 @@ pub(crate) mod ownership;
 pub mod schema_migration;
 pub mod text;
 pub mod text_migration;
+pub mod tombstone;
+#[cfg(test)]
+mod tombstone_tests;
 pub(crate) mod validation;
 pub mod vectors;
 

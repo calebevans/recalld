@@ -273,7 +273,7 @@ pub async fn create_memory(
         .await?;
     let receipt = inserted.receipt;
     let memory = inserted.record.ok_or_else(|| {
-        AppError::from(crate::storage::StorageError::CommittedInsertion {
+        AppError::from(crate::storage::StorageError::CommittedMutation {
             receipt: Box::new(receipt.clone()),
             source: Box::new(crate::storage::StorageError::RecoveryRequired(
                 "inserted record unavailable".into(),
@@ -1566,7 +1566,7 @@ pub async fn batch_store(
             .await
         {
             Ok(value) => value,
-            Err(error @ crate::storage::StorageError::CommittedInsertion { .. }) => {
+            Err(error @ crate::storage::StorageError::CommittedMutation { .. }) => {
                 return Err(error.into());
             }
             Err(error @ crate::storage::StorageError::CommitOutcomeUnknown { .. }) => {
@@ -1583,7 +1583,7 @@ pub async fn batch_store(
         };
         let receipt = inserted.receipt;
         let memory = inserted.record.ok_or_else(|| {
-            AppError::from(crate::storage::StorageError::CommittedInsertion {
+            AppError::from(crate::storage::StorageError::CommittedMutation {
                 receipt: Box::new(receipt.clone()),
                 source: Box::new(crate::storage::StorageError::RecoveryRequired(
                     "inserted record unavailable".into(),

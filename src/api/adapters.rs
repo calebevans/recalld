@@ -426,7 +426,7 @@ impl state::StorageEngine for StorageEngineAdapter {
         }
         .complete()
         .await
-        .map_err(|source| crate::storage::StorageError::CommittedInsertion {
+        .map_err(|source| crate::storage::StorageError::CommittedMutation {
             receipt: Box::new(receipt.clone()),
             source: Box::new(source),
         })
@@ -480,91 +480,16 @@ impl state::StorageEngine for StorageEngineAdapter {
     }
 
     async fn delete_memory(&self, id: MemoryId) -> Result<bool, crate::storage::StorageError> {
-        let storage = self.storage.clone();
-
-        // Perform read, tombstone check, tombstone, and free_vector_slot
-        // atomically under a single write lock to prevent TOCTOU races.
-        // Without this, two concurrent deletes could both read the record
-        // as non-tombstoned, both tombstone it, and both free the same
-        // vector slot -- corrupting the free list into a self-referential
-        // cycle.
-        // Returns the PRE-tombstone record, not a bool: `tombstone`
-        // erases the tag list, and the tag list is where the entity
-        // names live. A bool here would leave the entity index with no
-        // way to know what to unlink.
-        let deleted = tokio::task::spawn_blocking(move || {
-            let mut storage_w = storage.write().map_err(|e| {
-                crate::storage::StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("storage lock poisoned: {e}"),
-                ))
-            })?;
-
-            // Check if the record exists and is not already tombstoned.
-            let existing_record = match storage_w.get_record(id)? {
-                Some(r) => r,
-                None => {
-                    return Ok::<Option<crate::model::DiskRecord>, crate::storage::StorageError>(
-                        None,
-                    );
-                }
-            };
-
-            if existing_record.phase == DecayPhase::Tombstone {
-                return Ok(None);
-            }
-
-            // Tombstone the record.
-            storage_w.tombstone_memory(id)?;
-
-            // Free the vector slot.
-            let ns_id = NamespaceId::new(existing_record.namespace_id);
-            if let Err(e) = storage_w.free_vector_slot(ns_id, existing_record.vector_slot) {
-                tracing::warn!(
-                    memory_id = %id,
-                    vector_slot = existing_record.vector_slot,
-                    %e,
-                    "vector slot free failed (non-fatal)"
-                );
-            }
-
-            Ok(Some(existing_record))
-        })
+        crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
+        }
+        .forget(id)
         .await
-        .map_err(|e| {
-            crate::storage::StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("blocking task join error: {e}"),
-            ))
-        })??;
-
-        let Some(record) = deleted else {
-            return Ok(false);
-        };
-
-        // This used to stop at `cache.invalidate`, so an HTTP-deleted
-        // memory kept its vector-index entry (burning a top-k slot in
-        // every search and reading as a live autolink target), kept its
-        // FTS row — which survives restart, because the FTS index is
-        // only rebuilt when it is empty — and kept a graph node
-        // reporting Full phase at strength 1.0, still propping up its
-        // neighbours' decay resistance. Same helper as the MCP path now,
-        // so the two cannot drift apart again.
-        crate::index_cleanup::purge_from_indexes(
-            &crate::index_cleanup::IndexHandles {
-                cache: &self.cache,
-                vector_index: &self.vector_index,
-                fts_index: &self.fts_index,
-                entity_index: &self.entity_index,
-                graph: &self.graph,
-            },
-            std::slice::from_ref(&(id, record)),
-            crate::index_cleanup::FtsAction::PerRecord,
-            crate::index_cleanup::GraphAction::MarkTombstoned,
-        )
-        .await;
-
-        Ok(true)
     }
 
     async fn namespace_stats(

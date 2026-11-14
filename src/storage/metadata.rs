@@ -12,6 +12,7 @@ mod insertion;
 mod lifecycle_updates;
 pub(crate) mod removal_ledger;
 pub(crate) mod text_generation;
+mod tombstone;
 
 use std::collections::HashMap;
 use std::path::Path;
