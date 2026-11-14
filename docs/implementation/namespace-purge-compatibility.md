@@ -1,3 +1,5 @@
+> This document records the original purge-only slice. The completed-history offline consumer is now implemented and validated in [purge-offline-compatibility.md](purge-offline-compatibility.md). Active/Cleanup progress and unknown batch tables remain blocked.
+
 # Namespace purge canonical-table compatibility audit
 
 Implementation parent: published tombstone `dad8465` (runtime `1ae3d5a`),
