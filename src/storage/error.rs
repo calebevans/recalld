@@ -79,6 +79,10 @@ pub enum StorageError {
     #[error("redb commit error: {0}")]
     RedbCommit(#[from] redb::CommitError),
 
+    /// Provider output failed vector validation; the store remains usable.
+    #[error("EMBEDDING_UNAVAILABLE: invalid provider vector: {0}")]
+    ProviderVectorUnavailable(String),
+
     #[error("EDGE_CONFLICT: {0}")]
     EdgeConflict(String),
 

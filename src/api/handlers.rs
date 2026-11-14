@@ -217,7 +217,7 @@ pub async fn create_memory(
     }
 
     // --- Embedding (Issue 9: embed summary + full_text + tags) ---
-    let embedding = match req.embedding {
+    let raw_embedding = match req.embedding {
         Some(ref vec) => {
             if vec.len() != ns.embedding_dim as usize {
                 return Err(AppError::UnprocessableEntity {
@@ -245,6 +245,13 @@ pub async fn create_memory(
         }
     };
 
+    let mut embedding = raw_embedding.clone();
+    crate::storage::insertion::normalize_embedding(
+        &mut embedding,
+        ns.embedding_dim,
+        req.embedding.is_some(),
+    )?;
+
     // --- Near-duplicate advisory ---
     // Before the write, so the new memory is not yet in the vector index
     // and cannot match itself. See `near_duplicate_report`.
@@ -268,7 +275,7 @@ pub async fn create_memory(
                 parent_id: req.parent_id,
                 supersedes: req.supersedes,
             },
-            embedding.clone(),
+            raw_embedding,
         )
         .await?;
     let receipt = inserted.receipt;
@@ -1500,7 +1507,7 @@ pub async fn batch_store(
         }
 
         // Embedding
-        let embedding = match mem_req.embedding {
+        let raw_embedding = match mem_req.embedding {
             Some(ref vec) => {
                 if vec.len() != ns.embedding_dim as usize {
                     failed.push(BatchStoreFailure {
@@ -1539,6 +1546,20 @@ pub async fn batch_store(
             }
         };
 
+        let mut embedding = raw_embedding.clone();
+        if let Err(error) = crate::storage::insertion::normalize_embedding(
+            &mut embedding,
+            ns.embedding_dim,
+            mem_req.embedding.is_some(),
+        ) {
+            failed.push(BatchStoreFailure {
+                index,
+                error: error.to_string(),
+                field: mem_req.embedding.as_ref().map(|_| "embedding".into()),
+            });
+            continue;
+        }
+
         // Near-duplicate advisory, before this item is indexed. Items are
         // created in order and each is indexed before the next is checked,
         // so an intra-batch duplicate is reported too — same property the
@@ -1561,7 +1582,7 @@ pub async fn batch_store(
                     parent_id: mem_req.parent_id,
                     supersedes: mem_req.supersedes,
                 },
-                embedding.clone(),
+                raw_embedding,
             )
             .await
         {

@@ -69,3 +69,22 @@ pub fn inserted_id(receipt: &control::WriteReceipt) -> Result<MemoryId, StorageE
         )),
     }
 }
+
+/// Transport working vectors and final canonical staging use the same numeric
+/// boundary. Keep original supplied bytes in InsertMemory for request identity.
+/// Invalid generated output is unavailable, not caller input or store corruption.
+pub(crate) fn normalize_embedding(
+    embedding: &mut [f32],
+    dimensions: u32,
+    supplied: bool,
+) -> Result<(), StorageError> {
+    crate::embedding::validation::normalize_vector(embedding, dimensions as usize).map_err(
+        |message| {
+            if supplied {
+                StorageError::InvalidMutation(message)
+            } else {
+                StorageError::ProviderVectorUnavailable(message)
+            }
+        },
+    )
+}

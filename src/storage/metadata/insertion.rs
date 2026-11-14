@@ -25,7 +25,7 @@ impl MetadataStore {
         sampled_at: i64,
         embedding: &[f32],
         existing_edges: &[PersistedEdge],
-        stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord) -> Result<(), StorageError>,
+        stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord, &[f32]) -> Result<(), StorageError>,
     ) -> Result<WriteReceipt, StorageError> {
         let guard = self.mutation_guard()?;
         ctx.validate()?;
@@ -93,14 +93,14 @@ impl MetadataStore {
         if input.full_text.as_deref() == Some("") {
             return Err(StorageError::EmptyText);
         }
-        if !(1..=8192).contains(&config.embedding_dim)
-            || embedding.len() != config.embedding_dim as usize
-            || embedding.iter().any(|v| !v.is_finite())
-        {
-            return Err(StorageError::InvalidMutation(
-                "invalid insertion embedding dimensions or values".into(),
-            ));
-        }
+        // Caller identity was hashed from the original bytes above. Generated
+        // output never enters that hash; replay returns before this validation.
+        let mut normalized = embedding.to_vec();
+        crate::storage::insertion::normalize_embedding(
+            &mut normalized,
+            config.embedding_dim,
+            input.embedding.is_some(),
+        )?;
         let id = input.id.unwrap_or_else(MemoryId::new);
         if id == MemoryId::nil() {
             return Err(StorageError::InvalidMutation("nil memory ID".into()));
@@ -157,7 +157,7 @@ impl MetadataStore {
             text_length: 0,
         };
         record.encode()?;
-        stage(&config, &mut record)?;
+        stage(&config, &mut record, &normalized)?;
         tx.open_table(META_TABLE)?
             .insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
         for tag in &record.tags {

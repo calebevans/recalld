@@ -172,7 +172,8 @@ impl From<StorageError> for AppError {
                 receipt: (**receipt).clone(),
                 message: source.to_string(),
             },
-            StorageError::CommitOutcomeUnknown { .. } => AppError::ServiceUnavailable {
+            StorageError::CommitOutcomeUnknown { .. }
+            | StorageError::ProviderVectorUnavailable(_) => AppError::ServiceUnavailable {
                 message: err.to_string(),
             },
             StorageError::NotFound(uuid) => AppError::NotFound {
@@ -216,11 +217,9 @@ impl From<StorageError> for AppError {
 impl From<EmbeddingError> for AppError {
     fn from(err: EmbeddingError) -> Self {
         match &err {
-            EmbeddingError::DimensionMismatch { expected, got } => AppError::UnprocessableEntity {
-                message: format!("embedding dimension mismatch: expected {expected}, got {got}"),
-                field: Some("embedding".to_string()),
-            },
             EmbeddingError::Unavailable(_)
+            | EmbeddingError::InvalidResponse(_)
+            | EmbeddingError::DimensionMismatch { .. }
             | EmbeddingError::RateLimited { .. }
             | EmbeddingError::Network(_) => AppError::ServiceUnavailable {
                 message: format!("embedding provider: {err}"),

@@ -29,6 +29,9 @@ fn map_mutation_error(error: crate::storage::StorageError) -> bridge::BridgeErro
         | crate::storage::StorageError::RecoveryRequired(_) => {
             bridge::BridgeError::PartiallyApplied(error.to_string())
         }
+        crate::storage::StorageError::ProviderVectorUnavailable(_) => {
+            bridge::BridgeError::Unavailable(error.to_string())
+        }
         crate::storage::StorageError::InvalidMutation(_)
         | crate::storage::StorageError::EdgeConflict(_)
         | crate::storage::StorageError::MutationNamespaceMismatch => {
@@ -861,7 +864,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
         }
 
         // Generate full embedding (summary + full_text + tags for max surface).
-        let embedding = match &input.embedding {
+        let raw_embedding = match &input.embedding {
             Some(emb) => emb.clone(),
             None => {
                 let mut embed_text = match &input.full_text {
@@ -878,9 +881,22 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 self.embedding
                     .embed(&embed_text)
                     .await
-                    .map_err(|e| bridge::BridgeError::Internal(e.to_string()))?
+                    .map_err(|e| match e {
+                        crate::embedding::EmbeddingError::TextTooLong { .. } => {
+                            bridge::BridgeError::InvalidInput(e.to_string())
+                        }
+                        _ => bridge::BridgeError::Unavailable(e.to_string()),
+                    })?
             }
         };
+
+        let mut embedding = raw_embedding.clone();
+        crate::storage::insertion::normalize_embedding(
+            &mut embedding,
+            ns_config.embedding_dim,
+            input.embedding.is_some(),
+        )
+        .map_err(map_insertion_error)?;
 
         // Near-duplicate advisory.
         //
@@ -946,7 +962,7 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     parent_id: input.parent_id,
                     supersedes: input.supersedes,
                 },
-                embedding.clone(),
+                raw_embedding,
                 now,
             )
             .await
@@ -2552,6 +2568,142 @@ mod tests {
             parent_id: None,
             supersedes: None,
             check_duplicates: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn insertion_adapter_rejects_bad_provider_and_caller_vectors_and_normalizes_advisory() {
+        use crate::search::VectorIndex as _;
+        struct Provider(Vec<f32>);
+        #[async_trait::async_trait]
+        impl EmbeddingProvider for Provider {
+            async fn embed(&self, _: &str) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
+                Ok(self.0.clone())
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            fn model_name(&self) -> &str {
+                "synthetic-vector-boundary"
+            }
+        }
+        let fx = Fixture::new();
+        for supplied in [false, true] {
+            let mut adapter = fx.storage_adapter();
+            adapter.embedding = Arc::new(Provider(vec![0.; 4]));
+            let mut input = store_input("invalid", "default", vec![0.; 4]);
+            if !supplied {
+                input.embedding = None;
+            }
+            let before = fx
+                .storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation;
+            let error = adapter.store_memory(input).await.unwrap_err();
+            assert!(
+                if supplied {
+                    matches!(error, bridge::BridgeError::InvalidInput(_))
+                } else {
+                    matches!(error, bridge::BridgeError::Unavailable(_))
+                },
+                "{error}"
+            );
+            let rpc = crate::daemon::protocol::DaemonRpcError::from(&error);
+            assert_eq!(
+                rpc.code,
+                if supplied {
+                    crate::daemon::protocol::ERR_INVALID_INPUT
+                } else {
+                    crate::daemon::protocol::ERR_UNAVAILABLE
+                }
+            );
+            assert!(if supplied {
+                matches!(
+                    rpc.into_bridge_error(),
+                    bridge::BridgeError::InvalidInput(_)
+                )
+            } else {
+                matches!(rpc.into_bridge_error(), bridge::BridgeError::Unavailable(_))
+            });
+            assert_eq!(
+                fx.storage
+                    .read()
+                    .unwrap()
+                    .control_state()
+                    .unwrap()
+                    .committed_generation,
+                before
+            );
+            assert!(fx.storage.read().unwrap().scan_all().unwrap().is_empty());
+        }
+        let mut adapter = fx.storage_adapter();
+        adapter.embedding = Arc::new(Provider(vec![3., 4., 0., 0.]));
+        let first = adapter
+            .store_memory(store_input(
+                "supplied vector",
+                "default",
+                vec![3., 4., 0., 0.],
+            ))
+            .await
+            .unwrap();
+        let mut generated = store_input("provider vector", "default", vec![]);
+        generated.embedding = None;
+        let second = adapter.store_memory(generated).await.unwrap();
+        assert_eq!(
+            second.near_duplicates.unwrap().matches[0].id.to_string(),
+            first.id
+        );
+        for text in [first.id, second.id] {
+            let id = MemoryId::from_uuid(uuid::Uuid::parse_str(&text).unwrap());
+            let record = fx.record(id).unwrap();
+            let vector = fx
+                .storage
+                .read()
+                .unwrap()
+                .get_vector(NamespaceId::new(1), record.vector_slot)
+                .unwrap()
+                .unwrap();
+            assert_eq!(vector, vec![0.6, 0.8, 0., 0.]);
+            assert_eq!(
+                fx.vector_index.read().await.get_vector(id).unwrap(),
+                vector.as_slice()
+            );
+        }
+        // This fixture changes one f32 bit if normalized a second time. Both
+        // consumer paths must pass raw bytes to canonical staging, so their
+        // advisory working vector and persisted vector share one transform.
+        let raw: Vec<f32> = [0xc3f82a4a, 0xc3cf0889, 0xc401baf5, 0x432cdfd5]
+            .into_iter()
+            .map(f32::from_bits)
+            .collect();
+        let expected = [0xbf160f3a, 0xbefa6047, 0xbf1ce3b9, 0x3e5110db];
+        adapter.embedding = Arc::new(Provider(raw.clone()));
+        for supplied in [false, true] {
+            let mut input = store_input("rounding fixture", "default", raw.clone());
+            if !supplied {
+                input.embedding = None;
+            }
+            let result = adapter.store_memory(input).await.unwrap();
+            let id = MemoryId::from_uuid(uuid::Uuid::parse_str(&result.id).unwrap());
+            let slot = fx.record(id).unwrap().vector_slot;
+            let vector = fx
+                .storage
+                .read()
+                .unwrap()
+                .get_vector(NamespaceId::new(1), slot)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                vector.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                fx.vector_index.read().await.get_vector(id).unwrap(),
+                vector.as_slice()
+            );
         }
     }
 
