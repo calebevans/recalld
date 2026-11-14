@@ -424,8 +424,10 @@ async fn projected_eligibility_precedes_vector_fts_entity_and_metadata_caps() {
     })
     .await;
     let engine = engine(&f, CountingClock::new(DAY), &[]);
-    let q = query(json!({"text":"needle", "entities":["caleb"], "limit":1,
-        "minScore":0.0, "filter":{"minStrength":0.8}, "graphDepth":0, "recordAccess":false}));
+    let q = query(
+        json!({"text":"needle", "queryEmbedding":[1.0,0.0,0.0,0.0], "entities":["caleb"], "limit":1,
+        "minScore":0.0, "filter":{"minStrength":0.8}, "graphDepth":0, "recordAccess":false}),
+    );
     let out = engine.search_with_semantics(q, current()).await.unwrap();
     assert_eq!(out.response.results.len(), 1);
     assert_eq!(out.response.results[0].memory_id, f.ids[104]);
@@ -782,7 +784,9 @@ async fn returned_graph_result_uses_the_same_projection_as_admission_and_ranking
     let bytes = file_bytes(&f.files);
     let clock = CountingClock::new(DAY);
     let engine = engine(&f, clock.clone(), &[(0, 1, EdgeType::Associative)]);
-    let q = query(json!({"text":"needle", "minScore":0.8, "graphDepth":1, "recordAccess":false}));
+    let q = query(
+        json!({"text":"needle", "queryEmbedding":[1.0,0.0,0.0,0.0], "minScore":0.8, "graphDepth":1, "recordAccess":false}),
+    );
     let first = engine
         .search_with_semantics(q.clone(), current())
         .await
@@ -839,7 +843,7 @@ async fn legacy_retrieval_graph_formulas_also_consume_explicit_policy_projection
         tokio::sync::RwLock::new(index),
     )));
     let q = query(
-        json!({"text":"needle", "ftsQuery":"no-keyword-match", "graphDepth":1, "recordAccess":false}),
+        json!({"text":"needle", "queryEmbedding":[1.0,0.0,0.0,0.0], "ftsQuery":"no-keyword-match", "graphDepth":1, "recordAccess":false}),
     );
     let out = engine
         .search_with_semantics(q, RetrievalSemantics::V1)

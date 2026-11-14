@@ -2496,7 +2496,9 @@ mod tests {
     #[async_trait::async_trait]
     impl NamespaceResolver for SearchFixture {
         async fn resolve(&self, _name: &str) -> Result<NamespaceConfig> {
-            Ok(NamespaceConfig::default_namespace(1_700_000_000_000))
+            let mut config = NamespaceConfig::default_namespace(1_700_000_000_000);
+            config.embedding_dim = 2; // Matches this fixture's actual embedding provider.
+            Ok(config)
         }
     }
 
