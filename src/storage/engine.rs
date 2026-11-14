@@ -7,8 +7,8 @@
 //!
 //! See Spec 04 Section 7 for the design rationale.
 
-mod text_compaction;
 mod effects;
+mod text_compaction;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -391,13 +391,13 @@ impl RedbStorageEngine {
             crate::storage::text::generation::write_rejection_gate(&db_path, &descriptor)?;
             meta_store.select_text_generation(state.committed_generation, &descriptor, &vec![])?;
         }
-        let selected_text = meta_store.text_selection()?;
+        let selected_text = meta_store.text_selection_for_recovery()?;
         let text_store = match &selected_text {
             Some(selected) => TextStore::open_generation(&db_path, selected, true)?,
             None => TextStore::open(&db_path.join("fulltext.dat"))?,
         };
         // Validate canonical text before effects replay or any cleanup.
-        for (_, record) in meta_store.scan_all()? {
+        for (_, record) in meta_store.scan_all_for_recovery()? {
             if record.text_offset != 0 || record.text_length != 0 {
                 text_store.read(TextRef {
                     file_offset: record.text_offset,

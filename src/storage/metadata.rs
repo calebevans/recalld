@@ -7,8 +7,8 @@
 //!
 //! See CS-07 for the full specification.
 
-pub(crate) mod text_generation;
 pub(crate) mod effects;
+pub(crate) mod text_generation;
 
 use std::collections::HashMap;
 use std::path::Path;

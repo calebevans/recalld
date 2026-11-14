@@ -103,6 +103,14 @@ pub(crate) fn read_selection(
 impl MetadataStore {
     pub(crate) fn text_selection(&self) -> Result<Option<TextGeneration>, StorageError> {
         self.ensure_available()?;
+        self.text_selection_for_recovery()
+    }
+
+    /// Constructor-only read: validate selected text before replaying pending
+    /// effects while ordinary handle admission is still closed.
+    pub(crate) fn text_selection_for_recovery(
+        &self,
+    ) -> Result<Option<TextGeneration>, StorageError> {
         read_selection(&self.db.begin_read()?)
     }
 
