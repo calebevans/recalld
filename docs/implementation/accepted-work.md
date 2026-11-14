@@ -93,6 +93,11 @@ or build caches were added. Final archive SHA-256:
 No new public nine-episode suite was run on this core-only base; prior public
 evidence remains pinned to its own measured source.
 
+Each revision used a separate private target directory seeded from the preceding
+completed cache; no run switched source roots or switched back. Supplemental
+`binary-hashes.json` on the evidence branch records the exact executables named in
+each run's Cargo output. Previous source/run archives remain unchanged.
+
 ## Required joins and remaining A6 work
 
 This does not establish whole-store readiness or permit a snapshot/reset. Remaining
