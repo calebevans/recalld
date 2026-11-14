@@ -42,7 +42,8 @@
 //! `null` to `None`. Many client SDKs serialize optional fields as
 //! `null` rather than omitting them, and the previous
 //! `.and_then(|v| v.as_str())` chain treated the two identically. Any
-//! change to that would break those clients on every call.
+//! change to that would break those clients on every call. The corrected
+//! `quality` and `embeddingDim` controls are exceptions: only omission defaults.
 
 use serde_json::Value;
 
@@ -122,6 +123,62 @@ fn field_opt<'a>(obj: &'a Value, key: &str) -> Option<&'a Value> {
         None | Some(Value::Null) => None,
         Some(v) => Some(v),
     }
+}
+
+/// Require a JSON object before applying any defaults.
+pub fn require_object(obj: &Value) -> Result<(), ArgError> {
+    if !obj.is_object() {
+        return Err(ArgError::new("", "Arguments must be an object"));
+    }
+    Ok(())
+}
+
+/// Unlike legacy optional fields, these numeric controls reject explicit null.
+fn missing_only_u64(obj: &Value, key: &str, min: u64, max: u64) -> Result<Option<u64>, ArgError> {
+    require_object(obj)?;
+    if obj.get(key) == Some(&Value::Null) {
+        return Err(ArgError::new(
+            key,
+            format!("Parameter '{key}' must be an integer (got null)"),
+        ));
+    }
+    opt_u64_in_range(obj, key, min, max)
+}
+
+/// Shared MCP/HTTP reinforcement validation, before any mutation.
+pub fn parse_quality(obj: &Value) -> Result<u8, ArgError> {
+    Ok(
+        u8::try_from(missing_only_u64(obj, "quality", 1, 4)?.unwrap_or(3))
+            .expect("quality is bounded to 1..=4"),
+    )
+}
+
+/// Shared MCP/HTTP namespace options. Legacy optional floats accept null as omission.
+pub fn parse_create_namespace(
+    obj: &Value,
+) -> Result<crate::mcp::bridge::CreateNamespaceInput, ArgError> {
+    require_object(obj)?;
+    let name = require_str(obj, "name")?;
+    crate::model::validation::validate_namespace_name(&name)
+        .map_err(|e| ArgError::new("name", e.to_string()))?;
+    let embedding_dim = missing_only_u64(obj, "embeddingDim", 1, 8192)?
+        .map(|v| u16::try_from(v).expect("dimension is bounded to 1..=8192"));
+    let initial_stability = opt_f32_in_range(obj, "initialStability", 0.0, f32::MAX as f64)?;
+    if initial_stability == Some(0.0) {
+        return Err(ArgError::new(
+            "initialStability",
+            "Parameter 'initialStability' must be positive",
+        ));
+    }
+    let desired_retention = opt_f32_in_range(obj, "desiredRetention", 0.0, 1.0)?;
+    let decay_rate_multiplier = opt_f32_in_range(obj, "decayRateMultiplier", 0.0, f32::MAX as f64)?;
+    Ok(crate::mcp::bridge::CreateNamespaceInput {
+        name,
+        embedding_dim,
+        initial_stability,
+        desired_retention,
+        decay_rate_multiplier,
+    })
 }
 
 /// The number of bytes of a bad value echoed back in an error message.
@@ -757,7 +814,7 @@ pub fn opt_f32_in_range(
             ),
         ));
     };
-    if n.is_nan() || n < min || n > max {
+    if !n.is_finite() || !(n as f32).is_finite() || n < min || n > max {
         return Err(ArgError::new(
             key,
             format!("Parameter '{key}' must be between {min} and {max} (got {n})"),

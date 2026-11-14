@@ -24,11 +24,18 @@ use crate::model::constants::{
 };
 use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
-use crate::model::validation::{MemoryInputRef, validate_memory_input, validate_namespace_name};
+use crate::model::validation::{MemoryInputRef, validate_memory_input};
 use crate::serialization::{
-    ApiResponse, MemoryResponse, NamespaceRequest, NamespaceResponse, SearchHit, SearchRequest,
-    SearchResponse,
+    ApiResponse, MemoryResponse, NamespaceResponse, SearchHit, SearchRequest, SearchResponse,
 };
+
+/// Keep shared parser field names in HTTP validation errors.
+fn argument_error(error: crate::mcp::args::ArgError) -> AppError {
+    AppError::BadRequest {
+        message: error.message,
+        field: (!error.field.is_empty()).then_some(error.field),
+    }
+}
 
 /// Duration for which a cached health report is considered fresh.
 const HEALTH_REPORT_CACHE_TTL_SECS: u64 = 60;
@@ -481,23 +488,17 @@ pub async fn delete_memory(
 pub async fn reinforce_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<ReinforceRequest>,
+    Json(req): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<ReinforceResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
 
-    // Validate quality rating
-    if !(1..=4).contains(&req.quality) {
-        return Err(AppError::BadRequest {
-            message: "quality must be 1-4 (again/hard/good/easy)".into(),
-            field: Some("quality".into()),
-        });
-    }
+    let quality = crate::mcp::args::parse_quality(&req).map_err(argument_error)?;
 
     let updated = state
         .decay
-        .reinforce(memory_id, req.quality)
+        .reinforce(memory_id, quality)
         .await
         .map_err(|e| feedback_error(e, &id))?;
 
@@ -1093,31 +1094,22 @@ pub async fn list_namespaces(
 /// 4. Return 201 with namespace details.
 pub async fn create_namespace(
     State(state): State<AppState>,
-    Json(req): Json<NamespaceRequest>,
+    Json(req): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<ApiResponse<NamespaceResponse>>), AppError> {
     let start = Instant::now();
 
-    // Validate name format
-    validate_namespace_name(&req.name)?;
-
-    // Validate embedding dimensions if provided
-    if let Some(dim) = req.embedding_dim {
-        if dim == 0 || dim > 8192 {
-            return Err(AppError::BadRequest {
-                message: "embedding_dim must be between 1 and 8192".into(),
-                field: Some("embeddingDim".into()),
-            });
-        }
-    }
+    let req = crate::mcp::args::parse_create_namespace(&req).map_err(argument_error)?;
 
     // Create namespace (registry checks for duplicates)
     let ns = state
         .namespaces
         .create(
             &req.name,
-            req.embedding_dim,
-            req.initial_stability,
-            req.desired_retention,
+            req.embedding_dim.map(u32::from),
+            req.initial_stability
+                .unwrap_or(crate::model::constants::DEFAULT_INITIAL_STABILITY),
+            req.desired_retention
+                .unwrap_or(crate::model::constants::DEFAULT_DESIRED_RETENTION),
             req.decay_rate_multiplier,
         )
         .await
@@ -1722,8 +1714,20 @@ pub async fn scan_duplicates(
                 id: name.clone(),
             })?;
 
-        let threshold = req.threshold.clamp(0.0, 1.0);
-        let max_memories = req.max_memories.min(10_000);
+        if !req.threshold.is_finite() || !(0.0..=1.0).contains(&req.threshold) {
+            return Err(AppError::BadRequest {
+                message: "threshold must be finite and between 0 and 1".into(),
+                field: Some("threshold".into()),
+            });
+        }
+        if !(1..=10_000).contains(&req.max_memories) {
+            return Err(AppError::BadRequest {
+                message: "maxMemories must be between 1 and 10000".into(),
+                field: Some("maxMemories".into()),
+            });
+        }
+        let threshold = req.threshold;
+        let max_memories = req.max_memories;
 
         // Get memory IDs in this namespace
         let filter = ListFilter {
@@ -1736,34 +1740,25 @@ pub async fn scan_duplicates(
         let records = state.storage.list_memories(&filter).await?;
         let memory_ids: Vec<MemoryId> = records.iter().take(max_memories).map(|r| r.id).collect();
 
-        if memory_ids.len() < 2 {
-            let took = start.elapsed().as_micros() as u64;
-            return Ok(Json(ApiResponse {
-                data: ScanDuplicatesResponse {
-                    clusters: vec![],
-                    total: 0,
-                },
-                took_us: Some(took),
-            }));
-        }
-
         // Load embeddings
         let embeddings = state.search.get_embeddings_batch(&memory_ids);
+        let sampled_count = memory_ids.len();
         let id_embeddings: Vec<(MemoryId, Vec<f32>)> = memory_ids
             .into_iter()
             .filter_map(|mid| embeddings.get(&mid).map(|emb| (mid, emb.clone())))
             .collect();
 
-        if id_embeddings.len() < 2 {
-            let took = start.elapsed().as_micros() as u64;
-            return Ok(Json(ApiResponse {
-                data: ScanDuplicatesResponse {
-                    clusters: vec![],
-                    total: 0,
-                },
-                took_us: Some(took),
-            }));
-        }
+        let coverage = DuplicateScanCoverage {
+            algorithm: "sampledPairs",
+            eligible_count: records.len(),
+            sampled_count,
+            skipped_vector_count: sampled_count - id_embeddings.len(),
+            sample_cap: max_memories,
+            neighbor_cap: None,
+            truncated: sampled_count < records.len(),
+            // This legacy scan has no generation-consistent read view.
+            complete: false,
+        };
 
         // Union-Find based clustering
         let n = id_embeddings.len();
@@ -1854,7 +1849,11 @@ pub async fn scan_duplicates(
         let took = start.elapsed().as_micros() as u64;
 
         Ok(Json(ApiResponse {
-            data: ScanDuplicatesResponse { clusters, total },
+            data: ScanDuplicatesResponse {
+                clusters,
+                total,
+                coverage,
+            },
             took_us: Some(took),
         }))
     }
@@ -1992,3 +1991,7 @@ mod lifecycle_error_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "validation_tests.rs"]
+mod validation_tests;
