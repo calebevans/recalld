@@ -1835,11 +1835,18 @@ mod lifecycle_error_tests {
         ] {
             let id = f
                 .insert_memory_with(MemorySpec {
-                    phase,
+                    phase: if phase == DecayPhase::Tombstone {
+                        DecayPhase::Full
+                    } else {
+                        phase
+                    },
                     summary: "",
                     ..MemorySpec::new(NamespaceId::new(1))
                 })
                 .await;
+            if phase == DecayPhase::Tombstone {
+                f.tombstone(id);
+            }
             let error = adapter.reinforce(id, 3).await.unwrap_err();
             let response = feedback_error(error, &id.to_string()).into_response();
             assert_eq!(response.status(), StatusCode::CONFLICT);
