@@ -1,0 +1,95 @@
+warning: unused import: `HashMap`
+  --> src/storage/engine.rs:14:24
+   |
+14 | use std::collections::{HashMap, HashSet};
+   |                        ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/bench/locomo.rs:1920:19
+     |
+1920 |         if let Ok(mut storage_w) = harness.system.storage().write() {
+     |                   ----^^^^^^^^^
+     |                   |
+     |                   help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/bench/locomo.rs:1509:9
+     |
+1509 |     let mut storage_w = harness
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: associated items `new_persistent` and `has_memories` are never used
+   --> src/bench/locomo.rs:337:25
+    |
+314 | impl BenchHarness {
+    | ----------------- associated items in this implementation
+...
+337 |     pub(super) async fn new_persistent(
+    |                         ^^^^^^^^^^^^^^
+...
+356 |     pub(super) fn has_memories(&self) -> bool {
+    |                   ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `recalld` (lib) generated 4 warnings (run `cargo fix --lib -p recalld` to apply 3 suggestions)
+   Compiling recalld v1.0.0 (/work)
+warning: `recalld` (lib test) generated 4 warnings (4 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.35s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-7025a4141187b374)
+
+running 15 tests
+test api::legacy_label_tests::legacy_labels_reject_before_provider_or_mutation_in_actual_http_batch_and_mcp ... ok
+test api::legacy_label_tests::legacy_labels_normalized_positive_survive_receipted_rebuild_and_restart ... ok
+test mcp::bridge_adapters::tests::w67_filter_tags_names_the_group_that_carried_the_bad_label ... ok
+test model::schema::tests::schema_legacy_conversion_labels_evidence_and_defaults_are_explicit ... ok
+test model::validation::tests::a_max_length_label_still_fits_its_derived_tag ... ok
+test search::entity_index::tests::entity_rebuild_uses_canonical_labels_and_replaces_the_complete_view ... ok
+test search::pipeline::semantics_tests::fts_sqlite_failure_propagates_in_v2_and_labels_legacy_fallback ... ok
+test search::pipeline::strength_tests::label_tests::compiled_label_predicates_preserve_caller_text_and_use_whole_label_lowercase ... ok
+test search::pipeline::strength_tests::label_tests::legacy_label_filter_rejection_precedes_provider_and_keeps_legacy_shape ... ok
+test search::pipeline::strength_tests::label_tests::synthetic_canonical_empty_labels_never_fall_back_or_upgrade_provenance ... ok
+test search::pipeline::strength_tests::label_tests::synthetic_canonical_labels_filter_before_every_channel_cap_without_provider_calls ... ok
+test search::pipeline::strength_tests::label_tests::synthetic_canonical_labels_survive_actual_http_and_mcp_hydration ... ok
+test storage::metadata::tests::canonical_label_list_predicate_precedes_total_offset_and_limit ... ok
+test system::tests::entity_rebuild_uses_each_records_namespace_and_only_retained_labels ... ok
+test backup::restore::schema_tests::independent_v2_field_masks_preserve_unremoved_labels_and_payloads ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 808 filtered out; finished in 19.13s
+
+     Running unittests src/main.rs (/target/debug/deps/recalld-27bbb81e23f12ff5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/recalld_cli.rs (/target/debug/deps/recalld_cli-16a6b9f5f1a3f682)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/recalld_text_migrate.rs (/target/debug/deps/recalld_text_migrate-b3ddbfaa472dba30)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lifecycle_cli.rs (/target/debug/deps/lifecycle_cli-ef7aa35bda05dfab)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/text_migration_cli.rs (/target/debug/deps/text_migration_cli-c242142a48e76014)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+

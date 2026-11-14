@@ -1,0 +1,30 @@
+{
+  "PR58": {
+    "commit": "faa0b0a647322877c5d44e97107c93d3a61b4e32",
+    "ancestor": true
+  },
+  "PR61": {
+    "commit": "22093c5e53ffc449eac9a6310506c07fb2d9d5bd",
+    "ancestor": true
+  },
+  "PR62": {
+    "commit": "ed242ec99354020089cd366bec03792e063015c4",
+    "ancestor": true
+  },
+  "PR68": {
+    "commit": "b2923d1c0240b3a0f6406feefd956bd5a58c9f48",
+    "ancestor": true
+  },
+  "excluded_broad_writer": {
+    "commit": "30b2010004167b27db243ae1138fb72be4af194c",
+    "ancestor": false
+  },
+  "excluded_broad_entity_test_merge": {
+    "commit": "be8cfc1e6b3702cc22feee94bfd84f1e822c864f",
+    "ancestor": false
+  },
+  "excluded_catalog50": {
+    "commit": "d4f756c148b7ed817e0ff0b1d452846fece96c16",
+    "ancestor": false
+  }
+}

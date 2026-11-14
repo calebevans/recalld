@@ -1,0 +1,173 @@
+   Compiling recalld v1.0.0 (/work)
+warning: unused import: `HashMap`
+  --> src/storage/engine.rs:14:24
+   |
+14 | use std::collections::{HashMap, HashSet};
+   |                        ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/bench/locomo.rs:1920:19
+     |
+1920 |         if let Ok(mut storage_w) = harness.system.storage().write() {
+     |                   ----^^^^^^^^^
+     |                   |
+     |                   help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0046]: not all trait items implemented, missing: `insert_memory`, `complete_insertion`
+   --> src/search/by_id_transport_tests.rs:12:1
+    |
+ 12 |   impl crate::api::StorageEngine for OfflineHttpStorage {
+    |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `insert_memory`, `complete_insertion` in implementation
+    |
+   ::: src/api/state.rs:168:5
+    |
+168 | /     async fn insert_memory(
+169 | |         &self,
+170 | |         namespace_id: NamespaceId,
+171 | |         input: crate::storage::insertion::InsertMemory,
+172 | |         generated_embedding: crate::embedding::runtime::GeneratedEmbedding,
+173 | |     ) -> Result<crate::storage::insertion::InsertResult, StorageError>;
+    | |_______________________________________________________________________- `insert_memory` from trait
+174 |
+175 | /     async fn complete_insertion(
+176 | |         &self,
+177 | |         receipt: &crate::storage::control::WriteReceipt,
+178 | |     ) -> Result<(), StorageError>;
+    | |__________________________________- `complete_insertion` from trait
+
+error[E0061]: this method takes 3 arguments but 2 arguments were supplied
+   --> src/api/vector_query_tests.rs:122:42
+    |
+122 |             f.entity_index.write().await.add(id, &["fixture".into()]);
+    |                                          ^^^ -- argument #1 of type `id::NamespaceId` is missing
+    |
+note: method defined here
+   --> src/search/entity_index.rs:42:12
+    |
+ 42 |     pub fn add(&mut self, namespace_id: NamespaceId, memory_id: MemoryId, entities: &[String]) {
+    |            ^^^            -------------------------
+help: provide the argument
+    |
+122 |             f.entity_index.write().await.add(/* id::NamespaceId */, id, &["fixture".into()]);
+    |                                              ++++++++++++++++++++++
+
+error[E0061]: this method takes 3 arguments but 2 arguments were supplied
+   --> src/daemon/read_only_tests.rs:122:42
+    |
+122 |             f.entity_index.write().await.add(id, &["fixture".into()]);
+    |                                          ^^^ -- argument #1 of type `id::NamespaceId` is missing
+    |
+note: method defined here
+   --> src/search/entity_index.rs:42:12
+    |
+ 42 |     pub fn add(&mut self, namespace_id: NamespaceId, memory_id: MemoryId, entities: &[String]) {
+    |            ^^^            -------------------------
+help: provide the argument
+    |
+122 |             f.entity_index.write().await.add(/* id::NamespaceId */, id, &["fixture".into()]);
+    |                                              ++++++++++++++++++++++
+
+error[E0061]: this method takes 3 arguments but 1 argument was supplied
+   --> src/derived_completion.rs:309:38
+    |
+309 |         assert!(fx.storage_adapter().get_memory(memory_id).await.is_err());
+    |                                      ^^^^^^^^^^----------- two arguments of type `bool` and `std::option::Option<&str>` are missing
+    |
+note: method defined here
+   --> src/mcp/bridge.rs:63:14
+    |
+ 63 |     async fn get_memory(
+    |              ^^^^^^^^^^
+...
+ 66 |         record_access: bool,
+    |         -------------
+ 67 |         namespace: Option<&str>,
+    |         ---------
+help: provide the arguments
+    |
+309 |         assert!(fx.storage_adapter().get_memory(memory_id, /* bool */, /* std::option::Option<&str> */).await.is_err());
+    |                                                          +++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0061]: this method takes 2 arguments but 1 argument was supplied
+    --> src/mcp/bridge_adapters.rs:3926:25
+     |
+3926 |         assert!(adapter.delete_memory(ids[0]).await.unwrap());
+     |                         ^^^^^^^^^^^^^-------- argument #2 of type `std::option::Option<&str>` is missing
+     |
+note: method defined here
+    --> src/mcp/bridge.rs:72:14
+     |
+  72 |     async fn delete_memory(
+     |              ^^^^^^^^^^^^^
+...
+  75 |         namespace: Option<&str>,
+     |         ---------
+help: provide the argument
+     |
+3926 |         assert!(adapter.delete_memory(ids[0], /* std::option::Option<&str> */).await.unwrap());
+     |                                             +++++++++++++++++++++++++++++++++
+
+warning: variable does not need to be mutable
+    --> src/bench/locomo.rs:1509:9
+     |
+1509 |     let mut storage_w = harness
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+error[E0061]: this method takes 3 arguments but 2 arguments were supplied
+   --> src/search/strength_tests.rs:234:22
+    |
+234 |             entities.add(r.id, &r.entities);
+    |                      ^^^ ---- argument #1 of type `id::NamespaceId` is missing
+    |
+note: method defined here
+   --> src/search/entity_index.rs:42:12
+    |
+ 42 |     pub fn add(&mut self, namespace_id: NamespaceId, memory_id: MemoryId, entities: &[String]) {
+    |            ^^^            -------------------------
+help: provide the argument
+    |
+234 |             entities.add(/* id::NamespaceId */, r.id, &r.entities);
+    |                          ++++++++++++++++++++++
+
+error[E0061]: this method takes 3 arguments but 2 arguments were supplied
+    --> src/search/pipeline.rs:2584:22
+     |
+2584 |             entities.add(record.id, &record.entities);
+     |                      ^^^ --------- argument #1 of type `id::NamespaceId` is missing
+     |
+note: method defined here
+    --> src/search/entity_index.rs:42:12
+     |
+  42 |     pub fn add(&mut self, namespace_id: NamespaceId, memory_id: MemoryId, entities: &[String]) {
+     |            ^^^            -------------------------
+help: provide the argument
+     |
+2584 |             entities.add(/* id::NamespaceId */, record.id, &record.entities);
+     |                          ++++++++++++++++++++++
+
+warning: associated items `new_persistent` and `has_memories` are never used
+   --> src/bench/locomo.rs:337:25
+    |
+314 | impl BenchHarness {
+    | ----------------- associated items in this implementation
+...
+337 |     pub(super) async fn new_persistent(
+    |                         ^^^^^^^^^^^^^^
+...
+356 |     pub(super) fn has_memories(&self) -> bool {
+    |                   ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+Some errors have detailed explanations: E0046, E0061.
+For more information about an error, try `rustc --explain E0046`.
+warning: `recalld` (lib test) generated 3 warnings (3 duplicates)
+error: could not compile `recalld` (lib test) due to 7 previous errors; 3 warnings emitted
+warning: build failed, waiting for other jobs to finish...
+warning: `recalld` (lib) generated 4 warnings (run `cargo fix --lib -p recalld` to apply 3 suggestions)

@@ -1,0 +1,1089 @@
+   Compiling recalld v1.0.0 (/work)
+warning: unused import: `HashMap`
+  --> src/storage/engine.rs:14:24
+   |
+14 | use std::collections::{HashMap, HashSet};
+   |                        ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/bench/locomo.rs:1920:19
+     |
+1920 |         if let Ok(mut storage_w) = harness.system.storage().write() {
+     |                   ----^^^^^^^^^
+     |                   |
+     |                   help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/bench/locomo.rs:1509:9
+     |
+1509 |     let mut storage_w = harness
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: associated items `new_persistent` and `has_memories` are never used
+   --> src/bench/locomo.rs:337:25
+    |
+314 | impl BenchHarness {
+    | ----------------- associated items in this implementation
+...
+337 |     pub(super) async fn new_persistent(
+    |                         ^^^^^^^^^^^^^^
+...
+356 |     pub(super) fn has_memories(&self) -> bool {
+    |                   ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `recalld` (lib) generated 4 warnings (run `cargo fix --lib -p recalld` to apply 3 suggestions)
+warning: `recalld` (lib test) generated 4 warnings (4 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.25s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-7025a4141187b374)
+
+running 815 tests
+test api::adapters::tests::creation_adapters_reject_unusable_lifecycle_policy_before_persistence ... ok
+test api::adapters::tests::actual_http_insertion_adapter_reports_durable_receipt_if_publication_fails ... ok
+test api::adapters::tests::insertion_http_boundary_distinguishes_provider_unavailable_from_caller_invalid ... ok
+test api::adapters::tests::w35_http_delete_clears_every_index_and_marks_the_graph_node ... ok
+test api::errors::tests::dimension_mismatch_becomes_unprocessable_entity ... ok
+test api::errors::tests::namespace_not_found_becomes_not_found ... ok
+test api::errors::tests::validation_error_becomes_bad_request_with_field ... ok
+test api::adapters::tests::w36_http_delete_of_an_already_tombstoned_memory_reports_false ... ok
+test api::handlers::lifecycle_error_tests::feedback_handler_maps_terminal_missing_and_invalid_inputs_by_type ... ok
+test api::handlers::validation_tests::http_duplicate_coverage_reports_caps_missing_vectors_and_empty_samples ... ok
+test api::handlers::validation_tests::http_namespace_rejects_exported_probe_values_without_creation ... ok
+test api::handlers::validation_tests::http_quality_rejects_exported_probe_values_without_mutation ... ok
+test api::handlers::validation_tests::namespace_option_parity_and_no_creation_on_invalid_input ... ok
+test api::handlers::validation_tests::scope_assertions_reject_wrong_namespace_before_access_search_or_mutation ... ok
+test api::handlers::validation_tests::scope_assertions_similarity_uses_canonical_source_scope_with_stale_cache ... ok
+test api::handlers::validation_tests::scope_assertions_preserve_record_scope_despite_wrong_session_default ... ok
+test api::vector_query_tests::vector_query_http_search_and_similarity_succeed_without_embedding_provider ... ok
+test api::vector_query_tests::vector_query_invalid_vectors_reject_before_access_work ... ok
+test api::vector_query_tests::vector_query_precedence_preserves_fts_and_text_only_defaults ... ok
+test backup::restore::schema_tests::backup_and_restore_reject_unapplied_effects_without_rewriting_evidence ... ok
+test backup::restore::schema_tests::historical_schema_restore_is_inspectable_but_never_ordinary_serving ... ok
+test backup::restore::schema_tests::independent_v2_field_masks_preserve_unremoved_labels_and_payloads ... ok
+test backup::restore::schema_tests::forked_attestation_rejects_removed_pointer_and_invalid_historical_proofs ... ok
+test backup::restore::schema_tests::private_rebuild_failure_does_not_consume_applied_effects_or_publish_fork ... ok
+test backup::restore::schema_tests::schema_journal_restart_finishes_fork_then_refuses_ordinary_v2_serving ... ok
+test backup::restore::schema_tests::migrated_format_and_attested_backups_fork_with_masks_and_consume_applied_effects ... ok
+test backup::restore::schema_tests::unknown_record_extensions_roundtrip_only_when_no_removal_is_required ... ok
+test backup::restore::tests::containment_archive_rejects_undeclared_paths_and_links ... ok
+test backup::restore::tests::containment_duplicate_zip_central_entries_cannot_hide_in_library_inventory ... ok
+test backup::restore::tests::containment_interrupted_restore_and_symlink_target_fail_closed ... ok
+test backup::restore::tests::containment_restore_cannot_replace_another_process_even_with_force ... ok
+test backup::restore::tests::containment_restore_lock_child ... ok
+test backup::restore::tests::containment_restore_rejects_each_missing_canonical_file_before_target_replacement ... ok
+test backup::restore::tests::containment_restore_rejects_zero_vectors_sizes_checksums_and_duplicate_manifest ... ok
+test backup::restore::tests::containment_backup_force_cannot_bypass_ownership_and_quiescent_archive_restores ... ok
+test backup::restore::tests::containment_restore_round_trip_and_backup_validation_leave_source_unchanged ... ok
+test backup::restore::tests::explicit_historical_restore_is_fresh_gated_and_excluded_from_writes_and_serving ... ok
+test backup::restore::tests::integration_restore_rejects_partial_or_future_control_before_replacing_target ... ok
+test backup::restore::tests::missing_staging_after_old_move_restores_retained_target_without_resurrection ... ok
+test backup::restore::tests::restore_recovery_rejects_unknown_journal_lineage_and_changed_staging ... ok
+test backup::restore::tests::restore_journal_restart_finishes_every_durable_publication_boundary ... ok
+test backup::restore::tests::retained_restore_refuses_legacy_in_place_and_accepts_explicit_fresh_text_migration ... ok
+test backup::restore::tests::retained_restore_applies_newer_removals_forks_lineage_and_preserves_historical_receipts ... ok
+test backup::restore::tests::selected_generation_rejects_self_consistent_legacy_readable_gate_before_restore ... ok
+test backup::restore::tests::text_generation_restore_requires_selected_payload_even_if_manifest_omits_it ... ok
+test backup::restore::tests::unrelated_or_unreadable_target_never_downgrades_to_historical_restore ... ok
+test daemon::client::tests::access_recording_reads_are_not_replayed ... ok
+test daemon::client::tests::concurrent_reconnect_cannot_have_its_clamp_overwritten_by_ping ... ok
+test daemon::client::tests::future_response_id_poisons_and_next_call_recovers ... ok
+test daemon::client::tests::legacy_daemon_returning_empty_ping_clamps_to_1mib ... ok
+test daemon::client::tests::malformed_response_is_reported_as_a_protocol_error_not_a_size_error ... ok
+test daemon::client::tests::mutating_method_is_not_retried ... ok
+test daemon::client::tests::negotiated_limit_ignores_unknown_and_absurd_announcements ... ok
+test daemon::client::tests::only_methods_without_observable_effects_are_retry_safe ... ok
+test daemon::client::tests::oversize_request_fails_fast_and_connection_survives ... ok
+test daemon::client::tests::oversized_response_is_drained_and_connection_survives ... ok
+test daemon::client::tests::ping_negotiates_frame_limit ... ok
+test daemon::client::tests::read_only_method_retries_transparently_after_mid_call_close ... ok
+test daemon::client::tests::reconnect_gives_up_after_bounded_attempts ... ok
+test daemon::client::tests::reconnects_after_server_closes_connection ... ok
+test daemon::client::tests::stale_response_id_is_skipped ... ok
+test daemon::client::tests::w42_the_destructive_methods_are_neither_retry_safe_nor_access_only ... ok
+test daemon::lifecycle::tests::a_client_with_xdg_runtime_dir_finds_a_daemon_started_without_it ... ok
+test daemon::lifecycle::tests::a_client_without_xdg_runtime_dir_finds_a_daemon_started_with_it ... ok
+test daemon::lifecycle::tests::a_daemon_under_a_custom_xdg_runtime_dir_is_found_before_the_conventional_one ... ok
+test daemon::lifecycle::tests::a_runtime_dir_is_only_somewhere_to_look_if_it_is_private_to_the_user ... ok
+test daemon::lifecycle::tests::an_empty_xdg_runtime_dir_counts_as_unset ... ok
+test daemon::lifecycle::tests::an_explicit_socket_wins_and_nothing_is_probed ... ok
+test daemon::lifecycle::tests::with_no_daemon_running_the_defaults_are_unchanged ... ok
+test daemon::protocol::tests::declared_payload_that_never_arrives_times_out ... ok
+test daemon::protocol::tests::desync_length_beyond_drain_limit_is_fatal ... ok
+test daemon::protocol::tests::drain_times_out_when_payload_never_arrives ... ok
+test daemon::protocol::tests::err_too_large_round_trips_through_daemon_rpc_error ... ok
+test daemon::protocol::tests::frame_limits_leave_headroom_over_the_content_limit ... ok
+test daemon::protocol::tests::malformed_json_is_recoverable_and_stream_resyncs ... ok
+test daemon::protocol::tests::maximum_declared_length_with_no_body_times_out_without_hoarding ... ok
+test daemon::protocol::tests::multi_chunk_payload_round_trips_intact ... ok
+test daemon::protocol::tests::oversized_incoming_frame_is_drained_and_stream_resyncs ... ok
+test daemon::protocol::tests::payload_truncated_by_hangup_reports_closed ... ok
+test daemon::protocol::tests::read_returns_closed_on_clean_eof ... ok
+test daemon::protocol::tests::round_trip_request ... ok
+test daemon::protocol::tests::round_trip_response_error ... ok
+test daemon::protocol::tests::round_trip_response_success ... ok
+test daemon::protocol::tests::three_frames_read_back_in_order ... ok
+test daemon::protocol::tests::too_large_error_message_names_size_and_limit ... ok
+test daemon::protocol::tests::worst_case_valid_store_request_fits_in_one_frame ... ok
+test daemon::protocol::tests::write_rejects_oversized_request_without_writing ... ok
+test daemon::protocol::tests::write_rejects_oversized_response_without_writing ... ok
+test daemon::protocol::tests::zero_length_frame_is_malformed_not_fatal ... ok
+test daemon::server::read_only_tests::actual_transports_propagate_observation_failure_without_success_payload ... ok
+test daemon::server::read_only_tests::awaited_mcp_final_union_records_neighbors_only_when_exposed ... ok
+test daemon::server::read_only_tests::awaited_similarity_filters_before_single_exposure_and_false_skips_all_writes ... ok
+test daemon::server::read_only_tests::observed_join_tests::public_hydration_failure_never_observes_or_loses_text_error ... ok
+test backup::restore::tests::retained_restore_terminal_ledger_survives_tombstone_and_namespace_purge ... ok
+test daemon::server::read_only_tests::read_only_daemon_aliases_force_false_and_legacy_methods_keep_defaults ... ok
+test daemon::server::read_only_tests::read_only_graph_expansion_and_supersedes_hydrate_canonical_records ... ok
+test daemon::server::read_only_tests::read_only_http_get_search_and_similarity_success ... ok
+test daemon::server::read_only_tests::read_only_mcp_tools_and_legacy_get_contract ... ok
+test daemon::server::read_only_tests::read_only_old_handler_unknown_method_never_falls_back_to_mutating_rpc ... ok
+test daemon::server::read_only_tests::read_only_pipeline_bypasses_stale_cache_and_preserves_state ... ok
+test daemon::server::read_only_tests::scoped_read_only_aliases_fail_closed_on_older_single_control_daemons ... ok
+test daemon::server::read_only_tests::scoped_read_only_controls_survive_http_mcp_and_framed_daemon ... ok
+test daemon::server::read_only_tests::similarity_rest_full_text_failure_rejects_without_exposure ... ok
+test daemon::server::read_only_tests::similarity_rest_preserves_canonical_metadata_and_full_text ... ok
+test daemon::server::read_only_tests::similarity_threshold_namespace_and_returned_only_exposure ... ok
+test daemon::server::scope_tests::scope_assertions_remote_round_trip_and_old_daemon_fail_closed ... ok
+test daemon::server::scope_tests::scope_assertions_rpc_requires_assertion_and_legacy_rpc_rejects_ignored_fields ... ok
+test daemon::server::tests::a_good_frame_resets_the_strike_count ... ok
+test daemon::server::tests::a_run_of_unusable_frames_closes_the_connection ... ok
+test daemon::server::tests::action_for_frame_error_classification ... ok
+test daemon::server::tests::actual_daemon_insertion_dispatch_keeps_committed_failure_distinct_from_success ... ok
+test daemon::server::tests::dispatch_list_tags_rejects_params_it_cannot_decode ... ok
+test daemon::server::tests::dispatch_ping_announces_the_protocol_version ... ok
+test daemon::server::tests::dispatch_unknown_method_returns_invalid_input ... ok
+test daemon::server::tests::oversized_request_reply_explains_the_limit ... ok
+test daemon::server::tests::peer_frame_limit_holds_unannounced_peers_at_the_legacy_limit ... ok
+test daemon::server::tests::w70_delete_memories_caps_the_batch_at_the_shared_constant ... ok
+test decay::lifecycle::tests::clock_regression_and_large_jump_keep_feedback_finite ... ok
+test decay::lifecycle::tests::feedback_keeps_retained_phase_and_sticky_permastore ... ok
+test decay::lifecycle::tests::invalid_policy_and_feedback_are_rejected_without_mutation ... ok
+test decay::lifecycle::tests::mcp_and_http_feedback_share_policy_clock_and_terminal_guards ... ok
+test decay::lifecycle::tests::policy_inheritance_multiplier_direction_and_record_difficulty ... ok
+test decay::lifecycle::tests::projection_is_deterministic_bounded_and_uses_the_legacy_multiplier_direction ... ok
+test decay::observation::tests::actual_feedback_consumer_commits_one_receipt_and_invalidates_before_return ... ok
+test decay::observation::tests::later_namespace_failure_reports_prior_receipts_and_publishes_them ... ok
+test decay::observation::tests::namespace_batches_deduplicate_direct_wins_publish_and_survive_reopen ... ok
+test decay::observation::tests::publication_panic_is_committed_not_ready_and_reopen_retains_receipt ... ok
+test decay::observation::tests::same_namespace_failure_is_atomic_and_no_success_receipt ... ok
+test decay::sweep::independent_review_regressions::atomic_sweep_strips_real_payload_references_and_retains_v1_tags_after_reopen ... ok
+test decay::sweep::independent_review_regressions::purge_releases_storage_before_graph_publication_and_stale_sweep_skips ... ok
+test decay::sweep::independent_review_regressions::review_access_must_not_move_feedback_anchor_backward ... ok
+test decay::sweep::independent_review_regressions::review_stale_sweep_must_not_overwrite_committed_feedback ... ok
+test decay::sweep::independent_review_regressions::review_successful_sweep_must_publish_final_graph_phase ... ok
+test daemon::server::read_only_tests::observed_join_tests::public_postcommit_admission_faults_retain_receipts_and_exactly_once_history ... ok
+test decay::sweep::storage_independent_review::review_graph_change_must_revalidate_destructive_sweep_plan ... ok
+test decay::sweep::storage_independent_review::strength_only_patch_reprojects_growing_and_shrinking_bonus_at_original_clock ... ok
+test decay::sweep::storage_independent_review::summary_and_ghost_plans_recheck_graph_before_removal_and_can_still_commit ... ok
+test decay::sweep::tests::a_memory_tombstoned_after_the_phase_snapshot_is_not_swept ... ok
+test decay::sweep::tests::empty_successful_compaction_is_reported ... ok
+test decay::sweep::tests::fixed_time_sweep_obeys_namespace_thresholds_and_preserves_content_phases ... ok
+test decay::sweep::tests::manual_sweep_uses_injected_clock_and_zero_multiplier_skips_degradation ... ok
+test decay::sweep::independent_review_regressions::stale_transition_checks_each_expected_field_before_storage_or_graph_mutation ... ok
+test derived_completion::tests::actual_manual_sweep_completes_ghost_deletion ... ok
+test derived_completion::tests::actual_background_ghost_sweep_completes_without_reopen ... ok
+test derived_completion::tests::actual_namespace_purge_returns_with_admission_open ... ok
+test derived_completion::tests::entity_rebuild_online_completion_replaces_stale_namespace_postings ... ok
+test derived_completion::tests::insertion_completion_returns_receipt_on_failure_then_retries_all_views ... ok
+test derived_completion::tests::online_completion_drains_store_publication_before_graph_lock ... ok
+test embedding::bedrock::tests::test_cohere_dimension_validation ... ok
+test embedding::bedrock::tests::test_cohere_request_serialization ... ok
+test embedding::bedrock::tests::test_cohere_response_deserialization ... ok
+test embedding::bedrock::tests::test_detect_family_cohere ... ok
+test embedding::bedrock::tests::test_detect_family_titan ... ok
+test embedding::bedrock::tests::test_detect_family_unknown ... ok
+test embedding::bedrock::tests::test_titan_dimension_validation_invalid ... ok
+test embedding::bedrock::tests::test_titan_dimension_validation_valid ... ok
+test embedding::bedrock::tests::test_titan_request_serialization ... ok
+test embedding::bedrock::tests::test_titan_response_deserialization ... ok
+test embedding::cache::tests::batch_deduplicates_misses_and_preserves_order_with_hits ... ok
+test embedding::cache::tests::invalid_batches_never_populate_any_cache_entry ... ok
+test embedding::cache::tests::invalid_single_results_are_not_cached_for_either_task ... ok
+test embedding::cache::tests::query_and_document_do_not_alias_in_either_order ... ok
+test embedding::openai::response_shape_tests::native_profile_openai_real_response_fixtures_require_exact_index_cover ... ok
+test embedding::prefix::tests::test_batch_empty_prefix ... ok
+test embedding::prefix::tests::test_batch_prefix_applied ... ok
+test embedding::prefix::tests::test_dimensions_passthrough ... ok
+test embedding::prefix::tests::test_document_prefix_applied ... ok
+test embedding::prefix::tests::test_embed_delegates_to_inner_embed ... ok
+test embedding::prefix::tests::test_embed_query_delegates_to_inner_embed_query ... ok
+test embedding::prefix::tests::test_embed_query_empty_prefix_delegates_to_inner_embed_query ... ok
+test embedding::prefix::tests::test_empty_document_prefix_passthrough ... ok
+test embedding::prefix::tests::test_empty_query_prefix_passthrough ... ok
+test embedding::prefix::tests::test_has_document_prefix ... ok
+test embedding::prefix::tests::test_has_query_prefix ... ok
+test embedding::prefix::tests::test_model_name_passthrough ... ok
+test embedding::prefix::tests::test_query_prefix_applied ... ok
+test embedding::profile::tests::attestation_preparation_asserts_identity_and_never_changes_provenance ... ok
+test embedding::profile::tests::compatibility_never_blesses_unknown_legacy_or_equal_width_different_profiles ... ok
+test embedding::profile::tests::profile_input_rejects_types_nulls_unknowns_and_duplicate_fields ... ok
+test embedding::runtime::tests::native_profile_cache_rejects_bad_generated_vectors_and_batches_without_caching ... ok
+test embedding::runtime::tests::native_profile_factory_and_wrappers_preserve_effective_credential_free_identity ... ok
+test embedding::runtime::tests::native_profile_generation_checks_binding_before_provider_and_keeps_legacy_unverified ... ok
+test graph::activation::spreading_tests::test_spreading_basic ... ok
+test graph::activation::spreading_tests::test_spreading_contradicts_blocked ... ok
+test graph::activation::spreading_tests::test_spreading_decay_stops ... ok
+test graph::activation::spreading_tests::test_spreading_fan_attenuation ... ok
+test graph::activation::spreading_tests::test_spreading_ghost_skipped ... ok
+test graph::activation::spreading_tests::test_spreading_multi_seed ... ok
+test graph::activation::spreading_tests::test_spreading_namespace_isolation ... ok
+test graph::explicit_links::tests::cross_namespace_target_errors ... ok
+test derived_completion::tests::online_completion_retries_failure_and_rejects_late_stale_cache_refill ... ok
+test graph::explicit_links::tests::effects_failed_commit_never_publishes_live_graph_and_keeps_receipt ... ok
+test graph::explicit_links::tests::effects_graph_waiter_does_not_hold_storage_and_cache_counts_are_absolute ... ok
+test graph::explicit_links::tests::field_name_propagates_to_message_and_accessor ... ok
+test graph::explicit_links::tests::missing_target_errors ... ok
+test graph::explicit_links::tests::parent_edge_is_persisted_and_counted_on_the_parent ... ok
+test graph::explicit_links::tests::record_without_graph_node_errors ... ok
+test graph::explicit_links::tests::effects_stale_autolink_plan_cannot_attach_to_tombstone ... ok
+test graph::explicit_links::tests::self_reference_errors_only_when_id_is_known ... ok
+test graph::explicit_links::tests::repeated_parent_edge_does_not_double_count ... ok
+test graph::explicit_links::tests::valid_target_is_accepted ... ok
+test graph::structure::tests::duplicate_supersedes_edge_is_rejected_as_already_existing ... ok
+test graph::structure::tests::supersedes_edge_to_missing_target_errors ... ok
+test graph::structure::tests::supersedes_terminal_follows_the_chain_to_the_newest_version ... ok
+test graph::structure::tests::supersedes_terminal_is_none_for_a_current_memory ... ok
+test graph::structure::tests::supersedes_terminal_returns_none_on_a_cycle ... ok
+test graph::structure::tests::supersedes_terminal_returns_none_on_a_three_node_cycle ... ok
+test graph::structure::tests::valid_target_creates_edge_with_new_memory_as_source ... ok
+test graph::structure::tests::w23_remove_memory_removes_the_node_and_its_edges_without_bridging ... ok
+test graph::structure::tests::w23b_remove_memory_of_an_unknown_id_is_empty ... ok
+test graph::structure::tests::w72_removal_drops_an_id_index_entry_whose_node_is_gone ... ok
+test mcp::args::tests::a10_param_close_then_whitespace_run_then_terminator_is_rejected ... ok
+test mcp::args::tests::a11_trailing_terminator_with_trailing_whitespace_is_rejected ... ok
+test mcp::args::tests::a12_generic_to_generic_adjacency_with_single_space_is_rejected ... ok
+test mcp::args::tests::a13_adjacency_follower_may_carry_attributes ... ok
+test mcp::args::tests::a1_report_artifact_tail_is_rejected ... ok
+test mcp::args::tests::a2_vendor_prefix_inside_a_sentence_is_rejected ... ok
+test mcp::args::tests::a3_vendor_prefixed_parameter_open_tag_is_rejected ... ok
+test mcp::args::tests::a4_vendor_prefixed_invoke_attribute_is_rejected ... ok
+test mcp::args::tests::a5_vendor_prefixed_parameter_attribute_is_rejected ... ok
+test mcp::args::tests::a6_vendor_prefixed_function_calls_open_and_close_are_rejected ... ok
+test mcp::args::tests::a6b_bare_function_calls_tags_are_rejected ... ok
+test mcp::args::tests::a6c_bare_attribute_first_invoke_still_falls_to_another_rule_when_corrupt ... ok
+test mcp::args::tests::a7_bare_full_text_close_tag_is_rejected ... ok
+test mcp::args::tests::a8_bare_parent_id_close_tag_is_rejected ... ok
+test mcp::args::tests::a8b_bare_camel_case_open_tags_are_rejected ... ok
+test mcp::args::tests::a9_two_generic_param_tags_in_adjacency_are_rejected ... ok
+test mcp::args::tests::b10_maven_dependency_block_is_accepted ... ok
+test mcp::args::tests::b11_shell_redirection_is_accepted ... ok
+test mcp::args::tests::b12_adjacency_whose_follower_is_not_a_param_tag_is_accepted ... ok
+test mcp::args::tests::b13_plain_word_usage_is_accepted ... ok
+test mcp::args::tests::b14_generic_close_newline_non_param_follower_is_accepted ... ok
+test graph::explicit_links::tests::supersedes_and_parent_edges_count_the_same_way ... ok
+test mcp::args::tests::b16_param_close_far_from_its_follower_is_accepted ... ok
+test mcp::args::tests::b17_testng_suite_xml_is_accepted ... ok
+test mcp::args::tests::b18_maven_and_spring_parameter_elements_are_accepted ... ok
+test mcp::args::tests::b19_bare_invoke_with_a_name_attribute_is_accepted ... ok
+test mcp::args::tests::b1_csharp_doc_comment_is_accepted ... ok
+test mcp::args::tests::b2_html_details_summary_is_accepted ... ok
+test mcp::args::tests::b3_atom_entry_is_accepted ... ok
+test mcp::args::tests::b4_docbook_parameter_element_is_accepted ... ok
+test mcp::args::tests::b5_bpel_invoke_mid_prose_is_accepted ... ok
+test mcp::args::tests::b6_jsx_fragment_is_accepted ... ok
+test mcp::args::tests::b7_self_referential_prose_about_these_very_parameters_is_accepted ... ok
+test mcp::args::tests::b15_empty_and_one_mib_inputs_are_accepted_quickly ... ok
+test mcp::args::tests::b8_xml_config_with_a_namespace_element_is_accepted ... ok
+test mcp::args::tests::b9_rust_generics_and_comparisons_are_accepted ... ok
+test mcp::args::tests::b_prime_1_note_ending_in_a_quoted_bpel_terminator_is_rejected ... ok
+test mcp::args::tests::b_prime_2_generic_tags_never_fire_alone ... ok
+test mcp::args::tests::c18_check_duplicates_rejects_a_stringly_typed_boolean ... ok
+test mcp::args::tests::c19_parse_store_input_carries_check_duplicates ... ok
+test mcp::args::tests::c20_check_duplicates_is_none_when_absent_or_null ... ok
+test mcp::args::tests::c_elide_never_splits_a_character ... ok
+test mcp::args::tests::c_json_type_names ... ok
+test mcp::args::tests::c_opt_str_rejects_wrong_types ... ok
+test mcp::args::tests::c_opt_str_treats_null_as_absent_and_keeps_empty_strings ... ok
+test mcp::args::tests::c_opt_string_array_absent_null_and_empty_all_yield_empty ... ok
+test mcp::args::tests::c_opt_string_array_accepts_strings ... ok
+test mcp::args::tests::c_opt_string_array_names_the_bad_element_index ... ok
+test mcp::args::tests::c_opt_string_array_rejects_a_bare_string ... ok
+test mcp::args::tests::c_opt_string_array_rejects_an_object ... ok
+test mcp::args::tests::c_opt_uuid_absent_and_null_yield_none ... ok
+test mcp::args::tests::c_opt_uuid_accepts_the_lenient_forms_uuid_parse_str_allows ... ok
+test mcp::args::tests::c_opt_uuid_elides_a_long_bad_value ... ok
+test mcp::args::tests::c_opt_uuid_rejects_unparseable_and_wrong_typed_values ... ok
+test mcp::args::tests::c_require_str_reports_wrong_types ... ok
+test mcp::args::tests::c_require_str_treats_null_as_missing ... ok
+test mcp::args::tests::c_require_uuid_reports_missing_and_bad_values ... ok
+test mcp::args::tests::d11_error_display_is_exactly_the_message ... ok
+test mcp::args::tests::d10_batch_items_name_their_index_when_not_an_object ... ok
+test mcp::args::tests::d1_happy_path_populates_every_field ... ok
+test mcp::args::tests::d2_minimal_input_uses_the_default_namespace_argument ... ok
+test mcp::args::tests::d2b_explicit_nulls_behave_exactly_like_absent_keys ... ok
+test mcp::args::tests::d3_wrong_typed_namespace_fails_instead_of_falling_back ... ok
+test mcp::args::tests::d4_wrong_typed_tags_fail_instead_of_vanishing ... ok
+test mcp::args::tests::d5_unparseable_link_ids_fail_instead_of_being_dropped ... ok
+test mcp::args::tests::d6b_markup_in_summary_is_rejected ... ok
+test mcp::args::tests::d6_markup_in_full_text_is_rejected_with_the_full_message ... ok
+test mcp::args::tests::d6c_legitimate_technical_prose_still_stores ... ok
+test mcp::args::tests::d7_failure_precedence_is_deterministic ... ok
+test mcp::args::tests::d7b_markup_is_checked_before_the_length_limit ... ok
+test mcp::args::tests::d8b_per_element_length_limits_reach_both_mcp_doors ... ok
+test mcp::args::tests::d9_non_object_items_are_rejected_by_shape ... ok
+test mcp::args::tests::e10_opt_bool_accepts_true_and_false ... ok
+test mcp::args::tests::e11_opt_bool_rejects_stringly_and_numeric_booleans ... ok
+test mcp::args::tests::e12_namespace_or_falls_back_only_when_absent_or_null ... ok
+test mcp::args::tests::e13_namespace_or_rejects_a_wrong_typed_namespace ... ok
+test mcp::args::tests::e14_namespace_or_passes_an_empty_string_through ... ok
+test mcp::args::tests::e15_list_memories_defaults_when_everything_is_absent ... ok
+test mcp::args::tests::e16_list_memories_rejects_a_stringly_typed_limit ... ok
+test mcp::args::tests::e17_list_memories_rejects_a_limit_above_the_maximum_rather_than_clamping ... ok
+test mcp::args::tests::e18_list_memories_rejects_bare_string_tags ... ok
+test mcp::args::tests::e19_list_memories_accepts_epoch_millis_and_iso_8601_bounds ... ok
+test mcp::args::tests::e1_opt_u64_treats_absent_and_null_as_none ... ok
+test mcp::args::tests::e20_list_memories_rejects_a_wrong_typed_time_bound ... ok
+test mcp::args::tests::e21_list_memories_keeps_the_invalid_time_prefix_for_an_unparseable_string ... ok
+test mcp::args::tests::e22_list_tags_defaults_when_everything_is_absent ... ok
+test mcp::args::tests::e23_list_tags_all_namespaces_clears_the_namespace ... ok
+test mcp::args::tests::e24_list_tags_rejects_all_namespaces_with_an_explicit_namespace ... ok
+test mcp::args::tests::e25_list_tags_rejects_a_limit_above_the_maximum ... ok
+test mcp::args::tests::e26_list_tags_allows_all_namespaces_false_beside_an_explicit_namespace ... ok
+test mcp::args::tests::e2_opt_u64_accepts_both_inclusive_bounds ... ok
+test mcp::args::tests::e3_opt_u64_rejects_a_numeric_string ... ok
+test mcp::args::tests::e4_opt_u64_rejects_bool_array_and_object ... ok
+test mcp::args::tests::e5_opt_u64_rejects_negative_and_fractional ... ok
+test mcp::args::tests::e6_opt_u64_rejects_out_of_range_at_both_ends ... ok
+test mcp::args::tests::e7_opt_u64_keeps_the_message_bounded_for_a_huge_literal ... ok
+test mcp::args::tests::e8_opt_usize_never_truncates ... ok
+test mcp::args::tests::e9_opt_bool_treats_absent_and_null_as_none ... ok
+test mcp::bridge::tests::absent_supersedes_outcome_is_omitted_from_the_output ... ok
+test mcp::bridge::tests::b11_stored_memory_decodes_a_payload_without_near_duplicates ... ok
+test mcp::bridge::tests::b12_an_absent_report_is_omitted_from_the_output ... ok
+test mcp::bridge::tests::b13_a_report_round_trips_with_camel_case_keys ... ok
+test mcp::bridge::tests::b14_store_input_decodes_a_payload_without_check_duplicates ... ok
+test mcp::bridge::tests::b15_check_duplicates_round_trips_on_a_store_input ... ok
+test mcp::bridge::tests::list_tags_input_round_trips_a_global_scope ... ok
+test mcp::bridge::tests::list_tags_response_round_trips_in_camel_case ... ok
+test mcp::bridge::tests::list_tags_response_states_global_scope_with_explicit_nulls ... ok
+test mcp::bridge::tests::namespace_stats_decodes_a_payload_without_the_tombstone_count ... ok
+test mcp::bridge::tests::namespace_stats_round_trips_the_tombstone_count ... ok
+test mcp::bridge::tests::stored_memory_decodes_a_payload_without_the_supersedes_field ... ok
+test mcp::bridge::tests::supersedes_outcome_round_trips_on_a_stored_memory ... ok
+test mcp::bridge::tests::supersedes_status_round_trips_through_its_camel_case_names ... ok
+test mcp::bridge::tests::w44_delete_namespace_input_decodes_a_payload_without_force ... ok
+test mcp::bridge::tests::w68_a_missing_option_field_needs_no_serde_default ... ok
+test mcp::args::tests::d8_content_limits_still_fire_with_byte_based_messages ... ok
+test mcp::bridge_adapters::tests::a41_list_namespaces_reports_the_live_memory_count ... ok
+test mcp::bridge_adapters::tests::a42_list_namespaces_excludes_tombstoned_memories ... ok
+test mcp::bridge_adapters::tests::a43_list_namespaces_reports_zero_for_an_empty_namespace ... ok
+test mcp::bridge_adapters::tests::a43b_counts_are_per_namespace ... ok
+test mcp::bridge_adapters::tests::a44_namespace_stats_excludes_tombstones_and_reports_them_separately ... ok
+test mcp::bridge_adapters::tests::a45_memory_count_equals_the_sum_of_the_phase_counts ... ok
+test mcp::bridge_adapters::tests::a46_avg_strength_ignores_tombstoned_zero_strength_rows ... ok
+test mcp::bridge_adapters::tests::a47_vector_bytes_counts_only_live_memories ... ok
+test mcp::bridge_adapters::tests::a48_edge_and_permastore_counts_exclude_tombstones ... ok
+test mcp::bridge_adapters::tests::a49_stats_agree_with_list_memories_and_list_namespaces ... ok
+test mcp::bridge_adapters::tests::a50_namespace_stats_are_scoped_to_one_namespace ... ok
+test mcp::bridge_adapters::tests::a51_list_tags_counts_only_the_requested_namespace ... ok
+test mcp::bridge_adapters::tests::a52_list_tags_excludes_tombstoned_memories ... ok
+test mcp::bridge_adapters::tests::a53_list_tags_aggregates_across_namespaces_in_global_scope ... ok
+test mcp::bridge_adapters::tests::a54_list_tags_rejects_an_unknown_namespace ... ok
+test mcp::bridge_adapters::tests::a55_list_tags_counts_summary_and_ghost_phases ... ok
+test mcp::bridge_adapters::tests::a57_build_orders_count_descending_then_name_ascending ... ok
+test mcp::bridge_adapters::tests::a58_build_splits_derived_prefixes_and_strips_them ... ok
+test mcp::bridge_adapters::tests::a59_build_reports_the_untruncated_total_and_flags_truncation ... ok
+test mcp::bridge_adapters::tests::a60_build_keeps_a_slashed_plain_tag_in_the_tags_bucket ... ok
+test mcp::bridge_adapters::tests::a61_build_treats_a_bare_prefix_as_a_plain_tag ... ok
+test mcp::bridge_adapters::tests::entity_postings_survive_disabled_autolink_and_delete_without_legacy_tags ... FAILED
+test mcp::bridge_adapters::tests::a56_list_tags_reports_no_memory_count_in_global_scope ... ok
+test mcp::bridge_adapters::tests::f26_a_store_does_not_report_itself_as_its_own_duplicate ... ok
+test mcp::bridge_adapters::tests::f27_a_second_store_of_the_same_embedding_reports_the_first ... ok
+test mcp::bridge_adapters::tests::f28_check_duplicates_false_suppresses_the_report ... ok
+test mcp::bridge_adapters::tests::f29_a_duplicate_in_another_namespace_is_not_reported ... ok
+test mcp::bridge_adapters::tests::namespace_deletion_clears_orphan_entity_postings_only_in_its_scope ... ok
+test mcp::bridge_adapters::tests::insertion_adapter_rejects_bad_provider_and_caller_vectors_and_normalizes_advisory ... ok
+test mcp::bridge_adapters::tests::native_profile_mcp_store_rejects_runtime_dimension_before_provider_and_writes ... ok
+test mcp::bridge_adapters::tests::w25_delete_memory_still_clears_every_index_and_marks_the_graph_node ... ok
+test mcp::bridge_adapters::tests::w26_delete_memories_returns_one_flag_per_id_in_input_order ... ok
+test mcp::bridge_adapters::tests::w27_delete_memories_clears_every_index_for_every_deleted_id ... ok
+test mcp::bridge_adapters::tests::w28_a_duplicate_id_in_one_batch_frees_its_vector_slot_once ... ok
+test mcp::bridge_adapters::tests::w29_a_refused_non_force_delete_destroys_nothing ... ok
+test mcp::bridge_adapters::tests::w30_a_tombstone_only_namespace_deletes_without_force ... ok
+test mcp::bridge_adapters::tests::w31_a_forced_delete_removes_the_records_indexes_and_directory ... ok
+test mcp::bridge_adapters::tests::w32_the_default_namespace_is_refused_even_forced_and_even_empty ... ok
+test mcp::bridge_adapters::tests::w33_an_unknown_namespace_is_not_found_and_touches_nothing ... ok
+test mcp::bridge_adapters::tests::w34_recreating_a_deleted_namespace_gets_a_fresh_vector_file ... ok
+test mcp::bridge_adapters::tests::w45_create_namespace_validates_the_name_in_the_adapter ... ok
+test mcp::bridge_adapters::tests::w46_delete_namespace_refuses_an_unusable_name_as_invalid_input ... ok
+test mcp::bridge_adapters::tests::w47_a_legacy_empty_named_namespace_cannot_destroy_the_database ... ok
+test mcp::bridge_adapters::tests::w48_the_default_namespace_is_refused_under_any_casing ... ok
+test mcp::bridge_adapters::tests::w62_a_ghosted_memory_is_not_reported_as_a_near_duplicate ... ok
+test mcp::bridge_adapters::tests::w63_a_hard_deleted_memory_is_not_reported_as_a_near_duplicate ... ok
+test mcp::bridge_adapters::tests::w67_filter_tags_names_the_group_that_carried_the_bad_label ... ok
+test mcp::http_transport::tests::allowlisted_origin_is_permitted ... ok
+test mcp::http_transport::tests::base64_sentinel_is_decoded_before_comparison ... ok
+test mcp::http_transport::tests::delete_with_a_session_id_terminates_it ... ok
+test mcp::bridge_adapters::tests::w66_an_unfilterable_entity_is_an_error_not_a_wider_query ... ok
+test mcp::http_transport::tests::delete_without_a_session_id_is_405 ... ok
+test mcp::http_transport::tests::discover_is_answered_without_meta_or_session ... ok
+test mcp::http_transport::tests::failed_initialize_does_not_insert_a_session ... ok
+test mcp::http_transport::tests::foreign_origin_is_forbidden ... ok
+test mcp::http_transport::tests::get_is_405_with_allow_header ... ok
+test mcp::http_transport::tests::legacy_initialize_mints_a_session_id ... ok
+test mcp::http_transport::tests::legacy_message_without_session_header_echoes_the_real_id ... ok
+test mcp::http_transport::tests::mcp_name_mismatch_on_tools_call_is_header_mismatch ... ok
+test mcp::http_transport::tests::loopback_origins_are_allowed_on_any_scheme_or_port ... ok
+test mcp::http_transport::tests::mismatched_mcp_method_header_is_header_mismatch ... ok
+test mcp::http_transport::tests::missing_mcp_method_header_is_header_mismatch ... ok
+test mcp::http_transport::tests::missing_protocol_version_header_is_header_mismatch ... ok
+test mcp::http_transport::tests::modern_notification_skips_header_validation ... ok
+test mcp::http_transport::tests::modern_post_succeeds_without_a_session_header ... ok
+test mcp::http_transport::tests::modern_request_ignores_an_inbound_session_id ... ok
+test mcp::http_transport::tests::modern_response_carries_no_session_header ... ok
+test mcp::http_transport::tests::opaque_null_origin_is_forbidden ... ok
+test mcp::http_transport::tests::origin_absent_is_allowed ... ok
+test mcp::http_transport::tests::oversized_body_is_rejected ... ok
+test mcp::http_transport::tests::parse_error_uses_a_null_id ... ok
+test mcp::http_transport::tests::session_cap_returns_503 ... ok
+test mcp::http_transport::tests::repeat_initialize_with_a_live_session_reuses_the_same_id ... ok
+test mcp::http_transport::tests::sweep_evicts_idle_sessions_and_keeps_recent_ones ... ok
+test mcp::http_transport::tests::unknown_session_returns_404_with_a_jsonrpc_body ... ok
+test mcp::http_transport::tests::unsupported_protocol_version_is_rejected_with_supported_list ... ok
+test mcp::protocol::tests::envelope_adds_result_type_and_preserves_payload ... ok
+test mcp::protocol::tests::envelope_cache_hints_are_top_level_not_in_meta ... ok
+test mcp::protocol::tests::envelope_meta_uses_reverse_dns_server_info_key ... ok
+test mcp::protocol::tests::envelope_omits_cache_hints_when_absent ... ok
+test mcp::protocol::tests::era_hint_detects_legacy_handshake ... ok
+test mcp::protocol::tests::era_hint_detects_modern_meta ... ok
+test mcp::protocol::tests::era_hint_is_ambiguous_for_plain_requests ... ok
+test mcp::protocol::tests::era_hint_meta_key_wins_over_initialize_method ... ok
+test mcp::protocol::tests::handshake_exempt_methods_are_discover_and_ping ... ok
+test mcp::protocol::tests::json_rpc_id_null_round_trips ... ok
+test mcp::protocol::tests::negotiate_legacy_version_echoes_known_and_falls_back ... ok
+test mcp::protocol::tests::parse_meta_accepts_full_modern_block_and_carries_progress_token ... ok
+test mcp::protocol::tests::parse_meta_missing_client_capabilities_is_invalid_params ... ok
+test mcp::protocol::tests::parse_meta_missing_protocol_version_names_the_key ... ok
+test mcp::protocol::tests::parse_meta_unsupported_version_reports_supported_and_requested ... ok
+test mcp::protocol::tests::resource_templates_list_serializes_camel_case ... ok
+test mcp::protocol::tests::result_type_and_cache_scope_serialize_as_spec_strings ... ok
+test mcp::server::tests::cache_hints_match_the_spec_table ... ok
+test mcp::server::tests::discover_carries_public_cache_hints_and_result_type ... ok
+test mcp::server::tests::discover_is_answered_without_meta ... ok
+test mcp::server::tests::discover_reports_versions_capabilities_and_instructions ... ok
+test mcp::server::tests::discover_supported_versions_are_modern_only ... ok
+test mcp::server::tests::discover_with_unsupported_meta_version_is_rejected ... ok
+test mcp::server::tests::every_result_carries_result_type_complete ... ok
+test mcp::server::tests::every_result_carries_server_info_meta ... ok
+test mcp::server::tests::legacy_initialize_echoes_the_requested_version ... ok
+test mcp::server::tests::legacy_initialize_falls_back_for_unknown_version ... ok
+test mcp::server::tests::legacy_initialize_never_echoes_2026_07_28 ... ok
+test mcp::server::tests::legacy_ping_before_initialize_still_returns_empty_object ... ok
+test mcp::server::tests::legacy_session_works_after_initialize ... ok
+test mcp::server::tests::legacy_tools_list_before_initialize_names_the_meta_key ... ok
+test mcp::server::tests::modern_initialize_is_method_not_found ... ok
+test mcp::server::tests::modern_ping_is_method_not_found ... ok
+test mcp::server::tests::modern_tools_call_dispatches_to_handler ... ok
+test mcp::server::tests::modern_tools_list_needs_no_initialize ... ok
+test mcp::server::tests::notifications_produce_no_response ... ok
+test mcp::server::tests::unknown_method_is_method_not_found_in_both_eras ... ok
+test mcp::http_transport::tests::sweep_count_is_exact_while_sessions_are_being_created ... ok
+test mcp::tools::tests::a4_object_boundary_rejects_before_any_bridge_call ... ok
+test mcp::tools::tests::a4_optional_tool_arguments_preserve_no_arg_calls ... ok
+test mcp::tools::tests::a4_schemas_and_annotations_describe_current_behavior ... ok
+test mcp::tools::tests::array_fields_declare_max_items ... ok
+test mcp::tools::tests::d21_both_store_tools_declare_check_duplicates_defaulting_to_true ... ok
+test mcp::tools::tests::d22_store_memory_description_names_the_report_and_the_recovery ... ok
+test mcp::tools::tests::d23_scan_mode_threshold_default_serializes_as_a_clean_decimal ... ok
+test mcp::tools::tests::e24_batch_entry_carries_every_field_the_single_store_serializes ... ok
+test mcp::tools::tests::e25_batch_entry_omits_absent_optional_fields ... ok
+test mcp::tools::tests::a4_mcp_get_false_is_unchanged_and_default_observes_once ... ok
+test mcp::tools::tests::research_namespace_dimension_boundary_controls ... ok
+test mcp::tools::tests::research_namespace_dimension_range_is_rejected_without_creation ... ok
+test mcp::tools::tests::research_namespace_wrong_json_types_are_rejected_without_creation ... ok
+test mcp::tools::tests::research_quality_integer_range_is_rejected_without_mutation ... ok
+test mcp::tools::tests::research_quality_valid_and_omitted_controls ... ok
+test mcp::tools::tests::summary_schema_describes_the_limit_in_bytes_not_chars ... ok
+test mcp::tools::tests::summary_schema_keeps_max_length_guard ... ok
+test mcp::tools::tests::t34_every_tool_definition_has_a_unique_name ... ok
+test mcp::tools::tests::t35_declares_fourteen_tools ... ok
+test mcp::tools::tests::t36_every_declared_tool_has_a_dispatch_arm ... ok
+test mcp::tools::tests::t37_listing_schema_limits_match_their_constants ... ok
+test mcp::tools::tests::t38_read_only_tools_declare_the_read_only_hint ... ok
+test mcp::tools::tests::t39_list_namespaces_takes_no_parameters ... ok
+test mcp::tools::tests::t40_list_tags_declares_both_scope_switches ... ok
+test mcp::tools::tests::w37_forget_memories_ids_bounds_match_the_batch_constant ... ok
+test mcp::tools::tests::w38_delete_namespace_declares_a_required_name_and_force_defaulting_to_false ... ok
+test mcp::tools::tests::w39_forget_memory_description_does_not_promise_a_permanent_delete ... ok
+test mcp::tools::tests::w40_dispatch_tool_routes_every_declared_tool ... ok
+test mcp::tools::tests::w41_every_destructive_tool_declares_the_destructive_hint ... ok
+test mcp::tools::tests::w52_a_partial_purge_says_partially_destroyed_not_failed ... ok
+test mcp::tools::tests::w53_an_ordinary_delete_failure_keeps_the_failed_prefix ... ok
+test mcp::tools::tests::w64_recall_memories_rejects_every_malformed_argument ... ok
+test mcp::tools::tests::w65_find_similar_memories_rejects_every_malformed_argument ... ok
+test mcp::tools::tests::w69_namespace_stats_description_states_what_its_counts_exclude ... ok
+test mcp::tools::tests::w71_a_short_delete_memories_response_is_an_error_per_id ... ok
+test mcp::transport::tests::blank_lines_are_ignored ... ok
+test mcp::transport::tests::legacy_client_initializes_then_lists_tools ... ok
+test mcp::transport::tests::modern_client_discovers_then_lists_tools_without_initialize ... ok
+test mcp::transport::tests::parse_error_responds_with_a_null_id ... ok
+test model::duplicates::tests::an_empty_match_list_produces_no_report ... ok
+test model::duplicates::tests::truncate_summary_cuts_on_a_char_boundary_and_stays_within_budget ... ok
+test model::duplicates::tests::truncate_summary_leaves_a_short_summary_alone ... ok
+test model::schema::tests::schema_cached_entities_empty_is_authoritative_over_retained_tags ... ok
+test model::schema::tests::schema_cached_entities_keep_legacy_parser_and_retained_only_provenance_distinct ... ok
+test model::schema::tests::schema_cached_entities_preserve_exact_utf8_order_duplicates_and_byte_limit ... ok
+test model::schema::tests::schema_codec_preserves_utf8_order_duplicates_float_bits_and_optional_extensions ... ok
+test model::schema::tests::schema_codec_rejects_trailing_truncated_unknown_and_lossy_legacy_data ... ok
+test model::schema::tests::schema_legacy_conversion_labels_evidence_and_defaults_are_explicit ... ok
+test model::schema::tests::schema_profile_identity_distinguishes_revision_presence_prefix_and_case ... ok
+test model::tag::tests::t27_sort_orders_most_common_first ... ok
+test model::tag::tests::t28_ties_break_on_name_ascending ... ok
+test model::validation::tests::a_max_length_label_still_fits_its_derived_tag ... ok
+test model::validation::tests::array_count_limits ... ok
+test model::validation::tests::ascii_1900_is_accepted ... ok
+test model::validation::tests::ascii_2100_reports_equal_units_without_hint ... ok
+test model::validation::tests::count_is_reported_before_item_length ... ok
+test model::validation::tests::em_dash_boundary_counts_bytes_not_chars ... ok
+test model::validation::tests::em_dash_summary_reports_both_units_and_hint ... ok
+test model::validation::tests::empty_summary_is_rejected ... ok
+test model::validation::tests::four_byte_chars_at_exact_byte_limit_are_accepted ... ok
+test model::validation::tests::full_text_boundary ... ok
+test model::validation::tests::item_at_limit_in_multibyte_characters_is_accepted ... ok
+test model::validation::tests::item_error_names_the_offending_index ... ok
+test model::validation::tests::item_length_boundary_is_inclusive ... ok
+test model::validation::tests::item_limit_counts_bytes_not_characters ... ok
+test model::validation::tests::namespace_error_message_says_bytes ... ok
+test model::validation::tests::namespace_names ... ok
+test model::validation::tests::summary_byte_boundary_is_inclusive ... ok
+test model::validation::tests::summary_is_reported_before_tag_count ... ok
+test model::validation::tests::truncate_never_splits_a_character ... ok
+test model::validation::tests::truncate_returns_whole_string_when_short_enough ... ok
+test model::validation::tests::truncate_to_zero_or_below_first_char_yields_empty ... ok
+test search::adapters::entity_namespace_tests::entity_reader_selects_namespace_before_candidate_cap ... ok
+test search::adapters::tests::namespace_enumeration_scopes_ids_and_batch_reads_current_canonical_records ... ok
+test search::duplicates::tests::a10_a_zero_limit_reports_nothing ... ok
+test search::duplicates::tests::a1_an_empty_index_reports_nothing ... ok
+test search::duplicates::tests::a2_an_identical_vector_scores_one ... ok
+test search::duplicates::tests::a3_a_vector_below_the_threshold_is_ignored ... ok
+test search::duplicates::tests::a4_the_scan_is_scoped_to_the_query_namespace ... ok
+test search::duplicates::tests::a5_ghost_and_tombstone_memories_are_excluded ... ok
+test search::duplicates::tests::a6_the_result_is_capped_at_the_limit ... ok
+test search::duplicates::tests::a7_matches_come_back_in_descending_score_order ... ok
+test search::duplicates::tests::a8_skips_the_check_when_the_query_vector_is_not_l2_normalized ... ok
+test search::duplicates::tests::a9_a_dimension_mismatch_yields_no_matches_rather_than_an_error ... ok
+test search::entity_index::tests::add_and_find ... ok
+test search::entity_index::tests::case_insensitive ... ok
+test search::entity_index::tests::empty_entities ... ok
+test search::entity_index::tests::entity_rebuild_preserves_retained_only_provenance_and_excludes_removed_records ... ok
+test search::entity_index::tests::entity_rebuild_uses_canonical_labels_and_replaces_the_complete_view ... ok
+test search::entity_index::tests::exclude_id ... ok
+test search::entity_index::tests::namespaces_are_isolated_for_same_id_updates_removals_and_ties ... ok
+test search::entity_index::tests::remove_cleans_empty_postings ... ok
+test search::entity_index::tests::remove_memory ... ok
+test search::entity_index::tests::replacement_and_removal_are_idempotent_and_clear_all_aliases ... ok
+test search::entity_index::tests::sorted_by_shared_count_desc ... ok
+test search::entity_normalize::tests::basic_case_fold ... ok
+test search::entity_normalize::tests::empty_input ... ok
+test search::entity_normalize::tests::full_word_honorifics ... ok
+test search::entity_normalize::tests::honorific_stripping ... ok
+test search::entity_normalize::tests::multi_word_last_name ... ok
+test search::entity_normalize::tests::possessive_stripping ... ok
+test search::entity_normalize::tests::single_word_no_last_name ... ok
+test search::entity_normalize::tests::whitespace_collapse ... ok
+test search::fts::tests::add_and_search ... ok
+test mcp::tools::tests::research_quality_wrong_json_types_are_rejected_without_mutation ... ok
+test search::fts::tests::eligible_refill_orders_ties_and_distinguishes_cap_from_exhaustion ... ok
+test search::fts::tests::eligible_refill_rejects_corrupt_ids_and_sqlite_failures ... ok
+test search::fts::tests::equal_fts_scores_use_uuid_order_before_limit_and_after_reinsertion ... ok
+test search::fts::tests::escape_query_safety ... ok
+test search::fts::tests::escape_query_sanitizes ... ok
+test search::fts::tests::namespace_isolation ... ok
+test search::fts::tests::refill_cursor_does_not_mix_namespace_views_during_concurrent_writes ... ok
+test search::fts::tests::remove_document ... ok
+test search::fts::tests::remove_nonexistent ... ok
+test search::fts::tests::search_empty_index ... ok
+test search::fts::tests::search_no_matching_terms ... ok
+test search::fts::tests::update_existing_document ... ok
+test search::fts::tests::w20_remove_namespace_deletes_id_map_and_fts_content_together ... ok
+test search::fts::tests::w21_remove_namespace_leaves_other_namespaces_searchable ... ok
+test search::fts::tests::w22_remove_namespace_of_an_empty_namespace_is_zero ... ok
+test search::fts::tests::w61_remove_deletes_the_content_row_too ... ok
+test search::index::tests::eligible_top_k_uses_uuid_ties_at_heap_boundary_in_any_insertion_order ... ok
+test search::pipeline::semantics_tests::current_chain_boundaries_0_1_64_65_are_not_legacy_fallbacks ... FAILED
+test search::pipeline::semantics_tests::current_rejects_cycles_branches_missing_and_foreign_paths_but_history_retains_origin ... FAILED
+test search::pipeline::semantics_tests::current_requires_structure_and_correct_scope_even_when_the_canonical_record_is_eligible ... FAILED
+test search::pipeline::semantics_tests::current_resolves_before_graph_seeding_and_after_graph_discovery ... FAILED
+test search::pipeline::semantics_tests::dense_graph_edge_budget_reports_incomplete_without_partial_adjacency_bias ... ok
+test search::pipeline::semantics_tests::dense_supersession_reads_share_one_query_budget_in_uuid_order ... FAILED
+test search::pipeline::semantics_tests::diagnostics_capture_overlapping_sources_before_dedup_and_only_returned_ids ... FAILED
+test search::pipeline::semantics_tests::diagnostics_do_not_leak_filtered_foreign_or_unresolved_ids ... FAILED
+test search::pipeline::semantics_tests::diagnostics_keep_graph_overlap_observational_and_graph_inheritance_distinct ... FAILED
+test search::pipeline::semantics_tests::diagnostics_report_unknown_vector_exhaustion_and_measured_metadata_cap ... FAILED
+test search::pipeline::semantics_tests::diagnostics_separate_terminal_own_evidence_from_inherited_floor ... FAILED
+test search::pipeline::semantics_tests::diamond_cycle_contributions_and_caps_are_deterministic ... FAILED
+test search::pipeline::semantics_tests::filtered_successor_is_omitted_in_current_without_ineligible_diagnostic_ids ... FAILED
+test search::fts::tests::eligible_refill_budget_boundary_never_claims_exhaustive_underfill ... ok
+test search::pipeline::semantics_tests::fts_refill_uses_canonical_filters_before_cap_and_keeps_v1_behavior ... FAILED
+test search::pipeline::semantics_tests::fts_sqlite_failure_propagates_in_v2_and_labels_legacy_fallback ... FAILED
+test search::pipeline::semantics_tests::graph_cannot_receive_or_relay_through_ghost_tombstone_filtered_or_foreign_records ... FAILED
+test search::pipeline::semantics_tests::graph_depth_is_an_actual_bound_and_replacement_seed_evidence_is_invariant ... FAILED
+test search::pipeline::semantics_tests::real_rif_changes_legacy_scores_but_v2_is_off_and_neither_persists_suppression ... ok
+test search::pipeline::semantics_tests::rebuilt_reciprocal_edge_ties_use_uuid_and_charge_each_adjacency ... ok
+test search::pipeline::semantics_tests::rebuilt_reciprocal_edges_each_contribute_and_survive_engine_recall ... FAILED
+test search::pipeline::semantics_tests::tombstone_can_resolve_structural_chain_but_never_inherits_or_returns_content ... FAILED
+test search::pipeline::semantics_tests::v2_inheritance_preserves_min_score_temporal_boost_and_stronger_own_evidence ... FAILED
+test search::pipeline::semantics_tests::v2_metadata_budget_uses_ranked_eligible_records_and_uuid_ties ... ok
+test search::pipeline::semantics_tests::v2_rejects_nonfinite_canonical_and_graph_sources ... FAILED
+test search::pipeline::semantics_tests::v2_rejects_nonfinite_inputs_and_scores_and_transport_json_cannot_select_it ... FAILED
+test search::pipeline::semantics_tests::fts_engine_reports_work_underfill_and_candidate_cap_separately ... FAILED
+test search::pipeline::strength_tests::bonuses_use_projected_live_same_scope_donors_independent_of_query_tags ... ok
+test search::pipeline::strength_tests::by_id_get_projects_once_and_retains_canonical_scope_phase_and_bytes ... ok
+test search::pipeline::strength_tests::by_id_legacy_strength_and_cosine_values_ignore_clock_advancement ... ok
+test search::pipeline::strength_tests::by_id_prepared_selection_preserves_original_true_intent_and_false_thresholds ... ok
+test search::pipeline::strength_tests::by_id_scope_and_record_policy_mismatches_fail_closed ... ok
+test search::pipeline::strength_tests::by_id_similarity_projects_strength_without_reordering_cosines_after_clock_advance ... ok
+test search::pipeline::strength_tests::by_id_transport_tests::by_id_actual_rest_and_mcp_preserve_requested_access_intent_and_offline_bytes ... ok
+test search::pipeline::strength_tests::canonical_clock_projection_is_read_only_and_retains_committed_phase_and_unknown_dates ... ok
+test search::pipeline::strength_tests::explicit_policy_fails_closed_before_legacy_exposure_under_either_semantics ... ok
+test search::pipeline::strength_tests::legacy_policy_materialized_strength_is_identical_under_both_retrieval_semantics ... ok
+test search::pipeline::strength_tests::legacy_retrieval_graph_formulas_also_consume_explicit_policy_projection ... FAILED
+test search::pipeline::strength_tests::projected_eligibility_precedes_vector_fts_entity_and_metadata_caps ... FAILED
+test search::pipeline::strength_tests::projected_graph_activation_and_filtered_successors_do_not_use_materialized_strength ... ok
+test search::pipeline::strength_tests::pure_projection_ignores_independent_retrieval_and_compatibility_timestamps ... ok
+test search::pipeline::strength_tests::query_pins_current_revision_and_resolves_namespace_override_before_global ... ok
+test search::pipeline::strength_tests::replacement_revalidation_rejects_missing_version_revision_and_stability_errors ... ok
+test search::pipeline::tests::already_discovered_replacement_is_revalidated_against_canonical_tombstone ... ok
+test search::pipeline::tests::canonical_namespace_enumeration_failure_is_not_an_empty_success ... FAILED
+test search::pipeline::tests::effects_completed_during_query_cannot_return_a_successful_miss ... ok
+test search::pipeline::tests::eligibility_timing_includes_namespace_enumeration_and_canonical_loading ... ok
+test search::pipeline::tests::entity_recall_filters_namespace_and_metadata_before_cap ... FAILED
+test search::pipeline::tests::exact_vector_prefilter_matches_eligible_oracle_beyond_1600_rejections ... FAILED
+test search::pipeline::tests::full_pipeline_supersession_preserves_inherited_temporal_score ... FAILED
+test search::pipeline::tests::ghost_replacement_is_kept_out_unless_ghosts_were_requested ... ok
+test search::pipeline::tests::ghost_replacement_substitutes_when_ghosts_are_included ... ok
+test search::pipeline::tests::many_superseded_memories_share_one_replacement ... ok
+test search::pipeline::tests::metadata_scan_ranks_all_eligible_records_with_temporal_boost_and_uuid_ties ... ok
+test search::pipeline::tests::metadata_store_failure_keeps_the_superseded_memory ... ok
+test search::pipeline::tests::namespace_canonical_batch_failure_is_not_an_empty_success ... ok
+test search::pipeline::tests::native_profile_query_rejects_wrong_binding_and_bad_vectors_before_indexes ... ok
+test search::pipeline::tests::replacement_already_among_the_candidates_appears_exactly_once ... ok
+test search::pipeline::tests::replacement_failing_metadata_filters_is_not_substituted ... ok
+test search::pipeline::tests::replacement_from_another_namespace_is_not_leaked ... ok
+test search::pipeline::tests::replacement_with_no_record_anywhere_keeps_the_superseded_memory ... ok
+test search::pipeline::tests::substitutes_an_eligible_replacement_for_the_superseded_memory ... ok
+test search::pipeline::tests::supersession_can_inherit_after_own_min_score_rejection_without_fabricating_score ... ok
+test search::pipeline::tests::supersession_inheritance_is_invariant_to_discovery_order_and_weaker_own_evidence ... ok
+test search::pipeline::tests::tombstoned_replacement_does_not_drop_the_original ... ok
+test search::response::tests::eligibility_timing_serializes_additively_and_accepts_older_responses ... ok
+test serialization::json::tests::g30_a_read_response_omits_the_near_duplicate_report ... ok
+test serialization::json::tests::g30b_a_populated_report_round_trips_with_camel_case_keys ... ok
+test storage::control::tests::generation_is_canonical_decimal_u63_not_json_number ... ok
+test storage::control::tests::policy_receipt_requires_canonical_schema_before_writable_startup ... ok
+test storage::control::tests::request_identity_is_length_delimited_ordered_and_operation_scoped ... ok
+test storage::control::tests::retry_context_requires_lineage_and_valid_key_scope_version ... ok
+test storage::engine::insertion::tests::caller_identity_bits_conflicts_and_preallocation_rejections ... ok
+test storage::engine::insertion::tests::explicit_links_are_one_transaction_and_final_target_checks_precede_allocation ... ok
+test search::pipeline::strength_tests::returned_graph_result_uses_the_same_projection_as_admission_and_ranking ... FAILED
+test storage::engine::insertion::tests::insertion_concurrent_same_key_commits_one_uuid_and_generation ... ok
+test storage::engine::insertion::tests::insertion_canonical_effect_failure_retains_receipt_and_reopens_without_slot_reuse ... ok
+test storage::engine::insertion::tests::insertion_process_child ... ok
+test storage::engine::insertion::tests::insertion_pending_plan_preflight_rejects_before_original_store_changes ... ok
+test storage::engine::insertion::tests::insertion_rejects_schema_policy_and_invalid_receipt_numerics ... ok
+test storage::engine::insertion::tests::insertion_rejects_zero_generated_without_mutation ... ok
+test storage::engine::insertion::tests::insertion_rejects_zero_supplied_without_mutation ... ok
+test storage::engine::insertion::tests::insertion_replay_precedes_clock_provider_allocation_and_mutable_defaults ... ok
+test storage::engine::insertion::tests::insertion_unknown_commit_preserves_payload_until_receipt_reconciliation ... ok
+test storage::engine::insertion::tests::insertion_uses_canonical_target_after_preflight_and_retains_structural_tombstones ... ok
+test storage::engine::insertion::tests::insertion_vector_boundary_normalizes_both_origins_and_preserves_request_identity ... ok
+test storage::engine::tests::canonical_access_receipt_restarts_and_survives_namespace_purge ... ok
+test storage::engine::tests::containment_existing_store_never_initializes_missing_payloads ... ok
+test storage::engine::tests::containment_preserves_ambiguous_legacy_files ... ok
+test storage::engine::tests::containment_rejects_insert_identity_conflicts_before_payload_writes ... ok
+test storage::engine::tests::containment_reopen_rejects_duplicate_owners_and_owned_free_slots ... ok
+test storage::engine::insertion::tests::insertion_process_crashes_replay_or_reclaim_without_double_allocation ... ok
+test storage::engine::tests::containment_tombstone_reuse_delete_and_stale_release_preserve_new_owner ... ok
+test storage::engine::tests::effects_application_failure_returns_committed_id_and_denies_until_reopen ... ok
+test storage::engine::tests::effects_final_guard_checks_phase_and_supersedes_structure ... ok
+test storage::engine::tests::effects_graph_publication_crashes_remain_durable_and_unavailable ... ok
+test storage::engine::tests::effects_prevalidation_is_atomic_and_counts_are_absolute ... ok
+test storage::engine::tests::effects_process_child ... ok
+test storage::engine::tests::independent_join_ledger_receipt_snapshot_and_pending_barrier ... ok
+test storage::engine::tests::independent_join_recovery_plan_preflight_preserves_source ... ok
+test storage::engine::tests::parent_path_aliases_share_store_ownership ... ok
+test storage::engine::tests::preflight_preserves_valid_historical_applied_peer_counts ... ok
+test storage::engine::tests::unavailable_handle_blocks_payloads_metadata_and_writes_until_reopen ... ok
+test storage::engine::tests::w13_purge_removes_records_edges_the_config_row_and_the_directory ... ok
+test storage::engine::tests::w14_purge_removes_edges_that_point_into_the_namespace_from_outside ... ok
+test storage::engine::tests::effects_crash_reopen_replays_before_cleanup_once_logically ... ok
+test storage::engine::tests::w15_purge_tolerates_a_directory_that_is_already_gone ... ok
+test storage::engine::tests::w16_boot_sweep_removes_a_namespace_shaped_directory_with_no_live_namespace ... ok
+test storage::engine::tests::w17_boot_sweep_leaves_a_directory_that_is_not_shaped_like_a_namespace ... ok
+test storage::engine::tests::w18_boot_sweep_leaves_every_live_namespace_directory_on_a_plain_reopen ... ok
+test storage::engine::tests::w19_a_purged_namespace_stays_gone_across_a_reopen ... ok
+test storage::engine::tests::w45_a_dot_dot_name_cannot_delete_the_parent_of_the_data_directory ... ok
+test storage::engine::tests::w46_an_empty_name_cannot_delete_the_data_directory ... ok
+test storage::engine::tests::w47_only_a_single_ordinary_path_component_is_accepted ... ok
+test storage::engine::tests::w49_a_namespace_name_differing_only_in_case_is_a_duplicate ... ok
+test storage::engine::tests::w48_a_rejected_name_leaves_no_row_and_the_database_still_opens ... ok
+test storage::engine::tests::w50_a_namespace_resolves_by_name_regardless_of_case ... ok
+test storage::engine::tests::w52_a_purge_that_destroyed_nothing_reports_nothing_destroyed ... ok
+test storage::engine::tests::w51_the_boot_sweep_does_not_delete_a_case_variant_live_directory ... ok
+test storage::engine::tests::w53_a_partial_purge_carries_its_destroyed_records_and_asks_for_a_retry ... ok
+test storage::engine::tests::w56_a_purge_repairs_the_outgoing_edge_count_of_a_surviving_peer ... ok
+test storage::engine::tests::w57_a_purge_does_not_repair_a_peer_it_is_also_destroying ... ok
+test storage::engine::tests::w58_a_hard_delete_repairs_the_outgoing_edge_count_of_a_surviving_peer ... ok
+test storage::engine::tests::w59_a_swept_directory_is_moved_not_destroyed ... ok
+test storage::engine::tests::w60_the_quarantine_directory_is_not_itself_swept ... ok
+test storage::engine::text_compaction::tests::compaction_interruption_child ... ok
+test storage::engine::text_compaction::tests::compaction_header_identity_cannot_be_rebound_by_matching_prefix_hash ... ok
+test storage::engine::text_compaction::tests::compaction_orphans_require_header_identity_and_cleanup_failure_is_committed ... ok
+test storage::engine::text_compaction::tests::compaction_postcommit_publication_error_blocks_old_text_until_reopen ... ok
+
+running 1 test
+test storage::engine::text_compaction::tests::compaction_repeated_empty_and_tail_append_preserve_receipts_and_text ... ok
+
+running 1 test
+test storage::engine::text_compaction::tests::compaction_selected_missing_corrupt_header_prefix_and_extent_fail_closed ... ok
+
+running 1 test
+test storage::engine::text_compaction::tests::compaction_unknown_commit_reconciles_receipt_without_reclaiming_selected_payload ... ok
+test storage::indexes::tests::w10_remove_namespace_clears_every_phase_for_that_namespace_only ... ok
+
+running 1 test
+
+running 1 test
+test storage::lifecycle_migration::tests::active_policy_receipt_without_its_metadata_changes_is_rejected ... ok
+
+running 1 test
+
+running 1 test
+test storage::engine::text_compaction::tests::compaction_process_interruption_matrix_reopens_metadata_selection_twice ... ok
+test storage::lifecycle_migration::tests::expected_state_ownership_and_token_exhaustion_leave_source_untouched ... ok
+test storage::lifecycle_migration::tests::attested_policy_restore_keeps_original_publication_and_rejects_stripped_pointer ... ok
+test storage::lifecycle_migration::tests::failures_abandon_whole_transaction_and_postpublish_retry_reconciles_exact_destination ... ok
+test storage::lifecycle_migration::tests::malformed_suffix_and_namespace_proofs_fail_closed ... ok
+test storage::lifecycle_migration::tests::policy_revision_order_must_match_commits_within_each_origin ... ok
+test storage::lifecycle_migration::tests::migrated_backup_forks_preserving_policy_proof_and_uses_active_baseline_one ... ok
+test storage::lifecycle_migration::tests::preview_and_both_directions_preserve_payload_times_and_publication ... ok
+test storage::lifecycle_migration::tests::rollback_preserves_distinct_native_anchor_and_feedback_uses_it ... ok
+test storage::lifecycle_migration::tests::preview_projects_canonical_same_scope_live_donors_and_honors_disabled_policy ... ok
+test storage::metadata::insertion::profile_boundary_tests::native_profile_final_transaction_rechecks_canonical_binding_before_allocation ... ok
+test storage::metadata::insertion::profile_boundary_tests::native_profile_legacy_insertion_remains_unverified_and_replay_precedes_profile ... ok
+test storage::metadata::lifecycle_updates::tests::abandoned_precommit_transactions_leave_every_lifecycle_field_and_generation_unchanged ... ok
+test storage::metadata::lifecycle_updates::tests::feedback_commits_state_and_bounded_history_once_and_preserves_unowned_fields_on_reopen ... ok
+test storage::metadata::lifecycle_updates::tests::phase_loss_commits_strength_and_exact_v1_content_once_and_rebuilds_indexes ... ok
+test storage::metadata::lifecycle_updates::tests::phase_publication_holds_admission_after_atomic_content_commit ... ok
+test storage::lifecycle_migration::tests::schema_v2_copy_cannot_move_publication_past_policy_receipts ... ok
+test storage::metadata::lifecycle_updates::tests::stale_record_and_policy_are_checked_inside_final_transaction ... ok
+test storage::metadata::lifecycle_updates::tests::terminal_records_and_illegal_promotions_cannot_be_resurrected ... ok
+test storage::metadata::lifecycle_updates::tests::real_precommit_generation_failure_rolls_back_feedback_and_both_phase_losses ... ok
+test storage::metadata::observation::tests::concurrent_identical_batches_append_once ... ok
+test storage::metadata::observation::tests::dropped_real_transactions_and_generation_exhaustion_leave_no_partial_writes ... ok
+test storage::metadata::observation::tests::exposure_batch_is_distinct_ordered_monotonic_and_one_generation ... ok
+test storage::metadata::observation::tests::feedback_matches_legacy_planner_preserves_other_fields_and_replays_before_cas ... ok
+test storage::metadata::observation::tests::committed_observations_survive_process_exit_and_replay_after_purge ... ok
+test storage::metadata::observation::tests::feedback_rejects_canonically_ineligible_content_without_receipt ... ok
+test storage::metadata::observation::tests::final_transaction_asserts_scope_and_unexposed_similarity_source ... ok
+test storage::metadata::observation::tests::invalid_feedback_kinds_and_v2_contexts_do_not_mutate ... ok
+test storage::metadata::observation::tests::final_transaction_decodes_namespace_and_rejects_unsupported_policy_without_writes ... ok
+test storage::metadata::observation::tests::invalid_last_record_rolls_back_every_event_receipt_and_generation ... ok
+test storage::metadata::observation::tests::namespace_keys_are_independent_and_shared_across_operation_kinds ... ok
+test storage::metadata::observation::tests::observation_timestamps_fail_without_mutation_but_replay_ignores_current_clock ... ok
+test storage::metadata::observation::tests::malformed_new_receipt_outcomes_and_catalog_scope_fail_reopen ... ok
+test storage::metadata::removal_ledger::tests::every_legacy_removal_writer_records_evidence_and_purge_retains_it ... ok
+test storage::metadata::removal_ledger::tests::helper_union_hard_delete_dominance_and_abandoned_transaction ... ok
+test storage::metadata::removal_ledger::tests::legacy_adoption_reports_unknown_prior_history_without_invented_entries ... ok
+test storage::metadata::removal_ledger::tests::lifecycle_masks_are_monotone_and_exact_v1_tags_survive ... ok
+test storage::metadata::removal_ledger::tests::corrupt_or_missing_ledger_never_reinitializes_as_legacy ... ok
+test storage::metadata::removal_ledger::tests::real_backup_preserves_ledger_and_lossless_export_after_terminal_reuse_rejection ... ok
+test storage::metadata::tests::access_receipt_aborted_transaction_and_overflow_leave_no_mutation ... ok
+test storage::metadata::tests::access_receipt_replay_precedes_cas_but_never_lineage_check ... ok
+test storage::metadata::tests::access_receipts_serialize_concurrent_retries_and_scope_keys_by_namespace ... ok
+test storage::metadata::tests::containment_publication_blocks_second_writer_and_phase_reader_after_commit ... ok
+test storage::metadata::tests::containment_reopen_rebuilds_corrupt_checkpoint_and_batch_publishes_phase ... ok
+test storage::metadata::removal_ledger::tests::real_generation_failure_aborts_each_removal_with_no_ledger_or_record_loss ... ok
+test storage::metadata::tests::control_adopts_legacy_records_without_reencoding_and_fails_closed_on_unknown_state ... ok
+test storage::metadata::tests::control_missing_row_or_receipt_table_never_mints_a_new_lineage ... ok
+test storage::metadata::tests::integration_access_receipt_cannot_be_overwritten_by_a_paused_sweep ... ok
+test storage::metadata::tests::effects_schema_partial_future_or_malformed_layout_never_adopts ... ok
+test storage::metadata::tests::integration_adopted_control_never_recreates_missing_canonical_tables ... ok
+test storage::metadata::tests::integration_control_partial_table_sets_never_initialize_missing_tables ... ok
+test storage::metadata::tests::legacy_metadata_mutations_advance_generation_but_reads_and_checkpoints_do_not ... ok
+test storage::metadata::tests::update_decay_state_does_not_bring_a_tombstone_back ... ok
+test storage::metadata::tests::w01_purge_removes_live_and_tombstoned_rows_of_the_target_namespace_only ... ok
+test storage::metadata::tests::w02_purge_clears_the_tag_index ... ok
+test storage::metadata::tests::w03_purge_clears_the_namespace_index ... ok
+test storage::metadata::tests::w04_purge_of_an_unknown_or_empty_namespace_is_an_empty_ok ... ok
+test storage::metadata::tests::w05_purge_chunking_removes_every_record ... ok
+test storage::metadata::tests::integration_control_versions_types_and_receipt_references_fail_before_open ... ok
+test storage::metadata::tests::w07_a_duplicate_id_in_one_batch_yields_exactly_one_tombstoned_outcome ... ok
+test storage::metadata::tests::w06_batch_tombstone_reports_one_outcome_per_id_in_input_order ... ok
+test storage::metadata::tests::w09_batch_tombstone_of_an_empty_slice_is_an_empty_ok ... ok
+test storage::metadata::tests::w08_batch_tombstone_leaves_the_same_state_as_the_single_record_path ... ok
+test storage::metadata::tests::w54_the_emptiness_guard_sees_a_record_the_namespace_index_lost ... ok
+test storage::metadata::tests::w55_tombstones_do_not_make_a_namespace_non_empty ... ok
+test storage::metadata::text_generation::tests::text_selection_receipt_reopens_and_stale_generation_cannot_replace_it ... ok
+test storage::metadata::text_generation::tests::text_catalog_partial_unknown_descriptor_and_unsafe_filename_fail_closed ... ok
+test storage::ownership::tests::ownership_exclusion_child ... ok
+test storage::offline_snapshot::tests::offline_snapshot_reads_canonical_v2_without_serving_or_source_changes ... ok
+test storage::ownership::tests::ownership_fork_window_redb_releases_its_own_lock ... ok
+test storage::ownership::tests::ownership_fork_window_releases_directory_lock_when_parent_drops ... ok
+test storage::ownership::tests::ownership_fork_window_releases_stable_owner_when_parent_drops ... ok
+test storage::ownership::tests::ownership_fork_window_releases_vector_lock_independently ... ok
+test storage::ownership::tests::ownership_fork_window_offline_snapshot_releases_all_source_locks ... ok
+test storage::ownership::tests::ownership_guard_preserves_process_and_alias_exclusion ... ok
+test storage::ownership::tests::ownership_fork_window_reopens_actual_store_with_vectors ... ok
+test storage::schema_migration::combined_fixture_tests::combined_migration_preserves_real_ledger_keys_receipts_and_applied_effects ... ok
+
+running 1 test
+test storage::schema_migration::combined_fixture_tests::combined_pending_effects_reject_migration_immutably_but_startup_preflight_allows_recovery ... ok
+
+running 1 test
+test storage::schema_migration::tests::invalid_schema_state_fails_before_canonical_writable_open ... ok
+
+running 1 test
+
+running 1 test
+test storage::schema_migration::tests::interrupted_schema_publication_is_absent_or_complete_and_offline ... ok
+test storage::schema_migration::tests::migration_preserves_legacy_bytes_defaults_and_offline_restart ... ok
+test storage::schema_migration::tests::schema_interruption_child ... ok
+test storage::text_migration::tests::fresh_destination_migration_preserves_source_lineage_and_rejects_old_reader ... ok
+test storage::schema_migration::tests::malformed_attestation_evidence_is_rejected_without_changing_canonical_files ... ok
+test storage::text_migration::tests::migration_interruption_child ... ok
+test storage::text_migration::tests::legacy_in_place_compaction_refuses_without_selection_or_source_changes ... ok
+test storage::vectors::manager_tests::containment_double_free_is_idempotent_and_free_list_cycles_fail_reopen ... ok
+test storage::vectors::manager_tests::containment_zero_and_truncated_vector_files_are_never_initialized ... ok
+test storage::vectors::manager_tests::w11_a_removed_store_releases_its_lock_so_the_directory_can_be_replaced ... ok
+test storage::vectors::manager_tests::w12_removing_a_namespace_that_was_never_opened_is_none ... ok
+test system::tests::a_changed_embedding_width_skips_everything_without_failing ... ok
+
+running 1 test
+test system::tests::a_record_in_an_unreadable_namespace_is_skipped ... ok
+test system::tests::a_record_whose_vector_is_gone_is_skipped_and_startup_continues ... ok
+test system::tests::a_restart_reloads_the_vector_index_from_disk ... ok
+
+running 1 test
+test system::tests::a_stored_memory_still_has_its_embedding_after_a_restart ... ok
+test system::tests::a_tombstoned_memory_is_not_loaded ... ok
+test system::tests::actual_mcp_cached_consumers_block_then_recover_online ... ok
+
+running 1 test
+test system::tests::effects_block_cached_queries_and_reopen_rebuilds_deleted_fts_rows ... ok
+test system::tests::entity_rebuild_uses_each_records_namespace_and_only_retained_labels ... ok
+
+running 1 test
+test system::tests::online_completion_crash_reopen_preserves_receipt_and_deleted_content ... ok
+
+running 1 test
+test system::tests::the_load_reads_vectors_that_outlived_the_engine_that_wrote_them ... ok
+test system::tests::the_loaded_entry_carries_the_records_real_phase ... ok
+test system::tests::vectors_of_the_wrong_width_are_counted_not_fatal ... ok
+test time::tests::manual_clock_and_elapsed_time_are_monotone_and_saturating ... ok
+test time::tests::test_format_timestamp_new_york ... ok
+test time::tests::test_format_timestamp_utc ... ok
+test time::tests::test_parse_date_only ... ok
+test time::tests::test_parse_invalid ... ok
+test time::tests::test_parse_naive_datetime ... ok
+test time::tests::test_parse_rfc3339 ... ok
+test time::tests::test_parse_rfc3339_with_offset ... ok
+test time::tests::test_parse_time_value_integer ... ok
+test time::tests::test_parse_time_value_null ... ok
+test time::tests::test_parse_time_value_string ... ok
+test time::tests::test_resolve_iana ... ok
+test time::tests::test_resolve_invalid_falls_back_to_utc ... ok
+test time::tests::test_resolve_local_falls_back_to_utc ... ok
+test time::tests::test_resolve_utc ... ok
+
+running 1 test
+test storage::text_migration::tests::offline_migration_interruptions_never_publish_an_ungated_selection ... ok
+
+failures:
+
+---- mcp::bridge_adapters::tests::entity_postings_survive_disabled_autolink_and_delete_without_legacy_tags stdout ----
+
+thread 'mcp::bridge_adapters::tests::entity_postings_survive_disabled_autolink_and_delete_without_legacy_tags' (1506) panicked at src/mcp/bridge_adapters.rs:3916:13:
+assertion `left == right` failed
+  left: 1
+ right: 2
+
+---- search::pipeline::semantics_tests::current_chain_boundaries_0_1_64_65_are_not_legacy_fallbacks stdout ----
+
+thread 'search::pipeline::semantics_tests::current_chain_boundaries_0_1_64_65_are_not_legacy_fallbacks' (1757) panicked at src/search/semantics_tests.rs:57:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::current_rejects_cycles_branches_missing_and_foreign_paths_but_history_retains_origin stdout ----
+
+thread 'search::pipeline::semantics_tests::current_rejects_cycles_branches_missing_and_foreign_paths_but_history_retains_origin' (1760) panicked at src/search/semantics_tests.rs:129:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::current_requires_structure_and_correct_scope_even_when_the_canonical_record_is_eligible stdout ----
+
+thread 'search::pipeline::semantics_tests::current_requires_structure_and_correct_scope_even_when_the_canonical_record_is_eligible' (1763) panicked at src/search/semantics_tests.rs:566:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::current_resolves_before_graph_seeding_and_after_graph_discovery stdout ----
+
+thread 'search::pipeline::semantics_tests::current_resolves_before_graph_seeding_and_after_graph_discovery' (1766) panicked at src/search/semantics_tests.rs:371:10:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::dense_supersession_reads_share_one_query_budget_in_uuid_order stdout ----
+
+thread 'search::pipeline::semantics_tests::dense_supersession_reads_share_one_query_budget_in_uuid_order' (1772) panicked at src/search/semantics_tests.rs:245:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::diagnostics_capture_overlapping_sources_before_dedup_and_only_returned_ids stdout ----
+
+thread 'search::pipeline::semantics_tests::diagnostics_capture_overlapping_sources_before_dedup_and_only_returned_ids' (1775) panicked at src/search/semantics_tests.rs:984:10:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::diagnostics_do_not_leak_filtered_foreign_or_unresolved_ids stdout ----
+
+thread 'search::pipeline::semantics_tests::diagnostics_do_not_leak_filtered_foreign_or_unresolved_ids' (1778) panicked at src/search/semantics_tests.rs:1164:10:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::diagnostics_keep_graph_overlap_observational_and_graph_inheritance_distinct stdout ----
+
+thread 'search::pipeline::semantics_tests::diagnostics_keep_graph_overlap_observational_and_graph_inheritance_distinct' (1781) panicked at src/search/semantics_tests.rs:1098:10:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::diagnostics_report_unknown_vector_exhaustion_and_measured_metadata_cap stdout ----
+
+thread 'search::pipeline::semantics_tests::diagnostics_report_unknown_vector_exhaustion_and_measured_metadata_cap' (1784) panicked at src/search/semantics_tests.rs:1202:10:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::diagnostics_separate_terminal_own_evidence_from_inherited_floor stdout ----
+
+thread 'search::pipeline::semantics_tests::diagnostics_separate_terminal_own_evidence_from_inherited_floor' (1787) panicked at src/search/semantics_tests.rs:1056:18:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::diamond_cycle_contributions_and_caps_are_deterministic stdout ----
+
+thread 'search::pipeline::semantics_tests::diamond_cycle_contributions_and_caps_are_deterministic' (1790) panicked at src/search/semantics_tests.rs:403:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::filtered_successor_is_omitted_in_current_without_ineligible_diagnostic_ids stdout ----
+
+thread 'search::pipeline::semantics_tests::filtered_successor_is_omitted_in_current_without_ineligible_diagnostic_ids' (1793) panicked at src/search/semantics_tests.rs:173:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::fts_refill_uses_canonical_filters_before_cap_and_keeps_v1_behavior stdout ----
+
+thread 'search::pipeline::semantics_tests::fts_refill_uses_canonical_filters_before_cap_and_keeps_v1_behavior' (1799) panicked at src/search/semantics_tests.rs:688:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::fts_sqlite_failure_propagates_in_v2_and_labels_legacy_fallback stdout ----
+
+thread 'search::pipeline::semantics_tests::fts_sqlite_failure_propagates_in_v2_and_labels_legacy_fallback' (1802) panicked at src/search/semantics_tests.rs:748:13:
+assertion failed: error.to_string().contains("FTS search failed")
+
+---- search::pipeline::semantics_tests::graph_cannot_receive_or_relay_through_ghost_tombstone_filtered_or_foreign_records stdout ----
+
+thread 'search::pipeline::semantics_tests::graph_cannot_receive_or_relay_through_ghost_tombstone_filtered_or_foreign_records' (1805) panicked at src/search/semantics_tests.rs:338:192:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::graph_depth_is_an_actual_bound_and_replacement_seed_evidence_is_invariant stdout ----
+
+thread 'search::pipeline::semantics_tests::graph_depth_is_an_actual_bound_and_replacement_seed_evidence_is_invariant' (1808) panicked at src/search/semantics_tests.rs:274:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::rebuilt_reciprocal_edges_each_contribute_and_survive_engine_recall stdout ----
+
+thread 'search::pipeline::semantics_tests::rebuilt_reciprocal_edges_each_contribute_and_survive_engine_recall' (1818) panicked at src/search/semantics_tests.rs:886:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::tombstone_can_resolve_structural_chain_but_never_inherits_or_returns_content stdout ----
+
+thread 'search::pipeline::semantics_tests::tombstone_can_resolve_structural_chain_but_never_inherits_or_returns_content' (1821) panicked at src/search/semantics_tests.rs:213:10:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::v2_inheritance_preserves_min_score_temporal_boost_and_stronger_own_evidence stdout ----
+
+thread 'search::pipeline::semantics_tests::v2_inheritance_preserves_min_score_temporal_boost_and_stronger_own_evidence' (1824) panicked at src/search/semantics_tests.rs:596:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::v2_rejects_nonfinite_canonical_and_graph_sources stdout ----
+
+thread 'search::pipeline::semantics_tests::v2_rejects_nonfinite_canonical_and_graph_sources' (1830) panicked at src/search/semantics_tests.rs:628:5:
+assertion failed: matches!(engine.search_with_semantics(query(serde_json::json!({"text":"q"})),
+    current()).await, Err(SearchError::MetadataError(_)))
+
+---- search::pipeline::semantics_tests::v2_rejects_nonfinite_inputs_and_scores_and_transport_json_cannot_select_it stdout ----
+
+thread 'search::pipeline::semantics_tests::v2_rejects_nonfinite_inputs_and_scores_and_transport_json_cannot_select_it' (1833) panicked at src/search/semantics_tests.rs:545:10:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::semantics_tests::fts_engine_reports_work_underfill_and_candidate_cap_separately stdout ----
+
+thread 'search::pipeline::semantics_tests::fts_engine_reports_work_underfill_and_candidate_cap_separately' (1796) panicked at src/search/semantics_tests.rs:797:10:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::strength_tests::legacy_retrieval_graph_formulas_also_consume_explicit_policy_projection stdout ----
+
+thread 'search::pipeline::strength_tests::legacy_retrieval_graph_formulas_also_consume_explicit_policy_projection' (1867) panicked at src/search/strength_tests.rs:847:10:
+called `Result::unwrap()` on an `Err` value: Unavailable("embedding provenance is unknown; explicitly attest or re-embed before semantic use")
+
+---- search::pipeline::strength_tests::projected_eligibility_precedes_vector_fts_entity_and_metadata_caps stdout ----
+
+thread 'search::pipeline::strength_tests::projected_eligibility_precedes_vector_fts_entity_and_metadata_caps' (1870) panicked at src/search/strength_tests.rs:429:64:
+called `Result::unwrap()` on an `Err` value: Unavailable("embedding provenance is unknown; explicitly attest or re-embed before semantic use")
+
+---- search::pipeline::tests::canonical_namespace_enumeration_failure_is_not_an_empty_success stdout ----
+
+thread 'search::pipeline::tests::canonical_namespace_enumeration_failure_is_not_an_empty_success' (1887) panicked at src/search/pipeline.rs:2838:9:
+assertion failed: matches!(engine.search(query(json!({"text": "q"}))).await,
+    Err(SearchError::MetadataError(_)))
+
+---- search::pipeline::tests::entity_recall_filters_namespace_and_metadata_before_cap stdout ----
+
+thread 'search::pipeline::tests::entity_recall_filters_namespace_and_metadata_before_cap' (1892) panicked at src/search/pipeline.rs:2691:14:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::tests::exact_vector_prefilter_matches_eligible_oracle_beyond_1600_rejections stdout ----
+
+thread 'search::pipeline::tests::exact_vector_prefilter_matches_eligible_oracle_beyond_1600_rejections' (1895) panicked at src/search/pipeline.rs:2662:22:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::tests::full_pipeline_supersession_preserves_inherited_temporal_score stdout ----
+
+thread 'search::pipeline::tests::full_pipeline_supersession_preserves_inherited_temporal_score' (1898) panicked at src/search/pipeline.rs:2880:18:
+called `Result::unwrap()` on an `Err` value: EmbeddingFailed("embedding has 2 dimensions, namespace requires 1536 (1–8192)")
+
+---- search::pipeline::strength_tests::returned_graph_result_uses_the_same_projection_as_admission_and_ranking stdout ----
+
+thread 'search::pipeline::strength_tests::returned_graph_result_uses_the_same_projection_as_admission_and_ranking' (1883) panicked at src/search/strength_tests.rs:789:10:
+called `Result::unwrap()` on an `Err` value: Unavailable("embedding provenance is unknown; explicitly attest or re-embed before semantic use")
+
+
+failures:
+    mcp::bridge_adapters::tests::entity_postings_survive_disabled_autolink_and_delete_without_legacy_tags
+    search::pipeline::semantics_tests::current_chain_boundaries_0_1_64_65_are_not_legacy_fallbacks
+    search::pipeline::semantics_tests::current_rejects_cycles_branches_missing_and_foreign_paths_but_history_retains_origin
+    search::pipeline::semantics_tests::current_requires_structure_and_correct_scope_even_when_the_canonical_record_is_eligible
+    search::pipeline::semantics_tests::current_resolves_before_graph_seeding_and_after_graph_discovery
+    search::pipeline::semantics_tests::dense_supersession_reads_share_one_query_budget_in_uuid_order
+    search::pipeline::semantics_tests::diagnostics_capture_overlapping_sources_before_dedup_and_only_returned_ids
+    search::pipeline::semantics_tests::diagnostics_do_not_leak_filtered_foreign_or_unresolved_ids
+    search::pipeline::semantics_tests::diagnostics_keep_graph_overlap_observational_and_graph_inheritance_distinct
+    search::pipeline::semantics_tests::diagnostics_report_unknown_vector_exhaustion_and_measured_metadata_cap
+    search::pipeline::semantics_tests::diagnostics_separate_terminal_own_evidence_from_inherited_floor
+    search::pipeline::semantics_tests::diamond_cycle_contributions_and_caps_are_deterministic
+    search::pipeline::semantics_tests::filtered_successor_is_omitted_in_current_without_ineligible_diagnostic_ids
+    search::pipeline::semantics_tests::fts_engine_reports_work_underfill_and_candidate_cap_separately
+    search::pipeline::semantics_tests::fts_refill_uses_canonical_filters_before_cap_and_keeps_v1_behavior
+    search::pipeline::semantics_tests::fts_sqlite_failure_propagates_in_v2_and_labels_legacy_fallback
+    search::pipeline::semantics_tests::graph_cannot_receive_or_relay_through_ghost_tombstone_filtered_or_foreign_records
+    search::pipeline::semantics_tests::graph_depth_is_an_actual_bound_and_replacement_seed_evidence_is_invariant
+    search::pipeline::semantics_tests::rebuilt_reciprocal_edges_each_contribute_and_survive_engine_recall
+    search::pipeline::semantics_tests::tombstone_can_resolve_structural_chain_but_never_inherits_or_returns_content
+    search::pipeline::semantics_tests::v2_inheritance_preserves_min_score_temporal_boost_and_stronger_own_evidence
+    search::pipeline::semantics_tests::v2_rejects_nonfinite_canonical_and_graph_sources
+    search::pipeline::semantics_tests::v2_rejects_nonfinite_inputs_and_scores_and_transport_json_cannot_select_it
+    search::pipeline::strength_tests::legacy_retrieval_graph_formulas_also_consume_explicit_policy_projection
+    search::pipeline::strength_tests::projected_eligibility_precedes_vector_fts_entity_and_metadata_caps
+    search::pipeline::strength_tests::returned_graph_result_uses_the_same_projection_as_admission_and_ranking
+    search::pipeline::tests::canonical_namespace_enumeration_failure_is_not_an_empty_success
+    search::pipeline::tests::entity_recall_filters_namespace_and_metadata_before_cap
+    search::pipeline::tests::exact_vector_prefilter_matches_eligible_oracle_beyond_1600_rejections
+    search::pipeline::tests::full_pipeline_supersession_preserves_inherited_temporal_score
+
+test result: FAILED. 785 passed; 30 failed; 0 ignored; 0 measured; 0 filtered out; finished in 216.49s
+
+error: test failed, to rerun pass `--lib`
