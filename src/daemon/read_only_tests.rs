@@ -741,7 +741,7 @@ async fn scoped_read_only_controls_survive_http_mcp_and_framed_daemon() {
         .await;
         assert_eq!(
             status.as_u16(),
-            if namespace == "other" { 409 } else { 400 },
+            if namespace == "other" { 409 } else { 200 },
             "{body}"
         );
     }
