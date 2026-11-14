@@ -1,0 +1,35 @@
+[
+  {
+    "archive": "failed-9b6c7ec.tgz",
+    "archiveMembersVerified": 175,
+    "bytes": 709804,
+    "outputHashesVerified": 6,
+    "rawRoot": "/tmp/recalld-accepted-test-g8o6ohxe",
+    "sha256": "028d11fae21dc0707a7054346a013addd6b9339e35cfef826fc3acc0291b5658",
+    "sourceCommit": "9b6c7eca79625766ac5bf118ebf5856922431e83",
+    "sourceHashesVerified": 167,
+    "status": "failed"
+  },
+  {
+    "archive": "passed-b627cd5.tgz",
+    "archiveMembersVerified": 178,
+    "bytes": 754223,
+    "outputHashesVerified": 9,
+    "rawRoot": "/tmp/recalld-accepted-test-3059j5g6",
+    "sha256": "93a42addb8c284b4e1c658151aaab4606f66bde2a5173bcd2fbdbc52e697c11a",
+    "sourceCommit": "b627cd50c91bdbee8786b0c581c0a4348e265892",
+    "sourceHashesVerified": 167,
+    "status": "passed"
+  },
+  {
+    "archive": "passed-50e0c5e.tgz",
+    "archiveMembersVerified": 178,
+    "bytes": 754074,
+    "outputHashesVerified": 9,
+    "rawRoot": "/tmp/recalld-accepted-test-wjgq37hv",
+    "sha256": "f1f59723dcb51127d9a6376d1b76d3e611ee7c501f2fc175793e1255c81d0456",
+    "sourceCommit": "50e0c5e0d42bcdafa24acb9a9c267c5d3318fe85",
+    "sourceHashesVerified": 167,
+    "status": "passed"
+  }
+]

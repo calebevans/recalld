@@ -1,0 +1,3 @@
+50e0c5e0d42bcdafa24acb9a9c267c5d3318fe85 Caleb Evans <calebdevans@pm.me> Pass the existing purge publication guard directly
+b627cd50c91bdbee8786b0c581c0a4348e265892 Caleb Evans <calebdevans@pm.me> Use a purgeable namespace in durable drain regression
+9b6c7eca79625766ac5bf118ebf5856922431e83 Caleb Evans <calebdevans@pm.me> Track accepted work through metadata and derived publication

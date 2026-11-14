@@ -27,7 +27,7 @@ impl RedbStorageEngine {
             false,
             false,
         )?;
-        apply_pending(&self.meta_store, &self.edge_store, None).map_err(|source| {
+        apply_pending(&self.meta_store, &guard, &self.edge_store, None).map_err(|source| {
             StorageError::CommittedEffectsPending {
                 operation_id: result.receipt.operation_id,
                 source: Box::new(source),
@@ -58,6 +58,7 @@ impl RedbStorageEngine {
         )?;
         apply_pending(
             &self.meta_store,
+            &guard,
             &self.edge_store,
             Some(&mut self.vector_manager),
         )
@@ -71,8 +72,10 @@ impl RedbStorageEngine {
     pub(crate) fn recover_pending_effects(&mut self) -> Result<(), StorageError> {
         // Constructor only: no handle has escaped, and normal admission is
         // blocked for pending canonical effects. Replay precedes orphan cleanup.
+        let guard = self.meta_store.canonical_effects_guard(None)?;
         apply_pending(
             &self.meta_store,
+            &guard,
             &self.edge_store,
             Some(&mut self.vector_manager),
         )
@@ -93,10 +96,12 @@ impl RedbStorageEngine {
 
 pub(super) fn apply_pending(
     meta: &MetadataStore,
+    guard: &crate::storage::metadata::MutationGuard<'_>,
     edges: &EdgeStore,
     mut vectors: Option<&mut VectorManager>,
 ) -> Result<(), StorageError> {
     let result = (|| {
+        guard.check(meta)?;
         #[cfg(test)]
         if meta.fail_effect_application.swap(false, Ordering::SeqCst) {
             return Err(StorageError::RecoveryRequired(
@@ -123,7 +128,7 @@ pub(super) fn apply_pending(
                 store.sync()?;
             }
             crash_point("after_vector_sync");
-            meta.acknowledge_canonical_effects(effect)?;
+            meta.acknowledge_canonical_effects(guard, effect)?;
             crash_point("after_canonical_ack");
         }
         meta.canonical_pending.store(false, Ordering::SeqCst);

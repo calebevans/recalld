@@ -1,0 +1,2008 @@
+diff --git a/src/derived_completion.rs b/src/derived_completion.rs
+index 479ccf4..76c7fd2 100644
+--- a/src/derived_completion.rs
++++ b/src/derived_completion.rs
+@@ -6,6 +6,7 @@ use crate::cache::CacheManager;
+ use crate::graph::{RelationshipGraph, SharedGraph};
+ use crate::model::{DecayPhase, NamespaceId};
+ use crate::search::{EntityIndex, FlatVectorIndex, FtsIndex, VectorIndex, VectorMetadata};
++use crate::storage::work::WorkTicket;
+ use crate::storage::{RedbStorageEngine, StorageEngine, StorageError, TextRef};
+ 
+ #[derive(Clone)]
+@@ -19,6 +20,19 @@ pub(crate) struct DerivedCompletion {
+ }
+ 
+ impl DerivedCompletion {
++    // Register before any await/enqueue. Never hold this storage read lock while
++    // draining work: queued workers need the storage write lock to complete.
++    fn accept_work(&self, parent: Option<&WorkTicket>) -> Result<WorkTicket, StorageError> {
++        let storage = self.storage.read().map_err(|e| failed(e.to_string()))?;
++        Ok(storage.meta_store().work_tracker().admit(parent)?)
++    }
++
++    fn finish_known_work(&self, work: WorkTicket) {
++        if let Ok(storage) = self.storage.read() {
++            storage.meta_store().finish_work(work);
++        }
++    }
++
+     /// Actual insertion consumer: canonical commit under the store lease, then
+     /// drain leases and rebuild every derived view before ready success.
+     pub async fn insert(
+@@ -27,27 +41,49 @@ impl DerivedCompletion {
+         input: crate::storage::insertion::InsertMemory,
+         generated_embedding: Vec<f32>,
+         sampled_at: i64,
++    ) -> Result<crate::storage::insertion::InsertResult, StorageError> {
++        let work = self.accept_work(None)?;
++        let result = self
++            .insert_accepted(ctx, input, generated_embedding, sampled_at, &work)
++            .await;
++        self.finish_known_work(work);
++        result
++    }
++
++    async fn insert_accepted(
++        &self,
++        ctx: crate::storage::control::MutationContext,
++        input: crate::storage::insertion::InsertMemory,
++        generated_embedding: Vec<f32>,
++        sampled_at: i64,
++        work: &WorkTicket,
+     ) -> Result<crate::storage::insertion::InsertResult, StorageError> {
+         let gate = publication_gate(&self.storage).await?;
+         let lease = gate.read_owned().await;
+         let storage = self.storage.clone();
++        let child = work.child()?;
+         let result = tokio::task::spawn_blocking(move || {
+             let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+-            let receipt = storage.insert_memory_with_receipt(
+-                &ctx,
+-                &input,
+-                &generated_embedding,
+-                sampled_at,
+-            )?;
+-            let id = crate::storage::insertion::inserted_id(&receipt)?;
+-            let record = storage
+-                .get_record(id)
+-                .map_err(|source| StorageError::CommittedMutation {
+-                    receipt: Box::new(receipt.clone()),
+-                    source: Box::new(source),
+-                })?
+-                .map(|r| crate::model::CachedRecord::from(&r));
+-            Ok::<_, StorageError>(crate::storage::insertion::InsertResult { receipt, record })
++            let result = (|| {
++                let receipt = storage.insert_memory_with_work(
++                    &ctx,
++                    &input,
++                    &generated_embedding,
++                    sampled_at,
++                    Some(&child),
++                )?;
++                let id = crate::storage::insertion::inserted_id(&receipt)?;
++                let record = storage
++                    .get_record(id)
++                    .map_err(|source| StorageError::CommittedMutation {
++                        receipt: Box::new(receipt.clone()),
++                        source: Box::new(source),
++                    })?
++                    .map(|r| crate::model::CachedRecord::from(&r));
++                Ok::<_, StorageError>(crate::storage::insertion::InsertResult { receipt, record })
++            })();
++            storage.meta_store().finish_work(child);
++            result
+         })
+         .await
+         .map_err(|e| {
+@@ -57,7 +93,7 @@ impl DerivedCompletion {
+         })?;
+         drop(lease); // Complete takes this gate exclusively; never upgrade in place.
+         let result = result?;
+-        self.complete()
++        self.complete_with_work(Some(work))
+             .await
+             .map_err(|source| StorageError::CommittedMutation {
+                 receipt: Box::new(result.receipt.clone()),
+@@ -69,25 +105,43 @@ impl DerivedCompletion {
+     /// Legacy bool adapter. Resolve namespace and commit under one store guard;
+     /// each batch caller invokes this in order, with independent child commits.
+     pub async fn forget(&self, id: crate::model::MemoryId) -> Result<bool, StorageError> {
++        let work = self.accept_work(None)?;
++        let result = self.forget_accepted(id, &work).await;
++        self.finish_known_work(work);
++        result
++    }
++
++    async fn forget_accepted(
++        &self,
++        id: crate::model::MemoryId,
++        work: &WorkTicket,
++    ) -> Result<bool, StorageError> {
+         let gate = publication_gate(&self.storage).await?;
+         let lease = gate.read_owned().await;
+         let storage = self.storage.clone();
++        let child = work.child()?;
+         let receipt = tokio::task::spawn_blocking(move || {
+             let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+-            let Some(record) = storage.get_record(id)? else {
+-                return Ok(None);
+-            };
+-            // Preserve a clean legacy no-op. A pending prior forget must still
+-            // produce a receipt and finish publication, never claim ready here.
+-            if record.phase == DecayPhase::Tombstone
+-                && !storage.meta_store().needs_effects_rebuild()
+-            {
+-                return Ok(None);
+-            }
+-            let ctx = crate::storage::control::MutationContext::unkeyed(NamespaceId::new(
+-                record.namespace_id,
+-            ));
+-            storage.tombstone_memory_with_receipt(&ctx, id).map(Some)
++            let result = (|| {
++                let Some(record) = storage.get_record(id)? else {
++                    return Ok(None);
++                };
++                // Preserve a clean legacy no-op. A pending prior forget must still
++                // produce a receipt and finish publication, never claim ready here.
++                if record.phase == DecayPhase::Tombstone
++                    && !storage.meta_store().needs_effects_rebuild()
++                {
++                    return Ok(None);
++                }
++                let ctx = crate::storage::control::MutationContext::unkeyed(NamespaceId::new(
++                    record.namespace_id,
++                ));
++                storage
++                    .tombstone_memory_with_work(&ctx, id, Some(&child))
++                    .map(Some)
++            })();
++            storage.meta_store().finish_work(child);
++            result
+         })
+         .await
+         .map_err(|e| {
+@@ -99,7 +153,7 @@ impl DerivedCompletion {
+         let Some(receipt) = receipt? else {
+             return Ok(false);
+         };
+-        self.complete()
++        self.complete_with_work(Some(work))
+             .await
+             .map_err(|source| StorageError::CommittedMutation {
+                 receipt: Box::new(receipt.clone()),
+@@ -117,6 +171,14 @@ impl DerivedCompletion {
+     /// Retrying is safe: no receipt is acknowledged until every view is ready.
+     /// Canonical/uncertain-commit failures still require reopening the engine.
+     pub async fn complete(&self) -> Result<(), StorageError> {
++        self.complete_with_work(None).await
++    }
++
++    pub(crate) async fn complete_with_work(
++        &self,
++        parent: Option<&WorkTicket>,
++    ) -> Result<(), StorageError> {
++        let work = self.accept_work(parent)?;
+         self.cache.bind_storage(&self.storage);
+         let gate = publication_gate(&self.storage).await?;
+         let _publication = gate.write_owned().await;
+@@ -126,103 +188,119 @@ impl DerivedCompletion {
+         let mut entities = self.entities.clone().write_owned().await;
+         let storage = self.storage.clone();
+         let cache = self.cache.clone();
+-        tokio::task::spawn_blocking(move || {
++        let child = work.child()?;
++        let result = tokio::task::spawn_blocking(move || {
+             let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+-            storage.resume_pending_purges()?;
+-            storage.ensure_available()?;
+-            if !storage.meta_store().needs_effects_rebuild() {
+-                return Ok(());
+-            }
+-            let pending = storage.meta_store().pending_effects()?;
+-            let operation_id = pending
+-                .first()
+-                .ok_or_else(|| failed("dirty state without durable effects".into()))?
+-                .receipt
+-                .operation_id;
+             let result = (|| {
+-                // ponytail: O(records + edges) rebuild under the publication locks.
+-                // Replace with exact effect application when throughput warrants it.
+-                let records = storage.scan_all()?;
+-                let mut next_graph = RelationshipGraph::with_capacity(records.len());
+-                let mut next_vectors = FlatVectorIndex::new(vectors.dimensions());
+-                let mut next_entities = EntityIndex::with_capacity(records.len());
+-                fts.clear().map_err(|e| failed(e.to_string()))?;
+-                for (id, record) in &records {
+-                    let ns = NamespaceId::new(record.namespace_id);
+-                    next_graph
+-                        .add_node(
++                storage.resume_pending_purges_with_work(Some(&child))?;
++                storage.ensure_available()?;
++                if !storage.meta_store().needs_effects_rebuild() {
++                    return Ok(());
++                }
++                let pending = storage.meta_store().pending_effects()?;
++                let operation_id = pending
++                    .first()
++                    .ok_or_else(|| failed("dirty state without durable effects".into()))?
++                    .receipt
++                    .operation_id;
++                let result = (|| {
++                    // ponytail: O(records + edges) rebuild under the publication locks.
++                    // Replace with exact effect application when throughput warrants it.
++                    let records = storage.scan_all()?;
++                    let mut next_graph = RelationshipGraph::with_capacity(records.len());
++                    let mut next_vectors = FlatVectorIndex::new(vectors.dimensions());
++                    let mut next_entities = EntityIndex::with_capacity(records.len());
++                    fts.clear().map_err(|e| failed(e.to_string()))?;
++                    for (id, record) in &records {
++                        let ns = NamespaceId::new(record.namespace_id);
++                        next_graph
++                            .add_node(
++                                *id,
++                                ns,
++                                record.phase,
++                                record.decay_strength,
++                                record.vector_slot,
++                            )
++                            .map_err(|e| failed(e.to_string()))?;
++                        if record.phase == DecayPhase::Tombstone {
++                            continue;
++                        }
++                        let vector = storage
++                            .get_vector(ns, record.vector_slot)?
++                            .ok_or_else(|| failed(format!("missing vector for {id}")))?;
++                        let tags: Vec<String> =
++                            record.tags.iter().map(ToString::to_string).collect();
++                        next_vectors
++                            .add(
++                                *id,
++                                &vector,
++                                VectorMetadata {
++                                    namespace_id: ns,
++                                    decay_phase: record.phase.as_u8(),
++                                    tags: tags.clone(),
++                                },
++                            )
++                            .map_err(|e| failed(e.to_string()))?;
++                        let text = if record.text_length > 0 {
++                            Some(
++                                storage
++                                    .get_text(TextRef {
++                                        file_offset: record.text_offset,
++                                        length: record.text_length,
++                                    })?
++                                    .ok_or_else(|| failed(format!("missing text for {id}")))?,
++                            )
++                        } else {
++                            None
++                        };
++                        fts.add(ns, *id, &record.summary, text.as_deref(), &tags)
++                            .map_err(|e| failed(e.to_string()))?;
++                        next_entities.add(
+                             *id,
+-                            ns,
+-                            record.phase,
+-                            record.decay_strength,
+-                            record.vector_slot,
+-                        )
+-                        .map_err(|e| failed(e.to_string()))?;
+-                    if record.phase == DecayPhase::Tombstone {
+-                        continue;
++                            &crate::model::parse_structured_tags(&record.tags).entities,
++                        );
+                     }
+-                    let vector = storage
+-                        .get_vector(ns, record.vector_slot)?
+-                        .ok_or_else(|| failed(format!("missing vector for {id}")))?;
+-                    let tags: Vec<String> = record.tags.iter().map(ToString::to_string).collect();
+-                    next_vectors
+-                        .add(
+-                            *id,
+-                            &vector,
+-                            VectorMetadata {
+-                                namespace_id: ns,
+-                                decay_phase: record.phase.as_u8(),
+-                                tags: tags.clone(),
+-                            },
+-                        )
+-                        .map_err(|e| failed(e.to_string()))?;
+-                    let text = if record.text_length > 0 {
+-                        Some(
+-                            storage
+-                                .get_text(TextRef {
+-                                    file_offset: record.text_offset,
+-                                    length: record.text_length,
+-                                })?
+-                                .ok_or_else(|| failed(format!("missing text for {id}")))?,
+-                        )
+-                    } else {
+-                        None
+-                    };
+-                    fts.add(ns, *id, &record.summary, text.as_deref(), &tags)
+-                        .map_err(|e| failed(e.to_string()))?;
+-                    next_entities.add(
+-                        *id,
+-                        &crate::model::parse_structured_tags(&record.tags).entities,
+-                    );
+-                }
+-                let edges = storage.load_all_edges()?;
+-                let count = edges.len();
+-                if crate::graph::rebuild_from_storage(&mut next_graph, edges.into_iter()) != count {
+-                    return Err(failed("graph rejected canonical edges".into()));
+-                }
+-                *graph = next_graph;
+-                *vectors = next_vectors;
+-                *entities = next_entities;
+-                // Preserve unrelated cached candidates used by legacy temporal
+-                // linking. Cache invalidation itself never acquires storage or
+-                // graph locks; it is safe to finish its future on this blocking
+-                // worker while publication is closed. Bound cache hits still
+-                // reject any late stale refill against canonical metadata.
+-                let invalidated: Vec<_> = pending
+-                    .iter()
+-                    .flat_map(|effect| effect.invalidated_ids.iter().copied())
+-                    .collect();
+-                tokio::runtime::Handle::current().block_on(cache.batch_invalidate(&invalidated));
+-                crate::storage::metadata::effects::crash_point("before_online_derived_ack");
+-                storage.meta_store().acknowledge_rebuilt_effects()
++                    let edges = storage.load_all_edges()?;
++                    let count = edges.len();
++                    if crate::graph::rebuild_from_storage(&mut next_graph, edges.into_iter())
++                        != count
++                    {
++                        return Err(failed("graph rejected canonical edges".into()));
++                    }
++                    *graph = next_graph;
++                    *vectors = next_vectors;
++                    *entities = next_entities;
++                    // Preserve unrelated cached candidates used by legacy temporal
++                    // linking. Cache invalidation itself never acquires storage or
++                    // graph locks; it is safe to finish its future on this blocking
++                    // worker while publication is closed. Bound cache hits still
++                    // reject any late stale refill against canonical metadata.
++                    let invalidated: Vec<_> = pending
++                        .iter()
++                        .flat_map(|effect| effect.invalidated_ids.iter().copied())
++                        .collect();
++                    tokio::runtime::Handle::current()
++                        .block_on(cache.batch_invalidate(&invalidated));
++                    crate::storage::metadata::effects::crash_point("before_online_derived_ack");
++                    storage
++                        .meta_store()
++                        .acknowledge_rebuilt_effects_with_work(Some(&child))
++                })();
++                result.map_err(|source| StorageError::CommittedEffectsPending {
++                    operation_id,
++                    source: Box::new(source),
++                })
+             })();
+-            result.map_err(|source| StorageError::CommittedEffectsPending {
+-                operation_id,
+-                source: Box::new(source),
+-            })
++            storage.meta_store().finish_work(child);
++            result
+         })
+         .await
+-        .map_err(|e| failed(e.to_string()))?
++        .map_err(|e| failed(e.to_string()))?;
++        // The root remains active until the worker and its derived guards have
++        // returned, and this outer publication lease has also been released.
++        drop(_publication);
++        self.finish_known_work(work);
++        result
+     }
+ }
+ 
+@@ -250,6 +328,159 @@ mod tests {
+         }
+     }
+ 
++    async fn wait_for_work(
++        tracker: &crate::storage::work::WorkTracker,
++        predicate: impl Fn(crate::storage::work::WorkStatus) -> bool,
++    ) {
++        tokio::time::timeout(std::time::Duration::from_secs(5), async {
++            while !predicate(tracker.status()) {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .expect("work state was never reached");
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn accepted_insertion_and_transitive_publication_finish_after_admission_closes() {
++        use crate::storage::control::MutationContext;
++        use crate::storage::work::WorkError;
++        use std::time::{Duration, Instant};
++        let fx = Fixture::new();
++        let completion = publisher(&fx);
++        let tracker = fx.storage.read().unwrap().meta_store().work_tracker();
++        let gate = publication_gate(&fx.storage).await.unwrap();
++        let held = gate.write_owned().await;
++        let worker = completion.clone();
++        let insertion = tokio::spawn(async move {
++            worker
++                .insert(
++                    MutationContext::unkeyed(NamespaceId::new(1)),
++                    crate::storage::insertion::InsertMemory {
++                        id: None,
++                        summary: "accepted before freeze".into(),
++                        full_text: Some("published after close".into()),
++                        tags: vec![],
++                        initial_stability: None,
++                        created_at: None,
++                        embedding: Some(vec![1., 0., 0., 0.]),
++                        parent_id: None,
++                        supersedes: None,
++                    },
++                    vec![],
++                    123,
++                )
++                .await
++        });
++        wait_for_work(&tracker, |s| s.pending == 1).await;
++        let closing = tracker.clone();
++        let drain = tokio::task::spawn_blocking(move || {
++            closing.close_and_drain(Instant::now() + Duration::from_secs(10))
++        });
++        wait_for_work(&tracker, |s| !s.admission_open).await;
++        assert!(matches!(
++            completion.complete().await,
++            Err(StorageError::Work(WorkError::AdmissionClosed))
++        ));
++        drop(held);
++        let result = tokio::time::timeout(Duration::from_secs(10), insertion)
++            .await
++            .unwrap()
++            .unwrap()
++            .unwrap();
++        let freeze = drain.await.unwrap().unwrap();
++        let id = crate::storage::insertion::inserted_id(&result.receipt).unwrap();
++        let storage = fx.storage.read().unwrap();
++        assert!(storage.get_record(id).unwrap().is_some());
++        assert!(storage.meta_store().pending_effects().unwrap().is_empty());
++        let capture = storage.meta_store().freeze_metadata(freeze).unwrap();
++        assert_eq!(
++            capture.generation(),
++            storage.control_state().unwrap().generation_ref()
++        );
++        assert_eq!(tracker.status().pending, 0);
++        assert_eq!(tracker.status().unresolved, 0);
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn queued_purge_completion_resumes_children_and_acks_while_closing() {
++        use crate::storage::control::MutationContext;
++        use std::time::{Duration, Instant};
++        let fx = Fixture::new();
++        let ns = fx.create_namespace("drain-purge");
++        let id = fx.insert_memory_in(ns, &[]).await;
++        let completion = publisher(&fx);
++        let tracker = fx.storage.read().unwrap().meta_store().work_tracker();
++        fx.storage
++            .write()
++            .unwrap()
++            .begin_namespace_purge(&MutationContext::unkeyed(ns), true)
++            .unwrap();
++        // Durable purge state alone must block capture, even if volatile flags
++        // were stale and every currently registered in-process task has ended.
++        {
++            let freeze = tracker
++                .close_and_drain(Instant::now() + Duration::from_secs(5))
++                .unwrap();
++            assert!(
++                fx.storage
++                    .read()
++                    .unwrap()
++                    .meta_store()
++                    .freeze_metadata(freeze)
++                    .is_err()
++            );
++        }
++        let held = fx.graph.clone().write_owned().await;
++        let worker = completion.clone();
++        let completion_task = tokio::spawn(async move { worker.complete().await });
++        wait_for_work(&tracker, |s| s.pending == 1).await;
++        let closing = tracker.clone();
++        let drain = tokio::task::spawn_blocking(move || {
++            closing.close_and_drain(Instant::now() + Duration::from_secs(10))
++        });
++        wait_for_work(&tracker, |s| !s.admission_open).await;
++        drop(held);
++        tokio::time::timeout(Duration::from_secs(10), completion_task)
++            .await
++            .unwrap()
++            .unwrap()
++            .unwrap();
++        let freeze = drain.await.unwrap().unwrap();
++        let storage = fx.storage.read().unwrap();
++        assert!(storage.get_record(id).unwrap().is_none());
++        assert!(!fx.namespace_dir("drain-purge").exists());
++        assert!(storage.meta_store().pending_effects().unwrap().is_empty());
++        let _capture = storage.meta_store().freeze_metadata(freeze).unwrap();
++        assert_eq!(tracker.status().unresolved, 0);
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn cancelled_accepted_action_leaves_unresolved_admission_without_mutation() {
++        use std::time::{Duration, Instant};
++        let fx = Fixture::new();
++        let completion = publisher(&fx);
++        let tracker = fx.storage.read().unwrap().meta_store().work_tracker();
++        let before = fx.storage.read().unwrap().control_state().unwrap();
++        let held = publication_gate(&fx.storage)
++            .await
++            .unwrap()
++            .write_owned()
++            .await;
++        let task = tokio::spawn(async move { completion.forget(MemoryId::new()).await });
++        wait_for_work(&tracker, |s| s.pending == 1).await;
++        task.abort();
++        assert!(task.await.unwrap_err().is_cancelled());
++        drop(held);
++        assert_eq!(tracker.status().unresolved, 1);
++        assert!(
++            tracker
++                .close_and_drain(Instant::now() + Duration::from_millis(1))
++                .is_err()
++        );
++        assert_eq!(fx.storage.read().unwrap().control_state().unwrap(), before);
++    }
++
+     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+     async fn insertion_completion_returns_receipt_on_failure_then_retries_all_views() {
+         use crate::storage::control::{MutationContext, MutationOutcome, MutationScope};
+diff --git a/src/storage/engine.rs b/src/storage/engine.rs
+index 667566c..e62bced 100644
+--- a/src/storage/engine.rs
++++ b/src/storage/engine.rs
+@@ -1321,12 +1321,12 @@ impl StorageEngine for RedbStorageEngine {
+             false,
+             false,
+         )?;
+-        effects::apply_pending(&self.meta_store, &self.edge_store, None).map_err(|source| {
+-            StorageError::CommittedEffectsPending {
++        effects::apply_pending(&self.meta_store, &guard, &self.edge_store, None).map_err(
++            |source| StorageError::CommittedEffectsPending {
+                 operation_id: result.receipt.operation_id,
+                 source: Box::new(source),
+-            }
+-        })?;
++            },
++        )?;
+         Ok(result.edges_removed)
+     }
+ 
+diff --git a/src/storage/engine/effects.rs b/src/storage/engine/effects.rs
+index 3208af5..046ea9c 100644
+--- a/src/storage/engine/effects.rs
++++ b/src/storage/engine/effects.rs
+@@ -27,7 +27,7 @@ impl RedbStorageEngine {
+             false,
+             false,
+         )?;
+-        apply_pending(&self.meta_store, &self.edge_store, None).map_err(|source| {
++        apply_pending(&self.meta_store, &guard, &self.edge_store, None).map_err(|source| {
+             StorageError::CommittedEffectsPending {
+                 operation_id: result.receipt.operation_id,
+                 source: Box::new(source),
+@@ -58,6 +58,7 @@ impl RedbStorageEngine {
+         )?;
+         apply_pending(
+             &self.meta_store,
++            &guard,
+             &self.edge_store,
+             Some(&mut self.vector_manager),
+         )
+@@ -71,8 +72,10 @@ impl RedbStorageEngine {
+     pub(crate) fn recover_pending_effects(&mut self) -> Result<(), StorageError> {
+         // Constructor only: no handle has escaped, and normal admission is
+         // blocked for pending canonical effects. Replay precedes orphan cleanup.
++        let guard = self.meta_store.canonical_effects_guard(None)?;
+         apply_pending(
+             &self.meta_store,
++            &guard,
+             &self.edge_store,
+             Some(&mut self.vector_manager),
+         )
+@@ -93,10 +96,12 @@ impl RedbStorageEngine {
+ 
+ pub(super) fn apply_pending(
+     meta: &MetadataStore,
++    guard: &crate::storage::metadata::MutationGuard<'_>,
+     edges: &EdgeStore,
+     mut vectors: Option<&mut VectorManager>,
+ ) -> Result<(), StorageError> {
+     let result = (|| {
++        guard.check(meta)?;
+         #[cfg(test)]
+         if meta.fail_effect_application.swap(false, Ordering::SeqCst) {
+             return Err(StorageError::RecoveryRequired(
+@@ -123,7 +128,7 @@ pub(super) fn apply_pending(
+                 store.sync()?;
+             }
+             crash_point("after_vector_sync");
+-            meta.acknowledge_canonical_effects(effect)?;
++            meta.acknowledge_canonical_effects(guard, effect)?;
+             crash_point("after_canonical_ack");
+         }
+         meta.canonical_pending.store(false, Ordering::SeqCst);
+diff --git a/src/storage/engine/insertion.rs b/src/storage/engine/insertion.rs
+index 56316a7..efd25de 100644
+--- a/src/storage/engine/insertion.rs
++++ b/src/storage/engine/insertion.rs
+@@ -21,14 +21,27 @@ impl RedbStorageEngine {
+         input: &InsertMemory,
+         generated_embedding: &[f32],
+         sampled_at: i64,
++    ) -> Result<WriteReceipt, StorageError> {
++        self.insert_memory_with_work(ctx, input, generated_embedding, sampled_at, None)
++    }
++
++    pub(crate) fn insert_memory_with_work(
++        &mut self,
++        ctx: &MutationContext,
++        input: &InsertMemory,
++        generated_embedding: &[f32],
++        sampled_at: i64,
++        parent: Option<&crate::storage::work::WorkTicket>,
+     ) -> Result<WriteReceipt, StorageError> {
+         self.ensure_available()?;
++        let guard = self.meta_store.mutation_guard_with_work(parent)?;
+         let edges = self.edge_store.load_all_edges()?;
+         let vectors = &mut self.vector_manager;
+         let text = &mut self.text_store;
+         let mut staging_started = false;
+         let embedding = input.embedding.as_deref().unwrap_or(generated_embedding);
+         let result = self.meta_store.insert_with_effects(
++            &guard,
+             ctx,
+             input,
+             sampled_at,
+@@ -60,6 +73,7 @@ impl RedbStorageEngine {
+         if !receipt.replayed {
+             effects::apply_pending(
+                 &self.meta_store,
++                &guard,
+                 &self.edge_store,
+                 Some(&mut self.vector_manager),
+             )
+diff --git a/src/storage/engine/purge.rs b/src/storage/engine/purge.rs
+index a25858c..b4553c2 100644
+--- a/src/storage/engine/purge.rs
++++ b/src/storage/engine/purge.rs
+@@ -36,7 +36,7 @@ impl RedbStorageEngine {
+         let p = self
+             .lookup_namespace_purge(store_id, namespace, parent)?
+             .ok_or_else(|| StorageError::InvalidMutation("unknown purge operation".into()))?;
+-        self.purge_step(&p, chunk_limit)?;
++        self.purge_step(&p, chunk_limit, None)?;
+         self.lookup_namespace_purge(store_id, namespace, parent)?
+             .ok_or_else(|| StorageError::InvalidControl("lost purge progress".into()))
+     }
+@@ -45,17 +45,23 @@ impl RedbStorageEngine {
+         &mut self,
+         p: &PurgeProgress,
+         limit: usize,
++        parent: Option<&crate::storage::work::WorkTicket>,
+     ) -> Result<Option<crate::storage::metadata::effects::EffectResult>, StorageError> {
+         self.meta_store.ensure_handle_available()?;
+         match p.stage {
+             PurgeStage::Complete => Ok(None),
+             PurgeStage::Deleting => {
+-                let result =
+-                    self.meta_store
+-                        .advance_purge(p, limit, &self.edge_store.load_all_edges()?)?;
++                let guard = self.meta_store.purge_guard(parent)?;
++                let result = self.meta_store.advance_purge(
++                    &guard,
++                    p,
++                    limit,
++                    &self.edge_store.load_all_edges()?,
++                )?;
+                 if let Some(result) = &result {
+                     effects::apply_pending(
+                         &self.meta_store,
++                        &guard,
+                         &self.edge_store,
+                         Some(&mut self.vector_manager),
+                     )
+@@ -67,10 +73,11 @@ impl RedbStorageEngine {
+                 Ok(result)
+             }
+             PurgeStage::Cleanup => {
++                let guard = self.meta_store.purge_guard(parent)?;
+                 drop(self.vector_manager.remove(p.namespace_id));
+                 let path = self.namespace_dir(&p.name)?;
+                 let root = &self.db_path;
+-                self.meta_store.finish_purge_cleanup(p, || {
++                self.meta_store.finish_purge_cleanup(&guard, p, || {
+                     // Name validity and the durable lease were checked before
+                     // mutation. Refuse symlink/non-directory replacement.
+                     match std::fs::symlink_metadata(&path) {
+@@ -98,6 +105,13 @@ impl RedbStorageEngine {
+     /// Each canonical transaction is bounded; there is no forgotten queue that
+     /// needs a manual reopen to make an otherwise healthy purge progress.
+     pub(crate) fn resume_pending_purges(&mut self) -> Result<(), StorageError> {
++        self.resume_pending_purges_with_work(None)
++    }
++
++    pub(crate) fn resume_pending_purges_with_work(
++        &mut self,
++        parent: Option<&crate::storage::work::WorkTicket>,
++    ) -> Result<(), StorageError> {
+         loop {
+             let active = self
+                 .meta_store
+@@ -107,7 +121,7 @@ impl RedbStorageEngine {
+             let Some(p) = active else {
+                 return Ok(());
+             };
+-            self.purge_step(&p, CHUNK_LIMIT)?;
++            self.purge_step(&p, CHUNK_LIMIT, parent)?;
+         }
+     }
+ 
+@@ -145,7 +159,7 @@ impl RedbStorageEngine {
+         let mut records = Vec::new();
+         let mut peers = std::collections::HashMap::new();
+         while p.stage != PurgeStage::Complete {
+-            match self.purge_step(&p, CHUNK_LIMIT) {
++            match self.purge_step(&p, CHUNK_LIMIT, None) {
+                 Ok(Some(result)) => {
+                     records.extend(result.removed);
+                     peers.extend(result.peer_counts);
+diff --git a/src/storage/engine/tombstone.rs b/src/storage/engine/tombstone.rs
+index c52fb46..8e199c6 100644
+--- a/src/storage/engine/tombstone.rs
++++ b/src/storage/engine/tombstone.rs
+@@ -8,14 +8,28 @@ impl RedbStorageEngine {
+         &mut self,
+         ctx: &MutationContext,
+         id: MemoryId,
++    ) -> Result<WriteReceipt, StorageError> {
++        self.tombstone_memory_with_work(ctx, id, None)
++    }
++
++    pub(crate) fn tombstone_memory_with_work(
++        &mut self,
++        ctx: &MutationContext,
++        id: MemoryId,
++        parent: Option<&crate::storage::work::WorkTicket>,
+     ) -> Result<WriteReceipt, StorageError> {
+         self.ensure_available()?;
+-        let receipt =
+-            self.meta_store
+-                .tombstone_with_effects(ctx, id, &self.edge_store.load_all_edges()?)?;
++        let guard = self.meta_store.mutation_guard_with_work(parent)?;
++        let receipt = self.meta_store.tombstone_with_effects(
++            &guard,
++            ctx,
++            id,
++            &self.edge_store.load_all_edges()?,
++        )?;
+         if !receipt.replayed {
+             effects::apply_pending(
+                 &self.meta_store,
++                &guard,
+                 &self.edge_store,
+                 Some(&mut self.vector_manager),
+             )
+diff --git a/src/storage/error.rs b/src/storage/error.rs
+index 823e731..0f927fc 100644
+--- a/src/storage/error.rs
++++ b/src/storage/error.rs
+@@ -8,6 +8,9 @@ use crate::model::error::DecodeError;
+ /// Errors from storage operations (metadata, vectors, text, edges).
+ #[derive(Debug, Error)]
+ pub enum StorageError {
++    #[error(transparent)]
++    Work(#[from] crate::storage::work::WorkError),
++
+     /// Canonical mutation exists; retry publication, never retry as a new write.
+     #[error("INDEX_NOT_READY commitState=committed ready=false receipt={} cause={source}", serde_json::to_string(receipt).unwrap_or_default())]
+     CommittedMutation {
+diff --git a/src/storage/metadata.rs b/src/storage/metadata.rs
+index e0e612e..da16d96 100644
+--- a/src/storage/metadata.rs
++++ b/src/storage/metadata.rs
+@@ -16,6 +16,7 @@ pub(crate) mod purge;
+ pub(crate) mod removal_ledger;
+ pub(crate) mod text_generation;
+ mod tombstone;
++mod work;
+ 
+ use std::collections::HashMap;
+ use std::path::Path;
+@@ -34,6 +35,9 @@ use crate::storage::control::{
+ };
+ use crate::storage::error::StorageError;
+ use crate::storage::indexes::PhaseIndex;
++use crate::storage::work::{WorkTicket, WorkTracker};
++pub use work::MetadataFreeze;
++pub(crate) use work::MutationGuard;
+ 
+ // ═══════════════════════════════════════════════════════════════════════
+ // redb Table Definitions
+@@ -77,6 +81,7 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
+ /// concurrent read transactions and exclusive write transactions.
+ pub struct MetadataStore {
+     db: Database,
++    work_tracker: WorkTracker,
+     unavailable: std::sync::atomic::AtomicBool,
+     purge_pending: std::sync::atomic::AtomicBool,
+     pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
+@@ -142,7 +147,7 @@ impl MetadataStore {
+         }
+ 
+         // Force-create all tables by opening them in a write transaction.
+-        {
++        let store_id = {
+             let write_txn = db.begin_write()?;
+             control::initialize(&write_txn)?;
+             effects::initialize(&write_txn)?;
+@@ -153,13 +158,15 @@ impl MetadataStore {
+             let _ = write_txn.open_multimap_table(TAG_INDEX)?;
+             let _ = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
+             removal_ledger::initialize(&write_txn, pristine)?;
++            let store_id = control::read_control(&write_txn)?.store_id;
+             write_txn.commit()?;
+-        }
+-
++            store_id
++        };
+         // Legacy checkpoints have no generation watermark. Always rebuild
+         // from canonical records, even for direct MetadataStore callers.
+         let store = Self {
+             db,
++            work_tracker: WorkTracker::new(store_id),
+             unavailable: std::sync::atomic::AtomicBool::new(false),
+             purge_pending: std::sync::atomic::AtomicBool::new(false),
+             canonical_pending: std::sync::atomic::AtomicBool::new(false),
+@@ -231,15 +238,6 @@ impl MetadataStore {
+             StorageError::RedbCommit(e)
+         })
+     }
+-
+-    pub(crate) fn mutation_guard(
+-        &self,
+-    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
+-        let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
+-        // Recheck after waiting: the preceding writer may have failed.
+-        self.ensure_available()?;
+-        Ok(guard)
+-    }
+ }
+ 
+ // ── Core Methods ────────────────────────────────────────────────────
+@@ -546,12 +544,13 @@ impl MetadataStore {
+     // transaction at the last pre-commit boundary, without a fake backend.
+     fn prepare_access(
+         &self,
+-        _publication: &std::sync::RwLockWriteGuard<'_, ()>,
++        _publication: &MutationGuard<'_>,
+         ctx: &MutationContext,
+         id: MemoryId,
+         timestamp: i64,
+         kind: AccessKind,
+     ) -> Result<(redb::WriteTransaction, WriteReceipt), StorageError> {
++        _publication.check(self)?;
+         let kind_bytes = control::encode(&kind)?;
+         let hash = control::request_hash(ctx, "record_access", &[id.as_bytes(), &kind_bytes]);
+         let tx = self.db.begin_write()?;
+@@ -2184,7 +2183,7 @@ mod tests {
+         let ctx = keyed_context(&store, 1, "abort");
+         let before = store.control_state().unwrap();
+         // All three writes have been staged in the real redb transaction.
+-        let publication = store.publication.write().unwrap();
++        let publication = store.mutation_guard().unwrap();
+         let (tx, abandoned) = store
+             .prepare_access(&publication, &ctx, id, 123, AccessKind::DirectRetrieval)
+             .unwrap();
+diff --git a/src/storage/metadata/effects.rs b/src/storage/metadata/effects.rs
+index 4e81f41..9bbfb73 100644
+--- a/src/storage/metadata/effects.rs
++++ b/src/storage/metadata/effects.rs
+@@ -252,15 +252,27 @@ impl MetadataStore {
+     /// Called after every derived index is rebuilt, either during startup or
+     /// under the online coordinator's publication/index/storage guards.
+     pub(crate) fn acknowledge_rebuilt_effects(&self) -> Result<(), StorageError> {
+-        let ids: Vec<_> = self
+-            .pending_effects()?
+-            .iter()
+-            .map(|e| e.receipt.operation_id)
+-            .collect();
+-        for id in ids {
+-            self.acknowledge_derived_effects(id)?;
+-        }
+-        Ok(())
++        self.acknowledge_rebuilt_effects_with_work(None)
++    }
++
++    pub(crate) fn acknowledge_rebuilt_effects_with_work(
++        &self,
++        parent: Option<&WorkTicket>,
++    ) -> Result<(), StorageError> {
++        let work = self.work_tracker.admit(parent)?;
++        let result = (|| {
++            let ids: Vec<_> = self
++                .pending_effects()?
++                .iter()
++                .map(|e| e.receipt.operation_id)
++                .collect();
++            for id in ids {
++                self.acknowledge_derived_effects_with_work(id, Some(&work))?;
++            }
++            Ok(())
++        })();
++        self.finish_work(work);
++        result
+     }
+ 
+     pub(crate) fn pending_effects(&self) -> Result<Vec<PendingEffects>, StorageError> {
+@@ -270,7 +282,7 @@ impl MetadataStore {
+     /// Caller holds the publication write gate, including the edge snapshot.
+     pub(crate) fn commit_graph_effects(
+         &self,
+-        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
++        _guard: &MutationGuard<'_>,
+         namespace: NamespaceId,
+         existing_edges: &[PersistedEdge],
+         puts: &[PersistedEdge],
+@@ -278,6 +290,7 @@ impl MetadataStore {
+         delete_records: bool,
+         release_vectors: bool,
+     ) -> Result<EffectResult, StorageError> {
++        _guard.check(self)?;
+         self.ensure_available()?;
+         let tx = self.db.begin_write()?;
+         let ctx = MutationContext::unkeyed(namespace);
+@@ -301,7 +314,7 @@ impl MetadataStore {
+     /// Insertion has already staged its new row/indexes in this transaction.
+     pub(super) fn finish_record_effects(
+         &self,
+-        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
++        _guard: &MutationGuard<'_>,
+         tx: redb::WriteTransaction,
+         ctx: &MutationContext,
+         hash: [u8; 32],
+@@ -312,6 +325,7 @@ impl MetadataStore {
+         release_vectors: bool,
+         mutation: RecordMutation<'_>,
+     ) -> Result<EffectResult, StorageError> {
++        _guard.check(self)?;
+         let MutationScope::Namespace(namespace) = ctx.scope else {
+             return Err(StorageError::InvalidMutationContext(
+                 "record effects require namespace scope".into(),
+@@ -623,8 +637,10 @@ impl MetadataStore {
+ 
+     pub(crate) fn acknowledge_canonical_effects(
+         &self,
++        guard: &MutationGuard<'_>,
+         effect: &PendingEffects,
+     ) -> Result<(), StorageError> {
++        guard.check(self)?;
+         let mut completed = effect.clone();
+         completed.canonical_applied = true;
+         let tx = self.db.begin_write()?;
+@@ -640,7 +656,15 @@ impl MetadataStore {
+         &self,
+         operation_id: uuid::Uuid,
+     ) -> Result<(), StorageError> {
+-        let _publication = self.mutation_guard()?;
++        self.acknowledge_derived_effects_with_work(operation_id, None)
++    }
++
++    pub(crate) fn acknowledge_derived_effects_with_work(
++        &self,
++        operation_id: uuid::Uuid,
++        parent: Option<&WorkTicket>,
++    ) -> Result<(), StorageError> {
++        let _publication = self.mutation_guard_with_work(parent)?;
+         let tx = self.db.begin_write()?;
+         {
+             let mut effects = tx.open_table(EFFECTS)?;
+diff --git a/src/storage/metadata/insertion.rs b/src/storage/metadata/insertion.rs
+index 665477d..a42fbfe 100644
+--- a/src/storage/metadata/insertion.rs
++++ b/src/storage/metadata/insertion.rs
+@@ -20,6 +20,7 @@ impl MetadataStore {
+     /// of that reserved slot before this transaction resolves.
+     pub(crate) fn insert_with_effects(
+         &self,
++        guard: &MutationGuard<'_>,
+         ctx: &MutationContext,
+         input: &InsertMemory,
+         sampled_at: i64,
+@@ -27,7 +28,7 @@ impl MetadataStore {
+         existing_edges: &[PersistedEdge],
+         stage: impl FnOnce(&NamespaceConfig, &mut DiskRecord, &[f32]) -> Result<(), StorageError>,
+     ) -> Result<WriteReceipt, StorageError> {
+-        let guard = self.mutation_guard()?;
++        guard.check(self)?;
+         ctx.validate()?;
+         if ctx.contract_version != 1 {
+             return Err(StorageError::InvalidMutationContext(
+@@ -178,7 +179,7 @@ impl MetadataStore {
+             });
+         }
+         self.finish_record_effects(
+-            &guard,
++            guard,
+             tx,
+             ctx,
+             hash,
+@@ -249,6 +250,7 @@ mod schema_tests {
+         };
+         assert!(matches!(
+             store.insert_with_effects(
++                &store.mutation_guard().unwrap(),
+                 &MutationContext::unkeyed(config.id),
+                 &input,
+                 123,
+diff --git a/src/storage/metadata/lifecycle_updates.rs b/src/storage/metadata/lifecycle_updates.rs
+index 15fceaf..db60730 100644
+--- a/src/storage/metadata/lifecycle_updates.rs
++++ b/src/storage/metadata/lifecycle_updates.rs
+@@ -80,12 +80,13 @@ impl MetadataStore {
+     /// redb transaction after all fields and generation have been staged.
+     fn prepare_legacy_patch(
+         &self,
+-        _publication: &std::sync::RwLockWriteGuard<'_, ()>,
++        _publication: &MutationGuard<'_>,
+         id: MemoryId,
+         expected: &DiskRecord,
+         namespace: &NamespaceConfig,
+         patch: LegacyPatch<'_>,
+     ) -> Result<Option<(redb::WriteTransaction, DiskRecord)>, StorageError> {
++        _publication.check(self)?;
+         let tx = self.db.begin_write()?;
+         let mut record = {
+             let table = tx.open_table(META_TABLE)?;
+diff --git a/src/storage/metadata/purge.rs b/src/storage/metadata/purge.rs
+index 13e539f..1487da4 100644
+--- a/src/storage/metadata/purge.rs
++++ b/src/storage/metadata/purge.rs
+@@ -278,8 +278,11 @@ fn save(tx: &redb::WriteTransaction, p: &PurgeProgress) -> Result<(), StorageErr
+ impl MetadataStore {
+     /// The purge recovery path alone may enter while durable deletion admission
+     /// is closed. Uncertain commits/canonical effects still block it.
+-    pub(super) fn purge_guard(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, StorageError> {
+-        let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
++    pub(crate) fn purge_guard(
++        &self,
++        parent: Option<&WorkTicket>,
++    ) -> Result<MutationGuard<'_>, StorageError> {
++        let guard = self.publication_guard(parent)?;
+         self.ensure_handle_available()?;
+         Ok(guard)
+     }
+@@ -301,7 +304,7 @@ impl MetadataStore {
+             ));
+         }
+         let hash = control::request_hash(ctx, "namespace_purge_v1", &[&[u8::from(force)]]);
+-        let _guard = self.purge_guard()?;
++        let _guard = self.purge_guard(None)?;
+         let tx = self.db.begin_write()?;
+         if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
+             if !matches!(
+@@ -516,6 +519,7 @@ impl MetadataStore {
+ 
+     pub(crate) fn advance_purge(
+         &self,
++        guard: &MutationGuard<'_>,
+         p: &PurgeProgress,
+         limit: usize,
+         edges: &[crate::storage::PersistedEdge],
+@@ -525,7 +529,7 @@ impl MetadataStore {
+                 "purge chunk limit must be 1..=1000".into(),
+             ));
+         }
+-        let guard = self.purge_guard()?;
++        guard.check(self)?;
+         let tx = self.db.begin_write()?;
+         if load(&tx, p.start_receipt.operation_id)? != *p || p.stage != PurgeStage::Deleting {
+             return Err(invalid("stale deletion progress"));
+@@ -559,7 +563,7 @@ impl MetadataStore {
+             }
+             let ctx = MutationContext::unkeyed(p.namespace_id);
+             let result = self.finish_record_effects(
+-                &guard,
++                guard,
+                 tx,
+                 &ctx,
+                 [0; 32],
+@@ -590,10 +594,11 @@ impl MetadataStore {
+ 
+     pub(crate) fn finish_purge_cleanup(
+         &self,
++        guard: &MutationGuard<'_>,
+         p: &PurgeProgress,
+         cleanup: impl FnOnce() -> Result<(), StorageError>,
+     ) -> Result<(), StorageError> {
+-        let _guard = self.purge_guard()?;
++        guard.check(self)?;
+         let tx = self.db.begin_write()?;
+         if load(&tx, p.start_receipt.operation_id)? != *p || p.stage != PurgeStage::Cleanup {
+             return Err(invalid("stale directory cleanup reservation"));
+diff --git a/src/storage/metadata/tombstone.rs b/src/storage/metadata/tombstone.rs
+index 35ab171..3cecde6 100644
+--- a/src/storage/metadata/tombstone.rs
++++ b/src/storage/metadata/tombstone.rs
+@@ -4,11 +4,12 @@ use crate::storage::edges::PersistedEdge;
+ impl MetadataStore {
+     pub(crate) fn tombstone_with_effects(
+         &self,
++        guard: &MutationGuard<'_>,
+         ctx: &MutationContext,
+         id: MemoryId,
+         existing_edges: &[PersistedEdge],
+     ) -> Result<WriteReceipt, StorageError> {
+-        let guard = self.mutation_guard()?;
++        guard.check(self)?;
+         self.ensure_available()?;
+         ctx.validate()?;
+         let MutationScope::Namespace(namespace) = ctx.scope else {
+@@ -76,7 +77,7 @@ impl MetadataStore {
+                 .insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
+         }
+         self.finish_record_effects(
+-            &guard,
++            guard,
+             tx,
+             ctx,
+             hash,
+diff --git a/src/storage/metadata/work.rs b/src/storage/metadata/work.rs
+new file mode 100644
+index 0000000..eb5a6da
+--- /dev/null
++++ b/src/storage/metadata/work.rs
+@@ -0,0 +1,390 @@
++//! Metadata publication admission. This lease does not certify other files,
++//! derived generations, queued consumers, clocks, RNGs or behavioral caches.
++use super::*;
++use crate::storage::control::GenerationRef;
++use crate::storage::purge::PurgeStage;
++use crate::storage::work::WorkFreeze;
++use std::sync::RwLockWriteGuard;
++use std::sync::atomic::Ordering;
++
++/// Covers a synchronous mutation from admission through canonical publication.
++/// An uncertain return/panic retains unresolved work, in addition to the durable
++/// recovery manifest. Known errors may finish: descendants have their own tickets.
++pub(crate) struct MutationGuard<'a> {
++    store: &'a MetadataStore,
++    publication: Option<RwLockWriteGuard<'a, ()>>,
++    ticket: Option<WorkTicket>,
++}
++
++impl MutationGuard<'_> {
++    pub(crate) fn check(&self, store: &MetadataStore) -> Result<(), StorageError> {
++        store
++            .work_tracker
++            .check_ticket(self.ticket.as_ref().unwrap())?;
++        Ok(())
++    }
++}
++
++impl Drop for MutationGuard<'_> {
++    fn drop(&mut self) {
++        if std::thread::panicking() {
++            self.store.mark_unavailable();
++        }
++        // Publication must be released before the pending count reaches zero.
++        drop(self.publication.take());
++        let ticket = self.ticket.take().unwrap();
++        if !self.store.unavailable.load(Ordering::Acquire) {
++            ticket.finish();
++        }
++    }
++}
++
++/// A pinned metadata generation with no durable effects or active purge. This
++/// is deliberately NOT shared readiness, a ReadView, or a snapshot permission.
++/// Whole-store capture still requires all native writers and derived consumers
++/// to participate, plus frozen clock/config/RNG/cache state.
++pub struct MetadataFreeze<'a> {
++    generation: GenerationRef,
++    // Field order releases publication before reopening root admission.
++    _publication: RwLockWriteGuard<'a, ()>,
++    _admission: WorkFreeze,
++}
++
++impl MetadataFreeze<'_> {
++    pub fn generation(&self) -> GenerationRef {
++        self.generation
++    }
++}
++
++impl MetadataStore {
++    /// Clone under a brief outer storage read lock, then release that lock
++    /// BEFORE close_and_drain. Workers need the outer lock to finish.
++    pub fn work_tracker(&self) -> WorkTracker {
++        self.work_tracker.clone()
++    }
++
++    pub(crate) fn mutation_guard(&self) -> Result<MutationGuard<'_>, StorageError> {
++        self.mutation_guard_with_work(None)
++    }
++
++    pub(crate) fn mutation_guard_with_work(
++        &self,
++        parent: Option<&WorkTicket>,
++    ) -> Result<MutationGuard<'_>, StorageError> {
++        let guard = self.publication_guard(parent)?;
++        // Recheck after waiting: the preceding writer may have failed.
++        self.ensure_available()?;
++        Ok(guard)
++    }
++
++    // Recovery and purge choose their narrower availability checks, but neither
++    // may bypass admission. Register before waiting for the publication lock.
++    pub(crate) fn publication_guard(
++        &self,
++        parent: Option<&WorkTicket>,
++    ) -> Result<MutationGuard<'_>, StorageError> {
++        let ticket = self.work_tracker.admit(parent)?;
++        let publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
++        let guard = MutationGuard {
++            store: self,
++            publication: Some(publication),
++            ticket: Some(ticket),
++        };
++        if self.unavailable.load(Ordering::Acquire) {
++            return Err(StorageError::RecoveryRequired(
++                "store handle unavailable; reopen for recovery".into(),
++            ));
++        }
++        Ok(guard)
++    }
++
++    pub(crate) fn canonical_effects_guard(
++        &self,
++        parent: Option<&WorkTicket>,
++    ) -> Result<MutationGuard<'_>, StorageError> {
++        // Constructor replay may have canonical_pending/purge_pending set.
++        self.publication_guard(parent)
++    }
++
++    /// Call only once the synchronous worker has returned a known outcome.
++    /// Never use this on async cancellation or JoinError. Durable pending work
++    /// remains independently checked by capture even when execution has ended.
++    pub(crate) fn finish_work(&self, ticket: WorkTicket) {
++        if !self.unavailable.load(Ordering::Acquire) {
++            ticket.finish();
++        }
++    }
++
++    pub fn freeze_metadata(
++        &self,
++        admission: WorkFreeze,
++    ) -> Result<MetadataFreeze<'_>, StorageError> {
++        admission.check(&self.work_tracker)?;
++        // No unbounded wait after the drain deadline. A concurrent read can
++        // make capture busy; the caller must retry within its original deadline.
++        let publication = self.publication.try_write().map_err(|_| {
++            StorageError::RecoveryRequired("metadata publication busy or poisoned".into())
++        })?;
++        self.ensure_available()?;
++        let read = self.db.begin_read()?;
++        let state = control::validate_existing(&read)?
++            .ok_or_else(|| StorageError::InvalidControl("missing control state".into()))?;
++        let effects = super::effects::validate_existing(&read)?;
++        let purges = super::purge::validate_existing(&read, Some(&state))?;
++        if !effects.is_empty()
++            || self.derived_dirty.load(Ordering::SeqCst)
++            || purges.iter().any(|p| p.stage != PurgeStage::Complete)
++        {
++            return Err(StorageError::RecoveryRequired(
++                "durable effects or purge work pending".into(),
++            ));
++        }
++        let generation = state.generation_ref();
++        // Include the time spent checking durable manifests in the deadline.
++        admission.check(&self.work_tracker)?;
++        Ok(MetadataFreeze {
++            generation,
++            _publication: publication,
++            _admission: admission,
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::storage::work::WorkError;
++    use std::time::{Duration, Instant};
++
++    fn deadline() -> Instant {
++        Instant::now() + Duration::from_secs(5)
++    }
++
++    #[test]
++    fn metadata_capture_blocks_actual_writers_and_checks_owned_core() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
++        let tracker = store.work_tracker();
++        let before = store.control_state().unwrap().generation_ref();
++        let freeze = store
++            .freeze_metadata(tracker.close_and_drain(deadline()).unwrap())
++            .unwrap();
++        assert_eq!(freeze.generation(), before);
++        assert!(matches!(
++            store.create_namespace(&NamespaceConfig::default_namespace(0)),
++            Err(StorageError::Work(WorkError::AdmissionClosed))
++        ));
++        assert!(matches!(
++            store.purge_guard(None),
++            Err(StorageError::Work(WorkError::AdmissionClosed))
++        ));
++        assert!(matches!(
++            store.canonical_effects_guard(None),
++            Err(StorageError::Work(WorkError::AdmissionClosed))
++        ));
++        assert!(matches!(
++            store.acknowledge_rebuilt_effects_with_work(None),
++            Err(StorageError::Work(WorkError::AdmissionClosed))
++        ));
++        assert_eq!(store.control_state().unwrap().generation_ref(), before);
++        drop(freeze);
++        store
++            .create_namespace(&NamespaceConfig::default_namespace(0))
++            .unwrap();
++
++        let foreign = WorkTracker::new(tracker.store_id());
++        assert!(matches!(
++            store.freeze_metadata(foreign.close_and_drain(deadline()).unwrap()),
++            Err(StorageError::Work(WorkError::InvalidTicket))
++        ));
++        assert!(foreign.status().admission_open);
++        assert!(tracker.status().admission_open);
++    }
++
++    #[test]
++    fn accepted_writer_can_publish_and_ack_after_close_before_capture() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
++        let tracker = store.work_tracker();
++        let parent = tracker.begin().unwrap();
++        let child = parent.child().unwrap();
++        std::thread::scope(|scope| {
++            let closing = &tracker;
++            let drain = scope.spawn(move || closing.close_and_drain(deadline()).unwrap());
++            tracker.wait_until_closed();
++            assert!(matches!(
++                store.mutation_guard(),
++                Err(StorageError::Work(WorkError::AdmissionClosed))
++            ));
++            // These are actual mutation/recovery gates, not tracker-only children.
++            drop(store.mutation_guard_with_work(Some(&child)).unwrap());
++            drop(store.canonical_effects_guard(Some(&child)).unwrap());
++            drop(store.purge_guard(Some(&child)).unwrap());
++            store
++                .acknowledge_rebuilt_effects_with_work(Some(&child))
++                .unwrap();
++            store.finish_work(child);
++            store.finish_work(parent);
++            let freeze = store.freeze_metadata(drain.join().unwrap()).unwrap();
++            assert_eq!(
++                freeze.generation(),
++                store.control_state().unwrap().generation_ref()
++            );
++        });
++    }
++
++    #[test]
++    fn actual_writer_waiting_for_publication_is_already_admitted() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
++        let tracker = store.work_tracker();
++        let reading = store.publication.read().unwrap();
++        std::thread::scope(|scope| {
++            let writer = scope.spawn(|| {
++                store
++                    .create_namespace(&NamespaceConfig::default_namespace(0))
++                    .unwrap()
++            });
++            let limit = deadline();
++            while tracker.status().pending == 0 {
++                assert!(
++                    Instant::now() < limit,
++                    "writer did not register before publication wait"
++                );
++                std::thread::park_timeout(Duration::from_millis(1));
++            }
++            let closing = &tracker;
++            let drain = scope.spawn(move || closing.close_and_drain(deadline()).unwrap());
++            tracker.wait_until_closed();
++            drop(reading);
++            let id = writer.join().unwrap();
++            let capture = store.freeze_metadata(drain.join().unwrap()).unwrap();
++            assert!(store.get_namespace(id).unwrap().is_some());
++            assert_eq!(capture.generation().generation.get(), 1);
++            assert_eq!(tracker.status().pending, 0);
++        });
++    }
++
++    #[test]
++    fn unavailable_guard_retains_unresolved_and_clean_failure_does_not() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
++        let tracker = store.work_tracker();
++        store
++            .create_namespace(&NamespaceConfig::default_namespace(0))
++            .unwrap();
++        assert!(
++            store
++                .create_namespace(&NamespaceConfig::default_namespace(0))
++                .is_err()
++        );
++        assert_eq!(tracker.status().pending, 0);
++        {
++            let _guard = store.mutation_guard().unwrap();
++            store.mark_unavailable();
++        }
++        assert_eq!(tracker.status().pending, 1);
++        assert_eq!(tracker.status().unresolved, 1);
++        assert!(matches!(
++            tracker.close_and_drain(Instant::now()),
++            Err(WorkError::Deadline {
++                pending: 1,
++                unresolved: 1
++            })
++        ));
++    }
++
++    #[test]
++    fn capture_publication_contention_fails_without_reopening_another_lease() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
++        let tracker = store.work_tracker();
++        let reading = store.publication.read().unwrap();
++        assert!(
++            store
++                .freeze_metadata(tracker.close_and_drain(deadline()).unwrap())
++                .is_err()
++        );
++        assert!(tracker.status().admission_open);
++        drop(reading);
++        let frozen = store
++            .freeze_metadata(tracker.close_and_drain(deadline()).unwrap())
++            .unwrap();
++        assert!(matches!(
++            tracker.close_and_drain(Instant::now()),
++            Err(WorkError::AdmissionClosed)
++        ));
++        assert!(!tracker.status().admission_open);
++        drop(frozen);
++    }
++
++    #[test]
++    fn capture_checks_durable_purge_even_if_volatile_pending_flag_is_stale() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
++        let mut config = NamespaceConfig::default_namespace(0);
++        config.name = "drain-purge".into();
++        let ns = store.create_namespace(&config).unwrap();
++        store
++            .begin_purge(&MutationContext::unkeyed(ns), true)
++            .unwrap();
++        // Deliberately corrupt only the accelerator, not the canonical manifest.
++        store.purge_pending.store(false, Ordering::SeqCst);
++        let tracker = store.work_tracker();
++        assert_eq!(tracker.status().pending, 0);
++        let admission = tracker.close_and_drain(deadline()).unwrap();
++        assert!(store.freeze_metadata(admission).is_err());
++        assert!(tracker.status().admission_open);
++    }
++
++    #[tokio::test]
++    async fn capture_checks_durable_effects_even_if_dirty_flag_is_stale() {
++        use crate::storage::insertion::InsertMemory;
++        let fixture = crate::test_support::Fixture::new();
++        let mut engine = fixture.storage.write().unwrap();
++        let receipt = engine
++            .insert_memory_with_receipt(
++                &MutationContext::unkeyed(NamespaceId::new(1)),
++                &InsertMemory {
++                    id: None,
++                    summary: "durable unfinished publication".into(),
++                    full_text: None,
++                    tags: vec![],
++                    initial_stability: None,
++                    created_at: None,
++                    embedding: Some(vec![1., 0., 0., 0.]),
++                    parent_id: None,
++                    supersedes: None,
++                },
++                &[],
++                123,
++            )
++            .unwrap();
++        let store = engine.meta_store();
++        store.derived_dirty.store(false, Ordering::SeqCst);
++        assert_eq!(
++            store.pending_effects().unwrap()[0].receipt.operation_id,
++            receipt.operation_id
++        );
++        let tracker = store.work_tracker();
++        assert_eq!(tracker.status().pending, 0);
++        let admission = tracker.close_and_drain(deadline()).unwrap();
++        assert!(store.freeze_metadata(admission).is_err());
++        assert!(tracker.status().admission_open);
++    }
++
++    #[test]
++    fn panic_retains_unresolved_work_and_poisoned_owner_cannot_capture() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
++        let tracker = store.work_tracker();
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let _guard = store.mutation_guard().unwrap();
++            panic!("injected unknown writer outcome");
++        }));
++        assert!(result.is_err());
++        assert_eq!(tracker.status().unresolved, 1);
++        assert!(store.ensure_available().is_err());
++        assert!(tracker.close_and_drain(Instant::now()).is_err());
++    }
++}
+diff --git a/src/storage/mod.rs b/src/storage/mod.rs
+index f7152c3..52bd853 100644
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@ -37,6 +37,7 @@ pub mod tombstone;
+ mod tombstone_tests;
+ pub(crate) mod validation;
+ pub mod vectors;
++pub mod work;
+ 
+ // ── Re-exports ──────────────────────────────────────────────────────
+ 
+diff --git a/src/storage/work.rs b/src/storage/work.rs
+new file mode 100644
+index 0000000..42f4a6d
+--- /dev/null
++++ b/src/storage/work.rs
+@@ -0,0 +1,436 @@
++//! Owned-core accepted work. This is not a derived-view watermark or ReadView.
++//!
++//! Register before enqueue, register descendants before completing their parent,
++//! and finish only after all effects owned by that ticket have been published.
++//! Dropping a ticket without finishing retains unresolved work until owner reopen.
++use std::collections::BTreeMap;
++use std::sync::{Arc, Condvar, Mutex};
++use std::time::Instant;
++
++use uuid::Uuid;
++
++#[derive(Debug, thiserror::Error, PartialEq, Eq)]
++pub enum WorkError {
++    #[error("work admission is closed")]
++    AdmissionClosed,
++    #[error("work ticket belongs to another owned core or is no longer active")]
++    InvalidTicket,
++    #[error("work sequence exhausted")]
++    SequenceExhausted,
++    #[error("work drain deadline expired: {pending} pending, {unresolved} unresolved")]
++    Deadline { pending: usize, unresolved: usize },
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct WorkStatus {
++    pub admission_open: bool,
++    pub pending: usize,
++    pub unresolved: usize,
++}
++
++#[derive(Default)]
++struct State {
++    closed: bool,
++    next: u64,
++    // false = executing, true = abandoned/unknown completion. No payloads.
++    work: BTreeMap<u64, bool>,
++}
++
++struct Inner {
++    store_id: Uuid,
++    state: Mutex<State>,
++    changed: Condvar,
++}
++
++/// Clone this handle from the already owned MetadataStore, not a second session.
++#[derive(Clone)]
++pub struct WorkTracker(Arc<Inner>);
++
++impl WorkTracker {
++    pub(crate) fn new(store_id: Uuid) -> Self {
++        Self(Arc::new(Inner {
++            store_id,
++            state: Mutex::new(State::default()),
++            changed: Condvar::new(),
++        }))
++    }
++
++    pub fn store_id(&self) -> Uuid {
++        self.0.store_id
++    }
++
++    pub fn status(&self) -> WorkStatus {
++        let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
++        Self::status_locked(&state)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn wait_until_closed(&self) {
++        let limit = Instant::now() + std::time::Duration::from_secs(5);
++        let mut state = self.0.state.lock().unwrap();
++        while !state.closed {
++            let left = limit.saturating_duration_since(Instant::now());
++            assert!(!left.is_zero(), "drain never closed admission");
++            (state, _) = self.0.changed.wait_timeout(state, left).unwrap();
++        }
++    }
++
++    fn status_locked(state: &State) -> WorkStatus {
++        WorkStatus {
++            admission_open: !state.closed,
++            pending: state.work.len(),
++            unresolved: state.work.values().filter(|unknown| **unknown).count(),
++        }
++    }
++
++    /// A root must be accepted before its worker is queued or externally staged.
++    pub fn begin(&self) -> Result<WorkTicket, WorkError> {
++        self.admit(None)
++    }
++
++    pub(crate) fn admit(&self, parent: Option<&WorkTicket>) -> Result<WorkTicket, WorkError> {
++        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(parent) = parent {
++            if !Arc::ptr_eq(&self.0, &parent.tracker.0)
++                || state.work.get(&parent.id) != Some(&false)
++            {
++                return Err(WorkError::InvalidTicket);
++            }
++        } else if state.closed {
++            return Err(WorkError::AdmissionClosed);
++        }
++        state.next = state
++            .next
++            .checked_add(1)
++            .ok_or(WorkError::SequenceExhausted)?;
++        let id = state.next;
++        state.work.insert(id, false);
++        Ok(WorkTicket {
++            tracker: self.clone(),
++            id,
++            parent: parent.map(|p| p.id),
++            finished: false,
++        })
++    }
++
++    pub(crate) fn check_ticket(&self, ticket: &WorkTicket) -> Result<(), WorkError> {
++        let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
++        if Arc::ptr_eq(&self.0, &ticket.tracker.0) && state.work.get(&ticket.id) == Some(&false) {
++            Ok(())
++        } else {
++            Err(WorkError::InvalidTicket)
++        }
++    }
++
++    /// Stop new roots, then wait for the transitive fixed point. No tracker lock
++    /// is held while a worker executes, while waiting, or while accessing redb.
++    /// The returned lease keeps admission closed; it does not certify storage
++    /// readiness. The owner must separately validate canonical and derived work.
++    pub fn close_and_drain(&self, deadline: Instant) -> Result<WorkFreeze, WorkError> {
++        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
++        if state.closed {
++            return Err(WorkError::AdmissionClosed);
++        }
++        state.closed = true;
++        self.0.changed.notify_all();
++        loop {
++            let now = Instant::now();
++            if now >= deadline {
++                let status = Self::status_locked(&state);
++                state.closed = false;
++                self.0.changed.notify_all();
++                return Err(WorkError::Deadline {
++                    pending: status.pending,
++                    unresolved: status.unresolved,
++                });
++            }
++            if state.work.is_empty() {
++                return Ok(WorkFreeze {
++                    tracker: self.clone(),
++                    deadline,
++                });
++            }
++            (state, _) = self
++                .0
++                .changed
++                .wait_timeout(state, deadline.saturating_duration_since(now))
++                .unwrap_or_else(|e| e.into_inner());
++        }
++    }
++}
++
++/// Ticket IDs identify in-process work only, never canonical operation IDs or
++/// generations. This type intentionally cannot be cloned or serialized.
++pub struct WorkTicket {
++    tracker: WorkTracker,
++    id: u64,
++    parent: Option<u64>,
++    finished: bool,
++}
++
++impl WorkTicket {
++    pub fn id(&self) -> u64 {
++        self.id
++    }
++    pub fn parent_id(&self) -> Option<u64> {
++        self.parent
++    }
++    pub fn child(&self) -> Result<Self, WorkError> {
++        self.tracker.admit(Some(self))
++    }
++    /// Known failure with no remaining work may finish too; this records task
++    /// completion, not mutation success. Unknown/cancelled work must not finish.
++    pub fn finish(mut self) {
++        let mut state = self
++            .tracker
++            .0
++            .state
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        state.work.remove(&self.id);
++        self.finished = true;
++        self.tracker.0.changed.notify_all();
++    }
++}
++
++impl Drop for WorkTicket {
++    fn drop(&mut self) {
++        if !self.finished {
++            let mut state = self
++                .tracker
++                .0
++                .state
++                .lock()
++                .unwrap_or_else(|e| e.into_inner());
++            if let Some(unknown) = state.work.get_mut(&self.id) {
++                *unknown = true;
++            }
++            self.tracker.0.changed.notify_all();
++        }
++    }
++}
++
++/// Admission remains closed for this lease's lifetime. Canonical capture must
++/// also hold the owner's publication gate; this is never itself a snapshot.
++pub struct WorkFreeze {
++    tracker: WorkTracker,
++    deadline: Instant,
++}
++
++impl WorkFreeze {
++    pub(crate) fn check(&self, tracker: &WorkTracker) -> Result<(), WorkError> {
++        if !Arc::ptr_eq(&self.tracker.0, &tracker.0) {
++            return Err(WorkError::InvalidTicket);
++        }
++        let status = tracker.status();
++        if Instant::now() >= self.deadline {
++            return Err(WorkError::Deadline {
++                pending: status.pending,
++                unresolved: status.unresolved,
++            });
++        }
++        if status.admission_open || status.pending != 0 {
++            return Err(WorkError::InvalidTicket);
++        }
++        Ok(())
++    }
++}
++
++impl Drop for WorkFreeze {
++    fn drop(&mut self) {
++        let mut state = self
++            .tracker
++            .0
++            .state
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        state.closed = false;
++        self.tracker.0.changed.notify_all();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::mpsc;
++    use std::time::Duration;
++
++    fn deadline() -> Instant {
++        Instant::now() + Duration::from_secs(5)
++    }
++
++    fn wait_closed(tracker: &WorkTracker) {
++        tracker.wait_until_closed();
++    }
++
++    #[test]
++    fn accepted_descendants_drain_after_close_without_a_zero_count_gap() {
++        let tracker = WorkTracker::new(Uuid::new_v4());
++        let parent = tracker.begin().unwrap();
++        std::thread::scope(|scope| {
++            let (send, recv) = mpsc::channel();
++            let closing = &tracker;
++            scope.spawn(move || {
++                send.send(closing.close_and_drain(deadline()).unwrap())
++                    .unwrap()
++            });
++            wait_closed(&tracker);
++            assert!(matches!(tracker.begin(), Err(WorkError::AdmissionClosed)));
++            let child = parent.child().unwrap();
++            assert_eq!(child.parent_id(), Some(parent.id()));
++            parent.finish();
++            let grandchild = child.child().unwrap();
++            child.finish();
++            assert_eq!(tracker.status().pending, 1);
++            assert!(recv.try_recv().is_err());
++            grandchild.finish();
++            let frozen = recv.recv_timeout(Duration::from_secs(5)).unwrap();
++            assert_eq!(tracker.status().pending, 0);
++            assert!(matches!(tracker.begin(), Err(WorkError::AdmissionClosed)));
++            frozen.check(&tracker).unwrap();
++            drop(frozen);
++            tracker.begin().unwrap().finish();
++        });
++    }
++
++    #[test]
++    fn abandoned_ancestor_remains_unresolved_after_its_running_child_finishes() {
++        let tracker = WorkTracker::new(Uuid::new_v4());
++        let parent = tracker.begin().unwrap();
++        let child = parent.child().unwrap();
++        std::thread::scope(|scope| {
++            let (running, started) = mpsc::channel();
++            let (release, released) = mpsc::channel();
++            let worker = scope.spawn(move || {
++                running.send(()).unwrap();
++                released.recv().unwrap();
++                child.finish();
++            });
++            started.recv_timeout(Duration::from_secs(5)).unwrap();
++            drop(parent);
++            assert_eq!(tracker.status().pending, 2);
++            assert_eq!(tracker.status().unresolved, 1);
++            release.send(()).unwrap();
++            worker.join().unwrap();
++        });
++        assert!(matches!(
++            tracker.close_and_drain(Instant::now()),
++            Err(WorkError::Deadline {
++                pending: 1,
++                unresolved: 1
++            })
++        ));
++        assert!(tracker.status().admission_open);
++        assert_eq!(tracker.status().unresolved, 1);
++    }
++
++    #[test]
++    fn finished_parent_and_foreign_core_with_same_uuid_cannot_admit_children() {
++        let id = Uuid::new_v4();
++        let tracker = WorkTracker::new(id);
++        let foreign = WorkTracker::new(id);
++        let parent = tracker.begin().unwrap();
++        assert!(matches!(
++            foreign.admit(Some(&parent)),
++            Err(WorkError::InvalidTicket)
++        ));
++        // A public caller cannot reuse the consumed parent. Exercise the runtime
++        // check too, so a future internal carrier cannot resurrect its ID.
++        let stale = WorkTicket {
++            tracker: tracker.clone(),
++            id: parent.id(),
++            parent: None,
++            finished: true,
++        };
++        parent.finish();
++        assert!(matches!(stale.child(), Err(WorkError::InvalidTicket)));
++        let frozen = tracker.close_and_drain(deadline()).unwrap();
++        assert_eq!(frozen.check(&foreign), Err(WorkError::InvalidTicket));
++    }
++
++    #[test]
++    fn timeout_reopens_then_concurrent_reclose_keeps_admission_closed() {
++        let tracker = WorkTracker::new(Uuid::new_v4());
++        let parent = tracker.begin().unwrap();
++        assert!(matches!(
++            tracker.close_and_drain(Instant::now()),
++            Err(WorkError::Deadline {
++                pending: 1,
++                unresolved: 0
++            })
++        ));
++        assert!(tracker.status().admission_open);
++        std::thread::scope(|scope| {
++            let (send, recv) = mpsc::channel();
++            let closing = &tracker;
++            scope.spawn(move || {
++                send.send(closing.close_and_drain(deadline()).unwrap())
++                    .unwrap()
++            });
++            wait_closed(&tracker);
++            // A rejected second closer must not reopen the first closer's gate.
++            assert!(matches!(
++                tracker.close_and_drain(Instant::now()),
++                Err(WorkError::AdmissionClosed)
++            ));
++            assert!(matches!(tracker.begin(), Err(WorkError::AdmissionClosed)));
++            let child = parent.child().unwrap();
++            parent.finish();
++            assert!(recv.try_recv().is_err());
++            child.finish();
++            let frozen = recv.recv_timeout(Duration::from_secs(5)).unwrap();
++            assert!(!tracker.status().admission_open);
++            drop(frozen);
++            assert!(tracker.status().admission_open);
++        });
++    }
++
++    #[test]
++    fn spurious_notifications_do_not_complete_pending_work_or_extend_deadline() {
++        let tracker = WorkTracker::new(Uuid::new_v4());
++        let parent = tracker.begin().unwrap();
++        std::thread::scope(|scope| {
++            let limit = Instant::now() + Duration::from_millis(500);
++            let (send, recv) = mpsc::channel();
++            let closing = &tracker;
++            scope.spawn(move || send.send(closing.close_and_drain(limit)).unwrap());
++            wait_closed(&tracker);
++            // Notification without a state change is explicitly not completion.
++            tracker.0.changed.notify_all();
++            assert_eq!(tracker.status().pending, 1);
++            assert!(matches!(
++                recv.recv_timeout(Duration::from_secs(5)).unwrap(),
++                Err(WorkError::Deadline {
++                    pending: 1,
++                    unresolved: 0
++                })
++            ));
++            assert!(Instant::now() >= limit);
++            assert!(tracker.status().admission_open);
++        });
++        parent.finish();
++        assert!(matches!(
++            tracker.close_and_drain(Instant::now() - Duration::from_secs(1)),
++            Err(WorkError::Deadline {
++                pending: 0,
++                unresolved: 0
++            })
++        ));
++        let expired = WorkFreeze {
++            tracker: tracker.clone(),
++            deadline: Instant::now(),
++        };
++        assert!(matches!(
++            expired.check(&tracker),
++            Err(WorkError::Deadline { .. })
++        ));
++    }
++
++    #[test]
++    fn sequence_exhaustion_never_wraps_or_registers_work() {
++        let tracker = WorkTracker::new(Uuid::new_v4());
++        tracker.0.state.lock().unwrap().next = u64::MAX;
++        assert!(matches!(tracker.begin(), Err(WorkError::SequenceExhausted)));
++        assert_eq!(tracker.status().pending, 0);
++    }
++}

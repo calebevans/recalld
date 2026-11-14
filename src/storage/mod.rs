@@ -37,6 +37,7 @@ pub mod tombstone;
 mod tombstone_tests;
 pub(crate) mod validation;
 pub mod vectors;
+pub mod work;
 
 // ── Re-exports ──────────────────────────────────────────────────────
 
