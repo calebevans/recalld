@@ -283,6 +283,16 @@ pub struct RedbStorageEngine {
 }
 
 impl RedbStorageEngine {
+    /// Fail closed after an uncertain commit or failed derived publication.
+    /// Lock order for graph writers: graph -> storage -> metadata -> redb.
+    pub(crate) fn ensure_available(&self) -> Result<(), StorageError> {
+        self.meta_store.ensure_available()
+    }
+
+    pub(crate) fn mark_unavailable(&self) {
+        self.meta_store.mark_unavailable();
+    }
+
     /// Metadata lineage/generation foundation; not a whole-store read snapshot.
     pub fn control_state(&self) -> Result<ControlState, StorageError> {
         self.meta_store.control_state()
@@ -1158,6 +1168,7 @@ impl StorageEngine for RedbStorageEngine {
         embedding: &[f32],
         full_text: Option<&str>,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         // Reject identity conflicts before allocating or appending payloads.
         if record.id != *id.as_bytes() || record.namespace_id != namespace_id.get() {
             return Err(StorageError::InvalidMutation(
@@ -1214,6 +1225,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn get_record(&self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.get(id)
     }
 
@@ -1222,6 +1234,7 @@ impl StorageEngine for RedbStorageEngine {
         namespace_id: NamespaceId,
         slot: u32,
     ) -> Result<Option<Vec<f32>>, StorageError> {
+        self.ensure_available()?;
         let vector_store = self
             .vector_manager
             .get(namespace_id)
@@ -1230,6 +1243,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn get_text(&self, text_ref: TextRef) -> Result<Option<String>, StorageError> {
+        self.ensure_available()?;
         if !text_ref.is_some() {
             return Ok(None);
         }
@@ -1237,6 +1251,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn delete_memory(&mut self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
+        self.ensure_available()?;
         // 1. Delete from meta.db (also removes secondary indexes).
         let record = match self.meta_store.delete(id)? {
             Some(r) => r,
@@ -1258,6 +1273,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn tombstone_memory(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.tombstone(id)
     }
 
@@ -1272,6 +1288,7 @@ impl StorageEngine for RedbStorageEngine {
         stability: f32,
         is_permastore: bool,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.update_decay_state(
             id,
             phase,
@@ -1283,14 +1300,17 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.strip_full_text(id)
     }
 
     fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.strip_summary(id)
     }
 
     fn ids_in_phase(&self, phase: DecayPhase) -> Result<Vec<MemoryId>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.ids_in_phase(phase)
     }
 
@@ -1298,6 +1318,7 @@ impl StorageEngine for RedbStorageEngine {
         &self,
         phase: DecayPhase,
     ) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.scan_phase_records(phase)
     }
 
@@ -1305,6 +1326,7 @@ impl StorageEngine for RedbStorageEngine {
         &self,
         compute_new_state: &dyn Fn(&DiskRecord) -> Option<DiskRecord>,
     ) -> Result<usize, StorageError> {
+        self.ensure_available()?;
         self.meta_store.decay_sweep(compute_new_state)
     }
 
@@ -1316,6 +1338,7 @@ impl StorageEngine for RedbStorageEngine {
         timestamp: i64,
         kind: AccessKind,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.update_access(id, timestamp, kind)
     }
 
@@ -1330,11 +1353,13 @@ impl StorageEngine for RedbStorageEngine {
         auto_created: bool,
         created_at: u64,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.edge_store
             .add_edge(source, target, edge_type, weight, auto_created, created_at)
     }
 
     fn batch_add_edges(&self, edges: &[PersistedEdge]) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.edge_store.batch_add_edges(edges)
     }
 
@@ -1342,6 +1367,7 @@ impl StorageEngine for RedbStorageEngine {
         &self,
         source: MemoryId,
     ) -> Result<Vec<(MemoryId, EdgeType)>, StorageError> {
+        self.ensure_available()?;
         self.edge_store.get_outgoing(source)
     }
 
@@ -1349,14 +1375,17 @@ impl StorageEngine for RedbStorageEngine {
         &self,
         target: MemoryId,
     ) -> Result<Vec<(MemoryId, EdgeType)>, StorageError> {
+        self.ensure_available()?;
         self.edge_store.get_incoming(target)
     }
 
     fn remove_all_edges(&self, memory_id: MemoryId) -> Result<usize, StorageError> {
+        self.ensure_available()?;
         self.edge_store.remove_all_edges(memory_id)
     }
 
     fn load_all_edges(&self) -> Result<Vec<PersistedEdge>, StorageError> {
+        self.ensure_available()?;
         self.edge_store.load_all_edges()
     }
 
@@ -1377,6 +1406,7 @@ impl StorageEngine for RedbStorageEngine {
     /// by another store or a full disk, and both wedge the boot in
     /// exactly the same way.
     fn create_namespace(&mut self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
+        self.ensure_available()?;
         validate_namespace_name(&config.name).map_err(|e| StorageError::InvalidNamespaceName {
             name: config.name.clone(),
             reason: e.to_string(),
@@ -1406,20 +1436,24 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.list_namespaces()
     }
 
     fn get_namespace(&self, id: NamespaceId) -> Result<Option<NamespaceConfig>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.get_namespace(id)
     }
 
     fn get_namespace_by_name(&self, name: &str) -> Result<Option<NamespaceConfig>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.get_namespace_by_name(name)
     }
 
     // ── Text Compaction ─────────────────────────────────────────────
 
     fn compact_text_log(&mut self) -> Result<CompactionResult, StorageError> {
+        self.ensure_available()?;
         // ponytail: keep the append-only log until metadata can atomically
         // select a durable text generation. Marker ordering cannot do this.
         Err(StorageError::RecoveryRequired(
@@ -1430,34 +1464,41 @@ impl StorageEngine for RedbStorageEngine {
     // ── Tags ────────────────────────────────────────────────────────
 
     fn memories_with_tag(&self, tag: &str) -> Result<Vec<MemoryId>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.memories_with_tag(tag)
     }
 
     fn list_tags(&self) -> Result<Vec<(String, u64)>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.list_tags()
     }
 
     // ── Edge Count ──────────────────────────────────────────────────
 
     fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.update_edge_count(id, edge_count)
     }
 
     // ── Bulk / Diagnostic ───────────────────────────────────────────
 
     fn scan_all(&self) -> Result<Vec<(MemoryId, DiskRecord)>, StorageError> {
+        self.ensure_available()?;
         self.meta_store.scan_all()
     }
 
     fn count(&self) -> Result<u64, StorageError> {
+        self.ensure_available()?;
         self.meta_store.count()
     }
 
     fn count_active(&self) -> Result<u64, StorageError> {
+        self.ensure_available()?;
         self.meta_store.count_active()
     }
 
     fn exists(&self, id: MemoryId) -> Result<bool, StorageError> {
+        self.ensure_available()?;
         self.meta_store.exists(id)
     }
 
@@ -1466,6 +1507,7 @@ impl StorageEngine for RedbStorageEngine {
         namespace_id: NamespaceId,
         slot: u32,
     ) -> Result<(), StorageError> {
+        self.ensure_available()?;
         // Legacy callers carry no allocation epoch. Reject any release of a
         // currently owned slot, including delayed releases after slot reuse.
         // ponytail: O(n) guard until canonical vector_owners replaces the scan.
@@ -1486,6 +1528,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn sync(&mut self) -> Result<(), StorageError> {
+        self.ensure_available()?;
         // Sync fulltext.dat.
         self.text_store.sync_data()?;
 
@@ -1498,6 +1541,7 @@ impl StorageEngine for RedbStorageEngine {
     }
 
     fn persist_phase_index(&self) -> Result<(), StorageError> {
+        self.ensure_available()?;
         self.meta_store.persist_phase_index()
     }
 }
@@ -1510,6 +1554,37 @@ impl StorageEngine for RedbStorageEngine {
 mod tests {
     use super::*;
     use crate::model::EdgeType;
+
+    #[test]
+    fn unavailable_handle_blocks_payloads_metadata_and_writes_until_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let ns = make_namespace(&mut engine, "gate");
+        let id = add_memory(&mut engine, ns);
+        let record = engine.get_record(id).unwrap().unwrap();
+        engine.mark_unavailable();
+        assert!(engine.get_record(id).is_err());
+        assert!(engine.meta_store().get(id).is_err());
+        assert!(
+            engine
+                .get_text(TextRef {
+                    file_offset: record.text_offset,
+                    length: record.text_length
+                })
+                .is_err()
+        );
+        assert!(engine.get_vector(ns, record.vector_slot).is_err());
+        assert!(engine.load_all_edges().is_err());
+        assert!(engine.delete_memory(id).is_err());
+        assert!(engine.meta_store().update_edge_count(id, 9).is_err());
+        assert!(engine.sync().is_err());
+        drop(engine);
+        let engine = open_engine(dir.path());
+        assert_eq!(
+            engine.get_record(id).unwrap().unwrap().to_bytes(),
+            record.to_bytes()
+        );
+    }
 
     #[test]
     fn containment_rejects_insert_identity_conflicts_before_payload_writes() {
