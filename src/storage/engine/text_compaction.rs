@@ -1,13 +1,10 @@
 //! Engine-exclusive generation publication. No marker participates in selection.
 use super::*;
 use crate::storage::fsync::fsync_dir;
-use crate::storage::text::generation::{cleanup_orphans, install_legacy_gate};
+use crate::storage::text::generation::{cleanup_orphans, validate_rejection_gate};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Stage {
-    LegacyCopySynced,
-    LegacySelected,
-    GateInstalled,
     EntriesWritten,
     FileSynced,
     DirectorySynced,
@@ -25,7 +22,10 @@ impl RedbStorageEngine {
         mut boundary: impl FnMut(Stage) -> Result<(), StorageError>,
     ) -> Result<CompactionResult, StorageError> {
         self.ensure_available()?;
-        let initial = self.control_state()?;
+        let old = self.meta_store.text_selection()?.ok_or_else(|| StorageError::RecoveryRequired(
+            "legacy text compaction requires offline fresh-destination migration: recalld-text-migrate SOURCE DESTINATION".into()
+        ))?;
+        validate_rejection_gate(&self.db_path, old.store_id)?;
         let records = self.meta_store.scan_all()?;
         let refs: Vec<_> = records
             .iter()
@@ -44,23 +44,6 @@ impl RedbStorageEngine {
         for (_, reference) in &refs {
             self.text_store.read(*reference)?;
         }
-        if self.meta_store.text_selection()?.is_none() {
-            let (copy, descriptor) = self.text_store.copy_legacy(initial.store_id)?;
-            boundary(Stage::LegacyCopySynced)?;
-            self.meta_store.select_text_generation(
-                initial.committed_generation,
-                &descriptor,
-                &refs,
-            )?;
-            boundary(Stage::LegacySelected).inspect_err(|_| self.mark_unavailable())?;
-            self.text_store = copy;
-        }
-        let old = self
-            .meta_store
-            .text_selection()?
-            .ok_or_else(|| StorageError::InvalidControl("missing selected text".into()))?;
-        install_legacy_gate(&self.db_path, &old)?;
-        boundary(Stage::GateInstalled)?;
         let state = self.control_state()?;
         let old_size = self.text_store.file_size();
         let old_count = self.text_store.complete_entry_count()?;
@@ -118,11 +101,7 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
 
-    fn legacy_fixture(path: &Path) -> (RedbStorageEngine, Vec<(MemoryId, String)>) {
-        std::fs::create_dir_all(path).unwrap();
-        drop(MetadataStore::open(&path.join("meta.db")).unwrap());
-        drop(EdgeStore::open(&path.join("edges.db")).unwrap());
-        drop(TextStore::open(&path.join("fulltext.dat")).unwrap());
+    fn generation_fixture(path: &Path) -> (RedbStorageEngine, Vec<(MemoryId, String)>) {
         let mut engine = RedbStorageEngine::open(path).unwrap();
         let mut config = NamespaceConfig::default_namespace(0);
         config.embedding_dim = 4;
@@ -211,9 +190,6 @@ mod tests {
     #[test]
     fn compaction_process_interruption_matrix_reopens_metadata_selection_twice() {
         for stage in [
-            Stage::LegacyCopySynced,
-            Stage::LegacySelected,
-            Stage::GateInstalled,
             Stage::EntriesWritten,
             Stage::FileSynced,
             Stage::DirectorySynced,
@@ -223,7 +199,7 @@ mod tests {
             Stage::Unlinked,
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let (engine, kept) = legacy_fixture(dir.path());
+            let (engine, kept) = generation_fixture(dir.path());
             let before = engine.control_state().unwrap().committed_generation.get();
             let original_offset = engine.get_record(kept[0].0).unwrap().unwrap().text_offset;
             drop(engine);
@@ -242,15 +218,14 @@ mod tests {
                 let engine = RedbStorageEngine::open(dir.path()).unwrap();
                 assert_texts(&engine, &kept);
                 let delta = match stage {
-                    Stage::LegacyCopySynced => 0,
-                    Stage::Selected | Stage::Published | Stage::Cleanup | Stage::Unlinked => 2,
-                    _ => 1,
+                    Stage::Selected | Stage::Published | Stage::Cleanup | Stage::Unlinked => 1,
+                    _ => 0,
                 };
                 assert_eq!(
                     engine.control_state().unwrap().committed_generation.get(),
                     before + delta
                 );
-                if delta == 2 {
+                if delta == 1 {
                     assert_ne!(
                         engine.get_record(kept[0].0).unwrap().unwrap().text_offset,
                         original_offset
@@ -272,7 +247,7 @@ mod tests {
     #[test]
     fn compaction_repeated_empty_and_tail_append_preserve_receipts_and_text() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut engine, kept) = legacy_fixture(dir.path());
+        let (mut engine, kept) = generation_fixture(dir.path());
         let before = engine.control_state().unwrap().committed_generation.get();
         let first = engine.compact_text_log().unwrap();
         assert_eq!((first.entries_kept, first.entries_removed), (2, 1));
@@ -280,7 +255,7 @@ mod tests {
         let selected = engine.meta_store.text_selection().unwrap().unwrap();
         assert_eq!(
             engine.control_state().unwrap().committed_generation.get(),
-            before + 2
+            before + 1
         );
         assert!(
             TextStore::open(&dir.path().join("fulltext.dat")).is_err(),
@@ -313,7 +288,7 @@ mod tests {
     fn compaction_selected_missing_corrupt_header_prefix_and_extent_fail_closed() {
         for fault in ["missing", "header", "prefix", "extent"] {
             let dir = tempfile::tempdir().unwrap();
-            let (mut engine, kept) = legacy_fixture(dir.path());
+            let (mut engine, kept) = generation_fixture(dir.path());
             engine.compact_text_log().unwrap();
             let selected = engine.meta_store.text_selection().unwrap().unwrap();
             drop(engine);
@@ -347,8 +322,14 @@ mod tests {
             let orphan_path = orphan.path().to_owned();
             orphan.sync_all().unwrap();
             drop(orphan);
+            let metadata_before = std::fs::read(dir.path().join("meta.db")).unwrap();
             for _ in 0..2 {
                 assert!(RedbStorageEngine::open(dir.path()).is_err(), "{fault}");
+                assert_eq!(
+                    std::fs::read(dir.path().join("meta.db")).unwrap(),
+                    metadata_before,
+                    "failed preflight mutated metadata: {fault}"
+                );
             }
             assert!(
                 orphan_path.exists(),
@@ -360,7 +341,7 @@ mod tests {
     #[test]
     fn compaction_orphans_require_header_identity_and_cleanup_failure_is_committed() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut engine, kept) = legacy_fixture(dir.path());
+        let (mut engine, kept) = generation_fixture(dir.path());
         engine.compact_text_log().unwrap();
         let old = engine.meta_store.text_selection().unwrap().unwrap();
         let (foreign, _) = TextStore::create_generation(dir.path(), uuid::Uuid::new_v4()).unwrap();
@@ -408,7 +389,7 @@ mod tests {
     #[test]
     fn compaction_postcommit_publication_error_blocks_old_text_until_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut engine, kept) = legacy_fixture(dir.path());
+        let (mut engine, kept) = generation_fixture(dir.path());
         let record = engine.get_record(kept[0].0).unwrap().unwrap();
         assert!(
             engine
@@ -438,7 +419,7 @@ mod tests {
     #[test]
     fn compaction_unknown_commit_reconciles_receipt_without_reclaiming_selected_payload() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut engine, kept) = legacy_fixture(dir.path());
+        let (mut engine, kept) = generation_fixture(dir.path());
         engine.compact_text_log().unwrap();
         let lineage = engine.control_state().unwrap().store_id;
         crate::storage::metadata::text_generation::FAIL_AFTER_TEXT_COMMIT

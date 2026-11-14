@@ -23,6 +23,7 @@ pub mod indexes;
 pub mod metadata;
 pub(crate) mod ownership;
 pub mod text;
+pub mod text_migration;
 pub(crate) mod validation;
 pub mod vectors;
 

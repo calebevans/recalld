@@ -351,6 +351,7 @@ impl RedbStorageEngine {
             for name in ["meta.db", "edges.db", "fulltext.dat"] {
                 crate::storage::validation::require_file(&db_path.join(name))?;
             }
+            crate::storage::validation::preflight_text(&db_path)?;
         }
 
         // Step 2: Open meta.db.
@@ -361,6 +362,13 @@ impl RedbStorageEngine {
 
         // Legacy compaction was checked before opening any canonical file.
         // Step 5: Open fulltext.dat.
+        if !existing {
+            let state = meta_store.control_state()?;
+            let (prepared, id) = TextStore::create_generation(&db_path, state.store_id)?;
+            let descriptor = prepared.seal(state.store_id, id, 2)?;
+            crate::storage::text::generation::write_rejection_gate(&db_path, &descriptor)?;
+            meta_store.select_text_generation(state.committed_generation, &descriptor, &vec![])?;
+        }
         let selected_text = meta_store.text_selection()?;
         let text_store = match &selected_text {
             Some(selected) => TextStore::open_generation(&db_path, selected, true)?,
@@ -406,15 +414,11 @@ impl RedbStorageEngine {
         // Step 7: Startup validation.
         engine.startup_validation()?;
         if let Some(selected) = selected_text {
-            crate::storage::text::generation::install_legacy_gate(&engine.db_path, &selected)?;
             if let Err(error) =
                 crate::storage::text::generation::cleanup_orphans(&engine.db_path, &selected)
             {
                 tracing::warn!(%error, "text orphan cleanup pending");
             }
-        }
-        if !existing {
-            engine.compact_text_log()?;
         }
 
         Ok(engine)
@@ -2036,6 +2040,7 @@ mod tests {
         for entry in std::fs::read_dir(older.path()).unwrap() {
             let entry = entry.unwrap();
             if entry.file_name() == "meta.db"
+                || entry.file_name() == "fulltext.dat"
                 || crate::storage::metadata::text_generation::is_generation_filename(
                     &entry.file_name().to_string_lossy(),
                 )

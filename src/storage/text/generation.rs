@@ -113,40 +113,6 @@ impl TextStore {
         })
     }
 
-    /// The first upgrade commit preserves offsets and keeps original bytes intact.
-    pub(crate) fn copy_legacy(
-        &self,
-        store_id: Uuid,
-    ) -> Result<(Self, TextGeneration), StorageError> {
-        let id = Uuid::new_v4();
-        let path = self
-            .path
-            .parent()
-            .ok_or(StorageError::InvalidPath)?
-            .join(generation_filename(id));
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        let mut buffer = [0; 65536];
-        let mut offset = 0;
-        while offset < self.write_pos {
-            let n = (self.write_pos - offset).min(buffer.len() as u64) as usize;
-            read_exact_at(&self.file, &mut buffer[..n], offset)?;
-            file.write_all(&buffer[..n])?;
-            offset += n as u64;
-        }
-        let copy = Self {
-            file,
-            path,
-            write_pos: self.write_pos,
-            header_size: 16,
-        };
-        let descriptor = copy.seal(store_id, id, 1)?;
-        Ok((copy, descriptor))
-    }
-
     pub(crate) fn sync_all(&self) -> Result<(), StorageError> {
         self.file.sync_all().map_err(StorageError::Io)
     }
@@ -171,35 +137,44 @@ impl TextStore {
     }
 }
 
-/// This file only rejects old readers. Its contents NEVER select a payload.
-/// Called only after a durable metadata selection exists. An interrupted gate
-/// installation leaves either old bytes or the rejection header, both recoverable.
-pub(crate) fn install_legacy_gate(
+/// A rejection gate is never payload or selection authority. Validate it before
+/// opening writable databases and before publishing a backup/migration target.
+pub(crate) fn validate_rejection_gate(dir: &Path, store_id: Uuid) -> Result<(), StorageError> {
+    let path = dir.join("fulltext.dat");
+    crate::storage::validation::require_file(&path)?;
+    let file = File::open(path)?;
+    let mut bytes = [0; 48];
+    if file.metadata()?.len() != 48 {
+        return Err(StorageError::RecoveryRequired(
+            "invalid text rejection gate length".into(),
+        ));
+    }
+    read_exact_at(&file, &mut bytes, 0)?;
+    let id = Uuid::from_bytes(bytes[32..48].try_into().unwrap());
+    if id.is_nil() || bytes != header(store_id, id) {
+        return Err(StorageError::RecoveryRequired(
+            "invalid text rejection gate identity/version".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Only for a new empty store or an inaccessible fresh migration destination.
+/// NEVER gate a serving legacy store: old-reader fencing must precede selection.
+pub(crate) fn write_rejection_gate(
     dir: &Path,
     selected: &TextGeneration,
 ) -> Result<(), StorageError> {
-    let path = dir.join("fulltext.dat");
-    let bytes = header(selected.store_id, selected.id);
-    if let Ok(file) = File::open(&path) {
-        let mut current = [0; 48];
-        if file.metadata()?.len() == 48
-            && read_exact_at(&file, &mut current, 0).is_ok()
-            && current[..6] == bytes[..6]
-        {
-            return Ok(());
-        }
-    }
-    crate::storage::validation::require_file(&path)?;
     let temporary = dir.join(format!(".text-gate.{}", Uuid::new_v4()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)?;
-    file.write_all(&bytes)?;
+    file.write_all(&header(selected.store_id, selected.id))?;
     file.sync_all()?;
-    std::fs::rename(&temporary, &path)?;
+    std::fs::rename(&temporary, dir.join("fulltext.dat"))?;
     fsync_dir(dir)?;
-    Ok(())
+    validate_rejection_gate(dir, selected.store_id)
 }
 
 /// Conservative startup hygiene: only self-identifying owned v2 payloads qualify.

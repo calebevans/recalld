@@ -490,6 +490,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_generation_rejects_self_consistent_legacy_readable_gate_before_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, manifest) = fixture(root.path());
+        let selected = manifest
+            .files
+            .iter()
+            .find(|f| crate::storage::metadata::text_generation::is_generation_filename(&f.name))
+            .unwrap();
+        let mut forged = fs::read(source.join(&selected.name)).unwrap();
+        forged[4..6].copy_from_slice(&1u16.to_le_bytes());
+        fs::write(source.join("fulltext.dat"), forged).unwrap();
+        assert!(crate::storage::TextStore::open(&source.join("fulltext.dat")).is_ok());
+        let metadata_before = fs::read(source.join("meta.db")).unwrap();
+        assert!(canonical_files(&source).is_err());
+        assert!(RedbStorageEngine::open(&source).is_err());
+        assert_eq!(fs::read(source.join("meta.db")).unwrap(), metadata_before);
+        // Recompute every manifest checksum/size: rejection must be semantic.
+        let files: Vec<_> = manifest
+            .files
+            .iter()
+            .map(|f| source.join(&f.name))
+            .collect();
+        let forged_manifest = generate_manifest(&source, &files).unwrap();
+        let archive = archive(root.path(), &source, &forged_manifest);
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("sentinel"), b"preserve").unwrap();
+        assert!(restore(archive, &target).await.is_err());
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"preserve");
+    }
+
+    #[tokio::test]
     async fn text_generation_restore_requires_selected_payload_even_if_manifest_omits_it() {
         let root = tempfile::tempdir().unwrap();
         let (source, mut manifest) = fixture(root.path());
