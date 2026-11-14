@@ -273,7 +273,7 @@ impl VectorFileHeader {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Number of slots to pre-allocate when the file must grow.
-const GROWTH_CHUNK: u32 = 1024;
+pub(crate) const GROWTH_CHUNK: u32 = 1024;
 
 /// Per-namespace vector storage. Owns the mmap (read) and file handle
 /// (write). Not internally synchronized -- the caller wraps in
