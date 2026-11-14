@@ -4,10 +4,11 @@ use super::*;
 use crate::model::schema::{LifecycleVersion, TimestampOrigin};
 use crate::model::{DiskRecord, EdgeType};
 use crate::storage::control::Generation;
+use crate::storage::lifecycle_migration::{LifecycleMigrationOptions, migrate_lifecycle};
 use crate::storage::offline_snapshot::OfflineSnapshot;
 use crate::storage::schema_migration::{MigrationOptions, inspect_schema, migrate_schema};
 use crate::storage::{RedbStorageEngine, StorageEngine};
-use crate::test_support::{Fixture, MemorySpec};
+use crate::test_support::Fixture;
 use serde_json::json;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
@@ -60,22 +61,54 @@ async fn offline(
         } else {
             1.0
         };
-        ids.push(
-            fixture
-                .insert_memory_with(MemorySpec {
-                    namespace: if index == count { foreign } else { ns() },
-                    summary: "needle",
-                    tags: &["project/query", "entity/caleb"],
-                    embedding: Some(&[cosine, (1.0 - cosine * cosine).sqrt(), 0.0, 0.0]),
-                    ..MemorySpec::new(ns())
-                })
-                .await,
-        );
+        let id = MemoryId::new();
+        let namespace = if index == count { foreign } else { ns() };
+        let mut record = DiskRecord {
+            version: DiskRecord::CURRENT_VERSION,
+            schema: None,
+            id: *id.as_bytes(),
+            namespace_id: namespace.get(),
+            created_at: 0,
+            last_accessed_at: 0,
+            phase: DecayPhase::Full,
+            strength: 1.0,
+            decay_strength: 1.0,
+            stability: 1.0,
+            difficulty: 5.0,
+            is_permastore: 0,
+            vector_slot: 0,
+            edge_count: 0,
+            summary: "needle".into(),
+            tags: ["project/query", "entity/caleb"]
+                .into_iter()
+                .map(|tag| crate::model::Tag::new(tag).unwrap())
+                .collect(),
+            access_history: vec![],
+            text_offset: 0,
+            text_length: 0,
+        };
+        // Set only legacy input fields, before either real migration. Never
+        // rewrite a published schema-v2 policy, receipt, or lifecycle timestamp.
+        edit(index, &mut record);
+        assert!(record.schema.is_none());
+        fixture
+            .storage
+            .write()
+            .unwrap()
+            .insert_memory(
+                id,
+                namespace,
+                &mut record,
+                &[cosine, (1.0 - cosine * cosine).sqrt(), 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+        ids.push(id);
     }
     fixture.storage.write().unwrap().sync().unwrap();
     let source = fixture.close();
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("offline");
+    let mut path = directory.path().join("canonical");
     migrate_schema(
         source.path(),
         &path,
@@ -89,54 +122,37 @@ async fn offline(
         },
     )
     .unwrap();
-    // Sanctioned fixture-only policy setup after closing every writer. This is
-    // NOT a production migration or a participating writer/barrier bypass.
-    {
-        use crate::storage::metadata::{META_TABLE, NAMESPACE_TABLE};
-        use redb::ReadableTable;
-        let db = redb::Database::create(path.join("meta.db")).unwrap();
-        let tx = db.begin_write().unwrap();
-        {
-            let mut namespaces = tx.open_table(NAMESPACE_TABLE).unwrap();
-            let rows: Vec<_> = namespaces
+    if version == LifecycleVersion::ExplicitFeedbackV2 {
+        for namespace_id in [ns(), foreign] {
+            let state = inspect_schema(&path).unwrap();
+            let config = state
+                .namespaces
                 .iter()
-                .unwrap()
-                .map(|row| {
-                    let (key, value) = row.unwrap();
-                    (key.value(), NamespaceConfig::decode(value.value()).unwrap())
-                })
-                .collect();
-            for (key, mut ns) in rows {
-                let schema = ns.schema.as_mut().unwrap();
-                schema.lifecycle_version = version;
-                schema.policy_revision = revision("2");
-                namespaces
-                    .insert(key, serde_json::to_vec(&ns).unwrap().as_slice())
-                    .unwrap();
-            }
-            let mut table = tx.open_table(META_TABLE).unwrap();
-            for (index, id) in ids.iter().enumerate() {
-                let mut record = DiskRecord::from_bytes(
-                    table
-                        .get(id.as_bytes().as_slice())
-                        .unwrap()
-                        .unwrap()
-                        .value(),
-                )
+                .find(|n| n.id == namespace_id)
                 .unwrap();
-                let fields = &mut record.schema.as_mut().unwrap().lifecycle;
-                fields.lifecycle_version = version;
-                fields.policy_revision = revision("1");
-                edit(index, &mut record);
-                table
-                    .insert(
-                        id.as_bytes().as_slice(),
-                        record.encode().unwrap().as_slice(),
-                    )
-                    .unwrap();
-            }
+            let destination = directory
+                .path()
+                .join(format!("policy-{}", namespace_id.get()));
+            let receipt = migrate_lifecycle(
+                &path,
+                &destination,
+                &LifecycleMigrationOptions {
+                    expected_source: state.control.generation_ref(),
+                    namespace_id,
+                    expected_policy_revision: config.schema.as_ref().unwrap().policy_revision,
+                    target: version,
+                    idempotency_key: format!("strength-fixture-{}", namespace_id.get()),
+                },
+            )
+            .unwrap();
+            assert!(matches!(receipt.outcome,
+                crate::storage::control::MutationOutcome::LifecyclePolicyMigrated { transition }
+                    if transition.namespace_id == namespace_id
+                        && transition.from == LifecycleVersion::LegacyAccessV1
+                        && transition.to == version
+            ));
+            path = destination;
         }
-        tx.commit().unwrap();
     }
     let files = crate::storage::validation::canonical_files(&path).unwrap();
     let view = Arc::new(OfflineSnapshot::open(&path).unwrap()); // full canonical validation
@@ -279,13 +295,8 @@ async fn canonical_clock_projection_is_read_only_and_retains_committed_phase_and
         r.is_permastore = 1;
         r.strength = 0.01;
         r.decay_strength = 0.02;
-        r.last_accessed_at = 20 * DAY; // not the explicit-policy anchor
-        let fields = &mut r.schema.as_mut().unwrap().lifecycle;
-        fields.observed_at = -10 * DAY;
-        fields.retrieved_at = Some(20 * DAY);
-        fields.reinforced_at = None;
-        fields.decay_anchor_at = 0;
-        fields.timestamp_origin = TimestampOrigin::LegacyInferred;
+        r.created_at = -10 * DAY;
+        r.last_accessed_at = 0; // migration preserves this as the explicit anchor
     })
     .await;
     let bytes = file_bytes(&f.files);
@@ -295,6 +306,12 @@ async fn canonical_clock_projection_is_read_only_and_retains_committed_phase_and
         cached.lifecycle.as_ref(),
         original.schema.as_ref().map(|s| &s.lifecycle)
     );
+    let lifecycle = cached.lifecycle.as_ref().unwrap();
+    assert_eq!(lifecycle.observed_at, -10 * DAY);
+    assert_eq!(lifecycle.decay_anchor_at, 0);
+    assert_eq!(lifecycle.retrieved_at, None);
+    assert_eq!(lifecycle.reinforced_at, None);
+    assert_eq!(lifecycle.timestamp_origin, TimestampOrigin::LegacyInferred);
     let clock = CountingClock::new(0);
     let engine = engine(&f, clock.clone(), &[]);
     let first = engine
@@ -316,7 +333,7 @@ async fn canonical_clock_projection_is_read_only_and_retains_committed_phase_and
     assert_eq!(clock.calls.load(Ordering::SeqCst), 2);
     let observed = second.diagnostics.strength.unwrap();
     assert_eq!(observed.evaluated_at, 30 * DAY);
-    assert_eq!(observed.policy_revision, Some(revision("2")));
+    assert_eq!(observed.policy_revision, Some(revision("1")));
     assert_eq!(
         observed.lifecycle_version,
         LifecycleVersion::ExplicitFeedbackV2
@@ -350,6 +367,51 @@ async fn canonical_clock_projection_is_read_only_and_retains_committed_phase_and
         RedbStorageEngine::open(&f.path).is_err(),
         "projection cannot open the serving gate"
     );
+    assert_eq!(file_bytes(&f.files), bytes);
+}
+
+/// Pure projection contract, not evidence of a persisted native exposure.
+/// The latter needs the schema-aware exposure writer after policy migration.
+#[tokio::test]
+async fn pure_projection_ignores_independent_retrieval_and_compatibility_timestamps() {
+    let f = offline(1, LifecycleVersion::ExplicitFeedbackV2, |_, r| {
+        r.created_at = -10 * DAY;
+        r.phase = DecayPhase::Summary;
+        r.is_permastore = 1;
+        r.strength = 0.01;
+        r.decay_strength = 0.02;
+    })
+    .await;
+    let bytes = file_bytes(&f.files);
+    let original = CachedRecord::from(&f.view.record(f.ids[0]).unwrap().unwrap().record);
+    let mut synthetic = original.clone();
+    synthetic.last_accessed_at = 20 * DAY;
+    synthetic.lifecycle.as_mut().unwrap().retrieved_at = Some(20 * DAY);
+    let timestamps = synthetic.lifecycle.clone();
+    let config = f.view.resolve("default").await.unwrap();
+    let clock = CountingClock::new(0);
+    let engine = engine(&f, clock.clone(), &[]);
+    for now in [0, 30 * DAY] {
+        clock.now.store(now, Ordering::SeqCst);
+        let context = StrengthContext::pin(&engine, &config, false).unwrap();
+        let mut baseline = original.clone();
+        context.apply(&mut baseline).unwrap();
+        context.apply(&mut synthetic).unwrap();
+        assert_eq!(
+            (synthetic.strength, synthetic.decay_strength),
+            (baseline.strength, baseline.decay_strength)
+        );
+        if now == 0 {
+            assert_eq!(synthetic.strength, 1.0);
+        } else {
+            assert!(synthetic.strength < 0.7 && synthetic.strength > 0.01);
+        }
+        assert_eq!(synthetic.lifecycle, timestamps);
+        assert_eq!(synthetic.last_accessed_at, 20 * DAY);
+        assert_eq!(synthetic.phase, DecayPhase::Summary);
+        assert!(synthetic.is_permastore);
+    }
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 2);
     assert_eq!(file_bytes(&f.files), bytes);
 }
 
@@ -423,7 +485,6 @@ async fn bonuses_use_projected_live_same_scope_donors_independent_of_query_tags(
         if i == 2 {
             r.phase = DecayPhase::Ghost;
             r.summary.clear();
-            r.schema.as_mut().unwrap().labels.entities.clear();
         }
         r.stability = if i == 0 { 1.0 } else { 0.01 };
     })
@@ -523,7 +584,7 @@ impl NamespaceResolver for PinnedNamespace {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_pins_current_revision_and_resolves_namespace_override_before_global() {
     let f = offline(1, LifecycleVersion::ExplicitFeedbackV2, |_, r| {
-        r.schema.as_mut().unwrap().lifecycle.decay_anchor_at = DAY;
+        r.last_accessed_at = DAY;
     })
     .await;
     let clock = CountingClock::new(9 * DAY);
