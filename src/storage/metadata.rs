@@ -73,6 +73,7 @@ pub struct MetadataStore {
     pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
     derived_dirty: std::sync::atomic::AtomicBool,
     effects_epoch: std::sync::atomic::AtomicU64,
+    pub(crate) derived_publication: std::sync::Arc<tokio::sync::RwLock<()>>,
     #[cfg(test)]
     pub(crate) fail_effect_application: std::sync::atomic::AtomicBool,
     // Lock order: engine gate -> publication -> redb -> phase_index.
@@ -132,6 +133,7 @@ impl MetadataStore {
             canonical_pending: std::sync::atomic::AtomicBool::new(false),
             derived_dirty: std::sync::atomic::AtomicBool::new(false),
             effects_epoch: std::sync::atomic::AtomicU64::new(0),
+            derived_publication: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             fail_effect_application: std::sync::atomic::AtomicBool::new(false),
             publication: std::sync::RwLock::new(()),

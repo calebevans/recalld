@@ -367,6 +367,7 @@ impl Recalld {
             };
             // No external eviction listener for now.
             let mgr = CacheManager::new(cache_cfg, None);
+            mgr.bind_storage(&storage);
             tracing::info!("cache manager initialized");
             Arc::new(mgr)
         };
@@ -697,6 +698,15 @@ impl Recalld {
                 config.decay.decay_rate_multiplier,
             ) {
                 Ok(runner) => {
+                    let runner =
+                        runner.with_completion(crate::derived_completion::DerivedCompletion {
+                            storage: storage.clone(),
+                            cache: cache.clone(),
+                            graph: graph.clone(),
+                            vectors: vector_index.clone(),
+                            fts: fts_index.clone(),
+                            entities: entity_index.clone(),
+                        });
                     let handle = runner.start();
                     tracing::info!("decay sweep runner started");
                     (Some(runner), Some(handle))
@@ -819,6 +829,23 @@ impl Recalld {
     /// Access the flat vector index.
     pub fn vector_index(&self) -> &Arc<RwLock<FlatVectorIndex>> {
         &self.vector_index
+    }
+
+    /// Retry publication of committed effects without restarting. Errors leave
+    /// query admission closed; canonical application failures require reopen.
+    pub async fn complete_pending_effects(
+        &self,
+    ) -> std::result::Result<(), crate::storage::StorageError> {
+        crate::derived_completion::DerivedCompletion {
+            storage: self.storage.clone(),
+            cache: self.cache.clone(),
+            graph: self.graph.clone(),
+            vectors: self.vector_index.clone(),
+            fts: self.fts_index.clone(),
+            entities: self.entity_index.clone(),
+        }
+        .complete()
+        .await
     }
 
     /// Access the FTS5 full-text search index.
@@ -1151,6 +1178,131 @@ mod tests {
             .unwrap();
         assert!(hits.iter().all(|hit| hit.0 != dead));
         assert!(hits.iter().any(|hit| hit.0 == live));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_mcp_cached_consumers_block_then_recover_online() {
+        use crate::mcp::bridge::{SearchPipeline, StorageEngine as McpStorage};
+        use crate::mcp::bridge_adapters::{McpSearchAdapter, McpStorageAdapter};
+        let fx = Fixture::new();
+        let live = fx.insert_memory().await;
+        let dead = fx.insert_memory().await;
+        let dir = fx.close();
+        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+        let search = McpSearchAdapter::new(
+            system.query_engine.clone(),
+            system.embedding.clone(),
+            system.storage.clone(),
+            system.graph.clone(),
+            chrono_tz::UTC,
+        );
+        let adapter = McpStorageAdapter::new(
+            system.storage.clone(),
+            system.cache.clone(),
+            system.embedding.clone(),
+            system.vector_index.clone(),
+            system.fts_index.clone(),
+            system.entity_index.clone(),
+            system.graph.clone(),
+            system.config.clone(),
+            chrono_tz::UTC,
+        );
+        let stale = crate::model::CachedRecord::from(
+            &system
+                .storage
+                .read()
+                .unwrap()
+                .get_record(dead)
+                .unwrap()
+                .unwrap(),
+        );
+        system.cache.insert(dead, stale.clone()).await;
+        system.storage.write().unwrap().delete_memory(dead).unwrap();
+        assert!(search.find_similar(live, 5, None, true).await.is_err());
+        assert!(adapter.get_memory(dead).await.is_err());
+        assert!(adapter.get_memory(live).await.is_err());
+        system.complete_pending_effects().await.unwrap();
+        system.cache.insert(dead, stale).await;
+        assert!(
+            system
+                .query_engine
+                .get_memory(dead)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(adapter.get_memory(dead).await.unwrap().is_none());
+        assert!(adapter.get_memory(live).await.unwrap().is_some());
+        assert!(search.find_similar(live, 5, None, true).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn online_completion_crash_reopen_preserves_receipt_and_deleted_content() {
+        const CHILD: &str = "RECALLD_ONLINE_COMPLETION_CHILD";
+        if let Ok(path) = std::env::var(CHILD) {
+            let system = Recalld::new(offline_config(std::path::Path::new(&path)))
+                .await
+                .unwrap();
+            let dead = system.storage.read().unwrap().scan_all().unwrap()[0].0;
+            system.storage.write().unwrap().delete_memory(dead).unwrap();
+            system.complete_pending_effects().await.unwrap();
+            panic!("child did not exit at crash point");
+        }
+        let fx = Fixture::new();
+        let dead = fx.insert_memory().await;
+        let dir = fx.close();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("system::tests::online_completion_crash_reopen_preserves_receipt_and_deleted_content")
+            .arg("--exact").arg("--nocapture")
+            .env(CHILD, dir.path()).env("RECALLD_TEST_EFFECT_CRASH", "before_online_derived_ack")
+            .output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(91),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt = {
+            let storage = RedbStorageEngine::open(dir.path()).unwrap();
+            let pending = storage.meta_store().pending_effects().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].canonical_applied);
+            pending[0].receipt.clone()
+        };
+        let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+        assert!(
+            system
+                .storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .pending_effects()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            system
+                .query_engine
+                .get_memory(dead)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(system.fts_index.lock().await.is_empty().unwrap());
+        assert!(system.vector_index.read().await.get_vector(dead).is_none());
+        system.complete_pending_effects().await.unwrap();
+        assert_eq!(
+            system
+                .storage
+                .read()
+                .unwrap()
+                .meta_store()
+                .control_state()
+                .unwrap()
+                .committed_generation,
+            receipt.committed_generation
+        );
     }
 
     // ── the regression ───────────────────────────────────────────────

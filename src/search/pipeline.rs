@@ -357,11 +357,15 @@ impl QueryEngine {
         let stamp = self.meta_store.effects_stamp().await?;
         let result = self.search_admitted(query).await;
         if self.meta_store.effects_stamp().await? != stamp {
-            return Err(SearchError::MetadataError(
-                "unavailable: graph effects changed during query".into(),
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
             ));
         }
         result
+    }
+
+    pub(crate) async fn effects_stamp(&self) -> Result<u64> {
+        self.meta_store.effects_stamp().await
     }
 
     async fn search_admitted(&self, mut query: SearchQuery) -> Result<SearchResponse> {
@@ -887,8 +891,8 @@ impl QueryEngine {
         let stamp = self.meta_store.effects_stamp().await?;
         let result = self.get_memory_admitted(id).await;
         if self.meta_store.effects_stamp().await? != stamp {
-            return Err(SearchError::MetadataError(
-                "unavailable: graph effects changed during query".into(),
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
             ));
         }
         result
@@ -943,8 +947,8 @@ impl QueryEngine {
         let stamp = self.meta_store.effects_stamp().await?;
         let result = self.similar_admitted(id, k).await;
         if self.meta_store.effects_stamp().await? != stamp {
-            return Err(SearchError::MetadataError(
-                "unavailable: graph effects changed during query".into(),
+            return Err(SearchError::Unavailable(
+                "graph effects changed during query".into(),
             ));
         }
         result
@@ -1519,7 +1523,7 @@ mod tests {
             target: b,
         });
         let result = engine.get_memory(MemoryId::new()).await;
-        assert!(matches!(result, Err(SearchError::MetadataError(_))));
+        assert!(matches!(result, Err(SearchError::Unavailable(_))));
         assert!(
             fx.storage
                 .read()

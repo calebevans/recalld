@@ -186,7 +186,8 @@ impl MetadataStore {
         self.derived_dirty.load(Ordering::SeqCst)
     }
 
-    /// Called only after startup has rebuilt every derived index.
+    /// Called after every derived index is rebuilt, either during startup or
+    /// under the online coordinator's publication/index/storage guards.
     pub(crate) fn acknowledge_rebuilt_effects(&self) -> Result<(), StorageError> {
         let ids: Vec<_> = self
             .pending_effects()?

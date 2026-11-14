@@ -299,6 +299,7 @@ const MAX_CONNECTION_BONUS: f32 = 0.15;
 /// The runner holds `Arc` references to shared subsystems. It does NOT
 /// own those subsystems -- it borrows them via Arc for the background task.
 pub struct DecaySweepRunner {
+    completion: Option<crate::derived_completion::DerivedCompletion>,
     config: SweepConfig,
     decay_config: Arc<DecayConfig>,
     activation_config: ActivationConfig,
@@ -345,7 +346,16 @@ impl DecaySweepRunner {
             global_decay_multiplier,
             shutdown_tx,
             trigger_notify: Arc::new(Notify::new()),
+            completion: None,
         })
+    }
+
+    pub(crate) fn with_completion(
+        mut self,
+        completion: crate::derived_completion::DerivedCompletion,
+    ) -> Self {
+        self.completion = Some(completion);
+        self
     }
 
     /// Spawn the background sweep task on the tokio runtime.
@@ -358,6 +368,7 @@ impl DecaySweepRunner {
     /// 2. Enters a loop: sleep for `interval`, then sweep
     /// 3. Exits when `shutdown()` is called
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
+        let completion = self.completion.clone();
         let config = self.config.clone();
         let decay_config = Arc::clone(&self.decay_config);
         let activation_config = self.activation_config.clone();
@@ -382,6 +393,11 @@ impl DecaySweepRunner {
                     global_decay_multiplier,
                 )
                 .await;
+                if let Some(completion) = &completion {
+                    if let Err(error) = completion.complete().await {
+                        tracing::error!(%error, "sweep effects remain pending; next sweep retries completion");
+                    }
+                }
                 Self::log_result(&result);
             }
 
@@ -428,6 +444,11 @@ impl DecaySweepRunner {
                     global_decay_multiplier,
                 )
                 .await;
+                if let Some(completion) = &completion {
+                    if let Err(error) = completion.complete().await {
+                        tracing::error!(%error, "sweep effects remain pending; next sweep retries completion");
+                    }
+                }
                 Self::log_result(&result);
             }
         })

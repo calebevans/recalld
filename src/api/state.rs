@@ -51,15 +51,14 @@ pub trait SearchPipeline: Send + Sync {
     /// checking a new memory for duplicates does not age every
     /// neighbour's decay schedule.
     ///
-    /// Never errors — the caller is an advisory field that must not fail a
-    /// create.
+    /// Fails closed when derived views are unavailable.
     async fn near_duplicates(
         &self,
         embedding: &[f32],
         namespace_id: NamespaceId,
         threshold: f32,
         limit: usize,
-    ) -> Vec<(MemoryId, f32)>;
+    ) -> Result<Vec<(MemoryId, f32)>, super::errors::AppError>;
 
     /// Index a memory's embedding in the vector index.
     async fn index_memory(&self, id: MemoryId, embedding: &[f32], namespace_id: NamespaceId);
@@ -104,6 +103,12 @@ pub trait SearchPipeline: Send + Sync {
 /// Persistent storage engine (meta.db, fulltext.dat, vectors.dat, edges.db).
 #[async_trait::async_trait]
 pub trait StorageEngine: Send + Sync {
+    /// Drain in-flight create/index publication before online derived repair.
+    async fn publication_lease(
+        &self,
+    ) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, crate::storage::StorageError> {
+        Ok(None)
+    }
     /// Internal graph-effects admission, not public canonical generation/CAS.
     async fn effects_stamp(&self) -> Result<u64, StorageError> {
         Ok(0)

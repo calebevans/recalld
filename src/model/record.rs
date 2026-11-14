@@ -353,7 +353,7 @@ fn access_kind_from_u8(val: u8) -> AccessKind {
 /// - `access_history` — rarely needed for queries; loaded on demand.
 ///
 /// Estimated size per entry: ~634 bytes (see Spec 01 section 3.4).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CachedRecord {
     /// Unique identifier.
     pub id: MemoryId,
