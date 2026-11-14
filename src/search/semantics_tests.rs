@@ -944,3 +944,296 @@ async fn rebuilt_reciprocal_edge_ties_use_uuid_and_charge_each_adjacency() {
         assert_eq!(expansion.work.examined_edges, 4); // Both stored directions count.
     }
 }
+
+fn assert_score_provenance(result: &SemanticsResponse) {
+    let evidence = result.diagnostics.provenance.as_ref().unwrap();
+    assert_eq!(evidence.len(), result.response.results.len());
+    for item in &result.response.results {
+        let provenance = &evidence[&item.memory_id];
+        let reconstructed = provenance
+            .own_score
+            .unwrap_or(0.0)
+            .max(provenance.inherited_floor.unwrap_or(0.0));
+        assert!((reconstructed - provenance.final_score).abs() < 1e-6);
+        assert_eq!(Some(provenance.final_score), item.composite_score);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_capture_overlapping_sources_before_dedup_and_only_returned_ids() {
+    use crate::search::{FtsIndex, adapters::SharedFtsIndexRegistry};
+    use RetrievalChannel::*;
+    let dir = tempfile::tempdir().unwrap();
+    let index = FtsIndex::new(dir.path()).unwrap();
+    let records = (1..=3)
+        .map(|n| {
+            index.add(ns(), mid(n), "keyword", None, &[]).unwrap();
+            let mut record = rec(mid(n));
+            record.entities = vec!["Alice".into()];
+            record
+        })
+        .collect();
+    let (mut engine, _) = graph_engine(records, &[(mid(1), 0.9), (mid(2), 0.7)], &[]);
+    engine.fts_index = Arc::new(SharedFtsIndexRegistry::new(Arc::new(
+        tokio::sync::Mutex::new(index),
+    )));
+    let q = serde_json::json!({"text":"keyword", "entities":["Alice"], "limit":2});
+    let result = engine
+        .search_with_semantics(query(q.clone()), current())
+        .await
+        .unwrap();
+    let legacy = engine
+        .search_with_semantics(query(q), RetrievalSemantics::V1)
+        .await
+        .unwrap();
+    assert!(legacy.diagnostics.channels.is_none());
+    assert!(legacy.diagnostics.provenance.is_none());
+    assert_eq!(result_ids(&result.response), result_ids(&legacy.response));
+    for (a, b) in result.response.results.iter().zip(&legacy.response.results) {
+        assert_eq!(a.composite_score, b.composite_score); // Instrumentation does not tune ranking.
+    }
+    let channels = result.diagnostics.channels.as_ref().unwrap();
+    for (channel, offered) in [(Vector, 2), (Fts, 3), (Entity, 3)] {
+        assert_eq!(
+            channels[&channel].participation,
+            ChannelParticipation::Completed
+        );
+        assert_eq!(channels[&channel].offered, Some(offered));
+        assert_eq!(channels[&channel].admitted, Some(offered));
+        assert_eq!(channels[&channel].returned_own, 2);
+    }
+    for channel in [Vector, Entity] {
+        assert_eq!(channels[&channel].examined, None);
+        assert_eq!(channels[&channel].eligible, None);
+        assert_eq!(channels[&channel].exhausted, None);
+    }
+    assert_eq!(channels[&Fts].examined, Some(3));
+    assert_eq!(channels[&Fts].exhausted, Some(true));
+    assert_eq!(
+        channels[&Graph].participation,
+        ChannelParticipation::NotRequested
+    );
+    assert_eq!(channels[&Metadata].offered, None);
+    let evidence = result.diagnostics.provenance.as_ref().unwrap();
+    assert_eq!(
+        evidence.keys().copied().collect::<Vec<_>>(),
+        vec![mid(1), mid(2)]
+    );
+    assert_eq!(
+        evidence[&mid(1)].own_channels,
+        [Vector, Fts, Entity].into_iter().collect()
+    );
+    assert_eq!(evidence[&mid(1)].own_vector_score, Some(0.9));
+    assert!(evidence[&mid(1)].own_fts_score.is_some());
+    assert!(evidence[&mid(1)].inherited_channels.is_empty());
+    assert!(result.diagnostics.result_limit_applied);
+    assert_eq!(result.response.total_matches, 3);
+    assert_score_provenance(&result);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_separate_terminal_own_evidence_from_inherited_floor() {
+    use RetrievalChannel::*;
+    for own in [None, Some(0.2), Some(0.95)] {
+        let mut vectors = vec![(mid(1), 0.9)];
+        if let Some(score) = own {
+            vectors.push((mid(2), score));
+        }
+        let (engine, _) = graph_engine(
+            vec![rec(mid(1)), rec(mid(2))],
+            &vectors,
+            &[(mid(2), mid(1), EdgeType::Supersedes)],
+        );
+        for depth in [0, 1] {
+            let result = engine
+                .search_with_semantics(
+                    query(serde_json::json!({
+                        "text":"q", "graphDepth":depth
+                    })),
+                    current(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result_ids(&result.response), vec![mid(2)]);
+            let evidence = &result.diagnostics.provenance.as_ref().unwrap()[&mid(2)];
+            assert_eq!(evidence.own_vector_score, own);
+            assert_eq!(evidence.own_score.is_some(), own.is_some());
+            assert_eq!(evidence.own_channels.contains(&Vector), own.is_some());
+            assert_eq!(evidence.own_fts_score, None);
+            assert_eq!(evidence.own_graph_activation, None);
+            assert!(evidence.inherited_channels.contains(&Vector));
+            assert!((evidence.inherited_floor.unwrap() - 0.81).abs() < 1e-6);
+            assert_eq!(
+                result.diagnostics.channels.as_ref().unwrap()[&Vector].returned_inherited,
+                1
+            );
+            assert_score_provenance(&result);
+        }
+        let history = engine
+            .search_with_semantics(query(serde_json::json!({"text":"q"})), history())
+            .await
+            .unwrap();
+        for evidence in history.diagnostics.provenance.as_ref().unwrap().values() {
+            assert_eq!(evidence.inherited_floor, None);
+            assert!(evidence.inherited_channels.is_empty());
+        }
+        assert_score_provenance(&history);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_keep_graph_overlap_observational_and_graph_inheritance_distinct() {
+    use RetrievalChannel::*;
+    let (engine, _) = graph_engine(
+        vec![rec(mid(1)), rec(mid(2))],
+        &[(mid(1), 0.9), (mid(2), 0.0)],
+        &[(mid(1), mid(2), EdgeType::Associative)],
+    );
+    let result = engine
+        .search_with_semantics(
+            query(serde_json::json!({"text":"q","graphDepth":1})),
+            current(),
+        )
+        .await
+        .unwrap();
+    let evidence = &result.diagnostics.provenance.as_ref().unwrap()[&mid(2)];
+    assert_eq!(evidence.own_channels, [Vector, Graph].into_iter().collect());
+    assert!(evidence.own_graph_activation.unwrap() > 0.0);
+    assert_eq!(evidence.own_graph_depth, Some(1));
+    assert_eq!(evidence.own_score, Some(0.0)); // Graph overlap must not boost the direct candidate.
+    assert_eq!(evidence.final_score, 0.0);
+    assert_score_provenance(&result);
+    let graph = &result.diagnostics.channels.as_ref().unwrap()[&Graph];
+    assert_eq!(
+        (graph.offered, graph.admitted, graph.returned_own),
+        (Some(1), Some(1), 1)
+    );
+
+    let (engine, _) = graph_engine(
+        vec![rec(mid(1)), rec(mid(2)), rec(mid(3))],
+        &[(mid(1), 0.9)],
+        &[
+            (mid(1), mid(2), EdgeType::Associative),
+            (mid(3), mid(2), EdgeType::Supersedes),
+        ],
+    );
+    let result = engine
+        .search_with_semantics(
+            query(serde_json::json!({"text":"q","graphDepth":1})),
+            current(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result_ids(&result.response), vec![mid(1), mid(3)]);
+    let evidence = &result.diagnostics.provenance.as_ref().unwrap()[&mid(3)];
+    assert!(evidence.own_channels.is_empty());
+    assert_eq!(evidence.inherited_channels, [Graph].into_iter().collect());
+    assert_eq!(evidence.own_graph_activation, None);
+    assert_eq!(evidence.own_graph_depth, None);
+    assert_eq!(evidence.own_vector_score, None);
+    assert_eq!(result.diagnostics.graph_depths[&mid(3)], 1);
+    let graph = &result.diagnostics.channels.as_ref().unwrap()[&Graph];
+    assert_eq!(
+        (graph.admitted, graph.returned_own, graph.returned_inherited),
+        (Some(1), 0, 1)
+    );
+    assert_eq!(graph.examined, None); // Edge examinations remain in diagnostics.graph.
+    assert_eq!(graph.exhausted, None);
+    assert_score_provenance(&result);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_do_not_leak_filtered_foreign_or_unresolved_ids() {
+    let mut blocked = rec(mid(2));
+    blocked.tags = vec![Tag::new("blocked").unwrap()];
+    let mut foreign = rec(mid(3));
+    foreign.namespace_id = other_ns();
+    let (engine, _) = graph_engine(
+        vec![rec(mid(1)), blocked, foreign, rec(mid(4))],
+        &[(mid(1), 0.8), (mid(2), 0.9), (mid(3), 0.9), (mid(4), 0.9)],
+        &[(mid(2), mid(4), EdgeType::Supersedes)],
+    );
+    let result = engine
+        .search_with_semantics(
+            query(serde_json::json!({
+                "text":"q", "filter":{"excludeTags":["blocked"]}
+            })),
+            current(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result_ids(&result.response), vec![mid(1)]);
+    assert_eq!(
+        result
+            .diagnostics
+            .provenance
+            .as_ref()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![mid(1)]
+    );
+    assert_eq!(
+        result.diagnostics.unresolved[&UnresolvedReason::Ineligible],
+        1
+    );
+    let vector = &result.diagnostics.channels.as_ref().unwrap()[&RetrievalChannel::Vector];
+    assert_eq!(
+        (
+            vector.admitted,
+            vector.returned_own,
+            vector.returned_inherited
+        ),
+        (Some(2), 1, 0)
+    );
+    assert_score_provenance(&result);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_report_unknown_vector_exhaustion_and_measured_metadata_cap() {
+    use RetrievalChannel::*;
+    let records: Vec<_> = (1..=150).map(|n| rec(mid(n))).collect();
+    let vectors: Vec<_> = (1..=150).map(|n| (mid(n), 0.9)).collect();
+    let (engine, _) = graph_engine(records, &vectors, &[]);
+    let vector = engine
+        .search_with_semantics(query(serde_json::json!({"text":"q","limit":1})), current())
+        .await
+        .unwrap();
+    let count = &vector.diagnostics.channels.as_ref().unwrap()[&Vector];
+    assert_eq!(
+        (count.offered, count.admitted, count.returned_own),
+        (Some(100), Some(100), 1)
+    );
+    assert_eq!(count.examined, None);
+    assert_eq!(count.candidate_limited, None);
+    assert_eq!(count.exhausted, None); // A full heap cannot prove exhaustion.
+    let metadata = engine
+        .search_with_semantics(
+            query(serde_json::json!({
+                "queryMode":"metadata_only","filter":{"minStrength":0.0},"limit":1
+            })),
+            current(),
+        )
+        .await
+        .unwrap();
+    let channels = metadata.diagnostics.channels.as_ref().unwrap();
+    let count = &channels[&Metadata];
+    assert_eq!(
+        (count.offered, count.eligible, count.admitted),
+        (Some(150), Some(150), Some(100))
+    );
+    assert_eq!(count.examined, None); // Rejected canonical rows weren't instrumented.
+    assert_eq!(count.exhausted, Some(true));
+    assert_eq!(count.candidate_limited, Some(true));
+    assert_eq!(count.budget_exhausted, Some(false));
+    assert_eq!(count.returned_own, 1);
+    for channel in [Vector, Fts, Entity, Graph] {
+        assert_eq!(
+            channels[&channel].participation,
+            ChannelParticipation::NotRequested
+        );
+        assert_eq!(channels[&channel].offered, None);
+    }
+    assert_score_provenance(&metadata);
+}

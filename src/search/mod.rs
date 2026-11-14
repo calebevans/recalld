@@ -46,9 +46,10 @@ pub use entity_normalize::canonicalize_entity;
 // --- CS-16 re-exports ---
 pub use error::SearchError;
 pub use pipeline::{
-    AccessRecorder, EmbeddingProviderRegistry, EntityIndexReader, EntityRecallResult,
-    FtsAvailability, FtsDiagnostics, FtsIndexRegistry, FtsResult, GraphReader, MetadataStore,
-    NamespaceResolver, QueryEngine, RecordCache, RetrievalSemantics, RifProcessor, RifSuppression,
+    AccessRecorder, ChannelDiagnostics, ChannelParticipation, EmbeddingProviderRegistry,
+    EntityIndexReader, EntityRecallResult, FtsAvailability, FtsDiagnostics, FtsIndexRegistry,
+    FtsResult, GraphReader, MetadataStore, NamespaceResolver, QueryEngine, RecordCache,
+    ResultProvenance, RetrievalChannel, RetrievalSemantics, RifProcessor, RifSuppression,
     ScoredResult, SemanticsDiagnostics, SemanticsResponse, UnresolvedReason, VectorIndexRegistry,
     VersionMode, VersionStatus,
 };

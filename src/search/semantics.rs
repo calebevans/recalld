@@ -65,6 +65,10 @@ pub struct SemanticsDiagnostics {
     /// True when v2 forces RIF off; false preserves the configured legacy engine.
     pub rif_off: bool,
     pub fts: FtsDiagnostics,
+    /// V2-only observations. None means legacy instrumentation is unavailable.
+    pub channels: Option<BTreeMap<RetrievalChannel, ChannelDiagnostics>>,
+    /// Returned UUIDs only. Inherited evidence never exposes predecessor IDs.
+    pub provenance: Option<BTreeMap<MemoryId, ResultProvenance>>,
     pub supersession_edges_examined: usize,
     pub unresolved: BTreeMap<UnresolvedReason, usize>,
     pub graph: GraphWork,
@@ -80,6 +84,9 @@ impl SemanticsDiagnostics {
             semantics,
             rif_off: semantics != RetrievalSemantics::V1,
             fts: FtsDiagnostics::default(),
+            channels: (semantics != RetrievalSemantics::V1)
+                .then(super::diagnostics::empty_channels),
+            provenance: (semantics != RetrievalSemantics::V1).then(BTreeMap::new),
             supersession_edges_examined: 0,
             unresolved: BTreeMap::new(),
             graph: GraphWork::default(),
@@ -93,6 +100,7 @@ impl SemanticsDiagnostics {
         *self.unresolved.entry(reason).or_default() += 1;
     }
     pub(super) fn retain_returned(&mut self, candidates: &[Candidate]) {
+        self.observe_returned(candidates);
         let ids: HashSet<_> = candidates.iter().map(|c| c.record.id).collect();
         self.versions.retain(|id, _| ids.contains(id));
         self.graph_depths = candidates
@@ -273,6 +281,9 @@ impl QueryEngine {
                 own.effective_r = Self::compute_effective_r(&own.record);
                 own
             });
+            if candidate.record.id != id {
+                replacement.provenance.inherit(&candidate);
+            }
             replacement.composite_score =
                 replacement.composite_score.max(candidate.composite_score);
             replacement.seed_score = replacement.seed_score.max(candidate.seed_score);
@@ -316,6 +327,7 @@ impl QueryEngine {
             }
             c.seed_score = c.relevance_score.unwrap_or(c.composite_score);
             c.graph_depth = Some(0);
+            c.provenance.own_score = Some(c.composite_score);
         }
         let rank = |a: &Candidate, b: &Candidate| {
             b.composite_score
@@ -327,6 +339,11 @@ impl QueryEngine {
             candidates.sort_by(rank);
             diagnostics.metadata_candidate_limited = candidates.len() > budget;
             candidates.truncate(budget);
+            if let Some(channels) = &mut diagnostics.channels {
+                let metadata = channels.get_mut(&RetrievalChannel::Metadata).unwrap();
+                metadata.admitted = Some(candidates.len());
+                metadata.candidate_limited = Some(diagnostics.metadata_candidate_limited);
+            }
         }
         if mode == VersionMode::Current {
             self.resolve_versions2(candidates, query, namespace, mode, diagnostics)
@@ -343,10 +360,28 @@ impl QueryEngine {
                 self.graph
                     .expand_eligible(&seeds, namespace, query.graph_depth, eligible)?;
             diagnostics.graph = expansion.work;
-            let existing: HashSet<_> = candidates.iter().map(|c| c.record.id).collect();
+            let offered = expansion
+                .hits
+                .iter()
+                .map(|h| h.id)
+                .collect::<HashSet<_>>()
+                .len();
+            let existing: HashMap<_, _> = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.record.id, i))
+                .collect();
+            let mut overlapping = 0;
             let mut discovered = Vec::new();
             for hit in expansion.hits {
-                if existing.contains(&hit.id) {
+                if let Some(&index) = existing.get(&hit.id) {
+                    // Record observed overlap without changing the direct
+                    // candidate's activation/ranking fields or seed strength.
+                    let evidence = &mut candidates[index].provenance;
+                    evidence.own_channels.insert(RetrievalChannel::Graph);
+                    evidence.own_graph_activation = Some(hit.activation);
+                    evidence.own_graph_depth = Some(hit.depth);
+                    overlapping += 1;
                     continue;
                 }
                 let Some(record) = self.meta_store.get(&hit.id).await? else {
@@ -361,11 +396,30 @@ impl QueryEngine {
                 let mut c = Candidate::new(record);
                 c.activation_score = Some(hit.activation);
                 c.graph_depth = Some(hit.depth);
+                c.provenance.own_channels.insert(RetrievalChannel::Graph);
+                c.provenance.own_graph_depth = Some(hit.depth);
+                c.provenance.own_graph_activation = Some(hit.activation);
                 c.effective_r = Self::compute_effective_r(&c.record);
                 c.entity_score = crate::model::entity_overlap(&query.entities, &c.record.entities);
                 discovered.push(c);
             }
             self.apply_boosts(&mut discovered, query);
+            for candidate in &mut discovered {
+                candidate.provenance.own_score = Some(candidate.composite_score);
+            }
+            diagnostics.observe_channel(
+                RetrievalChannel::Graph,
+                offered,
+                discovered.len() + overlapping,
+            );
+            if let Some(channels) = &mut diagnostics.channels {
+                let graph = channels.get_mut(&RetrievalChannel::Graph).unwrap();
+                let limited = diagnostics.graph.state_limit || diagnostics.graph.edge_limit;
+                graph.budget_exhausted = Some(limited);
+                if limited {
+                    graph.candidate_limited = Some(true);
+                }
+            }
             candidates.extend(discovered);
             timings.graph_expansion_us = stage_start.elapsed().as_micros() as u64;
         }
