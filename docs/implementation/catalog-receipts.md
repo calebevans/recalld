@@ -1,0 +1,112 @@
+# Legacy catalog receipt participation
+
+Parent: minimal core join1ca36c4. Existing v1 engine namespace creation delegates
+through `create_namespace_with_receipt`; its public return remains the assigned
+ID. `update_namespace_policy_with_receipt` is a typed storage API, not a new
+HTTP/MCP operation. These changes do not activate ordinary schema-v2 writers,
+public CAS, profile binding, lifecycle-v2 policies or whole-store readiness.
+
+## Frozen request identity
+
+Uses existing `requestHashVersion=1` length-prefixed SHA256 with operation,
+contract version, immutable scope and expected-generation string, followed by
+one compact Serde JSON field value. The client key and store lineage select the
+receipt domain but are not additional hash fields. Expected generation remains
+part of request identity: an exact retry repeats its original precondition.
+
+- Create: operation `namespace_create_v1`, Catalog scope, JSON tuple
+  `[exactName,embeddingDim,policy]`. Namespace ID and `created_at` are excluded:
+  the ID is allocated transactionally and the timestamp is supplied by the
+  existing server caller. Replay retains the original ID and creation time.
+- Update: operation `namespace_policy_update_v1`, Namespace(ID) scope, policy
+  JSON object only. No update timestamp is sampled.
+- Policy field order: `initialStability`, `defaultDifficulty`, `phaseThresholds`
+  (ordered `fullToSummary`, `summaryToGhost`, `ghostToDelete`),
+  `permastoreThreshold`, `desiredRetention`, `decayRateMultiplier`.
+  Finite f32 values use Serde's shortest round-trippable encoding. Signed zero
+  remains distinct; no trimming or case folding changes hash input. The exact
+  create spelling is retained, with existing ASCII-insensitive name uniqueness.
+  `null` multiplier means inheritance and differs from any explicit value.
+
+Lineage is checked before replay; matching replay precedes CAS, namespace
+existence/uniqueness checks, ID allocation and filesystem side effects. Replaying
+a create after deletion returns its historical ID, not a recreated namespace.
+Changed inputs with the same key conflict. IDs from committed rows never reuse.
+
+## Transaction and file publication
+
+Name/dimension/policy/schema validation occurs at storage entry. Policy updates
+have no identity, directory, dimension, timestamp, lifecycle or profile setters.
+New ordinary rows require legacy `schema: None`; profiles and v2 policy toggles
+remain migration work. The existing fenced new-store layout is retained.
+
+Create holds metadata admission and one write transaction while it checks
+replay/CAS/capacity/uniqueness, allocates the next ID, and prepares row+receipt.
+Before commit, the engine creates a private temporary vector directory, syncs
+its file and directory, publishes it with atomic no-replace rename, then syncs
+the parent. Linux uses renameat2(RENAME_NOREPLACE); macOS uses
+renameatx_np(RENAME_EXCL), from the existing libc dependency. Unsupported
+platforms fail closed. No existing directory, file or symlink is adopted.
+The row, counter, receipt and key commit together and advance generation once.
+The prepared vector handle is then installed in memory without reopening it.
+
+Only the owned temporary directory is automatically removed on ordinary
+pre-publication failure. Once published, no compensating delete is attempted.
+An error after payload publication makes the handle unavailable; reopen
+quarantines an unreferenced namespace directory using existing orphan recovery,
+or opens the committed row and file. An uncertain metadata commit returns its
+operation ID and makes the handle unavailable; original files remain for
+reconciliation. Process exits can leave hidden owned staging directories, which
+are retained rather than broadly deleted. This is a bounded leak, not adoption
+of unknown data. Policy updates commit row+receipt together with the same
+uncertain-commit behavior and no filesystem publication.
+
+`MetadataStore::create_namespace` remains the explicit metadata-only API used by
+metadata fixtures. It shares validation/receipt allocation but cannot promise
+payload creation. Production engine and v1 adapters use the prepared-file path.
+No claim that all remaining direct record/catalog/purge writers participate.
+
+## Receipt compatibility and validation
+
+New payload-free outcomes are `NamespaceCreated {namespaceId,createdAt}` and
+`NamespacePolicyUpdated {namespaceId}`. receiptVersion stays1; old decoders
+reject unknown mandatory outcomes, and the inherited selected-text fence still
+rejects old readers/writers. Validation rejects zero IDs and invalid creation
+times. Future joins must preserve all graph/text/schema/access/feedback outcome
+variants rather than replace the match table with one branch's variants.
+
+Validation results and fault coverage are supplied with the final handoff.
+
+## Executed validation
+
+Image recalld-ci:1.94/toolchain1.94.1, network none,2CPUs,4GiB,2build jobs,
+private sequential cargo/target; synthetic stores only, no home/credentials or
+socket mounts. Final serial suite passed627library+1text-migration CLI test,
+4doctests ignored; formatting and all-target/all-feature Clippy passed with
+warnings. Eight added tests include one subprocess entry point. They cover
+keyed replay before stale CAS/filesystem preparation, input conflicts, replay
+after purge/name reuse, monotone IDs, policy atomicity/identity preservation,
+nine injected I/O/commit/publication boundaries, seven actual process exits,
+existing empty/nonempty directory preservation, invalid values/lineage,
+generation/ID exhaustion, a fixed request-hash digest and strict receipt outcomes.
+The legacy empty-name safety regression now plants its row through a raw
+synthetic transaction, because production metadata create correctly rejects it.
+
+One normal-parallel full run failed an existing graph-crash test with
+`DatabaseLocked` (626passed/1failed), after that same test had passed in the
+preceding full run. This error can originate only from stable-owner or legacy
+directory flock here, not redb; the original run did not identify which flock.
+Three isolated repeats and the serial full suite passed. One bounded ordinary-
+parallel full recheck with scratch-only test instrumentation passed627+1CLI.
+It logged the exact parent-drop, child-reaped and both reopen/drop lifetimes;
+no busy lock occurred in that graph test, so the original origin and proposed
+parallel-spawn inherited-descriptor mechanism remain unconfirmed. There is no
+production lock relaxation, retry or test-harness serialization change.
+Failure logs and diagnostic patch are preserved, not treated as resolved by
+passing reruns. macOS syscall declarations were inspected in the pinned libc
+source; runtime validation here was Linux only.
+
+Raw logs and scratch diagnostic patch:
+`/tmp/recalld-implementation/catalog-validation`. The diagnostic copy is
+`/tmp/recalld-implementation/catalog-lock-diagnostics/source`, separate from
+this implementation branch. No exhaustive crash/power-loss or readiness claim.

@@ -7,6 +7,7 @@
 //!
 //! See CS-07 for the full specification.
 
+mod catalog;
 pub(crate) mod effects;
 mod lifecycle_updates;
 pub(crate) mod removal_ledger;
@@ -1230,64 +1231,17 @@ impl MetadataStore {
     /// - `StorageError::DuplicateName` if a namespace with this name
     ///   already exists.
     pub fn create_namespace(&self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
-        self.ensure_available()?;
-        let _publication = self.mutation_guard()?;
-        let write_txn = self.db.begin_write()?;
-        let new_id;
-        {
-            // Check name uniqueness by scanning existing namespaces.
-            //
-            // Case-INSENSITIVELY, because the name becomes a directory
-            // name and macOS APFS, Windows NTFS and a case-insensitive
-            // ext4 volume all give "notes" and "Notes" the SAME
-            // directory. Two rows sharing one directory is not a
-            // cosmetic collision:
-            //
-            // - delete "notes" (row gone, remove_dir_all fails, warn
-            //   only), create "Notes", and the new namespace adopts the
-            //   old one's `vectors.dat` — somebody else's embeddings.
-            // - `create_namespace("Default")` used to pass the
-            //   uniqueness check, commit its row, no-op `create_dir_all`
-            //   onto `default/` and only then fail on the exclusive
-            //   flock. The row survived, and `delete_namespace("Default")`
-            //   walked past the `!= "default"` guard and unlinked the
-            //   real default's vectors.
-            //
-            // `validate_namespace_name` restricts names to ASCII, so
-            // ASCII case folding is total here.
-            let ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
-            for result in ns_table.iter()? {
-                let (_, value) = result?;
-                let existing: NamespaceConfig = serde_json::from_slice(value.value())
-                    .map_err(|e| StorageError::Deserialize(e.to_string()))?;
-                if existing.name.eq_ignore_ascii_case(&config.name) {
-                    return Err(StorageError::DuplicateName(config.name.clone()));
-                }
-            }
-            drop(ns_table);
-
-            // Assign next ID.
-            let mut counter_table = write_txn.open_table(NAMESPACE_COUNTER)?;
-            let current_max = counter_table.get("max_id")?.map(|v| v.value()).unwrap_or(0);
-            new_id = current_max
-                .checked_add(1)
-                .ok_or_else(|| StorageError::InvalidControl("namespace ID exhausted".into()))?;
-            counter_table.insert("max_id", new_id)?;
-            drop(counter_table);
-
-            // Write the namespace config with the assigned ID.
-            let mut stored_config = config.clone();
-            stored_config.id = NamespaceId::new(new_id);
-            let bytes = serde_json::to_vec(&stored_config)
-                .map_err(|e| StorageError::Serialize(e.to_string()))?;
-
-            let mut ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
-            ns_table.insert(new_id, bytes.as_slice())?;
+        let ctx = MutationContext {
+            scope: MutationScope::Catalog,
+            ..MutationContext::unkeyed(NamespaceId::new(1))
+        };
+        let receipt = self.create_catalog(&ctx, config, |_| Ok(()))?;
+        match receipt.outcome {
+            MutationOutcome::NamespaceCreated { namespace_id, .. } => Ok(namespace_id),
+            _ => Err(StorageError::InvalidControl(
+                "create receipt outcome mismatch".into(),
+            )),
         }
-        control::advance_generation(&write_txn)?;
-        self.commit(write_txn)?;
-
-        Ok(NamespaceId::new(new_id))
     }
 
     /// List all namespace configurations.
