@@ -129,3 +129,7 @@ startup rejection, and process exit immediately after committed exposure or
 feedback followed by reopen and replay after purge. The process-exit tests are
 not power-loss evidence. No fault-injected uncertain-I/O commit claim is made.
 Logs remain untracked in `.validation/tests.log` and `.validation/clippy.log`.
+
+Validated source commit: `5a72eb3a5b06f8a8cc9d1ca1f0641ab909a11328`.
+The final validation annotation is documentation-only; no Rust source changed
+between the successful checks and this commit.
