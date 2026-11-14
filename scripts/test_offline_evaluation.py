@@ -76,6 +76,12 @@ class SourceSnapshotTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             runner["snapshot_source"](self.root, self.output)
 
+    def test_symlink_parent_even_inside_checkout_fails_closed(self):
+        (self.root / "src").rename(self.root / "elsewhere")
+        (self.root / "src").symlink_to(self.root / "elsewhere", target_is_directory=True)
+        with self.assertRaises(RuntimeError):
+            runner["snapshot_source"](self.root, self.output)
+
 
 if __name__ == "__main__":
     unittest.main()

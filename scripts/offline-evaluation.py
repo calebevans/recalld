@@ -61,7 +61,10 @@ def snapshot_source(root, destination):
     hashes = {}
     for name in sorted(names):
         source = root / name
-        if source.is_symlink() or not source.is_file() or not source.resolve().is_relative_to(root.resolve()):
+        relative = Path(name)
+        if (not source.is_file() or not source.resolve().is_relative_to(root.resolve())
+                or any((root / Path(*relative.parts[:i])).is_symlink()
+                       for i in range(1, len(relative.parts) + 1))):
             raise RuntimeError(f"missing, nonregular or escaping source input: {name}")
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)

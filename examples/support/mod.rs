@@ -66,7 +66,7 @@ mod tests {
     use super::*;
     use recalld::{model::NamespaceConfig, storage::StorageEngine};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canonical_seed_rejects_bad_input_and_startup_makes_it_queryable() {
         let root = tempfile::tempdir().unwrap();
         let mut storage = RedbStorageEngine::open(root.path()).unwrap();
