@@ -157,12 +157,25 @@ fn read_manifest(backup_path: &Path) -> Result<BackupManifest, RestoreError> {
     let mut archive = ZipArchive::new(file)?;
 
     // Find manifest file.
-    let mut manifest_file = archive
+    let manifest_file = archive
         .by_name("backup_manifest.json")
         .map_err(|_| RestoreError::InvalidArchive("missing backup_manifest.json".to_string()))?;
 
+    let limit = super::manifest::MAX_MANIFEST_BYTES;
+    if manifest_file.size() > limit {
+        return Err(RestoreError::ManifestError(
+            "manifest exceeds 16 MiB limit".into(),
+        ));
+    }
     let mut contents = String::new();
-    manifest_file.read_to_string(&mut contents)?;
+    manifest_file
+        .take(limit + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > limit {
+        return Err(RestoreError::ManifestError(
+            "manifest exceeds 16 MiB limit".into(),
+        ));
+    }
 
     serde_json::from_str(&contents).map_err(|e| RestoreError::ManifestError(e.to_string()))
 }
@@ -389,6 +402,7 @@ fn extract_backup(
     {
         return Err(invalid("manifest contains a noncanonical namespace file"));
     }
+    super::schema_manifest::validate_manifest_snapshot(data_dir, manifest)?;
     Ok(())
 }
 
@@ -441,6 +455,24 @@ mod tests {
         let files = canonical_files(&source).unwrap();
         let manifest = generate_manifest(&source, &files).unwrap();
         (source, manifest)
+    }
+
+    // Deliberately bypass production generation for semantically corrupt but
+    // checksum-consistent archives. Production generation now rejects these.
+    fn checksum_valid_manifest(source: &Path, mut manifest: BackupManifest) -> BackupManifest {
+        manifest.total_size_bytes = 0;
+        for entry in &mut manifest.files {
+            let bytes = fs::read(source.join(&entry.name)).unwrap();
+            entry.size_bytes = bytes.len() as u64;
+            entry.crc32 = crc32fast::hash(&bytes);
+            if entry.sha256.is_some() {
+                entry.sha256 = Some(
+                    super::super::schema_manifest::sha256_file(&source.join(&entry.name)).unwrap(),
+                );
+            }
+            manifest.total_size_bytes += entry.size_bytes;
+        }
+        manifest
     }
 
     fn archive(root: &Path, source: &Path, manifest: &BackupManifest) -> PathBuf {
@@ -508,12 +540,7 @@ mod tests {
         assert!(RedbStorageEngine::open(&source).is_err());
         assert_eq!(fs::read(source.join("meta.db")).unwrap(), metadata_before);
         // Recompute every manifest checksum/size: rejection must be semantic.
-        let files: Vec<_> = manifest
-            .files
-            .iter()
-            .map(|f| source.join(&f.name))
-            .collect();
-        let forged_manifest = generate_manifest(&source, &files).unwrap();
+        let forged_manifest = checksum_valid_manifest(&source, manifest);
         let archive = archive(root.path(), &source, &forged_manifest);
         let target = root.path().join("target");
         fs::create_dir(&target).unwrap();
@@ -770,12 +797,7 @@ mod tests {
             assert!(canonical_files(&source).is_err());
             assert_eq!(fs::read(source.join("meta.db")).unwrap(), source_before);
             // Use a checksum-valid archive to isolate semantic validation.
-            let files: Vec<_> = manifest
-                .files
-                .iter()
-                .map(|f| source.join(&f.name))
-                .collect();
-            let manifest = generate_manifest(&source, &files).unwrap();
+            let manifest = checksum_valid_manifest(&source, manifest);
             let archive = archive(root.path(), &source, &manifest);
             let target = root.path().join("target");
             fs::create_dir(&target).unwrap();
