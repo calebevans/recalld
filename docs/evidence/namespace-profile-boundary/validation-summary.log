@@ -1,0 +1,36 @@
+focused.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 46.72s
+test api::handlers::validation_tests::namespace_profile_invalid_runtime_is_unavailable_without_catalog_mutation ... ok
+test api::handlers::validation_tests::namespace_profile_http_mcp_use_active_width_before_catalog_allocation ... ok
+test daemon::server::tests::namespace_profile_real_daemon_frames_enforce_active_width_before_catalog ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 684 filtered out; finished in 0.58s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+full-initial.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.76s
+test api::handlers::validation_tests::namespace_profile_http_mcp_use_active_width_before_catalog_allocation ... ok
+test api::handlers::validation_tests::namespace_profile_invalid_runtime_is_unavailable_without_catalog_mutation ... ok
+test daemon::server::tests::namespace_profile_real_daemon_frames_enforce_active_width_before_catalog ... ok
+test result: FAILED. 685 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 85.51s
+
+full-final.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.01s
+test api::handlers::validation_tests::namespace_profile_http_mcp_use_active_width_before_catalog_allocation ... ok
+test api::handlers::validation_tests::namespace_profile_invalid_runtime_is_unavailable_without_catalog_mutation ... ok
+test daemon::server::tests::namespace_profile_real_daemon_frames_enforce_active_width_before_catalog ... ok
+test result: ok. 687 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 83.40s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+fmt.log
+
+clippy.log
+warning: `recalld` (lib) generated 387 warnings (run `cargo clippy --fix --lib -p recalld` to apply 89 suggestions)
+warning: `recalld` (lib test) generated 407 warnings (387 duplicates) (run `cargo clippy --fix --lib -p recalld --tests` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.94s

@@ -1,0 +1,27 @@
+{
+  "focused.log": {
+    "path": "/tmp/recalld-namespace-profile-focused.log",
+    "bytes": 3025,
+    "sha256": "b47fb3a690d8e12e489fdead1cc6eab3a0f63c4f14ac7c766c2dc929b30c3956"
+  },
+  "full-initial.log": {
+    "path": "/tmp/recalld-namespace-profile-validation/full-initial.log",
+    "bytes": 63813,
+    "sha256": "1daa789eb25151c80218b46feead3b187c65759c035c5014be97cbf0034cae38"
+  },
+  "full-final.log": {
+    "path": "/tmp/recalld-namespace-profile-validation/full-final.log",
+    "bytes": 63928,
+    "sha256": "2981a9891f75a9f468c64356133a3925d57d71d20baec65987aa2d06a372c730"
+  },
+  "fmt.log": {
+    "path": "/tmp/recalld-namespace-profile-validation/fmt.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "clippy.log": {
+    "path": "/tmp/recalld-namespace-profile-validation/clippy.log",
+    "bytes": 341915,
+    "sha256": "207f9504cf6017f5df99ef769da3521588c1922daaab209a27acde9b8bf50c03"
+  }
+}

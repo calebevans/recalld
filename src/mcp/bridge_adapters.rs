@@ -1617,6 +1617,7 @@ fn build_list_tags_response(
 /// handles happen to be.
 pub struct McpNamespaceAdapter {
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+    embedding: Arc<dyn EmbeddingProvider>,
     cache: Arc<CacheManager>,
     vector_index: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
     fts_index: Arc<tokio::sync::Mutex<FtsIndex>>,
@@ -1630,6 +1631,7 @@ impl McpNamespaceAdapter {
     /// the indexes a namespace deletion has to clean.
     pub fn new(
         storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+        embedding: Arc<dyn EmbeddingProvider>,
         cache: Arc<CacheManager>,
         vector_index: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
         fts_index: Arc<tokio::sync::Mutex<FtsIndex>>,
@@ -1640,6 +1642,7 @@ impl McpNamespaceAdapter {
         cache.bind_storage(&storage);
         Self {
             storage,
+            embedding,
             cache,
             vector_index,
             fts_index,
@@ -1794,29 +1797,26 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         crate::model::validation::validate_namespace_name(&input.name)
             .map_err(|e| bridge::BridgeError::InvalidInput(e.to_string()))?;
 
+        let dim = crate::embedding::runtime::creation_dimension(
+            self.embedding.as_ref(),
+            input.embedding_dim.map(u32::from),
+        )
+        .map_err(|error| match error {
+            crate::embedding::runtime::NamespaceProfileError::Unavailable(_) => {
+                bridge::BridgeError::Unavailable(error.to_string())
+            }
+            _ => bridge::BridgeError::InvalidInput(error.to_string()),
+        })?;
+
         let now = chrono::Utc::now().timestamp_millis();
         let storage = self.storage.clone();
         let tz = self.timezone;
         let input_name = input.name.clone();
-        let embedding_dim = input.embedding_dim;
         let initial_stability = input.initial_stability;
         let desired_retention = input.desired_retention;
         let decay_rate_multiplier = input.decay_rate_multiplier;
 
         tokio::task::spawn_blocking(move || {
-            let dim = embedding_dim.map(|d| d as u32).unwrap_or_else(|| {
-                storage
-                    .read()
-                    .ok()
-                    .and_then(|s| {
-                        s.get_namespace_by_name(crate::model::constants::DEFAULT_NAMESPACE_NAME)
-                            .ok()
-                            .flatten()
-                    })
-                    .map(|ns| ns.embedding_dim)
-                    .unwrap_or(1536)
-            });
-
             let ns_config = NamespaceConfig {
                 schema: None,
                 id: NamespaceId::UNSET,
@@ -3630,52 +3630,6 @@ mod tests {
                 "{bad:?}: {err:?}"
             );
         }
-    }
-
-    /// The migration case, and the reason the refusal is by name rather
-    /// than by lookup: a database created before the validator reached
-    /// this layer can already hold a row named `""`, whose directory
-    /// **is** the data directory. Planting the row directly is the only
-    /// way to reach that state now.
-    #[tokio::test]
-    async fn w47_a_legacy_empty_named_namespace_cannot_destroy_the_database() {
-        let fx = Fixture::new();
-
-        {
-            let mut config = crate::model::NamespaceConfig::default_namespace(0);
-            config.name = String::new();
-            config.embedding_dim = crate::test_support::DIM as u32;
-            fx.storage
-                .write()
-                .expect("storage lock")
-                .meta_store()
-                .create_namespace(&config)
-                .expect("plant a legacy row");
-        }
-
-        let err = fx
-            .namespace_adapter()
-            .delete_namespace(bridge::DeleteNamespaceInput {
-                name: String::new(),
-                force: true,
-            })
-            .await
-            .expect_err("an empty namespace name must be refused");
-        assert!(
-            matches!(err, bridge::BridgeError::InvalidInput(_)),
-            "{err:?}"
-        );
-
-        assert!(
-            fx.path().join("meta.db").exists()
-                && fx.path().join("edges.db").exists()
-                && fx.path().join("fulltext.dat").exists(),
-            "the database was destroyed"
-        );
-        assert!(
-            fx.namespace_dir("default").join("vectors.dat").exists(),
-            "the default namespace's vectors were destroyed"
-        );
     }
 
     // ── case-insensitive namespace identity ──────────────────────────

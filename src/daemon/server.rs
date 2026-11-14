@@ -59,6 +59,7 @@ impl DaemonServer {
         );
         let namespaces: Arc<dyn NamespaceRegistry> = Arc::new(McpNamespaceAdapter::new(
             system.storage().clone(),
+            system.embedding().clone(),
             system.cache().clone(),
             system.vector_index().clone(),
             system.fts_index().clone(),
@@ -713,6 +714,107 @@ mod tests {
             id,
             method: "ping".into(),
             params: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_profile_real_daemon_frames_enforce_active_width_before_catalog() {
+        use crate::storage::StorageEngine as _;
+        let f = crate::test_support::Fixture::new();
+        for dimension in [8, 0] {
+            let namespace = crate::mcp::bridge_adapters::McpNamespaceAdapter::new(
+                f.storage.clone(),
+                Arc::new(crate::embedding::PassthroughProvider::new(dimension)),
+                f.cache.clone(),
+                f.vector_index.clone(),
+                f.fts_index.clone(),
+                f.entity_index.clone(),
+                f.graph.clone(),
+                chrono_tz::UTC,
+            );
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let (tx, rx) = watch::channel(false);
+            let task = tokio::spawn(handle_connection(
+                Arc::new(Unused),
+                Arc::new(Unused),
+                Arc::new(namespace),
+                Arc::new(Unused),
+                server,
+                Arc::new(AtomicU32::new(1)),
+                Arc::new(AtomicI64::new(lifecycle::now_millis())),
+                rx,
+                tx,
+            ));
+            let (reader, mut writer) = client.into_split();
+            let mut reader = BufReader::new(reader);
+            let before = std::fs::read(f.path().join("meta.db")).unwrap();
+            let generation = f
+                .storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation;
+            let request = DaemonRequest {
+                jsonrpc: "2.0".into(),
+                id: 1,
+                method: "create_namespace".into(),
+                params: serde_json::json!({"name":"daemon-rejected", "embeddingDim":4}),
+            };
+            write_framed_request(&mut writer, &request, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap();
+            let response = read_framed_response(&mut reader, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.error.unwrap().code,
+                if dimension == 0 {
+                    ERR_UNAVAILABLE
+                } else {
+                    ERR_INVALID_INPUT
+                }
+            );
+            assert_eq!(std::fs::read(f.path().join("meta.db")).unwrap(), before);
+            assert_eq!(
+                f.storage
+                    .read()
+                    .unwrap()
+                    .control_state()
+                    .unwrap()
+                    .committed_generation,
+                generation
+            );
+            assert!(!f.path().join("daemon-rejected").exists());
+            if dimension == 8 {
+                let request = DaemonRequest {
+                    id: 2,
+                    params: serde_json::json!({"name":"daemon-active"}),
+                    ..request
+                };
+                write_framed_request(&mut writer, &request, MAX_MESSAGE_SIZE)
+                    .await
+                    .unwrap();
+                let response = read_framed_response(&mut reader, MAX_MESSAGE_SIZE)
+                    .await
+                    .unwrap();
+                assert!(response.error.is_none(), "{response:?}");
+                assert_eq!(response.result.unwrap()["embeddingDim"], 8);
+                let storage = f.storage.read().unwrap();
+                let ns = storage
+                    .get_namespace_by_name("daemon-active")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(ns.embedding_dim, 8);
+                assert!(ns.schema.is_none());
+                assert_eq!(
+                    storage.control_state().unwrap().committed_generation.get(),
+                    generation.get() + 1
+                );
+            }
+            drop(writer);
+            drop(reader);
+            task.await.unwrap();
         }
     }
 

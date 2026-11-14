@@ -573,26 +573,21 @@ fn insertion_rejects_schema_policy_and_invalid_receipt_numerics() {
         };
         assert!(control::validate_receipt(&control::encode(&stored).unwrap()).is_err());
     }
-    // The legacy creation primitive can construct a synthetic schema-bearing
-    // namespace; the actual insertion writer must independently fail closed.
+    // Catalog admission now rejects schema-bearing legacy creation before any
+    // payload preparation. The metadata test independently probes insertion.
     let mut config = crate::model::NamespaceConfig::default_namespace(0);
     config.name = "schema".into();
     config.embedding_dim = DIM as u32;
     config.schema = Some(crate::model::schema::NamespaceSchemaV2::from_legacy());
-    let ns = engine.create_namespace(&config).unwrap();
     let before = generation(&engine);
     let text = std::fs::read(engine.text_store.path()).unwrap();
-    let vectors = std::fs::read(engine.db_path.join("schema/vectors.dat")).unwrap();
     assert!(matches!(
-        engine.insert_memory_with_receipt(&MutationContext::unkeyed(ns), &request(), &[], 123),
-        Err(StorageError::RecoveryRequired(_))
+        engine.create_namespace(&config),
+        Err(StorageError::InvalidMutation(_))
     ));
     assert_eq!(generation(&engine), before);
     assert_eq!(std::fs::read(engine.text_store.path()).unwrap(), text);
-    assert_eq!(
-        std::fs::read(engine.db_path.join("schema/vectors.dat")).unwrap(),
-        vectors
-    );
+    assert!(!engine.db_path.join("schema").exists());
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@
 //!
 //! See Spec 04 Section 7 for the design rationale.
 
+mod catalog;
 mod effects;
 mod insertion;
 mod text_compaction;
@@ -1485,48 +1486,21 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Namespaces ──────────────────────────────────────────────────
 
-    /// # The row must never outlive the directory
-    ///
-    /// This used to commit the `NAMESPACE_TABLE` row and only then ask
-    /// `open_or_create` whether the name could be a directory. A
-    /// rejected name therefore left a committed row for a namespace
-    /// whose directory can never be created — and [`Self::open`] step 6
-    /// calls `open_or_create` for **every** row and `?`-propagates, so
-    /// the next boot failed outright. One rejected `create_namespace`
-    /// call wedged the database.
-    ///
-    /// So: validate first, and roll the row back if the vector store
-    /// still refuses. Validation cannot see a directory already flocked
-    /// by another store or a full disk, and both wedge the boot in
-    /// exactly the same way.
+    /// Publish durable namespace vectors before committing its row and receipt.
+    /// The v1 wrapper retains its assigned-ID return shape.
     fn create_namespace(&mut self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
-        self.ensure_available()?;
-        validate_namespace_name(&config.name).map_err(|e| StorageError::InvalidNamespaceName {
-            name: config.name.clone(),
-            reason: e.to_string(),
-        })?;
-
-        let ns_id = self.meta_store.create_namespace(config)?;
-
-        // Open/create the vector file for this namespace.
-        if let Err(e) =
-            self.vector_manager
-                .open_or_create(ns_id, &config.name, config.embedding_dim as usize)
-        {
-            if let Err(rollback) = self.meta_store.delete_namespace(ns_id) {
-                tracing::error!(
-                    namespace = %config.name,
-                    namespace_id = ns_id.get(),
-                    error = %rollback,
-                    "Could not roll back the namespace row after its vector store failed \
-                     to open. The next startup will fail to open this namespace; remove \
-                     the row by hand."
-                );
+        let ctx = MutationContext {
+            scope: MutationScope::Catalog,
+            ..MutationContext::unkeyed(NamespaceId::new(1))
+        };
+        match self.create_namespace_with_receipt(&ctx, config)?.outcome {
+            crate::storage::control::MutationOutcome::NamespaceCreated { namespace_id, .. } => {
+                Ok(namespace_id)
             }
-            return Err(e.into());
+            _ => Err(StorageError::InvalidControl(
+                "create receipt outcome mismatch".into(),
+            )),
         }
-
-        Ok(ns_id)
     }
 
     fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError> {

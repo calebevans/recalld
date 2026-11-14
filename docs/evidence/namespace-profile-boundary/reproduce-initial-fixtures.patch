@@ -1,0 +1,62 @@
+--- a/src/storage/engine/insertion_tests.rs
++++ b/src/storage/engine/insertion_tests.rs
+@@ -573,21 +573,26 @@
+         };
+         assert!(control::validate_receipt(&control::encode(&stored).unwrap()).is_err());
+     }
+-    // Catalog admission now rejects schema-bearing legacy creation before any
+-    // payload preparation. The metadata test independently probes insertion.
++    // The legacy creation primitive can construct a synthetic schema-bearing
++    // namespace; the actual insertion writer must independently fail closed.
+     let mut config = crate::model::NamespaceConfig::default_namespace(0);
+     config.name = "schema".into();
+     config.embedding_dim = DIM as u32;
+     config.schema = Some(crate::model::schema::NamespaceSchemaV2::from_legacy());
++    let ns = engine.create_namespace(&config).unwrap();
+     let before = generation(&engine);
+     let text = std::fs::read(engine.text_store.path()).unwrap();
+-    assert!(matches!(
+-        engine.create_namespace(&config),
+-        Err(StorageError::InvalidMutation(_))
++    let vectors = std::fs::read(engine.db_path.join("schema/vectors.dat")).unwrap();
++    assert!(matches!(
++        engine.insert_memory_with_receipt(&MutationContext::unkeyed(ns), &request(), &[], 123),
++        Err(StorageError::RecoveryRequired(_))
+     ));
+     assert_eq!(generation(&engine), before);
+     assert_eq!(std::fs::read(engine.text_store.path()).unwrap(), text);
+-    assert!(!engine.db_path.join("schema").exists());
++    assert_eq!(
++        std::fs::read(engine.db_path.join("schema/vectors.dat")).unwrap(),
++        vectors
++    );
+ }
+ 
+ #[tokio::test]
+--- a/src/mcp/tools.rs
++++ b/src/mcp/tools.rs
+@@ -2557,23 +2557,7 @@
+         use crate::storage::StorageEngine as _;
+         let fixture = crate::test_support::Fixture::new();
+         let mut bridge = crate::test_support::StubBridge::default().into_bridge();
+-        // Positive range controls require an actually matching active provider.
+-        let dimension = if reject {
+-            crate::test_support::DIM
+-        } else {
+-            value.as_u64().unwrap() as usize
+-        };
+-        bridge.namespaces =
+-            std::sync::Arc::new(crate::mcp::bridge_adapters::McpNamespaceAdapter::new(
+-                fixture.storage.clone(),
+-                std::sync::Arc::new(crate::embedding::PassthroughProvider::new(dimension)),
+-                fixture.cache.clone(),
+-                fixture.vector_index.clone(),
+-                fixture.fts_index.clone(),
+-                fixture.entity_index.clone(),
+-                fixture.graph.clone(),
+-                chrono_tz::UTC,
+-            ));
++        bridge.namespaces = std::sync::Arc::new(fixture.namespace_adapter());
+         let result = dispatch_tool(
+             &bridge,
+             "create_namespace",
