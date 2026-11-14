@@ -373,7 +373,7 @@ pub async fn perform_autolink(
 /// Edge weight = Jaccard similarity (shared_count / union_count).
 pub async fn perform_entity_link(
     new_memory_id: MemoryId,
-    _namespace_id: NamespaceId,
+    namespace_id: NamespaceId,
     entities: &[String],
     max_entity_links: usize,
     entity_index: &tokio::sync::RwLock<EntityIndex>,
@@ -387,7 +387,7 @@ pub async fn perform_entity_link(
 
     let candidates = {
         let idx = entity_index.read().await;
-        idx.find_by_entities(entities, new_memory_id)
+        idx.find_by_entities(namespace_id, entities, new_memory_id)
     };
 
     if candidates.is_empty() {
