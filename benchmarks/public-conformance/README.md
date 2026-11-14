@@ -22,9 +22,36 @@ python3 scripts/public-conformance.py \
   --build-cache /path/to/isolated/target
 ```
 
-The supervisor copies only tracked `src/**/*.rs` and six explicit Cargo/harness/
-fixture/recipe inputs. It excludes unknown untracked files, secrets, local Cargo
-config and build scratch. Missing or symlink inputs fail closed. Every copied
+The supervisor copies tracked Rust files under Cargo source/test/example/bench
+roots, declared custom targets and build scripts, the three fixed Cargo inputs,
+and this checkout's four fixed harness inputs. `--source-root` selects a separate
+runtime checkout and requires `--source-commit`; the harness/fixture/recipe/tests
+still come from this checkout. Each manifest records both commits and every
+file's origin and hash. Existing evidence remains pinned to its original source.
+
+```sh
+python3 scripts/public-conformance.py \
+  --source-root /tmp/recalld-implementation/integration \
+  --source-commit FULL_STABLE_COMMIT \
+  --source-input tests/fixtures/required-asset.json \
+  --cache /path/to/isolated/cargo --build-cache /path/to/isolated/target
+```
+
+The asset flag is optional and repeatable; list only files the selected runtime
+actually needs. Inputs must be exact tracked repository-relative regular files.
+Unknown untracked files, secrets, local Cargo config and build scratch are not
+enumerated into the snapshot. Symlink paths, missing declared targets and dirty
+or moving frozen runtime inputs fail. Non-Rust files under selected target roots
+require explicit `--source-input` entries. Five named legacy LoCoMo JSON inputs
+are excluded with recorded reasons; that external-data track is not invoked.
+Literal Rust includes must resolve to declared inputs. Cargo metadata, fmt,
+tests and all-target Clippy run against the snapshot; computed includes,
+build-script reads and arbitrary runtime I/O cannot be statically inferred, so
+supply their assets explicitly and retain resulting build/test failures.
+Workspaces/local path dependencies currently fail with an explicit unsupported
+error. The runner never copies an entire checkout as fallback.
+
+Every copied
 file is hashed, including new harness files absent from the Git diff. Cargo and
 target are copied into separate scratch directories. Builds/tests/episodes run
 with `--network none`, 2 CPUs, 4 GiB, two build jobs, Rust 1.94.1, read-only root,
@@ -86,3 +113,6 @@ and batch reads, supersession fixtures, strict-validation repair, real semantic
 datasets and grouped statistical evaluation. The parent retains the known HTTP
 vector-only/similarity EmptyQuery limitation; successful HTTP similarity needs a
 subsequent combined parent with the independent vector fix. No full A6 completion.
+
+See [handoff and frozen-state controls plan](HANDOFF.md) for the combined-runtime
+rerun sequence and the boundary between this diagnostic and future A6 controls.

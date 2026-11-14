@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import http.server
 import json
+import re
 from pathlib import Path
 import select
 import shutil
@@ -13,13 +14,17 @@ import subprocess
 import tempfile
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = 'benchmarks/public-conformance/fixture.json'
-FIXED = ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', FIXTURE,
-         'scripts/public-conformance.py', 'scripts/public-conformance.Dockerfile']
+HARNESS_INPUTS = [FIXTURE, 'scripts/public-conformance.py',
+                  'scripts/public-conformance.Dockerfile', 'scripts/test_public_conformance.py']
+CARGO_INPUTS = ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml']
+LEGACY_DATA = {f'src/bench/data/{name}.json' for name in
+               ['locomo1', 'locomo10', 'locomo_conv30', 'locomo_conv41', 'locomo_first']}
 PROTOCOL = '2025-06-18'
 
 
@@ -41,6 +46,117 @@ def coverage(ids, mappings, labels):
     return len(found & set(labels)) / len(labels) if labels else None
 
 
+def git(root, *args):
+    return subprocess.check_output(['git', *args], cwd=root)
+
+
+def checked_file(root, name):
+    relative = Path(name)
+    if relative.is_absolute() or '..' in relative.parts or str(relative) != name:
+        raise RuntimeError(f'input must be a normalized repository-relative file: {name}')
+    path = root / name
+    if not path.is_file() or any((root / Path(*relative.parts[:i])).is_symlink()
+                                for i in range(1, len(relative.parts) + 1)):
+        raise RuntimeError(f'missing/nonregular input: {name}')
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise RuntimeError(f'input escapes source root: {name}')
+    return path
+
+
+def snapshot(source_root, destination, extra=(), expected_commit=None):
+    """Single-package tracked source, explicit assets, separately owned harness overlay."""
+    source_root = source_root.resolve()
+    top = Path(git(source_root, 'rev-parse', '--show-toplevel').decode().strip()).resolve()
+    if source_root != top:
+        raise RuntimeError('--source-root must be a Git checkout root')
+    commit = git(source_root, 'rev-parse', 'HEAD').decode().strip()
+    if expected_commit and git(source_root, 'rev-parse', '--verify', expected_commit + '^{commit}').decode().strip() != commit:
+        raise RuntimeError('source HEAD differs from --source-commit')
+    tracked = {n.decode() for n in git(source_root, 'ls-files', '-z').split(b'\0') if n}
+    cargo = tomllib.loads(checked_file(source_root, 'Cargo.toml').read_text())
+    if 'workspace' in cargo or 'package' not in cargo:
+        raise RuntimeError('workspace snapshots require an explicit future policy')
+    def contains_path(value):
+        return isinstance(value, dict) and ('path' in value or any(contains_path(v) for v in value.values()))
+    def check_dependencies(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in ('dependencies', 'dev-dependencies', 'build-dependencies', 'patch', 'replace') and contains_path(child):
+                    raise RuntimeError('local path dependencies require an explicit future policy')
+                check_dependencies(child)
+    check_dependencies(cargo)
+    roots = {'src', 'tests', 'examples', 'benches'}
+    names = set(CARGO_INPUTS) | set(extra)
+    for kind in ('lib', 'bin', 'example', 'test', 'bench'):
+        targets = [cargo[kind]] if kind == 'lib' and kind in cargo else cargo.get(kind, [])
+        for target in targets:
+            path = target.get('path')
+            if path:
+                checked_file(source_root, path)
+                names.add(path)
+                # Custom targets can have sibling Rust modules/assets.
+                parent = Path(path).parent
+                if parent != Path('.'):
+                    roots.add(str(parent))
+    build = cargo['package'].get('build', 'build.rs' if 'build.rs' in tracked else False)
+    if build:
+        names.add(build)
+        if Path(build).parent != Path('.'):
+            roots.add(str(Path(build).parent))
+    excluded = {}
+    for name in tracked:
+        if any(name.startswith(root + '/') for root in roots):
+            if name.endswith('.rs'):
+                names.add(name)
+            elif name in LEGACY_DATA and name not in extra:
+                excluded[name] = 'legacy external dataset; not invoked by this synthetic track'
+            elif name not in extra:
+                raise RuntimeError(f'undeclared target asset; add --source-input {name}')
+    for name in names:
+        if name not in tracked:
+            raise RuntimeError(f'required runtime input is not tracked: {name}')
+        if name in HARNESS_INPUTS:
+            raise RuntimeError(f'runtime input collides with harness overlay: {name}')
+        checked_file(source_root, name)
+    # Literal compile-time includes must be explicit, even in excluded data roots.
+    # Computed include expressions/build-script inputs remain compiler checks;
+    # no static scanner claims to infer arbitrary runtime I/O.
+    for name in sorted(names):
+        if name.endswith('.rs'):
+            code = (source_root / name).read_text()
+            for relative in re.findall(r'include(?:_str|_bytes)?!\s*\(\s*"([^"\n]+)"', code):
+                included = (source_root / name).parent / relative
+                try:
+                    required = str(included.resolve().relative_to(source_root))
+                except ValueError:
+                    raise RuntimeError(f'include escapes source root: {name}: {relative}')
+                if required not in names:
+                    raise RuntimeError(f'undeclared include; add --source-input {required}')
+    patch = git(source_root, 'diff', 'HEAD', '--', *sorted(names))
+    if expected_commit and patch:
+        raise RuntimeError('frozen runtime inputs have tracked modifications')
+    destination.mkdir(parents=True, exist_ok=False)
+    hashes, origins, modes = {}, {}, {}
+    for name in sorted(names | set(HARNESS_INPUTS)):
+        origin = ROOT if name in HARNESS_INPUTS else source_root
+        content = checked_file(origin, name).read_bytes()
+        if expected_commit and name in names and content != git(source_root, 'show', f'{commit}:{name}'):
+            raise RuntimeError(f'frozen runtime file differs from commit: {name}')
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(checked_file(origin, name).stat().st_mode & 0o777)
+        modes[name] = oct(target.stat().st_mode & 0o777)
+        hashes[name] = sha(target)
+        origins[name] = 'harness' if name in HARNESS_INPUTS else 'runtime'
+    if git(source_root, 'rev-parse', 'HEAD').decode().strip() != commit or git(source_root, 'diff', 'HEAD', '--', *sorted(names)) != patch:
+        raise RuntimeError('runtime changed during source snapshot')
+    return {'sourceCommit': commit, 'sourceRoot': str(source_root), 'sourceFilesSha256': hashes,
+            'sourceFileOrigins': origins, 'sourceFileModes': modes, 'excludedTrackedInputs': excluded,
+            'explicitSourceInputs': sorted(extra), 'frozenSourceCommitRequired': bool(expected_commit),
+            'harnessCommit': git(ROOT, 'rev-parse', 'HEAD').decode().strip()}, patch
+
+
 def host(args):
     if not args.cache or not args.build_cache:
         raise SystemExit('--cache and --build-cache required; copied, never shared live')
@@ -48,26 +164,15 @@ def host(args):
     output = scratch / 'output'
     output.mkdir()
     print(f'Scratch: {scratch}', flush=True)
-    tracked = subprocess.check_output(['git', 'ls-files', '-z', '--', 'src'], cwd=ROOT)
-    names = sorted(set(FIXED + [n.decode() for n in tracked.split(b'\0') if n.endswith(b'.rs')]))
-    hashes = {}
-    for name in names:
-        p = ROOT / name
-        if p.is_symlink() or not p.is_file() or not p.resolve().is_relative_to(ROOT.resolve()):
-            raise RuntimeError(f'missing/nonregular input: {name}')
-        target = scratch / 'source' / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(p, target)
-        hashes[name] = sha(target)
+    source, patch = snapshot(args.source_root or ROOT, scratch / 'source', args.source_input, args.source_commit)
     shutil.copytree(args.cache / 'registry', scratch / 'cargo/registry')
     shutil.copytree(args.build_cache, scratch / 'target')
     image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', args.image]))[0]
-    (output / 'source.patch').write_bytes(subprocess.check_output(['git', 'diff', 'HEAD', '--', *names], cwd=ROOT))
+    (output / 'source.patch').write_bytes(patch)
     manifest = {'manifestVersion': 1, 'track': 'public-v1-characterization',
-        'sourceCommit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
-        'sourceFilesSha256': hashes, 'dirtyPatchSha256': sha(output / 'source.patch'),
+        **source, 'dirtyPatchSha256': sha(output / 'source.patch'),
         'imageId': image['Id'], 'imageDigests': image.get('RepoDigests', []),
-        'fixtureSha256': hashes[FIXTURE], 'protocolVersion': PROTOCOL, 'contractVersion': 'legacy-v1',
+        'fixtureSha256': source['sourceFilesSha256'][FIXTURE], 'protocolVersion': PROTOCOL, 'contractVersion': 'legacy-v1',
         'clock': 'actual wall clock; no public manual clock', 'snapshots': 'A1 interfaces unavailable',
         'seed': 7, 'freshReplaysPerTransport': 3, 'transports': ['stdio', 'http-mcp', 'rest'],
         'limits': 'network none; 2 CPUs; 4 GiB; 2 build jobs', 'status': 'preparing'}
@@ -80,8 +185,10 @@ def host(args):
 mkdir -p /tmp/home
 rustc -Vv > /work/output/rustc.txt
 python3 --version > /work/output/python.txt
+python3 scripts/test_public_conformance.py > /work/output/runner-tests.log 2>&1
 cat /sys/fs/cgroup/cpu.max > /work/output/cgroup-cpu.txt
 cat /sys/fs/cgroup/memory.max > /work/output/cgroup-memory.txt
+cargo metadata --offline --locked --no-deps --format-version 1 > /work/output/cargo-targets.json
 cargo fmt --all -- --check > /work/output/fmt.log 2>&1
 cargo test --offline --locked --lib --all-features > /work/output/tests.log 2>&1
 cargo clippy --offline --locked --all-targets --all-features > /work/output/clippy.log 2>&1
@@ -464,10 +571,15 @@ def inside():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--source-root', type=Path, help='runtime Git checkout; harness stays here')
+    parser.add_argument('--source-commit', help='require exact clean runtime HEAD and copied bytes')
+    parser.add_argument('--source-input', action='append', default=[], help='additional exact tracked runtime file; repeat for assets')
     parser.add_argument('--cache', type=Path)
     parser.add_argument('--build-cache', type=Path)
     parser.add_argument('--image', default='recalld-ci:1.94')
     args = parser.parse_args()
+    if args.source_root and not args.source_commit:
+        parser.error('--source-root requires --source-commit to freeze the runtime')
     inside() if args.inside else host(args)
 
 
