@@ -50,9 +50,29 @@ a blanket historical-receipt rejection policy.
 
 ## Validation and limits
 
-Pre-parent-update source `d075e4c` passed 742 library tests, one CLI test, seven
-runner tests, formatting/clippy and all nine public episodes. Final validation
-after joining published `74c9bfb` is in progress; exact artifacts will follow. Development failed-request logs are retained.
+Measured source `1d52153db6520d9b64e568f281557441b11f0ff3` passed 742 library
+tests with normal parallel execution, one CLI integration test, seven runner
+tests, fmt, clippy (warnings allowed), and all nine public episodes. Additional
+exact-source logs cover 18 postcommit fault cases, 12 text-hydration failure
+controls and two final-transaction tests. Every final source/output manifest
+hash was checked (163 source, 164 output). The public strict checker passed all
+54 true similarity cases and false-read/restart comparisons. Only SQLite's
+`fts.db-shm` coordination bytes are excluded from the durable-file comparison;
+its raw hash remains recorded.
+
+Validation used image
+`sha256:daefdc9cbe9b0f39b1fc29d975148b3b10adc1bd4309f9ca1be8abd36ed811ef`,
+Rust1.94.1, network none, 2CPUs/4GiB, separate copied Cargo/target caches, and no
+personal mounts. Final output is `/tmp/recalld-public-conformance-3j81tywy/output`;
+raw exact-source fault/guard logs are its sibling `targeted/` directory. The
+separate evidence branch `study/observed-consumer-join` archives this run in
+`benchmarks/public-conformance/observed-consumer-join/validated-1d52153.tgz`,
+SHA256 `070420202f3c0f994268ea4c930b96681c1a791857be7a0d231adabe012d2b54`.
+Its REPORT and A6-CONTROL-PLAN record commands, limits, failed attempts and the
+actual barrier/frozen-reset/clock prerequisites. The previous complete d075 run
+and original c9/b2/981/b5 evidence remain unchanged.
+
+This documentation update does not change the measured runtime source.
 The public replay remains legacy-v1 diagnostic evidence, not an A1 coherent
 snapshot, barrier guarantee, release gate or completed A6. Receipts retained
 internally do not introduce a public keyed query/replay protocol. Real wall-clock
