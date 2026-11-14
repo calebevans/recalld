@@ -293,7 +293,10 @@ impl Fixture {
                 Arc::new(crate::rif::RifEngine::new(Default::default())),
                 self.graph.clone(),
             )),
-            Arc::new(StorageAccessRecorder::new(self.storage.clone())),
+            Arc::new(StorageAccessRecorder::new(
+                self.storage.clone(),
+                self.cache.clone(),
+            )),
         ));
         crate::mcp::bridge_adapters::McpSearchAdapter::new(
             engine,

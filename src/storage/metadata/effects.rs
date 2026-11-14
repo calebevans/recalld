@@ -546,3 +546,17 @@ pub(crate) fn validate_plan(
     }
     Ok(())
 }
+
+#[cfg(test)]
+impl MetadataStore {
+    /// Instance-local probe, reached only after actual exposure commit/publication.
+    pub(crate) fn after_observation_probe(&self) {
+        match self.observation_fault.swap(0, Ordering::SeqCst) {
+            1 => self.mark_unavailable(),
+            2 => {
+                self.effects_epoch.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
+}

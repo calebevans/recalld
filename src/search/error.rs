@@ -6,6 +6,8 @@ use thiserror::Error;
 /// Errors that can occur during search operations.
 #[derive(Debug, Error)]
 pub enum SearchError {
+    #[error(transparent)]
+    Observation(#[from] crate::decay::observation::ObservationError),
     /// Canonical effects or their derived publication are not ready.
     #[error("search unavailable: {0}")]
     Unavailable(String),

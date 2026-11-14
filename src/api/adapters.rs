@@ -94,105 +94,25 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         self.embedding.embed(text).await
     }
 
+    async fn record_exposures(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+        scope: crate::storage::control::ExposureScope,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, crate::search::SearchError> {
+        self.query_engine.record_exposures(accesses, scope).await
+    }
+
     async fn search(
         &self,
         query: state::SearchQuery,
     ) -> Result<Vec<state::ResolvedSearchResult>, crate::search::SearchError> {
-        // Convert API-layer SearchQuery to the pipeline's SearchQuery.
-        let (text, query_embedding) = match query.query {
-            state::QueryInput::Text(t) => (Some(t), None),
-            state::QueryInput::Vector(vector) => (None, Some(vector)),
-            state::QueryInput::TextAndVector { text, embedding } => (Some(text), Some(embedding)),
-        };
-
-        // A label that cannot become a tag is an error, not a dropped
-        // filter: dropping one from `includeTags` or `entities` WIDENS
-        // the query, and a caller cannot tell "every memory in the
-        // namespace" from a genuine match.
-        let mut require_tags: Vec<Tag> =
-            crate::model::parse_filter_tags("includeTags", "", &query.include_tags)
-                .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?;
-        require_tags.extend(
-            crate::model::parse_filter_tags(
-                "entities",
-                crate::model::constants::ENTITY_TAG_PREFIX,
-                &query.entities,
-            )
-            .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?,
-        );
-        // `excludeTags` is the safe direction — dropping one can only
-        // ever return MORE than asked for in the same sense a missing
-        // exclusion does, and it never masquerades as a match — so it
-        // keeps the lossy parse.
-        let exclude_tags: Vec<Tag> =
-            crate::model::parse_tags_lossy("search.excludeTags", &query.exclude_tags);
-        let phases: Vec<DecayPhase> = query
-            .decay_phases
-            .as_ref()
-            .map(|ps| {
-                ps.iter()
-                    .filter_map(|&p| match p {
-                        0 => Some(DecayPhase::Full),
-                        1 => Some(DecayPhase::Summary),
-                        2 => Some(DecayPhase::Ghost),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let pipeline_query = crate::search::SearchQuery {
-            record_access: query.record_access,
-            query_embedding,
-            text,
-            fts_query: None,
-            namespace: query.namespace_name.clone(), // Issue 1: pass actual namespace name
-            filter: crate::search::PipelineSearchFilter {
-                require_tags,
-                exclude_tags,
-                phases,
-                min_strength: query.min_score, // Issue 2: pass min_strength
-                ..Default::default()
-            },
-            limit: query.k,
-            min_score: 0.0,
-            include_ghosts: false,
-            query_mode: crate::search::QueryMode::default(),
-            graph_depth: (query.graph_depth as u8).min(3),
-            time_range_start: query.time_range_start, // Issue 3: pass time range
-            time_range_end: query.time_range_end,     // Issue 3: pass time range
-            entities: query.entities.clone(),         // Issue 4: pass entities
-        };
-        let response = self.query_engine.search(pipeline_query).await?;
-        Ok(response
-            .results
-            .into_iter()
-            .map(|r| {
-                // Issue 5: Parse entities from tags
-                let metadata = parse_structured_tags(&r.tags);
-                state::ResolvedSearchResult {
-                    memory: CachedRecord {
-                        lifecycle: None,
-                        id: r.memory_id,
-                        namespace_id: query.namespace_id, // Issue 6: use actual namespace_id
-                        created_at: r.created_at,
-                        last_accessed_at: r.last_accessed_at,
-                        phase: r.phase,
-                        strength: r.retrievability,
-                        decay_strength: r.effective_r,
-                        stability: r.stability,
-                        difficulty: 5.0,
-                        is_permastore: r.is_permastore,
-                        summary: r.summary.unwrap_or_default(),
-                        tags: r.tags,
-                        edge_count: r.edge_count,
-                        vector_slot: 0,
-                        entities: metadata.entities,
-                    },
-                    score: r.score.unwrap_or(0.0),
-                }
-            })
-            .collect())
+        self.search_inner(query, false).await
+    }
+    async fn prepare_search(
+        &self,
+        query: state::SearchQuery,
+    ) -> Result<Vec<state::ResolvedSearchResult>, crate::search::SearchError> {
+        self.search_inner(query, true).await
     }
 
     async fn find_similar(
@@ -222,8 +142,9 @@ impl state::SearchPipeline for SearchPipelineAdapter {
     async fn record_similar_accesses(
         &self,
         ids: &[MemoryId],
-    ) -> Result<(), crate::search::SearchError> {
-        self.query_engine.record_similar_accesses(ids).await
+        scope: crate::storage::control::ExposureScope,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, crate::search::SearchError> {
+        self.query_engine.record_similar_accesses(ids, scope).await
     }
 
     async fn near_duplicates(
@@ -1242,20 +1163,21 @@ impl FsrsEngineAdapter {
 
 #[async_trait]
 impl state::FsrsEngine for FsrsEngineAdapter {
-    async fn record_access(&self, id: MemoryId, kind: AccessKind) {
-        let now = self.clock.now_millis();
-        let storage = self.storage.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(storage_w) = storage.write() {
-                if let Ok(Some(record)) = storage_w.get_record(id) {
-                    if record.phase != DecayPhase::Tombstone {
-                        let timestamp = now.max(record.created_at).max(record.last_accessed_at);
-                        let _ = storage_w.update_access(id, timestamp, kind);
-                    }
-                }
-            }
-        })
-        .await;
+    async fn record_access_batch(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+    ) -> Result<
+        Vec<crate::storage::control::WriteReceipt>,
+        crate::decay::observation::ObservationError,
+    > {
+        crate::decay::observation::record_exposures(
+            self.storage.clone(),
+            self.cache.clone(),
+            accesses.to_vec(),
+            self.clock.now_millis(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn reinforce(
@@ -1266,6 +1188,7 @@ impl state::FsrsEngine for FsrsEngineAdapter {
     ) -> Result<state::ReinforceResult, Box<dyn std::error::Error + Send + Sync>> {
         let outcome = crate::decay::storage_adapter::reinforce(
             self.storage.clone(),
+            self.cache.clone(),
             id,
             quality,
             self.config.decay.decay_rate_multiplier,
@@ -1273,15 +1196,6 @@ impl state::FsrsEngine for FsrsEngineAdapter {
             namespace.map(str::to_owned),
         )
         .await;
-        // The first storage write may have committed even if the second failed.
-        if !matches!(
-            &outcome,
-            Err(crate::decay::lifecycle::LifecycleError::NamespaceMismatch(
-                _
-            ))
-        ) {
-            self.cache.invalidate(id).await;
-        }
         let plan = outcome?;
         Ok(state::ReinforceResult {
             strength: plan.strength,
@@ -1711,5 +1625,118 @@ mod tests {
             )
             .unwrap();
         }
+    }
+}
+
+impl SearchPipelineAdapter {
+    async fn search_inner(
+        &self,
+        query: state::SearchQuery,
+        defer_recording: bool,
+    ) -> Result<Vec<state::ResolvedSearchResult>, crate::search::SearchError> {
+        // Convert API-layer SearchQuery to the pipeline's SearchQuery.
+        let (text, query_embedding) = match query.query {
+            state::QueryInput::Text(t) => (Some(t), None),
+            state::QueryInput::Vector(vector) => (None, Some(vector)),
+            state::QueryInput::TextAndVector { text, embedding } => (Some(text), Some(embedding)),
+        };
+
+        // A label that cannot become a tag is an error, not a dropped
+        // filter: dropping one from `includeTags` or `entities` WIDENS
+        // the query, and a caller cannot tell "every memory in the
+        // namespace" from a genuine match.
+        let mut require_tags: Vec<Tag> =
+            crate::model::parse_filter_tags("includeTags", "", &query.include_tags)
+                .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?;
+        require_tags.extend(
+            crate::model::parse_filter_tags(
+                "entities",
+                crate::model::constants::ENTITY_TAG_PREFIX,
+                &query.entities,
+            )
+            .map_err(|e| crate::search::SearchError::InvalidFilter(e.to_string()))?,
+        );
+        // `excludeTags` is the safe direction — dropping one can only
+        // ever return MORE than asked for in the same sense a missing
+        // exclusion does, and it never masquerades as a match — so it
+        // keeps the lossy parse.
+        let exclude_tags: Vec<Tag> =
+            crate::model::parse_tags_lossy("search.excludeTags", &query.exclude_tags);
+        let phases: Vec<DecayPhase> = query
+            .decay_phases
+            .as_ref()
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(|&p| match p {
+                        0 => Some(DecayPhase::Full),
+                        1 => Some(DecayPhase::Summary),
+                        2 => Some(DecayPhase::Ghost),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let pipeline_query = crate::search::SearchQuery {
+            record_access: query.record_access,
+            query_embedding,
+            text,
+            fts_query: None,
+            namespace: query.namespace_name.clone(), // Issue 1: pass actual namespace name
+            filter: crate::search::PipelineSearchFilter {
+                require_tags,
+                exclude_tags,
+                phases,
+                min_strength: query.min_score, // Issue 2: pass min_strength
+                ..Default::default()
+            },
+            limit: query.k,
+            min_score: 0.0,
+            include_ghosts: false,
+            query_mode: crate::search::QueryMode::default(),
+            graph_depth: (query.graph_depth as u8).min(3),
+            time_range_start: query.time_range_start, // Issue 3: pass time range
+            time_range_end: query.time_range_end,     // Issue 3: pass time range
+            entities: query.entities.clone(),         // Issue 4: pass entities
+        };
+        let response = if defer_recording {
+            self.query_engine.prepare_search(pipeline_query).await?
+        } else {
+            self.query_engine.search(pipeline_query).await?
+        };
+        Ok(response
+            .results
+            .into_iter()
+            .map(|r| {
+                // Issue 5: Parse entities from tags
+                let metadata = parse_structured_tags(&r.tags);
+                state::ResolvedSearchResult {
+                    access_kind: if r.activation_score.is_some() {
+                        AccessKind::AssociativeRetrieval
+                    } else {
+                        AccessKind::DirectRetrieval
+                    },
+                    memory: CachedRecord {
+                        lifecycle: None,
+                        id: r.memory_id,
+                        namespace_id: query.namespace_id, // Issue 6: use actual namespace_id
+                        created_at: r.created_at,
+                        last_accessed_at: r.last_accessed_at,
+                        phase: r.phase,
+                        strength: r.retrievability,
+                        decay_strength: r.effective_r,
+                        stability: r.stability,
+                        difficulty: 5.0,
+                        is_permastore: r.is_permastore,
+                        summary: r.summary.unwrap_or_default(),
+                        tags: r.tags,
+                        edge_count: r.edge_count,
+                        vector_slot: 0,
+                        entities: metadata.entities,
+                    },
+                    score: r.score.unwrap_or(0.0),
+                }
+            })
+            .collect())
     }
 }

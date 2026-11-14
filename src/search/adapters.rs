@@ -475,14 +475,19 @@ impl RifProcessor for RifProcessorAdapter {
 
 /// Adapts `RedbStorageEngine` to `AccessRecorder`.
 pub struct StorageAccessRecorder {
-    clock: Arc<dyn crate::time::Clock>,
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+    cache: Arc<CacheManager>,
+    clock: Arc<dyn crate::time::Clock>,
 }
 
 impl StorageAccessRecorder {
-    pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
+    pub fn new(
+        storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+        cache: Arc<CacheManager>,
+    ) -> Self {
         Self {
             storage,
+            cache,
             clock: Arc::new(crate::time::SystemClock),
         }
     }
@@ -494,38 +499,27 @@ impl StorageAccessRecorder {
 
 #[async_trait]
 impl AccessRecorder for StorageAccessRecorder {
-    async fn record_access(&self, id: MemoryId, kind: AccessKind) -> Result<()> {
-        let now = self.clock.now_millis();
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || {
-            let storage_r = storage
-                .read()
-                .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
-            storage_r
-                .update_access(id, now, kind)
-                .map_err(|e| SearchError::Internal(e.to_string()))
-        })
-        .await
-        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
+    async fn record_access(
+        &self,
+        id: MemoryId,
+        kind: AccessKind,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
+        self.record_access_batch(&[(id, kind)], None).await
     }
-
-    async fn record_access_batch(&self, accesses: &[(MemoryId, AccessKind)]) -> Result<()> {
-        let now = self.clock.now_millis();
-        let storage = self.storage.clone();
-        let accesses = accesses.to_vec();
-        tokio::task::spawn_blocking(move || {
-            let storage_r = storage
-                .read()
-                .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?;
-            for (id, kind) in &accesses {
-                storage_r
-                    .update_access(*id, now, *kind)
-                    .map_err(|e| SearchError::Internal(e.to_string()))?;
-            }
-            Ok(())
-        })
+    async fn record_access_batch(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+        scope: Option<&crate::storage::control::ExposureScope>,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
+        crate::decay::observation::record_exposures_scoped(
+            self.storage.clone(),
+            self.cache.clone(),
+            accesses.to_vec(),
+            self.clock.now_millis(),
+            scope.cloned(),
+        )
         .await
-        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
+        .map_err(Into::into)
     }
 }
 

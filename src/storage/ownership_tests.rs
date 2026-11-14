@@ -238,3 +238,42 @@ fn ownership_guard_preserves_process_and_alias_exclusion() {
         assert!(acquire_for_test(kind, &alias).is_ok());
     }
 }
+
+#[test]
+fn ownership_fork_window_offline_snapshot_releases_all_source_locks() {
+    use crate::storage::offline_snapshot::OfflineSnapshot;
+    use crate::storage::{RedbStorageEngine, StorageEngine};
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = RedbStorageEngine::open(directory.path()).unwrap();
+    let mut namespace = crate::model::NamespaceConfig::default_namespace(0);
+    namespace.name = "snapshot-fork".into();
+    namespace.embedding_dim = 4;
+    engine.create_namespace(&namespace).unwrap();
+    drop(engine);
+    let files = crate::storage::validation::canonical_files(directory.path()).unwrap();
+    let before: Vec<_> = files
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let snapshot = OfflineSnapshot::open(directory.path()).unwrap();
+    assert!(matches!(
+        RedbStorageEngine::open(directory.path()),
+        Err(StorageError::DatabaseLocked)
+    ));
+    let _child = ForkWindow::hold();
+    drop(snapshot);
+    let after: Vec<_> = files
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    assert_eq!(
+        before, after,
+        "snapshot/drop must leave canonical files unchanged"
+    );
+    let reopened = RedbStorageEngine::open(directory.path());
+    assert!(
+        reopened.is_ok(),
+        "inherited snapshot descriptor prolonged ownership: {:?}",
+        reopened.err()
+    );
+}

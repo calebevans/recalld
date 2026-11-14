@@ -666,8 +666,10 @@ impl Recalld {
                 Arc::new(SharedGraphReader::new(graph.clone()));
             let rif_proc: Arc<dyn crate::search::RifProcessor> =
                 Arc::new(RifProcessorAdapter::new(rif_engine.clone(), graph.clone()));
-            let access_rec: Arc<dyn crate::search::AccessRecorder> =
-                Arc::new(StorageAccessRecorder::new(storage.clone()).with_clock(clock.clone()));
+            let access_rec: Arc<dyn crate::search::AccessRecorder> = Arc::new(
+                StorageAccessRecorder::new(storage.clone(), cache.clone())
+                    .with_clock(clock.clone()),
+            );
 
             let engine = QueryEngine::new(
                 ns_resolver,

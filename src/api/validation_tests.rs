@@ -32,7 +32,10 @@ fn fixture_clients(f: &Fixture) -> (Router, crate::mcp::bridge::McpBridge) {
             Arc::new(crate::rif::RifEngine::new(Default::default())),
             f.graph.clone(),
         )),
-        Arc::new(StorageAccessRecorder::new(f.storage.clone())),
+        Arc::new(StorageAccessRecorder::new(
+            f.storage.clone(),
+            f.cache.clone(),
+        )),
     ));
     let mut bridge = crate::test_support::StubBridge::default().into_bridge();
     bridge.search = Arc::new(crate::mcp::bridge_adapters::McpSearchAdapter::new(

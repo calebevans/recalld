@@ -39,20 +39,21 @@ impl AccessRecorder for ObservedAccess {
         &self,
         id: MemoryId,
         kind: AccessKind,
-    ) -> Result<(), crate::search::SearchError> {
-        self.inner.record_access(id, kind).await?;
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, crate::search::SearchError> {
+        let receipts = self.inner.record_access(id, kind).await?;
         self.completed.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_one();
-        Ok(())
+        Ok(receipts)
     }
     async fn record_access_batch(
         &self,
         values: &[(MemoryId, AccessKind)],
-    ) -> Result<(), crate::search::SearchError> {
-        self.inner.record_access_batch(values).await?;
+        scope: Option<&crate::storage::control::ExposureScope>,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, crate::search::SearchError> {
+        let receipts = self.inner.record_access_batch(values, scope).await?;
         self.completed.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_one();
-        Ok(())
+        Ok(receipts)
     }
 }
 struct Harness {
@@ -66,7 +67,7 @@ impl Harness {
     async fn new() -> Self {
         let f = Fixture::new();
         let access = Arc::new(ObservedAccess {
-            inner: StorageAccessRecorder::new(f.storage.clone()),
+            inner: StorageAccessRecorder::new(f.storage.clone(), f.cache.clone()),
             completed: AtomicUsize::new(0),
             notify: tokio::sync::Notify::new(),
         });

@@ -4,6 +4,7 @@
 //! FSRS retrievability calculation, RIF suppression, ranking, and
 //! response assembly.
 
+use crate::decay::observation::Observed;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -173,9 +174,17 @@ pub struct RifSuppression {
 #[async_trait::async_trait]
 pub trait AccessRecorder: Send + Sync {
     /// Record that a memory was accessed.
-    async fn record_access(&self, id: MemoryId, kind: AccessKind) -> Result<()>;
+    async fn record_access(
+        &self,
+        id: MemoryId,
+        kind: AccessKind,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>>;
     /// Batch record access for multiple memories.
-    async fn record_access_batch(&self, accesses: &[(MemoryId, AccessKind)]) -> Result<()>;
+    async fn record_access_batch(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+        _scope: Option<&crate::storage::control::ExposureScope>,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>>;
 }
 
 /// Shared graph handle for read-locked graph access.
@@ -478,14 +487,36 @@ impl QueryEngine {
         query: SearchQuery,
         semantics: RetrievalSemantics,
     ) -> Result<SemanticsResponse> {
+        self.search_checked(query, semantics, false).await
+    }
+
+    pub async fn prepare_search(&self, query: SearchQuery) -> Result<SearchResponse> {
+        Ok(self
+            .search_checked(query, RetrievalSemantics::V1, true)
+            .await?
+            .response)
+    }
+
+    async fn search_checked(
+        &self,
+        query: SearchQuery,
+        semantics: RetrievalSemantics,
+        defer_recording: bool,
+    ) -> Result<SemanticsResponse> {
         let stamp = self.meta_store.effects_stamp().await?;
-        let result = self.search_admitted(query, semantics).await;
+        let observed = self
+            .search_admitted(query, semantics, defer_recording)
+            .await?;
+        observed.finish(self.check_effects_stamp(stamp).await)
+    }
+
+    async fn check_effects_stamp(&self, stamp: u64) -> Result<()> {
         if self.meta_store.effects_stamp().await? != stamp {
             return Err(SearchError::Unavailable(
                 "graph effects changed during query".into(),
             ));
         }
-        result
+        Ok(())
     }
 
     pub(crate) async fn effects_stamp(&self) -> Result<u64> {
@@ -496,7 +527,8 @@ impl QueryEngine {
         &self,
         mut query: SearchQuery,
         semantics: RetrievalSemantics,
-    ) -> Result<SemanticsResponse> {
+        defer_recording: bool,
+    ) -> Result<Observed<SemanticsResponse>> {
         let mut diagnostics = SemanticsDiagnostics::new(semantics);
         let pipeline_start = Instant::now();
         let mut timings = StageTimings::default();
@@ -807,9 +839,18 @@ impl QueryEngine {
         timings.total_us = pipeline_start.elapsed().as_micros() as u64;
         let query_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
 
-        if query.record_access {
-            self.record_accesses_async(&candidates);
-        }
+        let receipts = if query.record_access && !defer_recording {
+            self.record_accesses(
+                &candidates,
+                crate::storage::control::ExposureScope {
+                    namespace: ns_config.name.clone(),
+                    source: None,
+                },
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
 
         let response = SearchResponse {
             results,
@@ -826,9 +867,12 @@ impl QueryEngine {
             "search complete"
         );
 
-        Ok(SemanticsResponse {
-            response,
-            diagnostics,
+        Ok(Observed {
+            value: SemanticsResponse {
+                response,
+                diagnostics,
+            },
+            receipts,
         })
     }
 
@@ -1198,24 +1242,19 @@ impl QueryEngine {
         record_access: bool,
     ) -> Result<Option<MemoryResponse>> {
         let stamp = self.meta_store.effects_stamp().await?;
-        let result = self
+        let observed = self
             .get_memory_with_access_admitted(id, record_access)
-            .await;
-        if self.meta_store.effects_stamp().await? != stamp {
-            return Err(SearchError::Unavailable(
-                "graph effects changed during query".into(),
-            ));
-        }
-        result
+            .await?;
+        observed.finish(self.check_effects_stamp(stamp).await)
     }
 
     async fn get_memory_with_access_admitted(
         &self,
         id: MemoryId,
         record_access: bool,
-    ) -> Result<Option<MemoryResponse>> {
+    ) -> Result<Observed<Option<MemoryResponse>>> {
         let Some(mut record) = self.meta_store.get(&id).await? else {
-            return Ok(None);
+            return Ok(Observed::unobserved(None));
         };
         let namespace = self
             .namespace_resolver
@@ -1231,39 +1270,43 @@ impl QueryEngine {
             .await?;
         context.apply(&mut record)?;
 
-        // Preserve legacy fire-and-forget only when access is permitted.
-        if context.requested_record_access {
-            let recorder = Arc::clone(&self.access_recorder);
-            let access_id = id;
-            tokio::spawn(async move {
-                if let Err(e) = recorder
-                    .record_access(access_id, AccessKind::DirectRetrieval)
-                    .await
+        let receipts = if record_access && record.phase != DecayPhase::Tombstone {
+            self.record_exposures(
+                &[(id, AccessKind::DirectRetrieval)],
+                crate::storage::control::ExposureScope {
+                    namespace: namespace.name.clone(),
+                    source: Some(id),
+                },
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        Ok(Observed {
+            receipts,
+            value: Some(MemoryResponse {
+                id: record.id,
+                namespace: namespace.name,
+                created_at: record.created_at,
+                last_accessed_at: record.last_accessed_at,
+                summary: if record.phase != DecayPhase::Ghost
+                    && record.phase != DecayPhase::Tombstone
                 {
-                    warn!("failed to record access for {access_id:?}: {e}");
-                }
-            });
-        }
-        Ok(Some(MemoryResponse {
-            id: record.id,
-            namespace: namespace.name,
-            created_at: record.created_at,
-            last_accessed_at: record.last_accessed_at,
-            summary: if record.phase != DecayPhase::Ghost && record.phase != DecayPhase::Tombstone {
-                Some(record.summary.clone())
-            } else {
-                None
-            },
-            full_text: None, // Loaded on demand by API layer
-            tags: record.tags.clone(),
-            phase: record.phase,
-            strength: record.strength,
-            decay_strength: record.decay_strength,
-            stability: record.stability,
-            is_permastore: record.is_permastore,
-            edge_count: record.edge_count,
-            access_count: 0, // Populated by API layer from access_history
-        }))
+                    Some(record.summary.clone())
+                } else {
+                    None
+                },
+                full_text: None, // Loaded on demand by API layer
+                tags: record.tags.clone(),
+                phase: record.phase,
+                strength: record.strength,
+                decay_strength: record.decay_strength,
+                stability: record.stability,
+                is_permastore: record.is_permastore,
+                edge_count: record.edge_count,
+                access_count: 0, // Populated by API layer from access_history
+            }),
+        })
     }
 
     /// Find the K most similar memories to a given memory.
@@ -1316,15 +1359,10 @@ impl QueryEngine {
         defer_recording: bool,
     ) -> Result<Vec<SearchResult>> {
         let stamp = self.meta_store.effects_stamp().await?;
-        let result = self
+        let observed = self
             .similar_with_access_admitted(id, k, min_score, requested_access, defer_recording)
-            .await;
-        if self.meta_store.effects_stamp().await? != stamp {
-            return Err(SearchError::Unavailable(
-                "graph effects changed during query".into(),
-            ));
-        }
-        result
+            .await?;
+        observed.finish(self.check_effects_stamp(stamp).await)
     }
 
     async fn similar_with_access_admitted(
@@ -1334,13 +1372,16 @@ impl QueryEngine {
         min_score: Option<f32>,
         record_access: bool,
         defer_recording: bool,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> Result<Observed<Vec<SearchResult>>> {
         let k = k.min(SearchQuery::MAX_USER_LIMIT);
         let mut record = self
             .meta_store
             .get(&id)
             .await?
             .ok_or(SearchError::MemoryNotFound(id))?;
+        if matches!(record.phase, DecayPhase::Ghost | DecayPhase::Tombstone) {
+            return Err(SearchError::MemoryNotFound(id));
+        }
         let namespace = self
             .namespace_resolver
             .resolve_id(record.namespace_id)
@@ -1423,16 +1464,31 @@ impl QueryEngine {
             })
             .collect();
 
-        if context.requested_record_access && !defer_recording {
-            self.record_similar_accesses(&results.iter().map(|r| r.memory_id).collect::<Vec<_>>())
-                .await?;
-        }
-        Ok(results)
+        let receipts = if context.requested_record_access && !defer_recording {
+            self.record_similar_accesses(
+                &results.iter().map(|r| r.memory_id).collect::<Vec<_>>(),
+                crate::storage::control::ExposureScope {
+                    namespace: namespace.name.clone(),
+                    source: Some(id),
+                },
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        Ok(Observed {
+            value: results,
+            receipts,
+        })
     }
 
     /// Shared final-result exposure hook. REST calls this only after fallible
     /// response hydration. Legacy batches are awaited, not receipt-atomic.
-    pub async fn record_similar_accesses(&self, ids: &[MemoryId]) -> Result<()> {
+    pub async fn record_similar_accesses(
+        &self,
+        ids: &[MemoryId],
+        scope: crate::storage::control::ExposureScope,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
         let mut seen = std::collections::HashSet::new();
         // Consumer preflight only: a schema-aware observation writer must also
         // enforce this under its publication guard on the later A3 join.
@@ -1453,10 +1509,7 @@ impl QueryEngine {
             .filter(|id| seen.insert(*id))
             .map(|id| (id, AccessKind::AssociativeRetrieval))
             .collect();
-        if !accesses.is_empty() {
-            self.access_recorder.record_access_batch(&accesses).await?;
-        }
-        Ok(())
+        self.record_exposures(&accesses, scope).await
     }
 
     // =====================================================================
@@ -1651,8 +1704,11 @@ impl QueryEngine {
             .collect()
     }
 
-    /// Fire-and-forget access recording.
-    fn record_accesses_async(&self, candidates: &[Candidate]) {
+    async fn record_accesses(
+        &self,
+        candidates: &[Candidate],
+        scope: crate::storage::control::ExposureScope,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
         let accesses: Vec<(MemoryId, AccessKind)> = candidates
             .iter()
             .map(|c| {
@@ -1665,16 +1721,22 @@ impl QueryEngine {
             })
             .collect();
 
-        if accesses.is_empty() {
-            return;
-        }
+        self.record_exposures(&accesses, scope).await
+    }
 
-        let recorder = Arc::clone(&self.access_recorder);
-        tokio::spawn(async move {
-            if let Err(e) = recorder.record_access_batch(&accesses).await {
-                warn!("failed to record access events: {e}");
-            }
-        });
+    /// Record the final caller-visible set after any outer hydration/filtering.
+    /// Outer callers must disable core recording to avoid duplicate events.
+    pub async fn record_exposures(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+        scope: crate::storage::control::ExposureScope,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
+        if accesses.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.access_recorder
+            .record_access_batch(accesses, Some(&scope))
+            .await
     }
 }
 
@@ -1826,11 +1888,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AccessRecorder for Unused {
-        async fn record_access(&self, _id: MemoryId, _kind: AccessKind) -> Result<()> {
+        async fn record_access(
+            &self,
+            _id: MemoryId,
+            _kind: AccessKind,
+        ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
             unreachable!("stage 8c does not record access")
         }
 
-        async fn record_access_batch(&self, _a: &[(MemoryId, AccessKind)]) -> Result<()> {
+        async fn record_access_batch(
+            &self,
+            _a: &[(MemoryId, AccessKind)],
+            _scope: Option<&crate::storage::control::ExposureScope>,
+        ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
             unreachable!("stage 8c does not record access")
         }
     }
@@ -2346,11 +2416,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AccessRecorder for SearchFixture {
-        async fn record_access(&self, _id: MemoryId, _kind: AccessKind) -> Result<()> {
-            Ok(())
+        async fn record_access(
+            &self,
+            _id: MemoryId,
+            _kind: AccessKind,
+        ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
+            Ok(Vec::new())
         }
-        async fn record_access_batch(&self, _accesses: &[(MemoryId, AccessKind)]) -> Result<()> {
-            Ok(())
+        async fn record_access_batch(
+            &self,
+            _accesses: &[(MemoryId, AccessKind)],
+            _scope: Option<&crate::storage::control::ExposureScope>,
+        ) -> Result<Vec<crate::storage::control::WriteReceipt>> {
+            Ok(Vec::new())
         }
     }
 

@@ -26,6 +26,7 @@ use crate::serialization::ApiError;
 /// human-readable message, and an optional field name for validation errors.
 #[derive(Debug)]
 pub enum AppError {
+    Observation(crate::decay::observation::ObservationError),
     /// 404 -- Memory, namespace, or resource not found.
     NotFound {
         /// The kind of resource (e.g. "memory", "namespace").
@@ -49,7 +50,9 @@ pub enum AppError {
     },
 
     /// 409 -- Explicit by-ID namespace assertion failed.
-    NamespaceMismatch { message: String },
+    NamespaceMismatch {
+        message: String,
+    },
 
     /// 422 -- Semantically invalid request (e.g. dimension mismatch,
     /// mutually exclusive fields both provided).
@@ -85,7 +88,17 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if let AppError::Observation(error) = self {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "OBSERVATION_FAILED", "observation": error,
+                })),
+            )
+                .into_response();
+        }
         let (status, error_code, message, field) = match &self {
+            AppError::Observation(_) => unreachable!(),
             AppError::NotFound { resource, id } => (
                 StatusCode::NOT_FOUND,
                 "NOT_FOUND".to_string(),
@@ -228,6 +241,7 @@ impl From<EmbeddingError> for AppError {
 impl From<SearchError> for AppError {
     fn from(err: SearchError) -> Self {
         match &err {
+            SearchError::Observation(error) => AppError::Observation(error.clone()),
             SearchError::Unavailable(message) => AppError::ServiceUnavailable {
                 message: message.clone(),
             },
@@ -349,5 +363,11 @@ mod tests {
             namespace: "default".to_string(),
         });
         assert!(matches!(err, AppError::UnprocessableEntity { .. }));
+    }
+}
+
+impl From<crate::decay::observation::ObservationError> for AppError {
+    fn from(error: crate::decay::observation::ObservationError) -> Self {
+        Self::Observation(error)
     }
 }

@@ -356,6 +356,30 @@ impl RedbStorageEngine {
             .update_access_with_receipt(ctx, id, timestamp, kind)
     }
 
+    /// Atomic per-namespace exposure batch; canonical commit only, not readiness.
+    pub fn record_exposure_batch(
+        &self,
+        ctx: &MutationContext,
+        accesses: &[(MemoryId, AccessKind)],
+        sampled_at: i64,
+    ) -> Result<Option<WriteReceipt>, StorageError> {
+        self.meta_store
+            .record_exposure_batch(ctx, accesses, sampled_at)
+    }
+
+    /// Fresh-state legacy feedback and a payload-free receipt in one transaction.
+    pub fn record_legacy_feedback(
+        &self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        quality: u8,
+        sampled_at: i64,
+        global_multiplier: f64,
+    ) -> Result<WriteReceipt, StorageError> {
+        self.meta_store
+            .record_legacy_feedback(ctx, id, quality, sampled_at, global_multiplier)
+    }
+
     pub fn lookup_operation(
         &self,
         store_id: uuid::Uuid,
@@ -377,7 +401,8 @@ impl RedbStorageEngine {
     /// 6. Opens vector files for all existing namespaces.
     /// 7. Runs startup validation (rebuilds phase index, cleans orphans).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let ownership = crate::storage::ownership::StoreOwnership::acquire(path.as_ref())?;
+        let ownership =
+            crate::storage::ownership::StoreOwnership::acquire_recovering(path.as_ref())?;
         let db_path = ownership.path.clone();
         std::fs::create_dir_all(&db_path)?;
         let lock_file = crate::storage::ownership::lock_directory(&db_path)?;
