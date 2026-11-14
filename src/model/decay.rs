@@ -7,8 +7,8 @@ use crate::model::namespace::PhaseThresholds;
 /// The degradation phase of a memory, determining what content is retained.
 ///
 /// Phases form a one-way ratchet during decay sweeps: Full -> Summary ->
-/// Ghost -> deletion. Access (which increases strength) can promote a
-/// memory back up, but in practice this is rare.
+/// Ghost -> deletion. Feedback may increase strength but never promotes
+/// a phase or reconstructs discarded content.
 ///
 /// `Tombstone` is a terminal phase used for user-initiated deletion:
 /// content is stripped and the memory is removed from all search indexes,

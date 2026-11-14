@@ -381,6 +381,7 @@ impl crate::mcp::bridge::SearchPipeline for StubBridge {
         _: usize,
         _: Option<f32>,
         _: bool,
+        _record_access: bool,
     ) -> Result<Vec<crate::mcp::bridge::SearchHit>, crate::mcp::bridge::BridgeError> {
         unreachable!("the handler was expected to reject its arguments before searching")
     }
@@ -405,6 +406,7 @@ impl crate::mcp::bridge::StorageEngine for StubBridge {
     async fn get_memory(
         &self,
         _: MemoryId,
+        _record_access: bool,
     ) -> Result<Option<crate::mcp::bridge::MemoryRecord>, crate::mcp::bridge::BridgeError> {
         unreachable!("the handler was expected to reject its arguments before reading")
     }

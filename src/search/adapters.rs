@@ -380,19 +380,27 @@ impl RifProcessor for RifProcessorAdapter {
 
 /// Adapts `RedbStorageEngine` to `AccessRecorder`.
 pub struct StorageAccessRecorder {
+    clock: Arc<dyn crate::time::Clock>,
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
 }
 
 impl StorageAccessRecorder {
     pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            clock: Arc::new(crate::time::SystemClock),
+        }
+    }
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
 #[async_trait]
 impl AccessRecorder for StorageAccessRecorder {
     async fn record_access(&self, id: MemoryId, kind: AccessKind) -> Result<()> {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = self.clock.now_millis();
         let storage = self.storage.clone();
         tokio::task::spawn_blocking(move || {
             let storage_r = storage
@@ -407,7 +415,7 @@ impl AccessRecorder for StorageAccessRecorder {
     }
 
     async fn record_access_batch(&self, accesses: &[(MemoryId, AccessKind)]) -> Result<()> {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = self.clock.now_millis();
         let storage = self.storage.clone();
         let accesses = accesses.to_vec();
         tokio::task::spawn_blocking(move || {
