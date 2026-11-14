@@ -23,6 +23,7 @@ use super::error::ValidationError;
 /// `entities`, `topics`, and `emotions` are input-only: callers merge
 /// them into `tags` after validation, so they must be checked here while
 /// they are still distinguishable.
+#[derive(Clone, Copy)]
 pub struct MemoryInputRef<'a> {
     pub summary: &'a str,
     pub full_text: Option<&'a str>,
@@ -60,6 +61,34 @@ pub fn validate_memory_input(input: MemoryInputRef<'_>) -> Result<(), Validation
     validate_item_lens("entities", input.entities, ENTITY_MAX_BYTES)?;
     validate_item_lens("topics", input.topics, TOPIC_MAX_BYTES)?;
     validate_item_lens("emotions", input.emotions, EMOTION_MAX_BYTES)?;
+    Ok(())
+}
+
+/// Legacy writers persist structured labels as normalized prefixed tags.
+/// Validate that representation before provider work or mutation. Generic
+/// schema validation and retained native labels keep their UTF-8 semantics.
+pub fn validate_legacy_memory_input(input: MemoryInputRef<'_>) -> Result<(), ValidationError> {
+    validate_memory_input(input)?;
+    use super::constants::{EMOTION_TAG_PREFIX, ENTITY_TAG_PREFIX, TOPIC_TAG_PREFIX};
+    for (field, prefix, labels) in [
+        ("entities", ENTITY_TAG_PREFIX, input.entities),
+        ("topics", TOPIC_TAG_PREFIX, input.topics),
+        ("emotions", EMOTION_TAG_PREFIX, input.emotions),
+    ] {
+        for (index, label) in labels.iter().enumerate() {
+            let normalized = label.to_lowercase();
+            let tag = super::Tag::new(format!("{prefix}{normalized}"));
+            if normalized.is_empty()
+                || tag
+                    .as_ref()
+                    .ok()
+                    .and_then(|tag| tag.as_str().strip_prefix(prefix))
+                    != Some(normalized.as_str())
+            {
+                return Err(ValidationError::UnrepresentableLegacyLabel { field, index });
+            }
+        }
+    }
     Ok(())
 }
 
