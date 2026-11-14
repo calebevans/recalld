@@ -1,0 +1,10 @@
+Mock Docker orchestration check only. Actual Rust results are in separate run logs.
+fetch exit=0; log=/tmp/recalld-unit-tests-S0Iczj/logs/fetch.log
+baseline-test exit=0; log=/tmp/recalld-unit-tests-S0Iczj/logs/baseline-test.log
+validation-probes exit=101; log=/tmp/recalld-unit-tests-S0Iczj/logs/validation-probes.log
+supersession-probe exit=101; log=/tmp/recalld-unit-tests-S0Iczj/logs/supersession-probe.log
+vector-benchmark exit=0; log=/tmp/recalld-unit-tests-S0Iczj/logs/vector-benchmark.log
+
+All logs retained at /tmp/recalld-unit-tests-S0Iczj/logs
+Recorded-commit expectations: baseline 0; validation 101; supersession 101; benchmark 0.
+runner_exit=0
