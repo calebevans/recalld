@@ -221,3 +221,12 @@ provider-validation; actual HTTP/MCP error categories and daemon roundtrip; and
 identical canonical/index bytes with the double-rounding fixture. Lifecycle
 fixtures now use nonzero vectors at the actual insertion boundary, while their
 phase/content assertions remain unchanged.
+
+Corrected source **`7fa19f8927a9c1c6d46005044b37cae5eebca113`** passed the final
+full offline run: **645 library + 1 CLI**, zero failures, four ignored doctests;
+fmt passed and clippy completed with warnings (371 library/382 test including
+duplicates). See [tracked before/after evidence](../evidence/insertion-vector-boundary/README.md),
+[hash manifest](../evidence/insertion-vector-boundary/manifest.json), and
+[work note](../work-notes/2026-11-14-insertion-vector-boundary.md).
+Future consumer integration must preserve `Observed` wrappers/typed committed
+errors from `3b590fb`; this minimal branch does not replace that independent join.
