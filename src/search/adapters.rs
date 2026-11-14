@@ -499,12 +499,8 @@ impl GraphReader for SharedGraphReader {
 
 /// Adapts a shared `EntityIndex` to `EntityIndexReader`.
 ///
-/// The EntityIndex is shared across all namespaces. The adapter
-/// accepts a `namespace_id` parameter but does not filter by it
-/// because the entity index does not track which namespace a
-/// memory belongs to. Namespace filtering happens in the pipeline's
-/// `passes_filters` stage, which checks each candidate's
-/// `CachedRecord::namespace_id` against the query namespace.
+/// Namespace postings are selected before the adapter's candidate cap.
+/// Canonical hard eligibility remains the retrieval pipeline's responsibility.
 pub struct SharedEntityIndexReader {
     entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
 }
@@ -518,7 +514,7 @@ impl SharedEntityIndexReader {
 impl EntityIndexReader for SharedEntityIndexReader {
     fn find_by_entities(
         &self,
-        _namespace_id: NamespaceId,
+        namespace_id: NamespaceId,
         entities: &[String],
         exclude_id: MemoryId,
         k: usize,
@@ -529,7 +525,7 @@ impl EntityIndexReader for SharedEntityIndexReader {
         let index = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.entity_index.read())
         });
-        let results = index.find_by_entities(entities, exclude_id);
+        let results = index.find_by_entities(namespace_id, entities, exclude_id);
         Ok(results
             .into_iter()
             .take(k)
@@ -538,5 +534,36 @@ impl EntityIndexReader for SharedEntityIndexReader {
                 shared_count,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod entity_namespace_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn entity_reader_selects_namespace_before_candidate_cap() {
+        let ns = NamespaceId::new(1);
+        let other = NamespaceId::new(2);
+        let mut index = EntityIndex::new();
+        let entities = vec!["John Smith".into(), "José".into()];
+        for _ in 0..100 {
+            index.add(other, MemoryId::new(), &entities);
+        }
+        let local = MemoryId::new();
+        index.add(ns, local, &["José".into()]);
+        let reader = SharedEntityIndexReader::new(Arc::new(tokio::sync::RwLock::new(index)));
+        let hits = reader
+            .find_by_entities(ns, &entities, MemoryId::new(), 1)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].memory_id, local);
+        assert_eq!(hits[0].shared_count, 1);
+        assert!(
+            reader
+                .find_by_entities(ns, &entities, local, 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

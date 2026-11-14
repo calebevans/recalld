@@ -1053,6 +1053,13 @@ impl bridge::StorageEngine for McpStorageAdapter {
             None => None,
         };
 
+        // Entity recall is independent of automatic graph linking. Publish the
+        // accepted names directly; legacy tags cannot represent every name.
+        self.entity_index
+            .write()
+            .await
+            .add(ns_config.id, memory_id, &input.entities);
+
         // Auto-link: discover and create edges to similar existing memories.
         if self.config.graph.autolink_enabled {
             let tag_strings: Vec<String> = merged_tags.clone();
@@ -1094,10 +1101,6 @@ impl bridge::StorageEngine for McpStorageAdapter {
                     &self.cache,
                 )
                 .await;
-
-                // Update entity index.
-                let mut idx = self.entity_index.write().await;
-                idx.add(memory_id, &entities);
             }
 
             // Temporal edges: link to recently-stored memories in the same namespace.
@@ -3581,6 +3584,78 @@ mod tests {
                 .len(),
             1,
             "a case-variant of 'default' left a namespace row behind"
+        );
+    }
+    #[tokio::test]
+    async fn entity_postings_survive_disabled_autolink_and_delete_without_legacy_tags() {
+        let fx = Fixture::new();
+        let foreign = fx.create_namespace("foreign");
+        let mut adapter = fx.storage_adapter();
+        Arc::make_mut(&mut adapter.config).graph.autolink_enabled = false;
+        let names = vec!["John Smith".into(), "José".into(), "Alice's".into()];
+        let mut ids = Vec::new();
+        for namespace in ["default", "foreign"] {
+            let mut input = store_input("accepted names", namespace, unit_x());
+            input.entities = names.clone();
+            let stored = adapter.store_memory(input).await.unwrap();
+            ids.push(MemoryId::from_uuid(
+                uuid::Uuid::parse_str(&stored.id).unwrap(),
+            ));
+        }
+        {
+            let index = fx.entity_index.read().await;
+            assert_eq!(index.len(), 2);
+            assert_eq!(
+                index.find_by_entities(default_ns(), &names, MemoryId::new()),
+                vec![(ids[0], 4)]
+            );
+            assert_eq!(
+                index.find_by_entities(foreign, &names, MemoryId::new()),
+                vec![(ids[1], 4)]
+            );
+        }
+        assert!(adapter.delete_memory(ids[0]).await.unwrap());
+        let index = fx.entity_index.read().await;
+        assert_eq!(index.len(), 1);
+        assert!(
+            index
+                .find_by_entities(default_ns(), &names, MemoryId::new())
+                .is_empty()
+        );
+        assert_eq!(
+            index.find_by_entities(foreign, &names, MemoryId::new()),
+            vec![(ids[1], 4)]
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_deletion_clears_orphan_entity_postings_only_in_its_scope() {
+        let fx = Fixture::new();
+        let scratch = fx.create_namespace("scratch");
+        let orphan = MemoryId::new();
+        let names = vec!["José".into()];
+        {
+            let mut index = fx.entity_index.write().await;
+            index.add(scratch, orphan, &names);
+            index.add(default_ns(), orphan, &names);
+        }
+        fx.namespace_adapter()
+            .delete_namespace(bridge::DeleteNamespaceInput {
+                name: "scratch".into(),
+                force: false,
+            })
+            .await
+            .unwrap();
+        let index = fx.entity_index.read().await;
+        assert_eq!(index.len(), 1);
+        assert!(
+            index
+                .find_by_entities(scratch, &names, MemoryId::new())
+                .is_empty()
+        );
+        assert_eq!(
+            index.find_by_entities(default_ns(), &names, MemoryId::new()),
+            vec![(orphan, 1)]
         );
     }
 }

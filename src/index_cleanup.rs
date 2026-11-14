@@ -83,10 +83,8 @@ pub(crate) struct IndexPurgeCounts {
 /// Takes **one** lock per subsystem for the whole slice, not one per
 /// record.
 ///
-/// `records` must be the memories as they were **before** any tombstone
-/// strip. `tombstone` erases the tag list, and the tag list is where the
-/// entity names live — pass the stripped record and the entity index
-/// keeps pointing at the deleted memory forever.
+/// Records supply canonical namespace IDs; entity cleanup uses reverse
+/// postings and works even after labels have been stripped by tombstoning.
 pub(crate) async fn purge_from_indexes(
     handles: &IndexHandles<'_>,
     records: &[(MemoryId, DiskRecord)],
@@ -151,13 +149,15 @@ pub(crate) async fn purge_from_indexes(
         }
     }
 
-    // 4. Entity index. Driven off the pre-strip tags.
+    // 4. Entity index: labels may already be stripped or lossy in legacy tags.
     {
         let mut entity_index = handles.entity_index.write().await;
-        for (id, record) in records {
-            let metadata = crate::model::parse_structured_tags(&record.tags);
-            if !metadata.entities.is_empty() {
-                entity_index.remove(*id, &metadata.entities);
+        match fts {
+            FtsAction::WholeNamespace(namespace_id) => entity_index.remove_namespace(namespace_id),
+            FtsAction::PerRecord => {
+                for (id, record) in records {
+                    entity_index.remove(NamespaceId::new(record.namespace_id), *id);
+                }
             }
         }
     }

@@ -618,13 +618,7 @@ impl Recalld {
 
         // -- Step 6c: Build entity index from scanned records ----------
         let entity_index = {
-            let mut idx = EntityIndex::with_capacity(all_records.len());
-            for (memory_id, record) in &all_records {
-                let entities = crate::model::parse_structured_tags(&record.tags).entities;
-                if !entities.is_empty() {
-                    idx.add(*memory_id, &entities);
-                }
-            }
+            let idx = EntityIndex::from_records(&all_records);
             tracing::info!(memories = idx.len(), "entity index built");
             Arc::new(RwLock::new(idx))
         };
@@ -1570,5 +1564,39 @@ mod tests {
             .search(&[1.0, 0.0, 0.0, 0.0], 5, &SearchFilter::default())
             .expect("search");
         assert_eq!(hits.first().map(|h| h.id), Some(id));
+    }
+    #[tokio::test]
+    async fn entity_rebuild_uses_each_records_namespace_and_only_retained_labels() {
+        let (dir, other, local_id, foreign_id) = {
+            let fx = Fixture::new();
+            let other = fx.create_namespace("other");
+            let local_id = fx.insert_memory_in(ns(), &["entity/alice"]).await;
+            let foreign_id = fx
+                .insert_memory_in(other, &["entity/alice", "entity/bob"])
+                .await;
+            (fx.close(), other, local_id, foreign_id)
+        };
+        for _ in 0..2 {
+            let system = Recalld::new(offline_config(dir.path())).await.unwrap();
+            let index = system.entity_index().read().await;
+            assert_eq!(index.len(), 2);
+            let query = vec!["Alice".into(), "Bob".into()];
+            assert_eq!(
+                index.find_by_entities(ns(), &query, MemoryId::new()),
+                vec![(local_id, 1)]
+            );
+            assert_eq!(
+                index.find_by_entities(other, &query, MemoryId::new()),
+                vec![(foreign_id, 2)]
+            );
+            // This fixture claims fidelity only for labels retained in legacy tags.
+            assert!(
+                index
+                    .find_by_entities(ns(), &["José".into()], MemoryId::new())
+                    .is_empty()
+            );
+            drop(index);
+            system.shutdown().await.unwrap();
+        }
     }
 }
