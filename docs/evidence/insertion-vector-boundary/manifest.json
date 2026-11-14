@@ -1,0 +1,78 @@
+{
+  "experiment": "actual insertion vector validation and normalization",
+  "before": {
+    "production_source": "bfb4c85608812e206830f851a409cc044b8d1b9f",
+    "probe_patch": "before-regression.patch",
+    "command": "cargo test --offline --all-features insertion_rejects_zero",
+    "exit_code": 101,
+    "passed": 0,
+    "failed": 2
+  },
+  "after": {
+    "source": "7fa19f8927a9c1c6d46005044b37cae5eebca113",
+    "commands": [
+      {
+        "command": "cargo test --offline --all-features",
+        "exit_code": 0,
+        "library_passed": 645,
+        "cli_passed": 1,
+        "doctests_ignored": 4
+      },
+      {
+        "command": "cargo clippy --offline --all-features --all-targets",
+        "exit_code": 0,
+        "library_warnings": 371,
+        "test_warnings_including_duplicates": 382
+      },
+      {
+        "command": "cargo fmt --all -- --check",
+        "exit_code": 0
+      }
+    ]
+  },
+  "environment": {
+    "image": "recalld-ci:1.94",
+    "image_id": "sha256:daefdc9cbe9b0f39b1fc29d975148b3b10adc1bd4309f9ca1be8abd36ed811ef",
+    "toolchain": "1.94.1",
+    "host": "aarch64-unknown-linux-gnu",
+    "network": "none",
+    "cpus": 2,
+    "memory": "4g",
+    "cargo_build_jobs": 2,
+    "mounts": [
+      "assigned worktree:/work",
+      "separate scratch cargo:/cargo",
+      "separate scratch target:/target"
+    ]
+  },
+  "retained_artifacts_sha256": {
+    "README.md": "1ae7e4e817e2f7163c9334409e242f2c7c91c2c5efb044c42843984f0d3c363f",
+    "after-clippy-summary.log": "30112d1a4835d947772730e3a563ed53253d6248ebe2fc2f3e677595da8c4213",
+    "after-tests-summary.log": "30b28ff097d16897f7c2ca3bc6208539a88f28517ad9666391e104007ffbd2f3",
+    "before-regression.patch": "242fe66ab1cb8d5b5f0bb7cf839ef8ae36ddfa7f30a4bc39327b05b0e188c985",
+    "before-zero.log": "c76a857e1b45b4979e958650163c61fcb4ed3e286ed3264425bc9994a1fcb32c"
+  },
+  "original_untracked_logs_sha256": {
+    "zero-before.log": "c76a857e1b45b4979e958650163c61fcb4ed3e286ed3264425bc9994a1fcb32c",
+    "vector-final-tests.log": "d909c05932af687770cc926363a1b7c3966983b87ca971003c3e1869579eb3c0",
+    "vector-final-clippy.log": "046720f42ee552312a3b48349d7c5f09aed62e247b3f8b156c38a00b3e3f0f62",
+    "vector-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_file_sha256": {
+    "bfb4c85608812e206830f851a409cc044b8d1b9f:src/storage/metadata/insertion.rs": "e275dae2561aaf0f814a710e4b29459310f3b9adb95e226052562a25d9aabcb6",
+    "bfb4c85608812e206830f851a409cc044b8d1b9f:src/storage/engine/insertion.rs": "ac956e782881f1bd029fdde7bb629170f3ceded434182125001522771f651cb0",
+    "7fa19f8927a9c1c6d46005044b37cae5eebca113:src/embedding/validation.rs": "34203afb1d6c922fa7a8094a193460d208e472d38ad264cc0f0ccbdeae359e61",
+    "7fa19f8927a9c1c6d46005044b37cae5eebca113:src/storage/metadata/insertion.rs": "d8544e16759ba32c102892e6715f95e495b0166549f4201ce6ef80b489a9fe03",
+    "7fa19f8927a9c1c6d46005044b37cae5eebca113:src/storage/engine/insertion_tests.rs": "2b9aa868f074ca53adc8992303c0a3e2cbbcee7a443627cabe45214248667374",
+    "7fa19f8927a9c1c6d46005044b37cae5eebca113:src/mcp/bridge_adapters.rs": "1b134431f7e8d7be8b2d2976548fc8fd0d333d6986fa1daf012d498b0e9c2276",
+    "7fa19f8927a9c1c6d46005044b37cae5eebca113:src/api/handlers.rs": "7e29785971f701b511c7f36225d080bbd9081901c47bd4aff307f87d1d17bf57",
+    "7fa19f8927a9c1c6d46005044b37cae5eebca113:src/daemon/protocol.rs": "b2d8f080fd83acde3321df5c4baa7ae1193f214446662b8d2de73dbee15d3c20"
+  },
+  "limits": [
+    "synthetic temporary stores only",
+    "not power-loss evidence",
+    "not a profile attestation or schema-v2 serving activation",
+    "before probe patch reconstructed from the exact recorded test addition; original failure log retained",
+    "full original after logs remain untracked; compact after excerpts are retained and hashed"
+  ]
+}
