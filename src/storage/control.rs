@@ -336,12 +336,23 @@ pub(crate) fn validate_existing(
             MutationOutcome::NamespacePolicyUpdated { namespace_id } => {
                 scope == MutationScope::Namespace(*namespace_id)
             }
-            MutationOutcome::MemoryInserted { .. } | MutationOutcome::MemoryTombstoned { .. } => matches!(scope, MutationScope::Namespace(_)),
+            MutationOutcome::MemoryInserted { .. } | MutationOutcome::MemoryTombstoned { .. } => {
+                matches!(scope, MutationScope::Namespace(_))
+            }
             _ => true,
         };
         if !scope_matches {
             return Err(StorageError::InvalidControl(
-                "receipt outcome disagrees with key scope".into(),
+                if matches!(
+                    stored.receipt.outcome,
+                    MutationOutcome::MemoryInserted { .. }
+                        | MutationOutcome::MemoryTombstoned { .. }
+                ) {
+                    "record mutation receipt has catalog scope"
+                } else {
+                    "catalog receipt outcome disagrees with key scope"
+                }
+                .into(),
             ));
         }
         if lineage != state.store_id
