@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import tomllib
 
 IMAGE = "recalld-ci:1.94"
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,11 +32,32 @@ def save(path, value):
 
 
 def snapshot_source(root, destination):
-    # Only tracked production Rust plus these exact harness/build inputs. Never
-    # enumerate untracked files, checkout-local Cargo config, data or artifacts.
-    tracked = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--", "src"], cwd=root)
+    # Tracked target inputs only; never copy scratch, ambient Cargo config or secrets.
+    tracked = {os.fsdecode(p) for p in subprocess.check_output(
+        ["git", "ls-files", "-z", "--cached"], cwd=root).split(b"\0") if p}
+    roots = ("src/", "tests/", "examples/", "benches/")
+    legacy_data = {f"src/bench/data/{name}.json" for name in
+                   ("locomo1", "locomo10", "locomo_conv30", "locomo_conv41", "locomo_first")}
     names = set(FIXED_INPUTS)
-    names.update(os.fsdecode(p) for p in tracked.split(b"\0") if p and p.endswith(b".rs"))
+    for name in tracked:
+        if name.startswith(roots):
+            if name.endswith(".rs"):
+                names.add(name)
+            elif name not in legacy_data:
+                raise RuntimeError(f"undeclared target asset requires explicit allowlist: {name}")
+    cargo = tomllib.loads((root / "Cargo.toml").read_text())
+    if "workspace" in cargo:
+        raise RuntimeError("workspace snapshot requires explicit policy")
+    for kind in ("lib", "bin", "test", "example", "bench"):
+        targets = [cargo[kind]] if kind == "lib" and kind in cargo else cargo.get(kind, [])
+        for target in targets:
+            if target.get("path") and target["path"] not in names:
+                raise RuntimeError(f"undeclared Cargo target: {target['path']}")
+    build = cargo.get("package", {}).get("build", "build.rs" if "build.rs" in tracked else False)
+    if build and build not in names:
+        raise RuntimeError(f"undeclared build script: {build}")
+    if not names <= tracked:
+        raise RuntimeError("required source inputs must be tracked")
     hashes = {}
     for name in sorted(names):
         source = root / name
@@ -99,7 +121,7 @@ def main():
         "sourceCommit": command(["git", "rev-parse", "HEAD"], cwd=ROOT),
         "dirtyPatchSha256": hashlib.sha256(patch).hexdigest(),
         "sourceFilesSha256": hashes,
-        "sourceInputPolicy": "tracked src/**/*.rs plus FIXED_INPUTS; no other tracked or untracked paths",
+        "sourceInputPolicy": "tracked Rust under src/tests/examples/benches plus FIXED_INPUTS; unknown assets/targets rejected; legacy datasets excluded",
         "dirtyPatchScope": "allowlisted source inputs only; per-file hashes are authoritative",
         "sourceTreeSha256": hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(),
         "lockfileSha256": hashes["Cargo.lock"],
@@ -113,13 +135,13 @@ def main():
                     "externalDataset": None, "license": "no third-party dataset", "sourceMappingVersion": 1},
         "versions": {"publicContract": None, "retrievalSemantics": "legacy source-pinned internal path",
                      "lifecycle": "legacy_access_v1 materialized strength; no sweeps", "rankingProfile": "baseline-v1",
-                     "canonicalSchema": "source-pinned; no v2 claim", "receipts": None, "readiness": None},
+                     "canonicalSchema": "source-pinned; no v2 claim", "receipts": 1, "readiness": "production startup completion; not whole-store barrier"},
         "embedding": {"profile": "splitmix64-f32-l2-v1", "model": None, "dimensions": args.dimensions,
                       "input": "exact fixture namespace and query text; misses fail closed", "cache": "off"},
-        "behavior": {"clock": "fixed stored timestamps; no injected A3 clock", "rif": "off", "graphDepth": 0,
+        "behavior": {"clock": "ManualClock for lifecycle; random store/operation IDs remain", "rif": "off", "graphDepth": 0,
                      "storageFilesystem": "container /tmp tmpfs; CPU/logic control, not persistent-disk ingestion measurement",
-                     "recordAccess": "harness-only acknowledged no-op adapter; public false-mode unavailable",
-                     "ingestion": "direct real StorageEngine + index publication; bypasses public validation",
+                     "recordAccess": "false through production recorder/admission",
+                     "ingestion": "canonical InsertMemory receipts then production startup/completion; internal Rust, not public transport",
                      "engine": "real QueryEngine and production storage/vector/FTS/entity/cache/graph/RIF adapters",
                      "store": "fresh temporary root per process; no snapshot/restore claim"},
         "performanceGate": {"established": False, "absoluteBudgets": None,
@@ -139,11 +161,12 @@ df -T /tmp > /work/output/storage-filesystem.txt
 cat /sys/fs/cgroup/memory.max > /work/output/cgroup-memory.txt
 cat /sys/fs/cgroup/cpu.max > /work/output/cgroup-cpu.txt
 python3 scripts/test_offline_evaluation.py > /work/output/runner-tests.log 2>&1
-rustfmt --check --edition 2024 examples/offline_eval.rs > /work/output/format.log 2>&1
-cargo test --locked --offline --lib > /work/output/library-tests.log 2>&1
+cargo fmt --all --check > /work/output/format.log 2>&1
+cargo test --locked --offline --all-features --lib --bins --tests --examples -j1 > /work/output/library-tests.log 2>&1
 cargo test --locked --offline --example offline_eval > /work/output/harness-tests.log 2>&1
-cargo clippy --locked --offline --example offline_eval > /work/output/clippy.log 2>&1
-cargo build --locked --offline --release --example offline_eval > /work/output/build.log 2>&1
+cargo clippy --locked --offline --all-features --all-targets > /work/output/clippy.log 2>&1
+cargo clean -p recalld > /work/output/package-clean.log 2>&1
+cargo build --locked --offline --release --example offline_eval -j1 > /work/output/build.log 2>&1
 '''
     (scratch / "build.sh").write_text(inner)
     docker = ["docker", "run", "--rm", "--network", "none", "--cpus", "2", "--memory", "4g",
@@ -154,6 +177,7 @@ cargo build --locked --offline --release --example offline_eval > /work/output/b
               "--env", f"RUSTUP_TOOLCHAIN={args.toolchain}", image["Id"]]
     try:
         subprocess.run(docker + ["bash", "/work/build.sh"], check=True)
+        manifest["executableSha256"] = sha(scratch / "target/release/examples/offline_eval")
         for run in range(args.runs):
             cmd = docker + ["/work/target/release/examples/offline_eval", "--out", f"/work/output/run-{run}"]
             for key in ["records", "dimensions", "k", "warmup", "samples", "seed"]:

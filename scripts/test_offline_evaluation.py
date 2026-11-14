@@ -18,6 +18,7 @@ class SourceSnapshotTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         for name in (*runner["FIXED_INPUTS"], "src/lib.rs", ".validation/tracked.txt", "notes.txt"):
             self.write(name, "fixture\n")
+        self.write("Cargo.toml", '[package]\nname="fixture"\nversion="0.1.0"\nedition="2024"\n')
         self.git("add", ".")
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                  "commit", "--no-gpg-sign", "-qm", "fixture")
@@ -43,6 +44,25 @@ class SourceSnapshotTests(unittest.TestCase):
         self.assertIn(b"allowed source edit", patch)
         self.assertNotIn(b"DO_NOT_COPY_CANARY", patch)
         self.assertEqual({str(p.relative_to(self.output)) for p in self.output.rglob("*") if p.is_file()}, set(hashes))
+
+    def test_actual_extra_example_modules_and_cli_targets_are_included(self):
+        for name in ("examples/performance_probe.rs", "examples/support/mod.rs", "tests/text_migration_cli.rs"):
+            self.write(name, "// tracked canonical consumer\n")
+        self.git("add", "examples", "tests")
+        hashes = runner["snapshot_source"](self.root, self.output)
+        self.assertIn("examples/support/mod.rs", hashes)
+        self.assertIn("examples/performance_probe.rs", hashes)
+        self.assertIn("tests/text_migration_cli.rs", hashes)
+
+    def test_unknown_target_asset_or_explicit_cargo_target_fails_closed(self):
+        self.write("tests/fixture.secret", "must not silently omit or copy\n")
+        self.git("add", "tests")
+        with self.assertRaises(RuntimeError):
+            runner["snapshot_source"](self.root, self.output)
+        self.git("rm", "-f", "tests/fixture.secret")
+        self.write("Cargo.toml", '[package]\nname="fixture"\nversion="0.1.0"\n[[test]]\nname="custom"\npath="other/check.rs"\n')
+        with self.assertRaises(RuntimeError):
+            runner["snapshot_source"](self.root, self.output)
 
     def test_missing_required_input_fails_closed(self):
         (self.root / "Cargo.lock").unlink()

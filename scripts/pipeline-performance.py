@@ -72,6 +72,9 @@ def main():
     p.add_argument("--mode", choices=["quiet", "characterization"], required=True,
                    help="quiet requires an explicitly arranged exclusive interval")
     args = p.parse_args()
+    historical_probe = "d7c1ca01f28ce3c91cd7411596f5085a83b9ca5e0b3dd75930e4994608503079"
+    if digest(Path(__file__).resolve().parent.parent / "examples/performance_probe.rs") != historical_probe:
+        raise SystemExit("This historical study driver requires the frozen 16c574b probe. Canonical fixture v2 requires a separately frozen study/protocol; no historical measurement claim transfers.")
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     anchor, candidate = args.anchor.resolve(), args.candidate.resolve()

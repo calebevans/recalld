@@ -1,19 +1,19 @@
 //! Internal production-engine diagnostic; NOT the A6 public-action harness.
+mod support;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use recalld::{
-    cache::{CacheConfig, CacheManager},
-    graph::RelationshipGraph,
-    model::{AccessKind, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId},
+    model::{DecayPhase, MemoryId, NamespaceConfig, NamespaceId},
     rif::{RifConfig, RifEngine},
     search::{adapters::*, *},
     storage::{RedbStorageEngine, StorageEngine},
@@ -147,23 +147,6 @@ impl EmbeddingProviderRegistry for ReplayEmbeddings {
     }
 }
 
-// The current public API cannot disable access. Suppress ONLY in this diagnostic,
-// and acknowledge every scheduled batch so post-query inspection is not racy.
-struct DiagnosticAccessRecorder {
-    completed: tokio::sync::Semaphore,
-}
-#[async_trait::async_trait]
-impl AccessRecorder for DiagnosticAccessRecorder {
-    async fn record_access(&self, _: MemoryId, _: AccessKind) -> Result<(), SearchError> {
-        self.completed.add_permits(1);
-        Ok(())
-    }
-    async fn record_access_batch(&self, _: &[(MemoryId, AccessKind)]) -> Result<(), SearchError> {
-        self.completed.add_permits(1);
-        Ok(())
-    }
-}
-
 fn write_json(path: impl AsRef<std::path::Path>, value: &Value) -> Result<()> {
     fs::write(path, serde_json::to_vec_pretty(value)?)?;
     Ok(())
@@ -271,7 +254,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Fresh fixture-only storage. This deliberately bypasses public ingestion.
+    // Canonical internal insertion with receipts; not public transport ingestion.
     let store_dir = tempfile::tempdir()?;
     let build_start = Instant::now();
     let mut storage = RedbStorageEngine::open(store_dir.path())?;
@@ -285,8 +268,6 @@ async fn main() -> Result<()> {
             "unexpected namespace identity"
         );
     }
-    let fts = FtsIndex::new(store_dir.path())?;
-    let mut graph = RelationshipGraph::new();
     let mut ledger = File::create(args.out.join("turn-ledger.jsonl"))?;
     for (i, v) in fixture.iter().enumerate() {
         writeln!(
@@ -294,49 +275,34 @@ async fn main() -> Result<()> {
             "{}",
             json!({"sourceId": i, "memoryId": id(i), "status": "attempted"})
         )?;
-        let mut record = DiskRecord {
-            version: DiskRecord::CURRENT_VERSION,
-            id: *id(i).as_bytes(),
-            namespace_id: namespace(i).get(),
-            created_at: TIME,
-            last_accessed_at: TIME,
-            phase: DecayPhase::Full,
-            strength: 1.0,
-            decay_strength: 1.0,
-            stability: 1.0,
-            difficulty: 5.0,
-            is_permastore: 0,
-            vector_slot: 0,
-            edge_count: 0,
-            summary: format!("fixture token{i}"),
-            tags: vec![],
-            access_history: vec![],
-            text_offset: 0,
-            text_length: 0,
-        };
-        storage.insert_memory(id(i), namespace(i), &mut record, v, None)?;
-        fts.add(namespace(i), id(i), &record.summary, None, &[])?;
-        graph.add_node(
+        let receipt = support::insert(
+            &mut storage,
             id(i),
             namespace(i),
-            DecayPhase::Full,
-            1.0,
-            record.vector_slot,
+            format!("fixture token{i}"),
+            v,
+            TIME,
         )?;
         writeln!(
             ledger,
             "{}",
-            json!({"sourceId": i, "memoryId": id(i), "status": "accepted"})
+            json!({"sourceId": i, "memoryId": id(i), "status": "accepted", "receipt": receipt,
+                "publication": "canonical committed; startup rebuild follows"})
         )?;
     }
+    storage.sync()?;
+    drop(storage);
+    let system = support::open_ready(store_dir.path(), args.dimensions, TIME).await?;
     let build_us = build_start.elapsed().as_secs_f64() * 1e6;
-    let before = record_state(&storage)?;
+    let storage = system.storage().clone();
+    let graph = system.graph().clone();
+    let before = record_state(&storage.read().unwrap())?;
+    let control_before = storage.read().unwrap().control_state()?;
     write_json(args.out.join("state-before.json"), &before)?;
-    let storage = Arc::new(std::sync::RwLock::new(storage));
-    let graph = Arc::new(tokio::sync::RwLock::new(graph));
-    let recorder = Arc::new(DiagnosticAccessRecorder {
-        completed: tokio::sync::Semaphore::new(0),
-    });
+    write_json(
+        args.out.join("control-before.json"),
+        &serde_json::to_value(&control_before)?,
+    )?;
     let embeddings = Arc::new(ReplayEmbeddings(
         (0..args.records)
             .step_by(10)
@@ -353,22 +319,12 @@ async fn main() -> Result<()> {
     let engine = QueryEngine::new(
         Arc::new(StorageNamespaceResolver::new(storage.clone())),
         embeddings,
-        Arc::new(SharedVectorIndexRegistry::new(Arc::new(
-            tokio::sync::RwLock::new(index),
-        ))),
-        Arc::new(SharedFtsIndexRegistry::new(Arc::new(
-            tokio::sync::Mutex::new(fts),
-        ))),
-        Arc::new(SharedEntityIndexReader::new(Arc::new(
-            tokio::sync::RwLock::new(EntityIndex::new()),
-        ))),
-        Arc::new(CacheManagerAdapter::new(Arc::new(CacheManager::new(
-            CacheConfig {
-                embedding_dim: args.dimensions,
-                ..Default::default()
-            },
-            None,
-        )))),
+        Arc::new(SharedVectorIndexRegistry::new(
+            system.vector_index().clone(),
+        )),
+        Arc::new(SharedFtsIndexRegistry::new(system.fts_index().clone())),
+        Arc::new(SharedEntityIndexReader::new(system.entity_index().clone())),
+        Arc::new(CacheManagerAdapter::new(system.cache().clone())),
         Arc::new(StorageMetadataAdapter::new(storage.clone())),
         Arc::new(SharedGraphReader::new(graph.clone())),
         Arc::new(RifProcessorAdapter::new(
@@ -378,8 +334,12 @@ async fn main() -> Result<()> {
             })),
             graph,
         )),
-        recorder.clone(),
-    );
+        Arc::new(
+            StorageAccessRecorder::new(storage.clone(), system.cache().clone())
+                .with_clock(system.clock().clone()),
+        ),
+    )
+    .with_lifecycle_inputs(system.clock().clone(), Default::default(), 1.0);
 
     let retained: Vec<_> = (0..args.records).collect();
     for hybrid in [false, true] {
@@ -393,15 +353,11 @@ async fn main() -> Result<()> {
             let q = (step % (args.records / 10)) * 10;
             let query: SearchQuery = serde_json::from_value(json!({"text": format!("query{q}"),
                 "ftsQuery": if hybrid { format!("token{q}") } else { "unmatchedfixtureterm".into() },
-                "namespace": "fixture", "limit": args.k, "graphDepth": 0}))?;
+                "namespace": "fixture", "limit": args.k, "graphDepth": 0, "recordAccess": false}))?;
             let start = Instant::now();
             let response = engine.search(query).await?;
             let call_us = start.elapsed().as_secs_f64() * 1e6;
             ensure!(!response.results.is_empty(), "empty fixture response");
-            tokio::time::timeout(Duration::from_secs(30), recorder.completed.acquire())
-                .await??
-                .forget();
-            let drained_us = start.elapsed().as_secs_f64() * 1e6;
             let encode_start = Instant::now();
             let encoded = serde_json::to_vec(&response)?;
             let encode_us = encode_start.elapsed().as_secs_f64() * 1e6;
@@ -454,7 +410,6 @@ async fn main() -> Result<()> {
                     response.timings.as_ref().context("missing stage timings")?,
                 )?;
                 timing["engineCallUs"] = json!(call_us);
-                timing["engineAndDiagnosticDrainUs"] = json!(drained_us);
                 timing["jsonSerializationUs"] = json!(encode_us);
                 for (name, value) in timing.as_object().unwrap() {
                     stages
@@ -479,14 +434,26 @@ async fn main() -> Result<()> {
     let after = record_state(&storage.read().unwrap())?;
     ensure!(before == after, "diagnostic queries mutated stored records");
     write_json(args.out.join("state-after.json"), &after)?;
+    let control_after = storage.read().unwrap().control_state()?;
+    ensure!(
+        control_before == control_after,
+        "false queries changed canonical control"
+    );
+    write_json(
+        args.out.join("control-after.json"),
+        &serde_json::to_value(control_after)?,
+    )?;
     write_json(args.out.join("replay.json"), &json!(replay))?;
     write_json(
         args.out.join("summary.json"),
         &json!({"diagnosticManifestVersion": 1,
-        "track": "legacy-internal-offline-foundation", "publicApiConformance": false,
+        "track": "canonical-internal-offline-v2", "publicApiConformance": false,
         "syntheticSemanticQualityClaim": false, "records": args.records, "dimensions": args.dimensions,
         "k": args.k, "seed": args.seed, "warmupPerCell": args.warmup, "samplesPerCell": args.samples,
-        "fixtureIngestUs": build_us, "canonicalRecordsUnchanged": true,
+        "fixtureIngestUs": build_us, "canonicalRecordsUnchanged": true, "canonicalControlUnchanged": true,
+        "ingestion": "InsertMemory receipts; production startup/completion", "recordAccess": false,
+        "clock": "ManualClock for lifecycle only; operation/store UUIDs remain random",
+        "identity": "explicit caller-supplied canonical memory IDs; not whole-store deterministic replay",
         "extraction": {"track": "raw-synthetic-unit", "sourceUnits": args.records,
             "attempted": args.records, "accepted": args.records, "rejected": 0,
             "sourceUnitCoverage": 1.0, "propositionPreservation": "not measured"},

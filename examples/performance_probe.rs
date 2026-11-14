@@ -1,4 +1,6 @@
 //! Isolated actual-engine instrumentation probe. No provider/network or serving-v2.
+mod support;
+
 use anyhow::{Result, ensure};
 use clap::Parser;
 use recalld::{
@@ -31,6 +33,8 @@ struct Args {
     samples: usize,
     #[arg(long, default_value_t = 60)]
     throughput_seconds: u64,
+    #[arg(long, default_value_t = 1000)]
+    throughput_minimum_requests: usize,
     #[arg(long)]
     initialize: bool,
     #[arg(long)]
@@ -141,6 +145,10 @@ fn canonical_state(storage: &RedbStorageEngine) -> Result<String> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(
+        args.samples > 0 && args.throughput_minimum_requests > 0,
+        "positive sample/request count required"
+    );
+    ensure!(
         args.records >= 200 && args.records % 10 == 0,
         "invalid corpus"
     );
@@ -161,30 +169,22 @@ async fn main() -> Result<()> {
         for (i, v) in fixture.iter().enumerate() {
             let id = MemoryId::from_uuid(uuid::Uuid::from_u128((i + 1) as u128));
             let ns = NamespaceId::new((i % 10 + 1) as u32);
-            let mut r = DiskRecord {
-                version: 1,
-                schema: None,
-                id: *id.as_bytes(),
-                namespace_id: ns.get(),
-                created_at: NOW,
-                last_accessed_at: NOW,
-                phase: DecayPhase::Full,
-                strength: 1.0,
-                decay_strength: 1.0,
-                stability: 1.0,
-                difficulty: 5.0,
-                is_permastore: 0,
-                vector_slot: 0,
-                edge_count: 0,
-                summary: "needle fixture".into(),
-                tags: vec![],
-                access_history: vec![],
-                text_offset: 0,
-                text_length: 0,
-            };
-            storage.insert_memory(id, ns, &mut r, v, None)?;
+            support::insert(&mut storage, id, ns, "needle fixture".into(), v, NOW)?;
         }
         storage.sync()?;
+        drop(storage);
+        let system = support::open_ready(&args.store, 384, NOW).await?;
+        system.storage().write().unwrap().sync()?;
+        fs::write(
+            args.store.join("fixture-source.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "fixtureVersion": 2, "track": "canonical-writer-internal-probe", "seed": args.seed,
+                "records": args.records, "dimensions": 384,
+                "ingestion": "InsertMemory receipts; production startup/completion",
+                "identity": "caller-supplied canonical memory IDs; random store/operation UUIDs",
+                "wholeStoreDeterministicReplay": false
+            }))?,
+        )?;
         return Ok(());
     }
     fs::create_dir(&args.out)?;
@@ -205,54 +205,36 @@ async fn main() -> Result<()> {
             "off"
         })
         .init();
-    let mut storage = RedbStorageEngine::open(&args.store)?;
-    let rows = storage.scan_all()?;
-    ensure!(rows.len() == args.records, "corpus count");
-    let mut index = FlatVectorIndex::new(384);
-    let fts = FtsIndex::new(&args.out)?;
-    let mut graph = recalld::graph::RelationshipGraph::new();
-    for (id, r) in rows {
-        let ns = NamespaceId::new(r.namespace_id);
-        let v = storage.get_vector(ns, r.vector_slot)?.unwrap();
-        index.add(
-            id,
-            &v,
-            VectorMetadata {
-                namespace_id: ns,
-                decay_phase: 1,
-                tags: vec![],
-            },
-        )?;
-        fts.add(ns, id, &r.summary, None, &[])?;
-        graph.add_node(id, ns, r.phase, r.strength, r.vector_slot)?;
-    }
-    storage.sync()?;
+    let source: serde_json::Value =
+        serde_json::from_slice(&fs::read(args.store.join("fixture-source.json"))?)?;
+    ensure!(
+        source["fixtureVersion"] == 2
+            && source["seed"] == args.seed
+            && source["records"] == args.records,
+        "canonical fixture manifest mismatch; initialize with this source"
+    );
+    let system = support::open_ready(&args.store, 384, NOW).await?;
+    let storage = system.storage().clone();
+    ensure!(
+        storage.read().unwrap().scan_all()?.len() == args.records,
+        "corpus count"
+    );
+    storage.write().unwrap().sync()?;
     let before = digest_files(&args.store)?;
-    let canonical_before = canonical_state(&storage)?;
-    let storage = Arc::new(std::sync::RwLock::new(storage));
-    let graph = Arc::new(tokio::sync::RwLock::new(graph));
-    let cache = Arc::new(recalld::cache::CacheManager::new(
-        recalld::cache::CacheConfig {
-            embedding_dim: 384,
-            ..Default::default()
-        },
-        None,
-    ));
+    let canonical_before = canonical_state(&storage.read().unwrap())?;
+    let graph = system.graph().clone();
+    let cache = system.cache().clone();
     let clock = Arc::new(recalld::time::ManualClock::new(NOW));
     let engine = QueryEngine::new(
         Arc::new(StorageNamespaceResolver::new(storage.clone())),
         Arc::new(SingleEmbeddingRegistry::new(Arc::new(
             recalld::embedding::PassthroughProvider::new(384),
         ))),
-        Arc::new(SharedVectorIndexRegistry::new(Arc::new(
-            tokio::sync::RwLock::new(index),
-        ))),
-        Arc::new(SharedFtsIndexRegistry::new(Arc::new(
-            tokio::sync::Mutex::new(fts),
-        ))),
-        Arc::new(SharedEntityIndexReader::new(Arc::new(
-            tokio::sync::RwLock::new(EntityIndex::new()),
-        ))),
+        Arc::new(SharedVectorIndexRegistry::new(
+            system.vector_index().clone(),
+        )),
+        Arc::new(SharedFtsIndexRegistry::new(system.fts_index().clone())),
+        Arc::new(SharedEntityIndexReader::new(system.entity_index().clone())),
         Arc::new(NoCache),
         Arc::new(StorageMetadataAdapter::new(storage.clone())),
         Arc::new(SharedGraphReader::new(graph.clone())),
@@ -297,7 +279,9 @@ async fn main() -> Result<()> {
     }
     let start = Instant::now();
     let mut completed = 0;
-    while start.elapsed() < Duration::from_secs(args.throughput_seconds) || completed < 1000 {
+    while start.elapsed() < Duration::from_secs(args.throughput_seconds)
+        || completed < args.throughput_minimum_requests
+    {
         engine
             .search(queries[completed % queries.len()].clone())
             .await?;
@@ -323,6 +307,8 @@ async fn main() -> Result<()> {
     fs::write(
         args.out.join("summary.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
+            "track":"canonical-writer-internal-probe-v2", "fixture_source":source,
+            "historicalMeasurementComparable":false,
             "seed":args.seed,"records":args.records,"trace":args.trace,"samples":args.samples,"p95_ns":p95,
             "throughput_completed":completed,"throughput_seconds":seconds,"requests_per_second":completed as f64/seconds,
             "result_sha256":result_hash.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>(),"canonical_file_sha256":before,"canonical_state_sha256":canonical_before,
