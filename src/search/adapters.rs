@@ -3,6 +3,7 @@
 //! Each adapter struct wraps a concrete subsystem type and implements
 //! the corresponding DI trait from `pipeline.rs`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -115,6 +116,7 @@ impl VectorIndexRegistry for SharedVectorIndexRegistry {
         namespace_id: NamespaceId,
         query_vec: &[f32],
         k: usize,
+        eligible_ids: Option<&HashSet<MemoryId>>,
     ) -> Result<Vec<ScoredResult>> {
         let index = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.index.read())
@@ -124,7 +126,7 @@ impl VectorIndexRegistry for SharedVectorIndexRegistry {
             ..Default::default()
         };
         let results = index
-            .search(query_vec, k, &filter)
+            .search_eligible(query_vec, k, &filter, eligible_ids)
             .map_err(|e| SearchError::VectorIndexError(e.to_string()))?;
         Ok(results
             .into_iter()
@@ -268,19 +270,16 @@ impl MetadataStore for StorageMetadataAdapter {
         .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
     }
 
-    async fn scan_all(&self) -> Result<Vec<CachedRecord>> {
+    async fn list_namespace_memories(&self, namespace_id: NamespaceId) -> Result<Vec<MemoryId>> {
         let storage = self.storage.clone();
         tokio::task::spawn_blocking(move || {
             let storage_r = storage
                 .read()
                 .map_err(|e| SearchError::MetadataError(format!("storage lock poisoned: {e}")))?;
-            let all = storage_r
-                .scan_all()
-                .map_err(|e| SearchError::MetadataError(e.to_string()))?;
-            Ok(all
-                .iter()
-                .map(|(_id, disk)| CachedRecord::from(disk))
-                .collect())
+            storage_r
+                .meta_store()
+                .memories_in_namespace(namespace_id)
+                .map_err(|e| SearchError::MetadataError(e.to_string()))
         })
         .await
         .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
@@ -485,12 +484,10 @@ impl GraphReader for SharedGraphReader {
 
 /// Adapts a shared `EntityIndex` to `EntityIndexReader`.
 ///
-/// The EntityIndex is shared across all namespaces. The adapter
-/// accepts a `namespace_id` parameter but does not filter by it
-/// because the entity index does not track which namespace a
-/// memory belongs to. Namespace filtering happens in the pipeline's
-/// `passes_filters` stage, which checks each candidate's
-/// `CachedRecord::namespace_id` against the query namespace.
+/// Canonical eligible IDs are scoped to the resolved namespace by the pipeline.
+/// Apply them before the result cap, so foreign or filtered postings cannot
+/// crowd out eligible records. Namespace-partitioned postings can later avoid
+/// scanning those foreign postings without changing this admission contract.
 pub struct SharedEntityIndexReader {
     entity_index: Arc<tokio::sync::RwLock<EntityIndex>>,
 }
@@ -508,6 +505,7 @@ impl EntityIndexReader for SharedEntityIndexReader {
         entities: &[String],
         exclude_id: MemoryId,
         k: usize,
+        eligible_ids: &HashSet<MemoryId>,
     ) -> Result<Vec<EntityRecallResult>> {
         if entities.is_empty() {
             return Ok(Vec::new());
@@ -515,7 +513,8 @@ impl EntityIndexReader for SharedEntityIndexReader {
         let index = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.entity_index.read())
         });
-        let results = index.find_by_entities(entities, exclude_id);
+        let results =
+            index.find_by_entities_filtered(entities, exclude_id, |id| eligible_ids.contains(&id));
         Ok(results
             .into_iter()
             .take(k)
@@ -524,5 +523,76 @@ impl EntityIndexReader for SharedEntityIndexReader {
                 shared_count,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::DecayPhase;
+    use crate::test_support::{Fixture, MemorySpec};
+
+    #[tokio::test]
+    async fn namespace_enumeration_scopes_ids_and_batch_reads_current_canonical_records() {
+        let fixture = Fixture::new();
+        let namespace = NamespaceId::new(1);
+        let foreign_namespace = fixture.create_namespace("foreign");
+        let live = fixture
+            .insert_memory_in(namespace, &["project/recalld"])
+            .await;
+        let ghost = fixture
+            .insert_memory_with(MemorySpec {
+                phase: DecayPhase::Ghost,
+                decay_strength: 0.2,
+                tags: &["type/ghost"],
+                ..MemorySpec::new(namespace)
+            })
+            .await;
+        let removed = fixture.insert_memory_in(namespace, &[]).await;
+        let foreign = fixture
+            .insert_memory_in(foreign_namespace, &["project/recalld"])
+            .await;
+        let adapter = StorageMetadataAdapter::new(fixture.storage.clone());
+        let mut ids = adapter.list_namespace_memories(namespace).await.unwrap();
+        assert_eq!(
+            ids.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([live, ghost, removed])
+        );
+        assert_eq!(
+            adapter
+                .list_namespace_memories(foreign_namespace)
+                .await
+                .unwrap(),
+            vec![foreign]
+        );
+        assert!(
+            adapter
+                .list_namespace_memories(NamespaceId::new(999))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The batch read must observe canonical state, not treat an enumerated ID as eligible.
+        fixture.tombstone(removed);
+        ids.push(MemoryId::new()); // A missing canonical row is skipped.
+        let records = adapter.get_batch(&ids).await.unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|r| r.namespace_id == namespace));
+        let removed = records.iter().find(|r| r.id == removed).unwrap();
+        assert_eq!(removed.phase, DecayPhase::Tombstone);
+        let ghost = records.iter().find(|r| r.id == ghost).unwrap();
+        assert_eq!(ghost.phase, DecayPhase::Ghost);
+        assert_eq!(ghost.strength, 0.2);
+        assert_eq!(ghost.tags[0].as_str(), "type/ghost");
+        assert_eq!(
+            adapter
+                .list_namespace_memories(namespace)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([live, ghost.id])
+        );
     }
 }
