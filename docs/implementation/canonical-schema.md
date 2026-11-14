@@ -1,0 +1,23 @@
+# Canonical schema-v2 codec and migration work
+
+This slice adds codec types without enabling ordinary schema-v2 serving or activating lifecycle v2. `DiskRecord::CURRENT_VERSION` remains 1 for existing adapters. Legacy insertion rejects v2 records before payload allocation; consumers need an explicit participating-writer path. The offline migration/export and read validation work follows this codec commit. Removal-ledger, restore-lineage and complete writer/readiness integration remain required.
+
+## Stable consumer interfaces
+
+`model::schema` owns `RecordSchemaV2`, `NamespaceSchemaV2`, `LifecycleFields`, `LifecycleVersion`, `TimestampOrigin`, `StructuredLabels`, `LabelProvenance`, `EmbeddingProfile`, `PreprocessingIdentity`, `ProviderKind`, `Normalization`, `EmbeddingBinding`, `BindingProvenance`, and `VectorReference`.
+
+`DiskRecord.schema: Option<RecordSchemaV2>` and `NamespaceConfig.schema: Option<NamespaceSchemaV2>` preserve v1 defaults when absent. The v2 record layout is byte 2, u32-LE length + complete v1 base bytes, then u32-LE length + schema JSON. Binary base floats retain their exact f32 bits. `DiskRecord::encode()` checks the version/schema agreement and schema invariants; canonical persistence uses it. `from_bytes` rejects truncated/trailing records, invalid retained tags and unknown event kinds instead of silently dropping tags or inventing retrieval events. Namespace decode rejects unknown required fields/versions. Optional `extensions` maps round-trip; nonempty unknown `requiredFeatures` blocks decode.
+
+A3 fields use their normative names: observed/retrieved/reinforced times, decay anchor, lifecycle version/update time, timestamp origin, phase-change time, policy revision and record generation. Revisions use the shared decimal-string u63 representation. Legacy conversion takes one explicit `migration_now`; it does not read wall time. Observed time uses creation with `legacy_inferred` provenance, anchor preserves old last access, lifecycle update is max(created,last access), and phase-change time records migration time when history is unknown. Retrieval/feedback dates come only from matching retained typed events; missing history stays unknown. Native and migrated namespace defaults remain `legacy_access_v1`.
+
+Labels are exact ordered UTF-8 strings, including duplicates, spaces, apostrophes and case. They are separate from Tag encoding. Legacy conversion preserves original tags and copies only raw retained entity/topic/emotion suffixes; `LegacyRetainedOnly` records that previously dropped labels are unrecoverable. Ghost/tombstone conversion adds no structured content. Derived normalization and consumer indexing remain separate.
+
+## Embedding identity
+
+A binding is `UnknownLegacy` or `Bound { profile_id, descriptor, provenance }`. Known binding provenance distinguishes native-v2 creation, explicit operator attestation and re-embedding. Migration must not infer identity from dimensions/current configuration or normalize old vector bytes. `VectorReference` stores slot, initialized allocation epoch and SHA-256 of exact vector bytes; tombstones have no live vector reference.
+
+Reuse `EmbeddingProfile::profile_id()`, not a second hash implementation. It yields `ep1:<lowercase SHA-256 hex>`. Each field is preceded by its u64 big-endian byte length, in this exact order: `recalld-embedding-profile`, identityVersion as u32-BE, provider kind bytes, exact model ID, one-byte revision-present discriminator, revision bytes only when present, dimension as u32-BE, document preprocessing version, document prefix, query preprocessing version, query prefix, `l2_unit_v1`. None differs from Some(empty). No trimming, case folding, credentials or config paths enter identity.
+
+Supported preprocessing names are `recalld-document-v1` and `recalld-query-v1`; unknown names fail closed. Document-v1 identifies the existing summary + optional two-newline/full-text + optional space/joined merged-tags composition and provider document mode. Query-v1 identifies unchanged query text and provider query mode. Prefix concatenation is literal prefix + text. A composition change requires a new supported version. Unknown model revision remains null.
+
+Codec validation: full offline all-feature suite passed 551 library tests and one CLI integration test, with four ignored doctests. The four added schema tests cover exact Unicode/order/duplicates/extensions and f32 bits, evidence-based legacy timestamps/defaults, malformed/future record rejection, and profile identity distinctions. These tests do not establish migration or ordinary v2 writer conformance yet.

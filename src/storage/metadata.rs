@@ -196,7 +196,7 @@ impl MetadataStore {
             old_phase = record.phase;
             f(&mut record)?;
 
-            table.insert(key, record.to_bytes().as_slice())?;
+            table.insert(key, record.encode()?.as_slice())?;
             record
         };
         control::advance_generation(&write_txn)?;
@@ -230,8 +230,13 @@ impl MetadataStore {
                 "record ID disagrees with key".into(),
             ));
         }
+        if record.version != 1 || record.schema.is_some() {
+            return Err(StorageError::RecoveryRequired(
+                "schema-v2 records require offline migration and participating writers".into(),
+            ));
+        }
         let key = id.as_bytes().as_slice();
-        let value = record.to_bytes();
+        let value = record.encode()?;
 
         let write_txn = self.db.begin_write()?;
         {
@@ -483,7 +488,7 @@ impl MetadataStore {
                 record.access_history.remove(0);
             }
             record.access_history.push(AccessEvent { timestamp, kind });
-            table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
+            table.insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
         }
         let receipt = control::record_receipt(
             &tx,
@@ -594,7 +599,7 @@ impl MetadataStore {
             record.strength = 0.0;
             record.decay_strength = 0.0;
 
-            meta.insert(key, record.to_bytes().as_slice())?;
+            meta.insert(key, record.encode()?.as_slice())?;
 
             // Remove from tag index.
             let mut tags = write_txn.open_multimap_table(TAG_INDEX)?;
@@ -1057,7 +1062,7 @@ impl MetadataStore {
                 if record.phase == DecayPhase::Tombstone {
                     namespaces.remove(record.namespace_id, key)?;
                 }
-                table.insert(key, record.to_bytes().as_slice())?;
+                table.insert(key, record.encode()?.as_slice())?;
                 transitions.push((
                     record.namespace_id,
                     record.vector_slot,
@@ -1579,7 +1584,7 @@ impl MetadataStore {
                 stripped.strength = 0.0;
                 stripped.decay_strength = 0.0;
 
-                meta.insert(key, stripped.to_bytes().as_slice())?;
+                meta.insert(key, stripped.encode()?.as_slice())?;
 
                 for tag in &existing.tags {
                     tags.remove(tag.as_str(), key)?;
@@ -1763,6 +1768,7 @@ mod tests {
     /// A live, Full-phase record in `namespace_id` occupying `slot`.
     fn record_in(namespace_id: u32, slot: u32, tags: &[&str]) -> DiskRecord {
         DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: [0u8; 16],
             namespace_id,

@@ -1199,6 +1199,12 @@ impl StorageEngine for RedbStorageEngine {
         full_text: Option<&str>,
     ) -> Result<(), StorageError> {
         self.ensure_available()?;
+        if record.version != 1 || record.schema.is_some() {
+            return Err(StorageError::RecoveryRequired(
+                "schema-v2 records require participating writers".into(),
+            ));
+        }
+        record.encode()?;
         // Reject identity conflicts before allocating or appending payloads.
         if record.id != *id.as_bytes() || record.namespace_id != namespace_id.get() {
             return Err(StorageError::InvalidMutation(
@@ -1801,6 +1807,7 @@ mod tests {
     fn add_memory(engine: &mut RedbStorageEngine, namespace_id: NamespaceId) -> MemoryId {
         let id = MemoryId::new();
         let mut record = DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: namespace_id.get(),
