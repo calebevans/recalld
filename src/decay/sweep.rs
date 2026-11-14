@@ -166,7 +166,7 @@ pub struct SweepResult {
     /// Memories where connection bonus prevented a phase transition
     /// that raw R alone would have triggered.
     pub saved_by_connection_bonus: u64,
-    /// Whether fulltext.dat compaction was triggered.
+    /// Whether text compaction succeeded, including an empty generation selection.
     pub compaction_triggered: bool,
     /// Wall-clock duration of the entire sweep.
     pub duration: Duration,
@@ -589,11 +589,7 @@ impl DecaySweepRunner {
             })
             .await;
             match compaction_result {
-                Ok(Ok(cr)) => {
-                    if cr.entries_removed > 0 {
-                        result.compaction_triggered = true;
-                    }
-                }
+                Ok(Ok(_)) => result.compaction_triggered = true,
                 Ok(Err(e)) => {
                     error!(error = %e, "fulltext.dat compaction failed");
                 }
@@ -1368,6 +1364,54 @@ mod tests {
     use crate::model::{DiskRecord, NamespaceConfig};
 
     const DIM: usize = 4;
+
+    #[tokio::test]
+    async fn empty_successful_compaction_is_reported() {
+        let fixture = crate::test_support::Fixture::new();
+        let id = fixture
+            .insert_memory_with(crate::test_support::MemorySpec {
+                phase: DecayPhase::Ghost,
+                summary: "",
+                ..crate::test_support::MemorySpec::new(crate::model::NamespaceId::new(1))
+            })
+            .await;
+        let before = fixture
+            .storage
+            .read()
+            .unwrap()
+            .meta_store()
+            .text_selection()
+            .unwrap()
+            .unwrap();
+
+        // No text was ever appended. Deleting the expired ghost still selects
+        // a fresh empty generation and must report that maintenance commit.
+        let result = DecaySweepRunner::execute_sweep_at(
+            &SweepConfig::default(),
+            &DecayConfig::default(),
+            &ActivationConfig::default(),
+            &fixture.storage,
+            &fixture.graph,
+            &fixture.cache,
+            1.0,
+            Some(1_000_000 * 86_400_000),
+        )
+        .await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.deletions, 1);
+        assert!(fixture.record(id).is_none());
+        let after = fixture
+            .storage
+            .read()
+            .unwrap()
+            .meta_store()
+            .text_selection()
+            .unwrap()
+            .unwrap();
+        assert_ne!(before.id, after.id);
+        assert_eq!(before.sealed_length, after.sealed_length);
+        assert!(result.compaction_triggered);
+    }
 
     /// An engine holding one live, Full-phase memory.
     fn engine_with_one_memory() -> (tempfile::TempDir, RedbStorageEngine, MemoryId) {
