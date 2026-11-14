@@ -1113,21 +1113,7 @@ pub async fn create_namespace(
             req.decay_rate_multiplier,
         )
         .await
-        .map_err(|e| {
-            if matches!(
-                e.downcast_ref::<crate::decay::lifecycle::LifecycleError>(),
-                Some(crate::decay::lifecycle::LifecycleError::InvalidInput(_))
-            ) {
-                AppError::BadRequest {
-                    message: e.to_string(),
-                    field: None,
-                }
-            } else {
-                AppError::Conflict {
-                    message: format!("namespace '{}' already exists", req.name),
-                }
-            }
-        })?;
+        .map_err(namespace_create_error)?;
 
     let response = NamespaceResponse {
         id: ns.id.get(),
@@ -1150,6 +1136,36 @@ pub async fn create_namespace(
             took_us: Some(took),
         }),
     ))
+}
+
+fn namespace_create_error(error: Box<dyn std::error::Error + Send + Sync>) -> AppError {
+    use crate::decay::lifecycle::LifecycleError;
+    use crate::storage::StorageError;
+    if matches!(
+        error.downcast_ref::<LifecycleError>(),
+        Some(LifecycleError::InvalidInput(_))
+    ) {
+        return AppError::BadRequest {
+            message: error.to_string(),
+            field: None,
+        };
+    }
+    match error.downcast::<StorageError>() {
+        Ok(error) => match *error {
+            StorageError::InvalidMutation(message)
+            | StorageError::InvalidNamespaceName {
+                reason: message, ..
+            } => AppError::BadRequest {
+                message,
+                field: None,
+            },
+            error @ StorageError::CommitOutcomeUnknown { .. } => AppError::ServiceUnavailable {
+                message: error.to_string(),
+            },
+            error => error.into(),
+        },
+        Err(source) => AppError::Internal { source },
+    }
 }
 
 /// GET /namespaces/:id/stats -- namespace statistics.

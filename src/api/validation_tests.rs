@@ -200,6 +200,84 @@ async fn http_namespace_rejects_exported_probe_values_without_creation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespace_creation_typed_validation_and_unavailable_errors() {
+    use crate::storage::StorageError;
+    use axum::response::IntoResponse;
+    let operation_id = uuid::Uuid::new_v4();
+    for (error, status) in [
+        (
+            StorageError::InvalidMutation("invalid policy".into()),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            StorageError::RecoveryRequired("reopen".into()),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            StorageError::CommittedEffectsPending {
+                operation_id,
+                source: Box::new(StorageError::RecoveryRequired("publish".into())),
+            },
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            StorageError::CommitOutcomeUnknown {
+                operation_id,
+                source: redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(
+                    "lost commit acknowledgement",
+                ))),
+            },
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let carries_operation = matches!(
+            &error,
+            StorageError::CommittedEffectsPending { .. }
+                | StorageError::CommitOutcomeUnknown { .. }
+        );
+        let response = namespace_create_error(Box::new(error)).into_response();
+        assert_eq!(response.status(), status);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("already exists"));
+        if carries_operation {
+            assert!(body.contains(&operation_id.to_string()));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespace_creation_storage_failure_is_not_a_duplicate() {
+    let f = Fixture::new();
+    let (app, _) = fixture_clients(&f);
+    let (status, _) = post(&app, "/namespaces", json!({"name":"duplicate"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = post(&app, "/namespaces", json!({"name":"duplicate"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let before = f.storage.read().unwrap().control_state().unwrap();
+
+    // Force a real catalog filesystem failure while keeping its database handles
+    // open. Restore the synthetic root before checking the response or dropping it.
+    let parked = tempfile::tempdir().unwrap();
+    let store = parked.path().join("store");
+    std::fs::rename(f.path(), &store).unwrap();
+    std::fs::write(f.path(), b"not a directory").unwrap();
+    let (status, body) = post(&app, "/namespaces", json!({"name":"io-failure"})).await;
+    std::fs::remove_file(f.path()).unwrap();
+    std::fs::rename(&store, f.path()).unwrap();
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(!body.to_string().contains("already exists"), "{body}");
+    let storage = f.storage.read().unwrap();
+    assert_eq!(storage.control_state().unwrap(), before);
+    assert!(
+        storage
+            .get_namespace_by_name("io-failure")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn namespace_option_parity_and_no_creation_on_invalid_input() {
     let f = Fixture::new();
     let (app, _) = fixture_clients(&f);

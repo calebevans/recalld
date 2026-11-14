@@ -37,6 +37,9 @@ Changed inputs with the same key conflict. IDs from committed rows never reuse.
 
 Name/dimension/policy/schema validation occurs at storage entry. Policy updates
 have no identity, directory, dimension, timestamp, lifecycle or profile setters.
+Legacy desired retention accepts finite values in [0,1], including both endpoints,
+matching tools16 HTTP/MCP validation. Zero decay multiplier remains valid. This
+compatibility rule does not change schema-v2 validation or enable its writers.
 New ordinary rows require legacy `schema: None`; profiles and v2 policy toggles
 remain migration work. The existing fenced new-store layout is retained.
 
@@ -134,3 +137,32 @@ offline Rust 1.94.1 Docker configuration above. This passing run does not resolv
 the earlier catalog-parent flock failure or establish its cause.
 Raw before/focused/full/fmt/Clippy logs are retained outside the source tree at
 `/tmp/recalld-implementation/catalog-receipt-scope-validation`.
+
+## Legacy policy compatibility correction
+
+Minimal validation join107407a contains only catalog scope82e840b and tools16
+cad1e99. Its merge keeps strict duplicate-scan validation/coverage inside the
+existing effects-stamp guard and retains both branches' test modules.
+
+Before correction, 54 namespace tests passed and three failed: direct engine
+creation rejected retention0 with `InvalidMutation`, HTTP/MCP option parity
+returned409 for the distinct name http-1, and an actual filesystem failure
+returned409 with a false duplicate-name message. Legacy storage now accepts
+finite retention0 and1 for creation and policy updates, with reopen persistence
+tests and zero decay multiplier. Nonfinite/out-of-range retention and ordinary
+schema-v2 creation remain rejected without allocation.
+
+HTTP creation maps errors by type: only DuplicateName produces the namespace
+already-exists conflict; invalid policy/name produces400, recovery/pending or
+unknown commit produces503 (preserving operation ID), unexpected I/O produces500.
+The real filesystem-error regression restores its synthetic root before checking
+response status and confirms no namespace or generation was committed.
+
+Fixed validation:58 focused namespace tests pass; the final normal-parallel
+all-feature suite passes646 library tests and1 CLI test, with4 doctests ignored.
+Formatting and all-feature/all-target Clippy pass with warnings. The same offline
+Rust1.94.1 Docker limits and private sequential caches apply. This does not resolve
+the separately retained earlier flock failure or certify whole-store readiness.
+
+Raw before/focused/full/fmt/Clippy logs:
+`/tmp/recalld-implementation/catalog-policy-compatibility-validation`.

@@ -46,11 +46,9 @@ impl NamespacePolicy {
             1.0,
         )
         .map_err(|e| StorageError::InvalidMutation(e.to_string()))?;
-        if !self.desired_retention.is_finite()
-            || !(0.0 < self.desired_retention && self.desired_retention < 1.0)
-        {
+        if !self.desired_retention.is_finite() || !(0.0..=1.0).contains(&self.desired_retention) {
             return Err(StorageError::InvalidMutation(
-                "desired retention must be finite and in (0,1)".into(),
+                "desired retention must be finite and in [0,1]".into(),
             ));
         }
         Ok(())

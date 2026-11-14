@@ -166,6 +166,36 @@ mod tests {
     }
 
     #[test]
+    fn catalog_namespace_legacy_retention_endpoints_persist_and_update() {
+        for retention in [0.0, 1.0] {
+            let root = tempfile::tempdir().unwrap();
+            let mut e = RedbStorageEngine::open(root.path()).unwrap();
+            let mut c = config("endpoints");
+            c.desired_retention = retention;
+            c.decay_rate_multiplier = Some(0.0);
+            let id = e
+                .create_namespace(&c)
+                .expect("legacy endpoint must remain valid");
+            drop(e);
+            let e = RedbStorageEngine::open(root.path()).unwrap();
+            let stored = e.get_namespace(id).unwrap().unwrap();
+            assert_eq!(stored.desired_retention, retention);
+            assert_eq!(stored.decay_rate_multiplier, Some(0.0));
+            let mut policy = NamespacePolicy::from(&stored);
+            policy.desired_retention = 1.0 - retention;
+            let ctx = context(&e, "endpoint-update", MutationScope::Namespace(id));
+            e.update_namespace_policy_with_receipt(&ctx, &policy)
+                .unwrap();
+            drop(e);
+            let e = RedbStorageEngine::open(root.path()).unwrap();
+            assert_eq!(
+                e.get_namespace(id).unwrap().unwrap().desired_retention,
+                1.0 - retention
+            );
+        }
+    }
+
+    #[test]
     fn catalog_receipt_scope_forgery_fails_startup_without_changing_source() {
         use crate::storage::control::{KEYS, RECEIPTS, scoped_key};
 
@@ -588,10 +618,19 @@ mod tests {
             c.embedding_dim = dim;
             assert!(e.create_namespace(&c).is_err());
         }
+        for retention in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+            let mut c = config("bad");
+            c.desired_retention = retention;
+            assert!(e.create_namespace(&c).is_err());
+        }
+        // Inclusive legacy retention does not enable ordinary schema-v2 creation.
+        for retention in [0.0, 1.0] {
+            let mut c = config("bad");
+            c.desired_retention = retention;
+            c.schema = Some(crate::model::schema::NamespaceSchemaV2::from_legacy());
+            assert!(e.create_namespace(&c).is_err());
+        }
         let mut c = config("bad");
-        c.desired_retention = f32::INFINITY;
-        assert!(e.create_namespace(&c).is_err());
-        c = config("bad");
         c.phase_thresholds.full_to_summary = f32::NAN;
         assert!(e.create_namespace(&c).is_err());
         let mut ctx = context(&e, "lineage", MutationScope::Catalog);
