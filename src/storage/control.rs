@@ -308,6 +308,17 @@ pub(crate) fn validate_existing(
         let (key, value) = entry?;
         let (lineage, _, operation) = decode_scope(key.value())?;
         let stored = validate_receipt(value.value())?;
+        // Policy receipts require the canonical schema consumer even when the
+        // schema table is entirely absent. Legacy decode alone is not proof.
+        if matches!(
+            stored.receipt.outcome,
+            MutationOutcome::LifecyclePolicyMigrated { .. }
+        ) && state.control_schema_version != 2
+        {
+            return Err(StorageError::InvalidControl(
+                "lifecycle policy receipt requires canonical schema 2".into(),
+            ));
+        }
         let permitted_origin = if lineage == state.store_id {
             stored.receipt.committed_generation <= state.committed_generation
         } else {
@@ -611,5 +622,57 @@ mod tests {
         ctx.scope = MutationScope::Catalog;
         ctx.contract_version = 3;
         assert!(ctx.validate().is_err());
+    }
+
+    #[test]
+    fn policy_receipt_requires_canonical_schema_before_writable_startup() {
+        use crate::model::schema::LifecycleVersion;
+        use crate::storage::{MetadataStore, lifecycle_migration::PolicyTransition};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.db");
+        drop(MetadataStore::open(&path).unwrap());
+        let db = redb::Database::open(&path).unwrap();
+        let tx = db.begin_write().unwrap();
+        let state = read_control(&tx).unwrap();
+        let ctx = MutationContext {
+            store_id: Some(state.store_id),
+            scope: MutationScope::Namespace(NamespaceId::new(1)),
+            idempotency_key: Some("forged-policy".into()),
+            expected_generation: Some(state.committed_generation),
+            contract_version: 1,
+        };
+        record_receipt(
+            &tx,
+            &ctx,
+            [7; 32],
+            MutationOutcome::LifecyclePolicyMigrated {
+                transition: PolicyTransition {
+                    namespace_id: NamespaceId::new(1),
+                    from: LifecycleVersion::LegacyAccessV1,
+                    to: LifecycleVersion::ExplicitFeedbackV2,
+                    previous_revision: Generation::default(),
+                    next_revision: Generation::default().next().unwrap(),
+                    previous_generation: state.committed_generation,
+                    record_count: 0,
+                    record_token_digest:
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                },
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let rejected = validate_existing(&db.begin_read().unwrap()).is_err();
+        drop(db);
+        assert!(
+            rejected,
+            "legacy control without a canonical schema must reject policy receipts"
+        );
+        let before = std::fs::read(&path).unwrap();
+        assert!(MetadataStore::open(&path).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "rejection precedes writable redb open"
+        );
     }
 }
