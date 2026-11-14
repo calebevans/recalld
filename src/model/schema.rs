@@ -447,6 +447,81 @@ mod tests {
         assert_eq!(decoded.last_accessed_at, 400);
     }
     #[test]
+    fn schema_cached_entities_preserve_exact_utf8_order_duplicates_and_byte_limit() {
+        let mut r = upgraded();
+        let entities = vec![
+            "John Smith".into(),
+            "José".into(),
+            "Jose\u{301}".into(),
+            "Alice's".into(),
+            "日本語".into(),
+            "José".into(),
+            "é".repeat(64),
+        ];
+        assert_eq!(
+            entities.last().unwrap().len(),
+            crate::model::constants::LABEL_MAX_BYTES
+        );
+        let labels = &mut r.schema.as_mut().unwrap().labels;
+        labels.entities = entities.clone();
+        labels.provenance = LabelProvenance::NativeV2;
+        let bytes = r.encode().unwrap();
+        let decoded = DiskRecord::from_bytes(&bytes).unwrap();
+        let cached = crate::model::CachedRecord::from(&decoded);
+        assert_eq!(cached.entities, entities);
+        assert_eq!(cached.tags, decoded.tags);
+        assert_eq!(decoded.encode().unwrap(), bytes);
+        assert_eq!(
+            decoded.schema.unwrap().labels.provenance,
+            LabelProvenance::NativeV2
+        );
+    }
+
+    #[test]
+    fn schema_cached_entities_empty_is_authoritative_over_retained_tags() {
+        let mut r = upgraded();
+        r.schema.as_mut().unwrap().labels.entities.clear();
+        assert!(
+            !crate::model::parse_structured_tags(&r.tags)
+                .entities
+                .is_empty()
+        );
+        let bytes = r.encode().unwrap();
+        let decoded = DiskRecord::from_bytes(&bytes).unwrap();
+        assert!(
+            crate::model::CachedRecord::from(&decoded)
+                .entities
+                .is_empty()
+        );
+        assert_eq!(decoded.encode().unwrap(), bytes);
+    }
+
+    #[test]
+    fn schema_cached_entities_keep_legacy_parser_and_retained_only_provenance_distinct() {
+        let legacy = record();
+        let cached = crate::model::CachedRecord::from(&legacy);
+        assert_eq!(
+            cached.entities,
+            crate::model::parse_structured_tags(&legacy.tags).entities
+        );
+        assert_eq!(cached.entities, ["John-smith"]);
+        assert!(legacy.schema.is_none());
+        let migrated = upgraded();
+        let bytes = migrated.encode().unwrap();
+        let decoded = DiskRecord::from_bytes(&bytes).unwrap();
+        // Only surviving tag suffixes were migrated; no original label is inferred.
+        assert_eq!(
+            crate::model::CachedRecord::from(&decoded).entities,
+            ["john-smith"]
+        );
+        assert_eq!(
+            decoded.schema.as_ref().unwrap().labels.provenance,
+            LabelProvenance::LegacyRetainedOnly
+        );
+        assert_eq!(decoded.encode().unwrap(), bytes);
+    }
+
+    #[test]
     fn schema_legacy_conversion_labels_evidence_and_defaults_are_explicit() {
         let r = upgraded();
         let schema = r.schema.unwrap();
