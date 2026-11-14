@@ -276,6 +276,33 @@ impl Fixture {
             .expect("tombstone memory");
     }
 
+    pub(crate) fn search_adapter(&self) -> crate::mcp::bridge_adapters::McpSearchAdapter {
+        use crate::search::adapters::*;
+        let embedding = Arc::new(crate::embedding::PassthroughProvider::new(DIM));
+        let engine = Arc::new(crate::search::QueryEngine::new(
+            Arc::new(StorageNamespaceResolver::new(self.storage.clone())),
+            Arc::new(SingleEmbeddingRegistry::new(embedding.clone())),
+            Arc::new(SharedVectorIndexRegistry::new(self.vector_index.clone())),
+            Arc::new(SharedFtsIndexRegistry::new(self.fts_index.clone())),
+            Arc::new(SharedEntityIndexReader::new(self.entity_index.clone())),
+            Arc::new(CacheManagerAdapter::new(self.cache.clone())),
+            Arc::new(StorageMetadataAdapter::new(self.storage.clone())),
+            Arc::new(SharedGraphReader::new(self.graph.clone())),
+            Arc::new(RifProcessorAdapter::new(
+                Arc::new(crate::rif::RifEngine::new(Default::default())),
+                self.graph.clone(),
+            )),
+            Arc::new(StorageAccessRecorder::new(self.storage.clone())),
+        ));
+        crate::mcp::bridge_adapters::McpSearchAdapter::new(
+            engine,
+            embedding,
+            self.storage.clone(),
+            self.graph.clone(),
+            chrono_tz::UTC,
+        )
+    }
+
     /// The MCP namespace adapter over this fixture's storage.
     pub(crate) fn namespace_adapter(&self) -> crate::mcp::bridge_adapters::McpNamespaceAdapter {
         crate::mcp::bridge_adapters::McpNamespaceAdapter::new(
