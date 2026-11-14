@@ -64,7 +64,15 @@ To set a custom default namespace for a project, create a `.recalld.toml` file i
 namespace = "my-project"
 ```
 
-When recalld starts in MCP mode, it walks up from the current working directory to find the nearest `.recalld.toml`. The `namespace` field sets the default namespace for all MCP operations in that directory tree. If no `.recalld.toml` is found, the default namespace is `"default"`.
+When recalld starts in MCP mode, it walks up from the current working directory to find the nearest `.recalld.toml`. The `namespace` field sets the default namespace for scoped MCP operations (store, recall, lists, stats, and duplicate scans) in that directory tree. If no `.recalld.toml` is found, the default namespace is `"default"`.
+
+### Optional by-ID namespace assertions
+
+`get_memory`, `reinforce_memory`, `forget_memory`, and single-mode `find_similar_memories` accept an optional `namespace` string. It asserts the namespace of the canonical record; it does not select a different scope. Omission keeps UUID-based scope even when the session default differs. An explicit mismatch (including a nonexistent namespace) fails with `NAMESPACE_MISMATCH` before embedding, access recording, or mutation. Unknown UUIDs remain not found. Null, empty strings, and invalid names are rejected as assertions.
+
+HTTP uses `?namespace=name` on `GET /memories/:id` and `DELETE /memories/:id`, and a JSON `namespace` field on `POST /memories/:id/reinforce` and `POST /similar/:id`. Mismatches return HTTP 409 with error code `NAMESPACE_MISMATCH`.
+
+Daemon forwarding uses dedicated `*_scoped` RPC methods. Combining a namespace assertion with `recordAccess=false` uses `get_memory_scoped_read_only` or `find_similar_scoped_read_only`; these require a namespace and force nonobserving retrieval. Older daemons reject unknown methods, and the client never retries through a weaker method. Existing assertion-only RPCs reject `recordAccess` fields, and existing read-only RPCs reject namespace assertions. Assertion-only true mode omits the wire flag to remain compatible. These are additive v1 controls, not authentication, receipts, or a transactional whole-store contract. Batch assertions remain outside this slice.
 
 ### Other MCP-compatible tools
 
@@ -142,11 +150,15 @@ Before this limit existed there was no per-element bound at all: an over-long en
 
 ### Argument validation
 
-`store_memory`, `store_memories`, `list_memories`, `list_tags`, `namespace_stats`, `recall_memories` and `find_similar_memories` validate their arguments strictly. A wrong-typed or unparseable argument is an error naming the field; it is never coerced, defaulted, or dropped. Earlier versions guessed silently — a `tags` array sent as a comma-joined string stored zero tags, a wrong-typed `namespace` fell back to the default partition, an unparseable `supersedes` stored the memory with no link, and a wrong-typed `timeRangeStart` was dropped, silently widening a range query to the whole namespace — so a client with a broken serializer could write a long run of quietly wrong memories, or read a long run of quietly wrong results, without a single error reaching the agent.
+`store_memory`, `store_memories`, `list_memories`, `list_tags`, `namespace_stats`, `recall_memories`, `find_similar_memories`, `reinforce_memory`, and `create_namespace` validate their arguments strictly. When supplied, tool arguments must be an object; omitted arguments default to `{}`. A wrong-typed or unparseable argument is an error naming the field; it is never coerced, defaulted, or dropped. Earlier versions guessed silently — a `tags` array sent as a comma-joined string stored zero tags, a wrong-typed `namespace` fell back to the default partition, an unparseable `supersedes` stored the memory with no link, and a wrong-typed `timeRangeStart` was dropped, silently widening a range query to the whole namespace — so a client with a broken serializer could write a long run of quietly wrong memories, or read a long run of quietly wrong results, without a single error reaching the agent.
 
 **An out-of-range `limit` is rejected, not clamped.** `list_memories` used to clamp a `limit` above 200 down to 200, which told a paginating caller it had seen the whole namespace when it had seen the first page. The schema already declares the maximum, so only a schema-violating client is affected, and it now gets one clean error instead of a quietly short page.
 
-**Explicit `null` still means "absent."** `{"fullText": null}` is treated exactly like omitting `fullText`, for every optional field. SDKs that serialize optional fields as `null` need no changes.
+**Null compatibility has two exceptions.** `quality` and `embeddingDim` default only when omitted; explicit null is invalid. Quality must be a JSON integer 1–4 (omitted: 3), and dimension a JSON integer 1–8192. Strings, fractions, booleans, and overflowing integers are rejected before mutation. MCP and HTTP use the same parsers. Other optional MCP fields retain null-as-omission behavior.
+
+Namespace options accept finite numbers: `initialStability` must remain positive when represented as `f32`, `desiredRetention` is 0–1 inclusive, and `decayRateMultiplier` is nonnegative. Stability and multiplier cannot exceed `f32::MAX`. Null float options use their defaults on both transports. Dimension bounds do not establish compatibility with an active embedding provider; profile validation is a later roadmap slice.
+
+Tool annotations reflect current behavior. Recall records access asynchronously and is neither read-only nor idempotent. Reinforcement can weaken memory and is not idempotent. Stores can supersede memories and may call external embedding providers, as can recall. MCP `get_memory` currently does **not** record access and remains read-only; HTTP direct fetch does record access. No receipt or exactly-once guarantee is implied.
 
 Example messages:
 
@@ -201,7 +213,7 @@ Store a new observation, fact, or piece of context. The system automatically gen
 | `entities` | string[] | no | `[]` | Named entities (people, places, orgs). Used for search indexing and graph linking. Max 32 items, 121 bytes each. |
 | `topics` | string[] | no | `[]` | Topic keywords, e.g. `["rust", "cooking"]`. Max 32 items, 122 bytes each. |
 | `emotions` | string[] | no | `[]` | Emotional tone, e.g. `["happy", "anxious"]`. Max 32 items, 120 bytes each. |
-| `namespace` | string | no | `"default"` | Memory partition |
+| `namespace` | string/null | no | session default | Memory partition |
 | `parentId` | string | no | -- | UUID of parent memory for hierarchical linking |
 | `supersedes` | string | no | -- | UUID of an existing memory in the same namespace that this one replaces. Recall returns this memory **in place of** the old one. The store fails if the target does not exist or is in a different namespace. See [supersedes semantics](#supersedes-semantics). |
 | `checkDuplicates` | boolean | no | `true` | Report existing memories that closely resemble this one. Never blocks the store; it only adds a `nearDuplicates` object to the result. See [near-duplicate warnings](#near-duplicate-warnings). |
@@ -376,7 +388,7 @@ Each object in the `memories` array accepts:
 | `entities` | string[] | no | `[]` | Named entities. Max 32 items, 121 bytes each. |
 | `topics` | string[] | no | `[]` | Topic keywords. Max 32 items, 122 bytes each. |
 | `emotions` | string[] | no | `[]` | Emotional tone. Max 32 items, 120 bytes each. |
-| `namespace` | string | no | `"default"` | Memory partition |
+| `namespace` | string/null | no | session default | Memory partition |
 | `parentId` | string | no | -- | UUID of parent memory |
 | `supersedes` | string | no | -- | UUID of an older memory this one replaces |
 | `checkDuplicates` | boolean | no | `true` | Report existing memories that closely resemble this item. Per item, not per batch. |
@@ -449,7 +461,7 @@ Search memories using natural language. Results are ranked by semantic similarit
 |-----------|------|----------|---------|-------------|
 | `query` | string | yes | -- | Natural language search query |
 | `limit` | integer | no | `10` | Maximum results (1-100) |
-| `namespace` | string | no | `"default"` | Which namespace to search |
+| `namespace` | string/null | no | session default | Which namespace to search |
 | `tags` | string[] | no | `[]` | Only return memories with ALL of these tags |
 | `entities` | string[] | no | `[]` | Filter to memories mentioning these entities |
 | `topics` | string[] | no | `[]` | Filter to memories about these topics |
@@ -537,6 +549,7 @@ Retrieve a specific memory by its ID.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `id` | string | yes | -- | Memory UUID |
+| `namespace` | string | no | record scope | Assert the canonical namespace before effects. Omit to use UUID scope; null is invalid. |
 
 #### Example
 
@@ -578,6 +591,7 @@ Strengthen a memory. Increases its stability so it decays more slowly.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `id` | string | yes | -- | Memory UUID to reinforce |
+| `namespace` | string | no | record scope | Assert the canonical namespace before effects. Omit to use UUID scope; null is invalid. |
 | `quality` | integer | no | `3` | Rating 1-4: 1=forgot (weakens), 2=hard, 3=good, 4=easy |
 
 Quality guide:
@@ -624,6 +638,7 @@ Use for incorrect, outdated or harmful information that must stop being recalled
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `id` | string | yes | -- | Memory UUID to forget. The memory moves to the Tombstone phase; its graph edges are kept and its UUID is never reused. |
+| `namespace` | string | no | record scope | Assert the canonical namespace before effects. Omit to use UUID scope; null is invalid. |
 
 #### Example
 
@@ -753,7 +768,7 @@ Refusal (a non-empty namespace without `force`):
 Find memories semantically similar to a given memory, or scan a namespace for duplicate clusters. Two modes:
 
 - **single** (default): requires an `id`, finds memories similar to it.
-- **scan**: requires a `namespace`, detects clusters of near-duplicate memories across the namespace.
+- **scan**: samples up to 200 namespace records and requests up to 11 vector candidates per source (ten plus one to allow for self-removal). Omitted or null `namespace` uses the configured session default. Clusters are threshold-connected: not every pair must meet the threshold.
 
 #### Parameters
 
@@ -761,11 +776,11 @@ Find memories semantically similar to a given memory, or scan a namespace for du
 |-----------|------|----------|---------|-------------|
 | `mode` | string | no | `"single"` | `"single"` or `"scan"` |
 | `id` | string | single mode | -- | Source memory UUID (required for single mode) |
-| `namespace` | string | scan mode | session default | Namespace to scan (required for scan mode; defaults to session default in single mode) |
+| `namespace` | string/null | no | session default | Scan mode: namespace to sample. Single mode: optional assertion against the source record namespace; omission uses record scope, null is invalid. |
 | `limit` | integer | no | `10` | Maximum results per source memory in single mode (1-100) |
 | `minScore` | number | no | -- | Minimum similarity threshold for single mode (0.0-1.0) |
 | `threshold` | number | no | `0.85` | Similarity threshold for scan mode duplicate detection (0.0-1.0) |
-| `sameNamespace` | boolean | no | `true` | Restrict to same namespace in single mode. Ignored in scan mode. |
+| `sameNamespace` | boolean | no | `true` | Legacy selector; the current single-mode adapter uses the source record namespace even when false. Ignored in scan mode. |
 
 #### Example (single mode)
 
@@ -834,25 +849,38 @@ Response:
       "maxSimilarity": 0.92
     }
   ],
-  "clusterCount": 1
+  "clusterCount": 1,
+  "coverage": {
+    "algorithm": "sampledNearestNeighbors",
+    "sampledCount": null,
+    "eligibleCount": null,
+    "skippedVectorCount": null,
+    "sampleCap": 200,
+    "neighborCap": 11,
+    "complete": false,
+    "truncated": null,
+    "countsAvailable": false
+  }
 }
 ```
+
+MCP coverage counts and `truncated` are unknown (`null`) because the legacy bridge returns only clusters; cluster membership cannot reconstruct those counts. `complete` is always false, including for empty results. HTTP duplicate scans instead compare pairs within a capped sample (default 500, maximum 10,000), return observed live-record, sampled-record, and missing-vector counts, and report whether sampling was truncated. HTTP `neighborCap` is null because it has no neighbor cap. Its `complete` also remains false because reads are not pinned to a generation. Neither endpoint proves there are no other duplicates. Exact paginated scans and bridge/daemon count reporting remain future work.
 
 ---
 
 ### create_namespace
 
-Create a new memory namespace. Each namespace has its own embedding space and decay configuration. Embedding dimensions are fixed after creation.
+Create a new memory namespace. Namespaces organize data; they are not access controls. Each namespace has its own embedding space and decay configuration. Embedding dimensions are fixed after creation.
 
 #### Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `name` | string | yes | -- | Alphanumeric, hyphens, underscores; 1-64 chars |
-| `embeddingDim` | integer | no | *inherited* | Embedding dimensions. Defaults to the `default` namespace's dimensions. Fixed after creation. |
-| `initialStability` | number | no | `3.7145` | Starting stability in days for new memories |
+| `embeddingDim` | integer | no | *inherited* | Integer 1–8192; null is invalid. Inherits the `default` namespace dimension (fallback 1536), fixed after creation. |
+| `initialStability` | number | no | `3.7145` | Positive finite starting stability in days for new memories |
 | `desiredRetention` | number | no | `0.9` | Target retention rate (0.0-1.0) |
-| `decayRateMultiplier` | number | no | *inherited* | 1.0 = normal, 2.0 = 2x slower decay, 0.5 = 2x faster, 0.0 = disabled |
+| `decayRateMultiplier` | number | no | *inherited* | Finite and nonnegative: 1.0 = normal, 2.0 = 2x slower decay, 0.5 = 2x faster, 0.0 = disabled |
 
 #### Example
 
@@ -890,7 +918,7 @@ Get statistics for a memory namespace including the live memory count, tombstone
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `namespace` | string | no | `"default"` | Namespace name to get stats for |
+| `namespace` | string/null | no | session default | Namespace name to get stats for |
 
 #### Example
 
@@ -933,7 +961,7 @@ List memories in a namespace with pagination and optional filters. Unlike `recal
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `namespace` | string | no | `"default"` | Which namespace to list from |
+| `namespace` | string/null | no | session default | Which namespace to list from |
 | `limit` | integer | no | `50` | Maximum results per page (1-200). A larger value is **rejected**, not clamped. |
 | `offset` | integer | no | `0` | Number of results to skip for pagination |
 | `tags` | string[] | no | `[]` | Only return memories with ALL of these tags |
@@ -1022,7 +1050,7 @@ A tag that merely contains a slash, such as `project/recalld`, stays in `tags`. 
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `namespace` | string | no | `"default"` | Which namespace to count within. Reads that namespace's memory records, costing about one `list_memories` call. |
+| `namespace` | string/null | no | session default | Which namespace to count within. Reads that namespace's memory records, costing about one `list_memories` call. |
 | `allNamespaces` | boolean | no | `false` | Count across every namespace instead of one. Cannot be combined with an explicit `namespace`. |
 | `limit` | integer | no | `50` | Maximum labels returned **per bucket** (1-500). Each bucket also reports its untruncated total. |
 

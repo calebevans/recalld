@@ -1439,7 +1439,7 @@ mod independent_review_regressions {
         .unwrap();
         assert_eq!(transitions.len(), 1);
         // Deterministically insert feedback exactly between scan/plan and apply.
-        let feedback = adapter(&f, 8 * DAY).reinforce(id, 3).await.unwrap();
+        let feedback = adapter(&f, 8 * DAY).reinforce(id, 3, None).await.unwrap();
         assert!(feedback.is_permastore);
         let committed = f.record(id).unwrap();
         DecaySweepRunner::update_record_state(
@@ -1492,7 +1492,7 @@ mod independent_review_regressions {
     async fn review_access_must_not_move_feedback_anchor_backward() {
         let f = Fixture::new();
         let id = f.insert_memory().await;
-        adapter(&f, 8 * DAY).reinforce(id, 3).await.unwrap();
+        adapter(&f, 8 * DAY).reinforce(id, 3, None).await.unwrap();
         assert_eq!(f.record(id).unwrap().last_accessed_at, 8 * DAY);
         adapter(&f, DAY)
             .record_access(id, AccessKind::DirectRetrieval)
@@ -1620,10 +1620,13 @@ mod independent_review_regressions {
         })
         .await
         .expect("purge must release storage before awaiting graph");
-        tokio::time::timeout(Duration::from_secs(5), adapter(&f, DAY).reinforce(live, 3))
-            .await
-            .expect("feedback must not wait for graph holding storage")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            adapter(&f, DAY).reinforce(live, 3, None),
+        )
+        .await
+        .expect("feedback must not wait for graph holding storage")
+        .unwrap();
         assert!(
             !purge.is_finished(),
             "purge publication must wait for graph"

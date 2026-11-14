@@ -357,9 +357,13 @@ pub struct ToolAnnotations {
 pub struct ToolCallParams {
     /// Name of the tool to call.
     pub name: String,
-    /// Tool input arguments.
-    #[serde(default)]
+    /// Tool input arguments. Omission means an empty object; explicit null is preserved.
+    #[serde(default = "empty_tool_arguments")]
     pub arguments: serde_json::Value,
+}
+
+fn empty_tool_arguments() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 /// Result of a tool call.

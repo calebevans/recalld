@@ -492,10 +492,16 @@ async fn read_only_daemon_aliases_force_false_and_legacy_methods_keep_defaults()
         search.search(input(Some(false))).await.unwrap().hits.len(),
         3
     );
-    assert!(storage.get_memory(h.ids[0], false).await.unwrap().is_some());
+    assert!(
+        storage
+            .get_memory(h.ids[0], false, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         search
-            .find_similar(h.ids[0], 10, None, true, false)
+            .find_similar(h.ids[0], 10, None, true, false, None)
             .await
             .unwrap()
             .len(),
@@ -525,7 +531,7 @@ async fn read_only_daemon_aliases_force_false_and_legacy_methods_keep_defaults()
         .await
         .unwrap();
     // Legacy daemon get was always nonobserving, with or without the new flag.
-    storage.get_memory(h.ids[0], true).await.unwrap();
+    storage.get_memory(h.ids[0], true, None).await.unwrap();
     client
         .call("get_memory", json!({"id":h.ids[0].to_string()}))
         .await
@@ -538,7 +544,7 @@ async fn read_only_daemon_aliases_force_false_and_legacy_methods_keep_defaults()
     client.call("search", omitted).await.unwrap();
     h.observed().await;
     search
-        .find_similar(h.ids[0], 10, None, true, true)
+        .find_similar(h.ids[0], 10, None, true, true, None)
         .await
         .unwrap();
     h.observed().await;
@@ -610,7 +616,7 @@ async fn read_only_old_handler_unknown_method_never_falls_back_to_mutating_rpc()
     );
     assert!(
         storage
-            .get_memory(id, false)
+            .get_memory(id, false, None)
             .await
             .unwrap_err()
             .to_string()
@@ -618,7 +624,7 @@ async fn read_only_old_handler_unknown_method_never_falls_back_to_mutating_rpc()
     );
     assert!(
         search
-            .find_similar(id, 10, None, true, false)
+            .find_similar(id, 10, None, true, false, None)
             .await
             .unwrap_err()
             .to_string()
@@ -627,13 +633,16 @@ async fn read_only_old_handler_unknown_method_never_falls_back_to_mutating_rpc()
     search.search(input(None)).await.unwrap();
     assert!(
         storage
-            .get_memory(id, true)
+            .get_memory(id, true, None)
             .await
             .unwrap_err()
             .to_string()
             .contains("fixture absent")
     );
-    search.find_similar(id, 10, None, true, true).await.unwrap();
+    search
+        .find_similar(id, 10, None, true, true, None)
+        .await
+        .unwrap();
     assert_eq!(
         server.await.unwrap(),
         [
@@ -686,4 +695,207 @@ async fn read_only_graph_expansion_and_supersedes_hydrate_canonical_records() {
         h.f.cache.get(replacement).await.unwrap().summary,
         "stale replacement"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_read_only_controls_survive_http_mcp_and_framed_daemon() {
+    use crate::daemon::bridge_adapters::{RemoteSearchAdapter, RemoteStorageAdapter};
+    let h = Harness::new().await;
+    h.f.create_namespace("other");
+    let before = h.snapshot().await;
+    let mut local = h.bridge();
+    local.default_namespace = "other".into();
+    for namespace in ["default", "other"] {
+        for tool in ["get_memory", "find_similar_memories"] {
+            let result = crate::mcp::tools::dispatch_tool(
+                &local,
+                tool,
+                json!({"id":h.ids[0].to_string(), "namespace":namespace,"recordAccess":false}),
+            )
+            .await;
+            assert_eq!(
+                result.is_error == Some(true),
+                namespace == "other",
+                "{result:?}"
+            );
+        }
+        let (status, _) = http_call(
+            h.http(),
+            "GET",
+            &format!(
+                "/memories/{}?namespace={namespace}&recordAccess=false",
+                h.ids[0]
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            status.as_u16(),
+            if namespace == "other" { 409 } else { 200 }
+        );
+        let (status, body) = http_call(
+            h.http(),
+            "POST",
+            &format!("/similar/{}", h.ids[0]),
+            json!({"namespace":namespace,"recordAccess":false}),
+        )
+        .await;
+        assert_eq!(
+            status.as_u16(),
+            if namespace == "other" { 409 } else { 400 },
+            "{body}"
+        );
+    }
+    // A true-mode mismatch also fails before queued observation work.
+    let (status, _) = http_call(
+        h.http(),
+        "POST",
+        &format!("/similar/{}", h.ids[0]),
+        json!({"namespace":"other","recordAccess":true}),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 409);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("combined.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let handlers = h.bridge();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        for i in 0..7 {
+            let req = read_framed_message(&mut socket, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap();
+            assert_eq!(req.method.ends_with("_scoped_read_only"), i < 6);
+            let result = dispatch(
+                handlers.search.as_ref(),
+                handlers.storage.as_ref(),
+                handlers.namespaces.as_ref(),
+                handlers.health.as_ref(),
+                &req.method,
+                req.params,
+            )
+            .await;
+            let response = match result {
+                Ok(result) => DaemonResponse::success(req.id, result),
+                Err(error) => DaemonResponse::error(req.id, (&error).into()),
+            };
+            write_framed_message(&mut socket, &response, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap();
+        }
+    });
+    let client = Arc::new(crate::daemon::DaemonClient::connect(&path).await.unwrap());
+    let mut remote = StubBridge::default().into_bridge();
+    remote.search = Arc::new(RemoteSearchAdapter::new(client.clone()));
+    remote.storage = Arc::new(RemoteStorageAdapter::new(client.clone()));
+    remote.default_namespace = "other".into();
+    for namespace in ["default", "other"] {
+        for tool in ["get_memory", "find_similar_memories"] {
+            let result = crate::mcp::tools::dispatch_tool(
+                &remote,
+                tool,
+                json!({"id":h.ids[0].to_string(), "namespace":namespace,"recordAccess":false}),
+            )
+            .await;
+            assert_eq!(
+                result.is_error == Some(true),
+                namespace == "other",
+                "{result:?}"
+            );
+        }
+    }
+    // Private combined aliases force false even with a contradictory true payload.
+    for method in [
+        "get_memory_scoped_read_only",
+        "find_similar_scoped_read_only",
+    ] {
+        client
+            .call(
+                method,
+                json!({"id":h.ids[0].to_string(),"namespace":"default",
+            "recordAccess":true,"limit":10,"minScore":null,"sameNamespace":true}),
+            )
+            .await
+            .unwrap();
+    }
+    h.assert_quiet(&before).await;
+    assert!(
+        h.f.cache.get(h.ids[1]).await.is_none(),
+        "false mode must not warm record caches"
+    );
+    // Assertion-only mode still records accesses; helper must strip the wire flag
+    // to retain compatibility with the original *_scoped protocol.
+    let result = crate::mcp::tools::dispatch_tool(
+        &remote,
+        "find_similar_memories",
+        json!({"id":h.ids[0].to_string(),"namespace":"default","recordAccess":true}),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    h.observed().await;
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_read_only_aliases_fail_closed_on_older_single_control_daemons() {
+    use crate::daemon::bridge_adapters::{RemoteSearchAdapter, RemoteStorageAdapter};
+    for older_alias in ["get_memory_read_only", "get_memory_scoped"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("older.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for i in 0..3 {
+                let req = read_framed_message(&mut socket, MAX_MESSAGE_SIZE)
+                    .await
+                    .unwrap();
+                let response = if i < 2 {
+                    assert!(
+                        req.method.ends_with("_scoped_read_only"),
+                        "no fallback to {older_alias}"
+                    );
+                    DaemonResponse::error(
+                        req.id,
+                        (&BridgeError::InvalidInput("unknown method".into())).into(),
+                    )
+                } else {
+                    assert_eq!(req.method, "get_memory");
+                    DaemonResponse::success(
+                        req.id,
+                        json!({
+                            "id":req.params["id"], "namespace":"default", "summary":"legacy fixture",
+                            "fullText":null, "tags":[], "phase":"Full", "strength":1.0,
+                            "stability":1.0, "createdAt":"1970-01-01T00:00:00Z", "lastAccessedAt":"1970-01-01T00:00:00Z",
+                            "isPermastore":false, "edgeCount":0
+                        }),
+                    )
+                };
+                write_framed_message(&mut socket, &response, MAX_MESSAGE_SIZE)
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = Arc::new(crate::daemon::DaemonClient::connect(&path).await.unwrap());
+        let storage = RemoteStorageAdapter::new(client.clone());
+        let search = RemoteSearchAdapter::new(client);
+        let id = MemoryId::new();
+        assert!(
+            storage
+                .get_memory(id, false, Some("default"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown method")
+        );
+        assert!(
+            search
+                .find_similar(id, 10, None, true, false, Some("default"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown method")
+        );
+        assert!(storage.get_memory(id, true, None).await.unwrap().is_some());
+        server.await.unwrap();
+    }
 }
