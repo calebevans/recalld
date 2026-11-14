@@ -195,3 +195,5 @@ pub trait VectorIndex: Send + Sync {
         metadata: VectorMetadata,
     ) -> Result<bool, VectorError>;
 }
+
+pub(crate) use query::default_record_access;

@@ -50,6 +50,12 @@ pub struct DaemonRpcError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FindSimilarParams {
+    /// False forbids retrieval-attributable writes; omission preserves v1 behavior.
+    #[serde(
+        rename = "recordAccess",
+        default = "crate::search::default_record_access"
+    )]
+    pub record_access: bool,
     /// Source memory ID.
     pub id: String,
     /// Maximum number of results.
@@ -63,6 +69,12 @@ pub struct FindSimilarParams {
 /// Parameters for the `get_memory` RPC method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetMemoryParams {
+    /// False forbids retrieval-attributable writes; omission preserves v1 behavior.
+    #[serde(
+        rename = "recordAccess",
+        default = "crate::search::default_record_access"
+    )]
+    pub record_access: bool,
     /// Memory ID to retrieve.
     pub id: String,
 }
