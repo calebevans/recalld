@@ -74,6 +74,7 @@ impl MetadataStore {
         if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
             return Ok((tx, receipt));
         }
+        validate_observation_time(sampled_at)?;
         read_namespace(&tx, namespace)?;
         let mut outcomes = Vec::with_capacity(distinct.len());
         {
@@ -85,6 +86,7 @@ impl MetadataStore {
                 let timestamp = sampled_at
                     .max(record.created_at)
                     .max(record.last_accessed_at);
+                validate_observation_time(timestamp)?;
                 record.last_accessed_at = timestamp;
                 if record.access_history.len() >= ACCESS_HISTORY_MAX {
                     record.access_history.remove(0);
@@ -147,6 +149,7 @@ impl MetadataStore {
         if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
             return Ok((tx, receipt));
         }
+        validate_observation_time(sampled_at)?;
         let policy = read_namespace(&tx, namespace)?;
         let mut record = read_record(&tx.open_table(META_TABLE)?, id, namespace)?;
         let resolved = crate::decay::lifecycle::resolve_policy(
@@ -157,6 +160,7 @@ impl MetadataStore {
         .map_err(|e| StorageError::InvalidMutation(e.to_string()))?;
         let plan = crate::decay::lifecycle::plan_feedback(&record, &resolved, sampled_at, quality)
             .map_err(|e| StorageError::InvalidMutation(e.to_string()))?;
+        validate_observation_time(plan.timestamp)?;
         if !super::lifecycle_updates::patch_legacy_feedback(&mut record, &plan)? {
             return Err(StorageError::InvalidMutation(
                 "feedback content unavailable".into(),
@@ -252,3 +256,12 @@ fn read_record(
 #[cfg(test)]
 #[path = "observation_tests.rs"]
 mod tests;
+
+fn validate_observation_time(timestamp: i64) -> Result<(), StorageError> {
+    if chrono::DateTime::from_timestamp_millis(timestamp).is_none() {
+        return Err(StorageError::InvalidMutation(
+            "unrepresentable observation timestamp".into(),
+        ));
+    }
+    Ok(())
+}

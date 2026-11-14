@@ -424,6 +424,7 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
             if accesses.is_empty()
                 || accesses.iter().any(|a| {
                     a.memory_id == MemoryId::nil()
+                        || chrono::DateTime::from_timestamp_millis(a.accessed_at).is_none()
                         || !seen.insert(a.memory_id)
                         || !matches!(
                             a.kind,
@@ -438,9 +439,14 @@ pub(crate) fn validate_receipt(bytes: &[u8]) -> Result<StoredReceipt, StorageErr
             }
         }
         MutationOutcome::LegacyFeedbackRecorded {
-            memory_id, quality, ..
+            memory_id,
+            quality,
+            applied_at,
         } => {
-            if *memory_id == MemoryId::nil() || !(1..=4).contains(quality) {
+            if *memory_id == MemoryId::nil()
+                || !(1..=4).contains(quality)
+                || chrono::DateTime::from_timestamp_millis(*applied_at).is_none()
+            {
                 return Err(StorageError::InvalidControl(
                     "invalid feedback receipt outcome".into(),
                 ));

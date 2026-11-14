@@ -626,3 +626,87 @@ fn feedback_rejects_canonically_ineligible_content_without_receipt() {
         assert_eq!(snapshot(&store, &[a, b]), before);
     }
 }
+
+#[test]
+fn observation_timestamps_fail_without_mutation_but_replay_ignores_current_clock() {
+    let (_dir, store, ns, [a, b]) = fixture();
+    for invalid in [i64::MAX, i64::MIN] {
+        let ctx = context(&store, ns, "bad-clock");
+        let before = snapshot(&store, &[a, b]);
+        assert!(
+            store
+                .record_exposure_batch(&ctx, &[(a, AccessKind::DirectRetrieval)], invalid)
+                .is_err()
+        );
+        assert_eq!(snapshot(&store, &[a, b]), before);
+        assert!(
+            store
+                .record_legacy_feedback(&ctx, b, 3, invalid, 1.0)
+                .is_err()
+        );
+        assert_eq!(snapshot(&store, &[a, b]), before);
+    }
+    let exposure_ctx = context(&store, ns, "good-exposure");
+    let exposure = store
+        .record_exposure_batch(&exposure_ctx, &[(a, AccessKind::DirectRetrieval)], 100)
+        .unwrap()
+        .unwrap();
+    let feedback_ctx = context(&store, ns, "good-feedback");
+    let feedback = store
+        .record_legacy_feedback(&feedback_ctx, b, 3, 100, 1.0)
+        .unwrap();
+    let before = snapshot(&store, &[a, b]);
+    let replay = store
+        .record_exposure_batch(&exposure_ctx, &[(a, AccessKind::DirectRetrieval)], i64::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.operation_id, exposure.operation_id);
+    let replay = store
+        .record_legacy_feedback(&feedback_ctx, b, 3, i64::MAX, f64::NAN)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.operation_id, feedback.operation_id);
+    assert_eq!(snapshot(&store, &[a, b]), before);
+
+    // A legacy record can already have an invalid anchor. Do not copy it into
+    // a new observation/receipt even when the supplied clock is valid.
+    let mut record = store.get(a).unwrap().unwrap();
+    record.last_accessed_at = i64::MAX;
+    let tx = store.db.begin_write().unwrap();
+    tx.open_table(META_TABLE)
+        .unwrap()
+        .insert(a.as_bytes().as_slice(), record.to_bytes().as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+    let ctx = context(&store, ns, "bad-anchor");
+    let before = snapshot(&store, &[a, b]);
+    assert!(
+        store
+            .record_exposure_batch(
+                &ctx,
+                &[
+                    (b, AccessKind::DirectRetrieval),
+                    (a, AccessKind::DirectRetrieval)
+                ],
+                100
+            )
+            .is_err()
+    );
+    assert!(store.record_legacy_feedback(&ctx, a, 3, 100, 1.0).is_err());
+    assert_eq!(snapshot(&store, &[a, b]), before);
+
+    for receipt in [exposure, feedback] {
+        let mut stored = control::StoredReceipt {
+            receipt,
+            request_hash_version: 1,
+            request_hash: [0; 32],
+        };
+        match &mut stored.receipt.outcome {
+            MutationOutcome::ExposuresRecorded { accesses } => accesses[0].accessed_at = i64::MAX,
+            MutationOutcome::LegacyFeedbackRecorded { applied_at, .. } => *applied_at = i64::MAX,
+            _ => unreachable!(),
+        }
+        assert!(control::validate_receipt(&control::encode(&stored).unwrap()).is_err());
+    }
+}

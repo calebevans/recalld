@@ -133,3 +133,19 @@ Logs remain untracked in `.validation/tests.log` and `.validation/clippy.log`.
 Validated source commit: `5a72eb3a5b06f8a8cc9d1ca1f0641ab909a11328`.
 The final validation annotation is documentation-only; no Rust source changed
 between the successful checks and this commit.
+
+### Timestamp follow-up
+
+New exposure/feedback transactions reject timestamps outside Chrono's millisecond
+range, both the fresh sampled clock and the effective monotonic anchor. Validation
+occurs after matching replay, so an invalid current clock cannot invalidate an
+already committed retry. Empty exposure remains a no-op. Startup receipt validation
+also rejects unrenderable timestamps in these two new outcomes only; the older
+scalar access API/outcome is unchanged.
+
+Validation: isolated `recalld-ci:1.94`, toolchain 1.94.1, network none, 2 CPUs/4 GiB;
+`cargo test --offline --all-features storage::metadata::observation`: 11 passed,
+558 filtered out. Includes no-mutation checks for min/max timestamps and invalid
+stored anchors, replay with invalid current clock/policy, and malformed receipt
+outcomes. `cargo fmt --all -- --check` and offline all-feature/all-target Clippy
+passed (existing warnings). No power-loss claim.
