@@ -1,0 +1,16 @@
+   Compiling recalld v1.0.0 (/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.97s
+     Running unittests src/lib.rs (/target/debug/deps/recalld-e423ca3d07310388)
+
+running 1 test
+native receipt scaling: receipts=4, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native feedback scaling: receipts=4, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native receipt scaling: receipts=20, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native feedback scaling: receipts=20, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native receipt scaling: receipts=69, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+native feedback scaling: receipts=69, work=ValidationWork { full_validations: 0, receipt_decodes: 1 }
+strict reopen receipt work: ValidationWork { full_validations: 7, receipt_decodes: 1053 }
+test storage::metadata::native_lifecycle::tests::native_hot_path_work_is_independent_of_receipt_count_but_reopen_checks_history ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 669 filtered out; finished in 2.61s
+

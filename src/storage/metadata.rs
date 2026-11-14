@@ -118,6 +118,9 @@ impl MetadataStore {
             let read = db.begin_read()?;
             let control = control::validate_existing(&read)?;
             super::canonical_schema::validate_metadata_format(&read, control.as_ref())?;
+            if native_lifecycle_only {
+                restoration::validate_inventory(&read)?;
+            }
             if native_lifecycle_only && text_generation::read_selection(&read)?.is_none() {
                 return Err(StorageError::InvalidControl(
                     "native lifecycle entry requires the selected-text old-reader fence".into(),

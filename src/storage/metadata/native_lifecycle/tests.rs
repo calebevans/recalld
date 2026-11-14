@@ -1112,3 +1112,134 @@ async fn capture_rechecks_poison_after_waiting_for_publication() {
         assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
     }
 }
+
+#[tokio::test]
+async fn native_hot_path_work_is_independent_of_receipt_count_but_reopen_checks_history() {
+    let root = tempfile::tempdir().unwrap();
+    let d = fixture(
+        root.path(),
+        LifecycleVersion::ExplicitFeedbackV2,
+        1500.,
+        Some(1.),
+    )
+    .await;
+    let clock = Arc::new(TestClock::new(DAY));
+    let session = open(&d, clock.clone());
+    let mut exposure_work = Vec::new();
+    let mut feedback_work = Vec::new();
+    let mut first_receipt = None;
+    for n in 1..=64 {
+        control::take_validation_work();
+        let intent = session
+            .capture_exposure(scope(&d), &[(d.a, AccessKind::DirectRetrieval)])
+            .unwrap();
+        let context = ctx(&d, intent.capture_generation(), &format!("scaling-{n}"));
+        let receipt = session.record_exposure(&context, &intent).unwrap().unwrap();
+        first_receipt.get_or_insert(receipt.clone());
+        let replay = session.record_exposure(&context, &intent).unwrap().unwrap();
+        assert!(replay.replayed);
+        assert_eq!(receipt.operation_id, replay.operation_id);
+        let work = control::take_validation_work();
+        exposure_work.push(work);
+        if [1, 16, 64].contains(&n) {
+            let read = session.metadata.db.begin_read().unwrap();
+            let count = read.open_table(control::RECEIPTS).unwrap().len().unwrap();
+            eprintln!("native receipt scaling: receipts={count}, work={work:?}");
+            drop(read);
+            control::take_validation_work();
+            let intent = session.capture_feedback(d.b, None, 3).unwrap();
+            let context = ctx(&d, intent.capture_generation(), &format!("feedback-{n}"));
+            session.apply_feedback(&context, &intent).unwrap();
+            assert!(session.apply_feedback(&context, &intent).unwrap().replayed);
+            let feedback = control::take_validation_work();
+            eprintln!("native feedback scaling: receipts={count}, work={feedback:?}");
+            feedback_work.push(feedback);
+        }
+    }
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 67);
+    for work in exposure_work.iter().chain(&feedback_work) {
+        assert_eq!(work.full_validations, 0, "unexpected full proof: {work:?}");
+        assert!(
+            work.receipt_decodes <= 4,
+            "unbounded receipt work: {work:?}"
+        );
+        assert_eq!(*work, exposure_work[0], "receipt work grew with history");
+    }
+    drop(session);
+    control::take_validation_work();
+    let session = open(&d, clock.clone());
+    let work = control::take_validation_work();
+    assert!(work.full_validations > 0);
+    assert!(work.receipt_decodes >= 67);
+    eprintln!("strict reopen receipt work: {work:?}");
+    drop(session);
+
+    // Corrupt an old receipt only after releasing ownership. Reopen must still
+    // reject the complete history before writable open changes source bytes.
+    let receipt = first_receipt.unwrap();
+    let db = redb::Database::open(d.path.join("meta.db")).unwrap();
+    let tx = db.begin_write().unwrap();
+    let key = control::scoped_key(
+        receipt.store_id,
+        MutationScope::Namespace(d.ns),
+        receipt.operation_id.as_bytes(),
+    );
+    tx.open_table(control::RECEIPTS)
+        .unwrap()
+        .remove(key.as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+    drop(db);
+    let before = std::fs::read(d.path.join("meta.db")).unwrap();
+    assert!(NativeLifecycleSession::open(&d.path, NativePolicyInputs::default(), clock).is_err());
+    assert_eq!(std::fs::read(d.path.join("meta.db")).unwrap(), before);
+}
+
+#[tokio::test]
+async fn native_open_rejects_unknown_canonical_tables_before_writable_open() {
+    let root = tempfile::tempdir().unwrap();
+    let d = fixture(
+        root.path(),
+        LifecycleVersion::ExplicitFeedbackV2,
+        1500.,
+        Some(1.),
+    )
+    .await;
+    // Corruption fixtures only. A successful migration supplies all native
+    // records, control and publication proof before adding unsupported state.
+    for multimap in [false, true] {
+        let db = redb::Database::open(d.path.join("meta.db")).unwrap();
+        let tx = db.begin_write().unwrap();
+        if multimap {
+            tx.open_multimap_table(redb::MultimapTableDefinition::<u32, u32>::new(
+                "future_native_state",
+            ))
+            .unwrap();
+        } else {
+            tx.open_table(redb::TableDefinition::<u32, u32>::new(
+                "future_native_state",
+            ))
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        drop(db);
+        let before = std::fs::read(d.path.join("meta.db")).unwrap();
+        assert!(MetadataStore::open_native_lifecycle(&d.path.join("meta.db")).is_err());
+        assert_eq!(std::fs::read(d.path.join("meta.db")).unwrap(), before);
+        let db = redb::Database::open(d.path.join("meta.db")).unwrap();
+        let tx = db.begin_write().unwrap();
+        if multimap {
+            tx.delete_multimap_table(redb::MultimapTableDefinition::<u32, u32>::new(
+                "future_native_state",
+            ))
+            .unwrap();
+        } else {
+            tx.delete_table(redb::TableDefinition::<u32, u32>::new(
+                "future_native_state",
+            ))
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        drop(db);
+    }
+}

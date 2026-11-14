@@ -1,0 +1,68 @@
+{
+  "baseline": "744ef3c27c6c2b8ffba07ddbf5c0f13eb2b298ce",
+  "receipt_checkpoints": [
+    4,
+    20,
+    69
+  ],
+  "checkpoint_definition": "stored count after fresh exposure commit, before subsequent feedback commit",
+  "operation_bundle": "capture, fresh commit, then matching keyed replay",
+  "before": {
+    "exposure_full_validations": [
+      3,
+      3,
+      3
+    ],
+    "exposure_receipt_decodes": [
+      21,
+      117,
+      411
+    ],
+    "feedback_full_validations": [
+      3,
+      3,
+      3
+    ],
+    "feedback_receipt_decodes": [
+      27,
+      123,
+      417
+    ]
+  },
+  "after": {
+    "exposure_full_validations": [
+      0,
+      0,
+      0
+    ],
+    "exposure_receipt_decodes": [
+      1,
+      1,
+      1
+    ],
+    "feedback_full_validations": [
+      0,
+      0,
+      0
+    ],
+    "feedback_receipt_decodes": [
+      1,
+      1,
+      1
+    ],
+    "strict_reopen_full_validations": 7,
+    "strict_reopen_receipt_decodes": 1053
+  },
+  "focused_tests_passed": 16,
+  "claims": "test counters only; no timing or ordinary serving guarantee",
+  "validation": {
+    "library_passed": 670,
+    "cli_passed": 2,
+    "doctests_ignored": 4,
+    "fmt_exit": 0,
+    "clippy_exit": 0,
+    "clippy_lib_test_warnings": 429,
+    "clippy_duplicate_lib_test_warnings": 411,
+    "source_package_cleaned_before_final_full": true
+  }
+}
