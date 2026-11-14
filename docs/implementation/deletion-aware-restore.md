@@ -1,5 +1,9 @@
 # Deletion-aware restore of the gated v1 layout
 
+This document records the bounded `4abc959` core. The subsequent
+[schema/effects bridge](schema-restore-bridge.md) adds explicit offline consumers
+while preserving ordinary schema-v2 serving guards.
+
 This implementation depends on removal-ledger `214d719` (including atomic
 lifecycle and the graph revalidation fix) and selected-text/fence PR34
 `838cafc`. Merge `5672ab0` records both actual parents. It does not depend on
