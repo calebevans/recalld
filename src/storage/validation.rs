@@ -61,6 +61,9 @@ pub(crate) fn preflight_text(path: &Path) -> Result<(), StorageError> {
     let (_copy, metadata) = inspect_database_copy(&path.join("meta.db"), true)?;
     let read = metadata.begin_read()?;
     let control = super::control::validate_existing(&read)?;
+    if let Some(control) = &control {
+        super::lineage::ensure_serving(&read, control)?;
+    }
     super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
     // Valid pending effects are recoverable at startup; only malformed evidence fails here.
     let effects = super::metadata::effects::validate_existing(&read)?;
@@ -110,6 +113,14 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
     let (_meta_copy, meta) = inspect_database(&path.join("meta.db"))?;
     let read = meta.begin_read()?;
     let control = super::control::validate_existing(&read)?;
+    if super::metadata::purge::validate_existing(&read, control.as_ref())?
+        .iter()
+        .any(|p| p.stage != super::purge::PurgeStage::Complete)
+    {
+        return Err(StorageError::RecoveryRequired(
+            "unfinished namespace purge; reopen and finish before offline inventory".into(),
+        ));
+    }
     super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
     let schema_state = control
         .as_ref()

@@ -68,12 +68,20 @@ impl DerivedCompletion {
 
     /// Legacy bool adapter. Resolve namespace and commit under one store guard;
     /// each batch caller invokes this in order, with independent child commits.
-    pub async fn forget(&self, id: crate::model::MemoryId) -> Result<bool, StorageError> {
+    pub async fn forget(
+        &self,
+        id: crate::model::MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let namespace = namespace.map(str::to_owned);
         let gate = publication_gate(&self.storage).await?;
         let lease = gate.read_owned().await;
         let storage = self.storage.clone();
         let receipt = tokio::task::spawn_blocking(move || {
             let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            if let Some(namespace) = namespace.as_deref() {
+                storage.assert_memory_namespace(id, namespace)?;
+            }
             let Some(record) = storage.get_record(id)? else {
                 return Ok(None);
             };
@@ -127,7 +135,8 @@ impl DerivedCompletion {
         let storage = self.storage.clone();
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || {
-            let storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            let mut storage = storage.write().map_err(|e| failed(e.to_string()))?;
+            storage.resume_pending_purges()?;
             storage.ensure_available()?;
             if !storage.meta_store().needs_effects_rebuild() {
                 return Ok(());
@@ -298,7 +307,12 @@ mod tests {
             panic!()
         };
         assert_eq!(receipt.committed_generation, before.next().unwrap());
-        assert!(fx.storage_adapter().get_memory(memory_id).await.is_err());
+        assert!(
+            fx.storage_adapter()
+                .get_memory(memory_id, false, None)
+                .await
+                .is_err()
+        );
         assert_eq!(
             fx.storage
                 .read()
@@ -386,10 +400,13 @@ mod tests {
             .pending_effects()
             .unwrap();
         assert_eq!(pending.len(), 1);
-        assert!(adapter.get_memory(dead).await.is_err());
-        assert!(adapter.get_memory(live).await.is_err());
+        assert!(adapter.get_memory(dead, false, None).await.is_err());
+        assert!(adapter.get_memory(live, false, None).await.is_err());
         assert!(
-            adapter.get_memory(MemoryId::new()).await.is_err(),
+            adapter
+                .get_memory(MemoryId::new(), false, None)
+                .await
+                .is_err(),
             "no false miss while blocked"
         );
 
@@ -398,7 +415,7 @@ mod tests {
         *fx.vector_index.write().await = FlatVectorIndex::new(DIM + 1);
         assert!(matches!(publisher(&fx).complete().await,
             Err(StorageError::CommittedMutation {receipt, ..}) if receipt.operation_id == pending[0].receipt.operation_id));
-        assert!(adapter.get_memory(live).await.is_err());
+        assert!(adapter.get_memory(live, false, None).await.is_err());
         assert_eq!(
             fx.storage
                 .read()
@@ -420,8 +437,20 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(adapter.get_memory(dead).await.unwrap().is_none());
-        assert!(adapter.get_memory(live).await.unwrap().is_some());
+        assert!(
+            adapter
+                .get_memory(dead, false, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            adapter
+                .get_memory(live, false, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(fx.vector_index.read().await.get_vector(dead).is_none());
         assert!(fx.vector_index.read().await.get_vector(live).is_some());
         assert!(!fx.graph.read().await.contains(&dead));
@@ -444,7 +473,13 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(adapter.get_memory(dead).await.unwrap().is_none());
+        assert!(
+            adapter
+                .get_memory(dead, false, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
         publisher(&fx).complete().await.unwrap();
     }
 
@@ -588,7 +623,7 @@ mod tests {
         );
         assert!(
             fx.storage_adapter()
-                .get_memory(dead)
+                .get_memory(dead, false, None)
                 .await
                 .unwrap()
                 .is_none()

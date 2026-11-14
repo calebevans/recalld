@@ -308,9 +308,13 @@ impl VectorStore {
     /// * `dir` -- directory that will contain the file (created if absent).
     /// * `dim` -- embedding dimensionality for this namespace.
     ///
+    pub(crate) fn relocate_path(&mut self, dir: &Path) {
+        self.path = dir.join("vectors.dat");
+    }
+
     /// On create: writes a 64-byte header and zero vector slots.
     /// On open: validates the header, acquires an exclusive file lock.
-    pub fn open(dir: &Path, dim: usize) -> Result<Self> {
+    pub(super) fn open(dir: &Path, dim: usize) -> Result<Self> {
         let dim_u16: u16 = dim.try_into().map_err(|_| VectorError::Corrupt {
             path: dir.to_path_buf(),
             reason: format!("dimension {dim} exceeds u16::MAX"),
@@ -487,7 +491,7 @@ impl VectorStore {
     /// Remaps the mmap after insertion so subsequent `get_vector` calls
     /// see the new data. For batch inserts, use [`insert_vector_no_remap`]
     /// followed by a single [`finish_batch`] call.
-    pub fn insert_vector(&mut self, vector: &[f32]) -> Result<u32> {
+    pub(super) fn insert_vector(&mut self, vector: &[f32]) -> Result<u32> {
         let slot = self.insert_vector_no_remap(vector)?;
         // Re-mmap so subsequent get_vector calls see the new data.
         self.remap()?;
@@ -498,7 +502,7 @@ impl VectorStore {
     /// **must** call [`finish_batch`] after all insertions to refresh
     /// the mmap. This avoids thousands of mmap/munmap syscalls during
     /// batch operations.
-    pub fn insert_vector_no_remap(&mut self, vector: &[f32]) -> Result<u32> {
+    pub(super) fn insert_vector_no_remap(&mut self, vector: &[f32]) -> Result<u32> {
         if vector.len() != self.dimensions as usize {
             return Err(VectorError::WrongVectorLength {
                 expected: self.dimensions as usize,
@@ -529,7 +533,7 @@ impl VectorStore {
     /// Finish a batch of `insert_vector_no_remap` calls by performing
     /// a single mmap remap. This refreshes the read view so that
     /// `get_vector` and `all_vectors_raw` see all newly written data.
-    pub fn finish_batch(&mut self) -> Result<()> {
+    pub(super) fn finish_batch(&mut self) -> Result<()> {
         self.remap()
     }
 
@@ -621,7 +625,7 @@ impl VectorStore {
 
     /// Mark `slot` as free. Zeros the slot data (preventing stale SIMD
     /// matches), then prepends the slot to the embedded free list.
-    pub fn free_slot(&mut self, slot: u32) -> Result<()> {
+    pub(super) fn free_slot(&mut self, slot: u32) -> Result<()> {
         if slot >= self.slot_count {
             return Err(VectorError::SlotOutOfBounds {
                 slot,
@@ -724,7 +728,7 @@ impl VectorStore {
 
     /// Drop the current mmap and create a new one over the (possibly
     /// extended) file. Updates the cached `slot_count`.
-    pub fn remap(&mut self) -> Result<()> {
+    pub(super) fn remap(&mut self) -> Result<()> {
         // SAFETY: file is exclusively locked, no external writer.
         let new_mmap = unsafe {
             Mmap::map(&*self.file).map_err(|e| VectorError::Io {
@@ -783,7 +787,7 @@ impl VectorManager {
     /// * `namespace_name` -- human-readable name, used as the
     ///   subdirectory name (e.g., `"default"`, `"work-context"`).
     /// * `dimensions`     -- embedding dimensionality for this namespace.
-    pub fn open_or_create(
+    pub(super) fn open_or_create(
         &mut self,
         namespace_id: NamespaceId,
         namespace_name: &str,
@@ -839,6 +843,10 @@ impl VectorManager {
         Ok(self.stores.get_mut(&namespace_id).unwrap())
     }
 
+    pub(crate) fn install_prepared(&mut self, id: NamespaceId, store: VectorStore) {
+        self.stores.insert(id, store);
+    }
+
     /// Get a shared reference to an already-opened store.
     /// Returns None if the namespace has not been opened.
     pub fn get(&self, namespace_id: NamespaceId) -> Option<&VectorStore> {
@@ -846,7 +854,7 @@ impl VectorManager {
     }
 
     /// Get a mutable reference to an already-opened store.
-    pub fn get_mut(&mut self, namespace_id: NamespaceId) -> Option<&mut VectorStore> {
+    pub(super) fn get_mut(&mut self, namespace_id: NamespaceId) -> Option<&mut VectorStore> {
         self.stores.get_mut(&namespace_id)
     }
 
@@ -876,7 +884,7 @@ impl VectorManager {
     /// precede.
     #[must_use = "the returned store holds an exclusive lock and a live mmap; \
                   drop it before removing the namespace directory"]
-    pub fn remove(&mut self, namespace_id: NamespaceId) -> Option<VectorStore> {
+    pub(super) fn remove(&mut self, namespace_id: NamespaceId) -> Option<VectorStore> {
         self.stores.remove(&namespace_id)
     }
 }

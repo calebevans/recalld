@@ -7,13 +7,15 @@
 //!
 //! See Spec 04 Section 7 for the design rationale.
 
+mod catalog;
 mod effects;
 mod insertion;
 mod maintenance;
+mod purge;
 mod text_compaction;
 mod tombstone;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -53,6 +55,7 @@ pub trait StorageEngine: Send + Sync {
     /// 2. Appends full_text to fulltext.dat (if provided).
     /// 3. Sets vector_slot and text pointer on the record.
     /// 4. Inserts the record into meta.db with secondary indexes.
+    #[cfg(test)]
     fn insert_memory(
         &mut self,
         id: MemoryId,
@@ -96,6 +99,7 @@ pub trait StorageEngine: Send + Sync {
     /// FTS, and entity indexes separately.
     ///
     /// Returns `Ok(())` if the memory existed, or `Err(NotFound)` if not.
+    #[cfg(test)]
     fn tombstone_memory(&self, id: MemoryId) -> Result<(), StorageError>;
 
     // ── Decay State ─────────────────────────────────────────────────
@@ -108,6 +112,7 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Returns `Err(NotFound)` if the memory does not exist or has been
     /// tombstoned; a tombstone is never rewritten.
+    #[cfg(test)]
     fn update_decay_state(
         &self,
         id: MemoryId,
@@ -119,6 +124,7 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// Atomic v1 feedback state/history patch; false rejects a stale snapshot.
+    #[cfg(test)]
     fn apply_legacy_feedback(
         &self,
         id: MemoryId,
@@ -143,11 +149,13 @@ pub trait StorageEngine: Send + Sync {
     /// Called during Full -> Summary phase transitions to mark the
     /// text data in fulltext.dat as dead space reclaimable by
     /// compaction.
+    #[cfg(test)]
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError>;
 
     /// Clear the summary field on a memory record.
     ///
     /// Called during Summary -> Ghost phase transitions.
+    #[cfg(test)]
     fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError>;
 
     /// Return the IDs of all memories currently in the given phase.
@@ -162,6 +170,7 @@ pub trait StorageEngine: Send + Sync {
     /// Execute a decay sweep using the provided transition function.
     ///
     /// Returns the number of records transitioned.
+    #[cfg(test)]
     fn decay_sweep(
         &self,
         compute_new_state: &dyn Fn(&DiskRecord) -> Option<DiskRecord>,
@@ -225,6 +234,27 @@ pub trait StorageEngine: Send + Sync {
     /// Get a namespace by name.
     fn get_namespace_by_name(&self, name: &str) -> Result<Option<NamespaceConfig>, StorageError>;
 
+    /// Check an opt-in by-ID assertion using canonical rows, never a session default
+    /// or cache. Call under the same storage guard as the protected operation.
+    fn assert_memory_namespace(&self, id: MemoryId, namespace: &str) -> Result<(), StorageError> {
+        validate_namespace_name(namespace).map_err(|e| StorageError::InvalidNamespaceName {
+            name: namespace.to_owned(),
+            reason: e.to_string(),
+        })?;
+        let record = self
+            .get_record(id)?
+            .ok_or(StorageError::NotFound(id.into_inner()))?;
+        let asserted = self.get_namespace_by_name(namespace)?;
+        if asserted.is_some_and(|ns| ns.id.get() == record.namespace_id) {
+            Ok(())
+        } else {
+            Err(StorageError::NamespaceMismatch {
+                id: id.into_inner(),
+                namespace: namespace.to_owned(),
+            })
+        }
+    }
+
     // ── Text Compaction ─────────────────────────────────────────────
 
     /// Run fulltext.dat compaction, reclaiming dead space from decayed
@@ -244,6 +274,7 @@ pub trait StorageEngine: Send + Sync {
     /// Update the edge_count field on a memory's DiskRecord.
     ///
     /// Performs a read-modify-write in a single redb transaction.
+    #[cfg(test)]
     fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError>;
 
     // ── Bulk / Diagnostic ───────────────────────────────────────────
@@ -264,6 +295,7 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Called after tombstoning a memory to return the on-disk slot
     /// to the free list so it can be reused.
+    #[cfg(test)]
     fn free_vector_slot(
         &mut self,
         namespace_id: NamespaceId,
@@ -338,6 +370,30 @@ impl RedbStorageEngine {
             .update_access_with_receipt(ctx, id, timestamp, kind)
     }
 
+    /// Atomic per-namespace exposure batch; canonical commit only, not readiness.
+    pub fn record_exposure_batch(
+        &self,
+        ctx: &MutationContext,
+        accesses: &[(MemoryId, AccessKind)],
+        sampled_at: i64,
+    ) -> Result<Option<WriteReceipt>, StorageError> {
+        self.meta_store
+            .record_exposure_batch(ctx, accesses, sampled_at)
+    }
+
+    /// Fresh-state legacy feedback and a payload-free receipt in one transaction.
+    pub fn record_legacy_feedback(
+        &self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        quality: u8,
+        sampled_at: i64,
+        global_multiplier: f64,
+    ) -> Result<WriteReceipt, StorageError> {
+        self.meta_store
+            .record_legacy_feedback(ctx, id, quality, sampled_at, global_multiplier)
+    }
+
     pub fn lookup_operation(
         &self,
         store_id: uuid::Uuid,
@@ -359,7 +415,8 @@ impl RedbStorageEngine {
     /// 6. Opens vector files for all existing namespaces.
     /// 7. Runs startup validation (rebuilds phase index, cleans orphans).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let ownership = crate::storage::ownership::StoreOwnership::acquire(path.as_ref())?;
+        let ownership =
+            crate::storage::ownership::StoreOwnership::acquire_recovering(path.as_ref())?;
         let db_path = ownership.path.clone();
         std::fs::create_dir_all(&db_path)?;
         let lock_file = crate::storage::ownership::lock_directory(&db_path)?;
@@ -437,6 +494,7 @@ impl RedbStorageEngine {
 
         // Step 7: Startup validation.
         engine.recover_pending_effects()?;
+        engine.resume_pending_purges()?;
         engine.startup_validation()?;
         if let Some(selected) = selected_text {
             if let Err(error) =
@@ -749,22 +807,22 @@ impl RedbStorageEngine {
     /// Return a reference to the underlying MetadataStore.
     /// Useful for callers that need direct access (e.g., batch
     /// operations not covered by the trait).
-    pub fn meta_store(&self) -> &MetadataStore {
+    pub(crate) fn meta_store(&self) -> &MetadataStore {
         &self.meta_store
     }
 
     /// Return a reference to the underlying EdgeStore.
-    pub fn edge_store(&self) -> &EdgeStore {
+    pub(crate) fn edge_store(&self) -> &EdgeStore {
         &self.edge_store
     }
 
     /// Return a reference to the underlying VectorManager.
-    pub fn vector_manager(&self) -> &VectorManager {
+    pub(crate) fn vector_manager(&self) -> &VectorManager {
         &self.vector_manager
     }
 
     /// Return a mutable reference to the underlying VectorManager.
-    pub fn vector_manager_mut(&mut self) -> &mut VectorManager {
+    pub(crate) fn vector_manager_mut(&mut self) -> &mut VectorManager {
         &mut self.vector_manager
     }
 
@@ -801,6 +859,8 @@ pub struct PurgedNamespace {
     /// Whether the namespace's vector directory was removed. `false`
     /// means it was already gone, or a guard refused to touch it.
     pub directory_removed: bool,
+    /// Durable completion outcome; derived views still require acknowledgement.
+    pub receipt: WriteReceipt,
 }
 
 /// A [`RedbStorageEngine::purge_namespace`] that failed.
@@ -866,154 +926,6 @@ impl std::error::Error for NamespacePurgeError {
 }
 
 impl RedbStorageEngine {
-    /// Destroy a namespace: its records, its edges, its configuration
-    /// row and its vector file.
-    ///
-    /// # DESTRUCTIVE AND IRREVERSIBLE
-    ///
-    /// Every memory in the namespace is gone when this returns. There
-    /// is no undo and no backup. Callers are expected to have obtained
-    /// explicit confirmation before getting here.
-    ///
-    /// # The caller must finish the job
-    ///
-    /// This method can only reach what storage owns. The returned
-    /// records are the caller's input for cleaning the FTS index, the
-    /// in-memory vector index, the entity index and the relationship
-    /// graph — none of which this layer holds a handle to. Skip that and
-    /// the namespace is gone from disk but still burning top-k slots in
-    /// every search.
-    ///
-    /// # Ordering, and what a crash costs
-    ///
-    /// 1. Purge `META_TABLE` rows (chunked).
-    /// 2. Purge edges.
-    /// 3. Delete the `NAMESPACE_TABLE` row. **Point of no return.**
-    /// 4. Drop the `VectorStore`, then remove the directory.
-    ///
-    /// A crash before (3) leaves a live namespace holding fewer
-    /// memories: ugly, but consistent, and re-running the call finishes
-    /// it. A crash after (3) leaves an orphan directory and orphan FTS
-    /// rows — wasted disk, no wrong answers — and the directory is
-    /// reclaimed by the boot sweep in `startup_validation`.
-    ///
-    /// No crash marker is needed. Namespace ids are never recycled and
-    /// `NAMESPACE_TABLE` is authoritative, so "the row is gone" is
-    /// itself the durable record that the namespace is dead.
-    ///
-    /// # A failure is not the same as "nothing happened"
-    ///
-    /// Step 1 commits in chunks, so an ERROR — not merely a crash — part
-    /// of the way through has already destroyed everything up to that
-    /// point. The error type carries those records for exactly the
-    /// reason the success type does: without them the caller cannot
-    /// clean the indexes, and nothing ever can, because a retry finds
-    /// their `META_TABLE` rows already gone and reports an empty purge.
-    pub fn purge_namespace(
-        &mut self,
-        namespace_id: NamespaceId,
-    ) -> Result<PurgedNamespace, NamespacePurgeError> {
-        let config = match self.meta_store.get_namespace(namespace_id) {
-            Ok(Some(config)) => config,
-            Ok(None) => {
-                return Err(NamespacePurgeError::nothing_destroyed(
-                    StorageError::NamespaceNotFound(namespace_id.get()),
-                ));
-            }
-            Err(e) => return Err(NamespacePurgeError::nothing_destroyed(e)),
-        };
-
-        tracing::info!(
-            namespace = %config.name,
-            namespace_id = namespace_id.get(),
-            "Purging namespace (destructive, irreversible)"
-        );
-
-        let victims = self
-            .meta_store
-            .scan_all()
-            .map_err(NamespacePurgeError::nothing_destroyed)?;
-        let ids: Vec<_> = victims
-            .iter()
-            .filter(|(_, r)| r.namespace_id == namespace_id.get())
-            .map(|(id, _)| *id)
-            .collect();
-        let mut records = Vec::new();
-        let mut edges_removed = 0;
-        let mut peer_counts = std::collections::HashMap::new();
-        for chunk in ids.chunks(PURGE_CHUNK_SIZE) {
-            let result = (|| {
-                let guard = self.meta_store.mutation_guard()?;
-                let result = self.meta_store.commit_graph_effects(
-                    &guard,
-                    namespace_id,
-                    &self.edge_store.load_all_edges()?,
-                    &[],
-                    chunk,
-                    true,
-                    false,
-                )?;
-                // Preserve known committed removals even if materialization fails.
-                records.extend(result.removed);
-                edges_removed += result.edges_removed;
-                peer_counts.extend(result.peer_counts);
-                effects::apply_pending(
-                    &self.meta_store,
-                    &self.edge_store,
-                    Some(&mut self.vector_manager),
-                )
-                .map_err(|source| StorageError::CommittedEffectsPending {
-                    operation_id: result.receipt.operation_id,
-                    source: Box::new(source),
-                })
-            })();
-            if let Err(source) = result {
-                return Err(NamespacePurgeError::partial(records, source));
-            }
-        }
-        let peer_edge_counts = peer_counts
-            .into_iter()
-            .filter(|(id, _)| !ids.contains(id))
-            .collect();
-        let live_removed = records
-            .iter()
-            .filter(|(_, r)| r.phase != DecayPhase::Tombstone)
-            .count();
-        let tombstones_removed = records.len() - live_removed;
-
-        // 3. Configuration row. Point of no return.
-        if let Err(e) = self.meta_store.delete_namespace(namespace_id) {
-            return Err(NamespacePurgeError::partial(records, e));
-        }
-
-        // 4. Vector file. The store must be dropped before the unlink:
-        //    it holds an fs2 exclusive lock and a live mmap.
-        let store = self.vector_manager.remove(namespace_id);
-        drop(store);
-
-        let directory_removed = self.remove_namespace_dir(&config.name);
-
-        tracing::info!(
-            namespace = %config.name,
-            namespace_id = namespace_id.get(),
-            live_removed,
-            tombstones_removed,
-            edges_removed,
-            directory_removed,
-            "Namespace purge complete"
-        );
-
-        Ok(PurgedNamespace {
-            config,
-            records,
-            live_removed,
-            tombstones_removed,
-            edges_removed,
-            peer_edge_counts,
-            directory_removed,
-        })
-    }
-
     /// Remove every edge touching `ids`, and repair the outgoing
     /// `edge_count` of every SURVIVING memory that had an edge into one
     /// of them. Returns the edges removed and the `(peer, new_count)`
@@ -1101,6 +1013,7 @@ impl RedbStorageEngine {
     /// committed by the time this runs, so a failure here is wasted disk
     /// to be logged and swept at next boot, not a reason to report the
     /// deletion as failed.
+    #[cfg(test)]
     fn remove_namespace_dir(&self, name: &str) -> bool {
         let dir = match self.namespace_dir(name) {
             Ok(dir) => dir,
@@ -1200,13 +1113,6 @@ impl RedbStorageEngine {
 /// own quarantine can never become a candidate for the next sweep.
 const QUARANTINE_DIR_NAME: &str = ".orphaned";
 
-/// How many records one `purge_namespace_records` transaction commits.
-///
-/// Bounds how long a purge holds the redb write lock. Small enough that
-/// a concurrent reader is not stalled for seconds; large enough that a
-/// hundred-thousand-record namespace is not a hundred thousand fsyncs.
-const PURGE_CHUNK_SIZE: usize = 1_000;
-
 // ═══════════════════════════════════════════════════════════════════════
 // StorageEngine Implementation
 // ═══════════════════════════════════════════════════════════════════════
@@ -1214,6 +1120,7 @@ const PURGE_CHUNK_SIZE: usize = 1_000;
 impl StorageEngine for RedbStorageEngine {
     // ── Memory CRUD ─────────────────────────────────────────────────
 
+    #[cfg(test)]
     fn insert_memory(
         &mut self,
         id: MemoryId,
@@ -1317,6 +1224,7 @@ impl StorageEngine for RedbStorageEngine {
             .and_then(|r| r.removed.into_iter().next().map(|(_, r)| r)))
     }
 
+    #[cfg(test)]
     fn tombstone_memory(&self, id: MemoryId) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.meta_store.tombstone(id)
@@ -1324,6 +1232,7 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Decay State ─────────────────────────────────────────────────
 
+    #[cfg(test)]
     fn update_decay_state(
         &self,
         id: MemoryId,
@@ -1344,6 +1253,7 @@ impl StorageEngine for RedbStorageEngine {
         )
     }
 
+    #[cfg(test)]
     fn apply_legacy_feedback(
         &self,
         id: MemoryId,
@@ -1383,11 +1293,13 @@ impl StorageEngine for RedbStorageEngine {
         })
     }
 
+    #[cfg(test)]
     fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.meta_store.strip_full_text(id)
     }
 
+    #[cfg(test)]
     fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.meta_store.strip_summary(id)
@@ -1406,6 +1318,7 @@ impl StorageEngine for RedbStorageEngine {
         self.meta_store.scan_phase_records(phase)
     }
 
+    #[cfg(test)]
     fn decay_sweep(
         &self,
         compute_new_state: &dyn Fn(&DiskRecord) -> Option<DiskRecord>,
@@ -1500,48 +1413,21 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Namespaces ──────────────────────────────────────────────────
 
-    /// # The row must never outlive the directory
-    ///
-    /// This used to commit the `NAMESPACE_TABLE` row and only then ask
-    /// `open_or_create` whether the name could be a directory. A
-    /// rejected name therefore left a committed row for a namespace
-    /// whose directory can never be created — and [`Self::open`] step 6
-    /// calls `open_or_create` for **every** row and `?`-propagates, so
-    /// the next boot failed outright. One rejected `create_namespace`
-    /// call wedged the database.
-    ///
-    /// So: validate first, and roll the row back if the vector store
-    /// still refuses. Validation cannot see a directory already flocked
-    /// by another store or a full disk, and both wedge the boot in
-    /// exactly the same way.
+    /// Publish durable namespace vectors before committing its row and receipt.
+    /// The v1 wrapper retains its assigned-ID return shape.
     fn create_namespace(&mut self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
-        self.ensure_available()?;
-        validate_namespace_name(&config.name).map_err(|e| StorageError::InvalidNamespaceName {
-            name: config.name.clone(),
-            reason: e.to_string(),
-        })?;
-
-        let ns_id = self.meta_store.create_namespace(config)?;
-
-        // Open/create the vector file for this namespace.
-        if let Err(e) =
-            self.vector_manager
-                .open_or_create(ns_id, &config.name, config.embedding_dim as usize)
-        {
-            if let Err(rollback) = self.meta_store.delete_namespace(ns_id) {
-                tracing::error!(
-                    namespace = %config.name,
-                    namespace_id = ns_id.get(),
-                    error = %rollback,
-                    "Could not roll back the namespace row after its vector store failed \
-                     to open. The next startup will fail to open this namespace; remove \
-                     the row by hand."
-                );
+        let ctx = MutationContext {
+            scope: MutationScope::Catalog,
+            ..MutationContext::unkeyed(NamespaceId::new(1))
+        };
+        match self.create_namespace_with_receipt(&ctx, config)?.outcome {
+            crate::storage::control::MutationOutcome::NamespaceCreated { namespace_id, .. } => {
+                Ok(namespace_id)
             }
-            return Err(e.into());
+            _ => Err(StorageError::InvalidControl(
+                "create receipt outcome mismatch".into(),
+            )),
         }
-
-        Ok(ns_id)
     }
 
     fn list_namespaces(&self) -> Result<Vec<NamespaceConfig>, StorageError> {
@@ -1580,6 +1466,7 @@ impl StorageEngine for RedbStorageEngine {
 
     // ── Edge Count ──────────────────────────────────────────────────
 
+    #[cfg(test)]
     fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.meta_store.update_edge_count(id, edge_count)
@@ -1607,6 +1494,7 @@ impl StorageEngine for RedbStorageEngine {
         self.meta_store.exists(id)
     }
 
+    #[cfg(test)]
     fn free_vector_slot(
         &mut self,
         namespace_id: NamespaceId,

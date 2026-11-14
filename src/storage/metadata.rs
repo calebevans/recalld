@@ -7,10 +7,15 @@
 //!
 //! See CS-07 for the full specification.
 
+mod catalog;
 pub(crate) mod effects;
 mod insertion;
 mod lifecycle_updates;
+pub(crate) mod namespace_state;
+mod observation;
+pub(crate) mod purge;
 pub(crate) mod removal_ledger;
+pub(crate) mod restoration;
 pub(crate) mod text_generation;
 mod tombstone;
 
@@ -75,12 +80,17 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 pub struct MetadataStore {
     db: Database,
     unavailable: std::sync::atomic::AtomicBool,
+    purge_pending: std::sync::atomic::AtomicBool,
     pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
     derived_dirty: std::sync::atomic::AtomicBool,
     effects_epoch: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) observation_fault: std::sync::atomic::AtomicU8,
     pub(crate) derived_publication: std::sync::Arc<tokio::sync::RwLock<()>>,
     #[cfg(test)]
     pub(crate) fail_effect_application: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_purge_child_commit: std::sync::atomic::AtomicBool,
     // Lock order: engine gate -> publication -> redb -> phase_index.
     // Hold across commit and bitmap publication, including direct callers.
     publication: std::sync::RwLock<()>,
@@ -97,15 +107,17 @@ impl MetadataStore {
     /// - Sets a 16 MB read cache (covers top B+tree levels).
     /// - Creates all tables on first open.
     /// - Loads or rebuilds the phase index from persisted bitmaps.
-    pub fn open(path: &Path) -> Result<Self, StorageError> {
-        // redb's writable open changes bookkeeping. Refuse an offline v2 store
-        // using a disposable inspection copy, including direct metadata callers.
-        if path.try_exists()? && std::fs::metadata(path)?.len() > 0 {
-            let (_copy, inspection) = super::validation::inspect_database_copy(path, true)?;
-            if control::validate_existing(&inspection.begin_read()?)?
-                .is_some_and(|state| state.control_schema_version == 2)
-            {
-                return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
+    pub(crate) fn open(path: &Path) -> Result<Self, StorageError> {
+        // redb's writable open can change bookkeeping. Reject historical mode
+        // on a disposable copy even for callers bypassing the engine.
+        if path.try_exists()? && path.metadata()?.len() > 0 {
+            let (_copy, db) = super::validation::inspect_database_copy(path, true)?;
+            let read = db.begin_read()?;
+            if let Some(control) = control::validate_existing(&read)? {
+                super::lineage::ensure_serving(&read, &control)?;
+                if control.control_schema_version == 2 {
+                    return Err(StorageError::RecoveryRequired("canonical schema v2 is offline until participating writers are enabled; use schema inspect/export".into()));
+                }
             }
         }
         let db = redb::Builder::new()
@@ -155,16 +167,34 @@ impl MetadataStore {
         let store = Self {
             db,
             unavailable: std::sync::atomic::AtomicBool::new(false),
+            purge_pending: std::sync::atomic::AtomicBool::new(false),
             canonical_pending: std::sync::atomic::AtomicBool::new(false),
             derived_dirty: std::sync::atomic::AtomicBool::new(false),
             effects_epoch: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            observation_fault: std::sync::atomic::AtomicU8::new(0),
             derived_publication: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             fail_effect_application: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_purge_child_commit: std::sync::atomic::AtomicBool::new(false),
             publication: std::sync::RwLock::new(()),
             phase_index: std::sync::RwLock::new(PhaseIndex::new()),
         };
-        store.rebuild_phase_index()?;
+        store.purge_pending.store(
+            store
+                .purge_progress()?
+                .iter()
+                .any(|p| p.stage != crate::storage::purge::PurgeStage::Complete),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let records = store.scan_all_for_recovery()?;
+        let phases: Vec<_> = records
+            .iter()
+            .map(|(_, r)| (r.namespace_id, r.vector_slot, r.phase))
+            .collect();
+        *store.phase_index.write().unwrap_or_else(|e| e.into_inner()) =
+            PhaseIndex::rebuild_from_records(&phases);
         let pending = store.pending_effects()?;
         store.canonical_pending.store(
             pending.iter().any(|e| !e.canonical_applied),
@@ -186,6 +216,11 @@ impl MetadataStore {
     }
 
     pub(crate) fn ensure_available(&self) -> Result<(), StorageError> {
+        self.ensure_handle_available()?;
+        self.require_no_active_purge()
+    }
+
+    pub(crate) fn ensure_handle_available(&self) -> Result<(), StorageError> {
         if self.unavailable.load(std::sync::atomic::Ordering::Acquire)
             || self
                 .canonical_pending
@@ -211,6 +246,13 @@ impl MetadataStore {
         let guard = self.publication.write().unwrap_or_else(|e| e.into_inner());
         // Recheck after waiting: the preceding writer may have failed.
         self.ensure_available()?;
+        let read = self.db.begin_read()?;
+        let table = read.open_table(control::CONTROL)?;
+        let value = table
+            .get("state")?
+            .ok_or_else(|| StorageError::InvalidControl("missing control".into()))?;
+        let control = ControlState::decode(value.value())?;
+        crate::storage::lineage::ensure_serving(&read, &control)?;
         Ok(guard)
     }
 }
@@ -283,7 +325,8 @@ impl MetadataStore {
     ///
     /// # Errors
     /// - `StorageError::DuplicateId` if a record with this ID already exists.
-    pub fn insert(&self, id: MemoryId, record: &DiskRecord) -> Result<(), StorageError> {
+    #[cfg(test)]
+    pub(crate) fn insert(&self, id: MemoryId, record: &DiskRecord) -> Result<(), StorageError> {
         self.ensure_available()?;
         let _publication = self.mutation_guard()?;
         if record.id != *id.as_bytes() {
@@ -374,7 +417,8 @@ impl MetadataStore {
     /// which brought the record back in a live phase with its content
     /// stripped, its `NAMESPACE_INDEX` entry gone, and a `vector_slot`
     /// that had already been freed and could belong to another memory.
-    pub fn update_decay_state(
+    #[cfg(test)]
+    pub(crate) fn update_decay_state(
         &self,
         id: MemoryId,
         phase: DecayPhase,
@@ -404,7 +448,8 @@ impl MetadataStore {
     /// Called during Full -> Summary phase transitions to mark the
     /// text data in fulltext.dat as dead space reclaimable by
     /// compaction. Does not modify fulltext.dat itself.
-    pub fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
+    #[cfg(test)]
+    pub(crate) fn strip_full_text(&self, id: MemoryId) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.update_record(&id, |record| {
             record.text_offset = 0;
@@ -418,7 +463,8 @@ impl MetadataStore {
     ///
     /// Called during Summary -> Ghost phase transitions. After this,
     /// only the embedding and relationship edges remain.
-    pub fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
+    #[cfg(test)]
+    pub(crate) fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.update_record(&id, |record| {
             record.summary = String::new();
@@ -470,7 +516,7 @@ impl MetadataStore {
         scope: MutationScope,
         operation_id: uuid::Uuid,
     ) -> Result<Option<WriteReceipt>, StorageError> {
-        self.ensure_available()?;
+        self.ensure_handle_available()?;
         let tx = self.db.begin_read()?;
         let table = tx.open_table(control::CONTROL)?;
         let value = table
@@ -503,15 +549,7 @@ impl MetadataStore {
         self.ensure_available()?;
         let publication = self.mutation_guard()?;
         let (tx, receipt) = self.prepare_access(&publication, ctx, id, timestamp, kind)?;
-        if !receipt.replayed {
-            tx.commit().map_err(|source| {
-                self.mark_unavailable();
-                StorageError::CommitOutcomeUnknown {
-                    operation_id: receipt.operation_id,
-                    source,
-                }
-            })?;
-        }
+        self.commit_observation(tx, &receipt)?;
         Ok(receipt)
     }
 
@@ -545,6 +583,7 @@ impl MetadataStore {
             if record.phase == DecayPhase::Tombstone {
                 return Err(StorageError::NotFound(id.into_inner()));
             }
+            namespace_state::require_namespace_active(&tx, NamespaceId::new(record.namespace_id))?;
             record.last_accessed_at = timestamp;
             if record.access_history.len() >= ACCESS_HISTORY_MAX {
                 record.access_history.remove(0);
@@ -572,7 +611,8 @@ impl MetadataStore {
     /// # Returns
     /// The deleted `DiskRecord` (for the caller to know which vector
     /// slot to free, etc.), or `None` if the ID did not exist.
-    pub fn delete(&self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
+    #[cfg(test)]
+    pub(crate) fn delete(&self, id: MemoryId) -> Result<Option<DiskRecord>, StorageError> {
         self.ensure_available()?;
         let _publication = self.mutation_guard()?;
         let key = id.as_bytes().as_slice();
@@ -637,7 +677,8 @@ impl MetadataStore {
     /// updated (removed from old phase, NOT added to tombstone since
     /// tombstoned records don't have valid vector slots for bitmap
     /// tracking).
-    pub fn tombstone(&self, id: MemoryId) -> Result<(), StorageError> {
+    #[cfg(test)]
+    pub(crate) fn tombstone(&self, id: MemoryId) -> Result<(), StorageError> {
         self.ensure_available()?;
         let _publication = self.mutation_guard()?;
         let key = id.as_bytes().as_slice();
@@ -810,7 +851,12 @@ impl MetadataStore {
     ///
     /// Performs a read-modify-write in a single redb write transaction.
     /// Does not update any secondary indexes (edge_count is not indexed).
-    pub fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
+    #[cfg(test)]
+    pub(crate) fn update_edge_count(
+        &self,
+        id: MemoryId,
+        edge_count: u16,
+    ) -> Result<(), StorageError> {
         self.ensure_available()?;
         self.update_record(&id, |record| {
             record.edge_count = edge_count;
@@ -928,6 +974,34 @@ impl MetadataStore {
         }
 
         Ok(ids)
+    }
+
+    /// Load namespace members and canonical records from one redb read snapshot.
+    /// This is metadata-only coherence, not a snapshot of graph/vector/FTS views.
+    pub fn records_in_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<DiskRecord>, StorageError> {
+        let read = self.db.begin_read()?;
+        let namespaces = read.open_multimap_table(NAMESPACE_INDEX)?;
+        let records = read.open_table(META_TABLE)?;
+        let mut result = Vec::new();
+        for entry in namespaces.get(namespace_id.get())? {
+            let key = entry?;
+            let bytes: [u8; 16] = key.value().try_into().map_err(|_| {
+                StorageError::CorruptIndex("invalid UUID length in namespace index".into())
+            })?;
+            if let Some(value) = records.get(bytes.as_slice())? {
+                let record = DiskRecord::from_bytes(value.value())?;
+                if record.id != bytes || record.namespace_id != namespace_id.get() {
+                    return Err(StorageError::CorruptIndex(
+                        "namespace index disagrees with record identity".into(),
+                    ));
+                }
+                result.push(record);
+            }
+        }
+        Ok(result)
     }
 
     /// Number of live (non-tombstoned) memories in `namespace_id`.
@@ -1072,7 +1146,8 @@ impl MetadataStore {
     ///
     /// # Returns
     /// The number of records that were transitioned.
-    pub fn decay_sweep(
+    #[cfg(test)]
+    pub(crate) fn decay_sweep(
         &self,
         compute_new_state: impl Fn(&DiskRecord) -> Option<DiskRecord>,
     ) -> Result<usize, StorageError> {
@@ -1091,7 +1166,8 @@ impl MetadataStore {
     }
 
     /// Batch replacement with immutable identity/slot and coherent indexes.
-    pub fn batch_update_records(
+    #[cfg(test)]
+    pub(crate) fn batch_update_records(
         &self,
         records: &[(MemoryId, DiskRecord)],
     ) -> Result<(), StorageError> {
@@ -1231,65 +1307,22 @@ impl MetadataStore {
     /// # Errors
     /// - `StorageError::DuplicateName` if a namespace with this name
     ///   already exists.
-    pub fn create_namespace(&self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
-        self.ensure_available()?;
-        let _publication = self.mutation_guard()?;
-        let write_txn = self.db.begin_write()?;
-        let new_id;
-        {
-            // Check name uniqueness by scanning existing namespaces.
-            //
-            // Case-INSENSITIVELY, because the name becomes a directory
-            // name and macOS APFS, Windows NTFS and a case-insensitive
-            // ext4 volume all give "notes" and "Notes" the SAME
-            // directory. Two rows sharing one directory is not a
-            // cosmetic collision:
-            //
-            // - delete "notes" (row gone, remove_dir_all fails, warn
-            //   only), create "Notes", and the new namespace adopts the
-            //   old one's `vectors.dat` — somebody else's embeddings.
-            // - `create_namespace("Default")` used to pass the
-            //   uniqueness check, commit its row, no-op `create_dir_all`
-            //   onto `default/` and only then fail on the exclusive
-            //   flock. The row survived, and `delete_namespace("Default")`
-            //   walked past the `!= "default"` guard and unlinked the
-            //   real default's vectors.
-            //
-            // `validate_namespace_name` restricts names to ASCII, so
-            // ASCII case folding is total here.
-            let ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
-            for result in ns_table.iter()? {
-                let (_, value) = result?;
-                let existing: NamespaceConfig = serde_json::from_slice(value.value())
-                    .map_err(|e| StorageError::Deserialize(e.to_string()))?;
-                if existing.name.eq_ignore_ascii_case(&config.name) {
-                    return Err(StorageError::DuplicateName(config.name.clone()));
-                }
-            }
-            drop(ns_table);
-
-            // Assign next ID.
-            let mut counter_table = write_txn.open_table(NAMESPACE_COUNTER)?;
-            let current_max = counter_table.get("max_id")?.map(|v| v.value()).unwrap_or(0);
-            new_id = current_max
-                .checked_add(1)
-                .ok_or_else(|| StorageError::InvalidControl("namespace ID exhausted".into()))?;
-            counter_table.insert("max_id", new_id)?;
-            drop(counter_table);
-
-            // Write the namespace config with the assigned ID.
-            let mut stored_config = config.clone();
-            stored_config.id = NamespaceId::new(new_id);
-            let bytes = serde_json::to_vec(&stored_config)
-                .map_err(|e| StorageError::Serialize(e.to_string()))?;
-
-            let mut ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
-            ns_table.insert(new_id, bytes.as_slice())?;
+    #[cfg(test)]
+    pub(crate) fn create_namespace(
+        &self,
+        config: &NamespaceConfig,
+    ) -> Result<NamespaceId, StorageError> {
+        let ctx = MutationContext {
+            scope: MutationScope::Catalog,
+            ..MutationContext::unkeyed(NamespaceId::new(1))
+        };
+        let receipt = self.create_catalog(&ctx, config, |_| Ok(()))?;
+        match receipt.outcome {
+            MutationOutcome::NamespaceCreated { namespace_id, .. } => Ok(namespace_id),
+            _ => Err(StorageError::InvalidControl(
+                "create receipt outcome mismatch".into(),
+            )),
         }
-        control::advance_generation(&write_txn)?;
-        self.commit(write_txn)?;
-
-        Ok(NamespaceId::new(new_id))
     }
 
     /// List all namespace configurations.
@@ -1373,7 +1406,11 @@ impl MetadataStore {
     ///
     /// Only removes the config entry. Memory cleanup is the caller's
     /// responsibility. The namespace ID is never recycled.
-    pub fn delete_namespace(&self, id: NamespaceId) -> Result<NamespaceConfig, StorageError> {
+    #[cfg(test)]
+    pub(crate) fn delete_namespace(
+        &self,
+        id: NamespaceId,
+    ) -> Result<NamespaceConfig, StorageError> {
         self.ensure_available()?;
         let _publication = self.mutation_guard()?;
         let write_txn = self.db.begin_write()?;
@@ -1421,7 +1458,8 @@ impl MetadataStore {
     /// `NAMESPACE_TABLE` row **after** this returns, never before —
     /// deleting it first turns a crash mid-purge into orphan records
     /// belonging to a namespace that no longer exists.
-    pub fn purge_namespace_records(
+    #[cfg(test)]
+    pub(crate) fn purge_namespace_records(
         &self,
         namespace_id: NamespaceId,
         batch_size: usize,
@@ -1650,7 +1688,11 @@ impl MetadataStore {
     /// slot per `Tombstoned` outcome cannot free the same slot twice —
     /// which would build a cycle in the free list and underflow
     /// `live_count`.
-    pub fn batch_tombstone(&self, ids: &[MemoryId]) -> Result<Vec<TombstoneOutcome>, StorageError> {
+    #[cfg(test)]
+    pub(crate) fn batch_tombstone(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<Vec<TombstoneOutcome>, StorageError> {
         self.ensure_available()?;
         let _publication = self.mutation_guard()?;
         if ids.is_empty() {
@@ -1931,6 +1973,16 @@ mod tests {
         (dir, store)
     }
 
+    fn open_store_with_namespaces() -> (tempfile::TempDir, MetadataStore) {
+        let (dir, store) = open_store();
+        for name in ["default", "other"] {
+            let mut config = NamespaceConfig::default_namespace(0);
+            config.name = name.into();
+            store.create_namespace(&config).unwrap();
+        }
+        (dir, store)
+    }
+
     /// A live, Full-phase record in `namespace_id` occupying `slot`.
     fn record_in(namespace_id: u32, slot: u32, tags: &[&str]) -> DiskRecord {
         DiskRecord {
@@ -1971,7 +2023,7 @@ mod tests {
     fn integration_access_receipt_cannot_be_overwritten_by_a_paused_sweep() {
         use std::sync::{Arc, mpsc};
         use std::time::Duration;
-        let (_dir, store) = open_store();
+        let (_dir, store) = open_store_with_namespaces();
         let id = insert(&store, 1, 0, &[]);
         let ctx = MutationContext::unkeyed(NamespaceId::new(1));
         let store = Arc::new(store);
@@ -2103,7 +2155,7 @@ mod tests {
             "missing_receipt",
             "foreign_scope",
         ] {
-            let (dir, store) = open_store();
+            let (dir, store) = open_store_with_namespaces();
             let id = insert(&store, 1, 0, &[]);
             let ctx = keyed_context(&store, 1, "original");
             let receipt = store
@@ -2199,10 +2251,18 @@ mod tests {
 
     #[test]
     fn access_receipt_aborted_transaction_and_overflow_leave_no_mutation() {
-        let (dir, store) = open_store();
+        let (dir, store) = open_store_with_namespaces();
         let id = insert(&store, 1, 0, &[]);
         let ctx = keyed_context(&store, 1, "abort");
         let before = store.control_state().unwrap();
+        let receipts_before = store
+            .db
+            .begin_read()
+            .unwrap()
+            .open_table(control::RECEIPTS)
+            .unwrap()
+            .len()
+            .unwrap();
         // All three writes have been staged in the real redb transaction.
         let publication = store.publication.write().unwrap();
         let (tx, abandoned) = store
@@ -2254,13 +2314,13 @@ mod tests {
                 .unwrap()
                 .len()
                 .unwrap(),
-            1
+            receipts_before + 1
         );
     }
 
     #[test]
     fn access_receipt_replay_precedes_cas_but_never_lineage_check() {
-        let (_dir, store) = open_store();
+        let (_dir, store) = open_store_with_namespaces();
         let id = insert(&store, 1, 0, &[]);
         let ctx = keyed_context(&store, 1, "access");
         let original = store
@@ -2314,7 +2374,7 @@ mod tests {
 
     #[test]
     fn access_receipts_serialize_concurrent_retries_and_scope_keys_by_namespace() {
-        let (_dir, store) = open_store();
+        let (_dir, store) = open_store_with_namespaces();
         let store = std::sync::Arc::new(store);
         let id = insert(&store, 1, 0, &[]);
         let other = insert(&store, 2, 0, &[]);

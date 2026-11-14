@@ -46,12 +46,7 @@ impl MetadataStore {
         // Reserve a generation before writing external bytes (without advancing
         // it yet). Exhaustion must leave payload files untouched.
         control::read_control(&tx)?.committed_generation.next()?;
-        let config = NamespaceConfig::decode(
-            tx.open_table(NAMESPACE_TABLE)?
-                .get(namespace.get())?
-                .ok_or(StorageError::NamespaceNotFound(namespace.get()))?
-                .value(),
-        )?;
+        let config = super::namespace_state::require_namespace_active(&tx, namespace)?;
         if config.id != namespace {
             return Err(StorageError::MutationNamespaceMismatch);
         }
@@ -216,4 +211,54 @@ fn replay_insert(
     };
     let hash = input.request_hash(ctx, f32::from_bits(initial_stability_bits), embedding_dim)?;
     control::replay_or_check(tx, ctx, hash)
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    #[test]
+    fn insertion_independently_rejects_schema_policy_before_payload_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
+        let mut config = NamespaceConfig::default_namespace(0);
+        config.embedding_dim = 4;
+        config.id = store.create_namespace(&config).unwrap();
+        config.schema = Some(crate::model::schema::NamespaceSchemaV2::from_legacy());
+        // Synthetic legacy schema row, bypassing the separately tested catalog
+        // admission solely to prove the final insertion boundary independently.
+        let tx = store.db.begin_write().unwrap();
+        tx.open_table(NAMESPACE_TABLE)
+            .unwrap()
+            .insert(
+                config.id.get(),
+                control::encode(&config).unwrap().as_slice(),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        let before = store.control_state().unwrap();
+        let input = InsertMemory {
+            id: None,
+            summary: "schema probe".into(),
+            full_text: None,
+            tags: vec![],
+            initial_stability: None,
+            created_at: None,
+            embedding: Some(vec![1., 0., 0., 0.]),
+            parent_id: None,
+            supersedes: None,
+        };
+        assert!(matches!(
+            store.insert_with_effects(
+                &MutationContext::unkeyed(config.id),
+                &input,
+                123,
+                &[],
+                &[],
+                |_, _, _| panic!("payload staged")
+            ),
+            Err(StorageError::RecoveryRequired(_))
+        ));
+        assert_eq!(store.control_state().unwrap(), before);
+        assert!(store.scan_all().unwrap().is_empty());
+    }
 }

@@ -1,13 +1,19 @@
-//! Pure legacy lifecycle planning against the current record layout.
+//! Pure lifecycle planning against explicit canonical anchors when present.
 //!
-//! `last_accessed_at` remains the v1 anchor. No inferred feedback dates,
-//! lifecycle v2 policy, durable receipts, or schema changes are introduced here.
+//! Legacy records retain their v1 anchor. This planner does not enable any
+//! ordinary schema-v2 writer or synthesize observed/retrieved/feedback times.
 
 use super::{DecayConfig, FsrsEngine};
 use crate::model::{DecayPhase, DiskRecord, NamespaceConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
+    #[error(transparent)]
+    Observation(#[from] super::observation::ObservationError),
+    /// An explicit namespace assertion failed before feedback effects.
+    #[error("{0}")]
+    NamespaceMismatch(String),
+
     #[error("invalid lifecycle input: {0}")]
     InvalidInput(&'static str),
     #[error("memory content is unavailable for feedback")]
@@ -164,17 +170,26 @@ pub fn plan_feedback(
             "invalid record stability or difficulty",
         ));
     }
-    // Until A1 persists lifecycle_updated_at, these are the known v1 times.
-    let timestamp = now_millis
-        .max(record.last_accessed_at)
-        .max(record.created_at);
+    let (anchor, updated_at) = record.schema.as_ref().map_or(
+        (
+            record.last_accessed_at,
+            record.last_accessed_at.max(record.created_at),
+        ),
+        |schema| {
+            (
+                schema.lifecycle.decay_anchor_at,
+                schema.lifecycle.lifecycle_updated_at,
+            )
+        },
+    );
+    let timestamp = now_millis.max(updated_at);
     let config = DecayConfig {
         difficulty: record.difficulty,
         ..policy.config.clone()
     };
     let stability = FsrsEngine::new(&config).review_stability(
         record.stability,
-        crate::time::elapsed_days(timestamp, record.last_accessed_at),
+        crate::time::elapsed_days(timestamp, anchor),
         quality,
         policy.decay_rate_multiplier,
     );
@@ -417,8 +432,8 @@ mod tests {
             3,
         )
         .unwrap();
-        let ma = mcp.reinforce_memory(a, 3).await.unwrap();
-        let hb = http.reinforce(b, 3).await.unwrap();
+        let ma = mcp.reinforce_memory(a, 3, None).await.unwrap();
+        let hb = http.reinforce(b, 3, None).await.unwrap();
         assert_eq!(
             clock.calls.load(Ordering::SeqCst),
             2,
@@ -436,7 +451,7 @@ mod tests {
         .unwrap();
         let expected = plan_feedback(&f.record(inherited).unwrap(), &policy, 8 * DAY, 3).unwrap();
         assert_eq!(
-            http.reinforce(inherited, 3).await.unwrap().stability,
+            http.reinforce(inherited, 3, None).await.unwrap().stability,
             expected.stability
         );
         for id in [a, b] {
@@ -447,15 +462,15 @@ mod tests {
             assert_eq!(r.text_length, 0);
             assert_eq!(r.is_permastore, 1);
             let before = r.to_bytes();
-            assert!(mcp.reinforce_memory(id, 0).await.is_err());
-            assert!(http.reinforce(id, 5).await.is_err());
+            assert!(mcp.reinforce_memory(id, 0, None).await.is_err());
+            assert!(http.reinforce(id, 5, None).await.is_err());
             assert_eq!(before, f.record(id).unwrap().to_bytes());
         }
         // A backward production clock cannot move the existing anchor backward.
         let regressed = f
             .storage_adapter()
             .with_clock(Arc::new(ManualClock::new(DAY)));
-        regressed.reinforce_memory(a, 1).await.unwrap();
+        regressed.reinforce_memory(a, 1, None).await.unwrap();
         assert_eq!(f.record(a).unwrap().last_accessed_at, 8 * DAY);
         let ghost = f
             .insert_memory_with(MemorySpec {
@@ -464,17 +479,21 @@ mod tests {
                 ..MemorySpec::new(namespace)
             })
             .await;
-        assert!(mcp.reinforce_memory(ghost, 3).await.is_err());
-        assert!(http.reinforce(ghost, 3).await.is_err());
+        assert!(mcp.reinforce_memory(ghost, 3, None).await.is_err());
+        assert!(http.reinforce(ghost, 3, None).await.is_err());
         assert!(f.record(ghost).unwrap().access_history.is_empty());
-        mcp.delete_memory(a).await.unwrap();
+        mcp.delete_memory(a, None).await.unwrap();
         let tombstone = f.record(a).unwrap().to_bytes();
-        assert!(mcp.reinforce_memory(a, 3).await.is_err());
-        assert!(http.reinforce(a, 3).await.is_err());
+        assert!(mcp.reinforce_memory(a, 3, None).await.is_err());
+        assert!(http.reinforce(a, 3, None).await.is_err());
         assert_eq!(tombstone, f.record(a).unwrap().to_bytes());
         f.storage.write().unwrap().delete_memory(b).unwrap();
-        assert!(http.reinforce(b, 3).await.is_err());
+        assert!(http.reinforce(b, 3, None).await.is_err());
         assert!(f.record(b).is_none());
-        assert!(mcp.reinforce_memory(MemoryId::new(), 3).await.is_err());
+        assert!(
+            mcp.reinforce_memory(MemoryId::new(), 3, None)
+                .await
+                .is_err()
+        );
     }
 }

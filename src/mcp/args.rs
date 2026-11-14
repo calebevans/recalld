@@ -23,7 +23,7 @@
 //! 3. **Markup detection** ([`scan_client_markup`]) — text fields that
 //!    contain literal tool-call markup are rejected rather than stored.
 //! 4. Everything about *how long* or *how many* is delegated to
-//!    [`crate::model::validation::validate_memory_input`], which the
+//!    [`crate::model::validation::validate_legacy_memory_input`], which the
 //!    HTTP API shares.
 //!
 //! A *numeric* bound is treated the same way. An out-of-range `limit` is
@@ -42,7 +42,8 @@
 //! `null` to `None`. Many client SDKs serialize optional fields as
 //! `null` rather than omitting them, and the previous
 //! `.and_then(|v| v.as_str())` chain treated the two identically. Any
-//! change to that would break those clients on every call.
+//! change to that would break those clients on every call. The corrected
+//! `quality` and `embeddingDim` controls are exceptions: only omission defaults.
 
 use serde_json::Value;
 
@@ -51,7 +52,9 @@ use crate::model::MemoryId;
 use crate::model::constants::{
     DEFAULT_LIST_LIMIT, DEFAULT_TAG_LIMIT, MAX_LIST_LIMIT, MAX_TAG_LIMIT,
 };
-use crate::model::validation::{MemoryInputRef, truncate_on_char_boundary, validate_memory_input};
+use crate::model::validation::{
+    MemoryInputRef, truncate_on_char_boundary, validate_legacy_memory_input,
+};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Error type
@@ -122,6 +125,62 @@ fn field_opt<'a>(obj: &'a Value, key: &str) -> Option<&'a Value> {
         None | Some(Value::Null) => None,
         Some(v) => Some(v),
     }
+}
+
+/// Require a JSON object before applying any defaults.
+pub fn require_object(obj: &Value) -> Result<(), ArgError> {
+    if !obj.is_object() {
+        return Err(ArgError::new("", "Arguments must be an object"));
+    }
+    Ok(())
+}
+
+/// Unlike legacy optional fields, these numeric controls reject explicit null.
+fn missing_only_u64(obj: &Value, key: &str, min: u64, max: u64) -> Result<Option<u64>, ArgError> {
+    require_object(obj)?;
+    if obj.get(key) == Some(&Value::Null) {
+        return Err(ArgError::new(
+            key,
+            format!("Parameter '{key}' must be an integer (got null)"),
+        ));
+    }
+    opt_u64_in_range(obj, key, min, max)
+}
+
+/// Shared MCP/HTTP reinforcement validation, before any mutation.
+pub fn parse_quality(obj: &Value) -> Result<u8, ArgError> {
+    Ok(
+        u8::try_from(missing_only_u64(obj, "quality", 1, 4)?.unwrap_or(3))
+            .expect("quality is bounded to 1..=4"),
+    )
+}
+
+/// Shared MCP/HTTP namespace options. Legacy optional floats accept null as omission.
+pub fn parse_create_namespace(
+    obj: &Value,
+) -> Result<crate::mcp::bridge::CreateNamespaceInput, ArgError> {
+    require_object(obj)?;
+    let name = require_str(obj, "name")?;
+    crate::model::validation::validate_namespace_name(&name)
+        .map_err(|e| ArgError::new("name", e.to_string()))?;
+    let embedding_dim = missing_only_u64(obj, "embeddingDim", 1, 8192)?
+        .map(|v| u16::try_from(v).expect("dimension is bounded to 1..=8192"));
+    let initial_stability = opt_f32_in_range(obj, "initialStability", 0.0, f32::MAX as f64)?;
+    if initial_stability == Some(0.0) {
+        return Err(ArgError::new(
+            "initialStability",
+            "Parameter 'initialStability' must be positive",
+        ));
+    }
+    let desired_retention = opt_f32_in_range(obj, "desiredRetention", 0.0, 1.0)?;
+    let decay_rate_multiplier = opt_f32_in_range(obj, "decayRateMultiplier", 0.0, f32::MAX as f64)?;
+    Ok(crate::mcp::bridge::CreateNamespaceInput {
+        name,
+        embedding_dim,
+        initial_stability,
+        desired_retention,
+        decay_rate_multiplier,
+    })
 }
 
 /// The number of bytes of a bad value echoed back in an error message.
@@ -644,7 +703,7 @@ pub fn reject_client_markup(field: &str, text: &str) -> Result<(), ArgError> {
 /// `summary` (presence, type, markup), `fullText` (type, markup), the
 /// four array fields, `namespace`, `parentId`, `supersedes`,
 /// `checkDuplicates`, and finally the shared content limits from
-/// [`validate_memory_input`](crate::model::validation::validate_memory_input).
+/// [`validate_legacy_memory_input`](crate::model::validation::validate_legacy_memory_input).
 pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreInput, ArgError> {
     if !item.is_object() {
         return Err(ArgError::new(
@@ -672,7 +731,7 @@ pub fn parse_store_input(item: &Value, default_namespace: &str) -> Result<StoreI
     let supersedes = opt_uuid(item, "supersedes")?;
     let check_duplicates = opt_bool(item, "checkDuplicates")?;
 
-    validate_memory_input(MemoryInputRef {
+    validate_legacy_memory_input(MemoryInputRef {
         summary: &summary,
         full_text: full_text.as_deref(),
         tags: &tags,
@@ -757,7 +816,7 @@ pub fn opt_f32_in_range(
             ),
         ));
     };
-    if n.is_nan() || n < min || n > max {
+    if !n.is_finite() || !(n as f32).is_finite() || n < min || n > max {
         return Err(ArgError::new(
             key,
             format!("Parameter '{key}' must be between {min} and {max} (got {n})"),
@@ -793,6 +852,18 @@ pub fn opt_enum(obj: &Value, key: &str, allowed: &[&str]) -> Result<Option<Strin
     Ok(Some(value))
 }
 
+/// The new access switch is missing-only defaulted, never null/string coerced.
+pub fn record_access(obj: &Value) -> Result<bool, ArgError> {
+    match obj.get("recordAccess") {
+        None => Ok(true),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ArgError::new(
+            "recordAccess",
+            "recordAccess must be a boolean",
+        )),
+    }
+}
+
 /// A parsed `recall_memories` call.
 pub struct RecallArgs {
     /// What the search pipeline is given.
@@ -826,6 +897,8 @@ pub fn parse_recall_input(obj: &Value, default_namespace: &str) -> Result<Recall
 
     Ok(RecallArgs {
         input: SearchInput {
+            include_neighbors: !compact,
+            record_access: record_access(obj)?,
             query,
             namespace,
             limit,
@@ -842,8 +915,34 @@ pub fn parse_recall_input(obj: &Value, default_namespace: &str) -> Result<Recall
     })
 }
 
+/// Parse an opt-in by-ID assertion. Only omission disables the assertion.
+pub fn parse_namespace_assertion(obj: &Value) -> Result<Option<&str>, ArgError> {
+    let Some(value) = obj.get("namespace") else {
+        return Ok(None);
+    };
+    let name = value.as_str().ok_or_else(|| {
+        ArgError::new(
+            "namespace",
+            "namespace assertion must be a string; omit it to use the record scope",
+        )
+    })?;
+    crate::model::validation::validate_namespace_name(name)
+        .map_err(|e| ArgError::new("namespace", e.to_string()))?;
+    Ok(Some(name))
+}
+
+/// Deserialize a present namespace assertion; serde default handles omission.
+pub fn deserialize_namespace_assertion<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+    crate::model::validation::validate_namespace_name(&name).map_err(serde::de::Error::custom)?;
+    Ok(Some(name))
+}
+
 /// A parsed `find_similar_memories` call in `single` mode.
 pub struct FindSimilarArgs {
+    pub record_access: bool,
     /// The memory to find neighbours of.
     pub id: MemoryId,
     /// Maximum neighbours to return.
@@ -863,6 +962,7 @@ pub fn parse_find_similar_args(obj: &Value) -> Result<FindSimilarArgs, ArgError>
     let same_namespace = opt_bool(obj, "sameNamespace")?.unwrap_or(true);
 
     Ok(FindSimilarArgs {
+        record_access: record_access(obj)?,
         id,
         limit,
         min_score,

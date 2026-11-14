@@ -178,7 +178,7 @@ pub struct EdgeStore {
 
 impl EdgeStore {
     /// Open or create the edge store at the given path.
-    pub fn open(path: &Path) -> Result<Self, StorageError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, StorageError> {
         let db = Database::create(path)?;
 
         // Ensure tables exist.
@@ -230,7 +230,7 @@ impl EdgeStore {
     ///
     /// If an edge with the same (source, edge_type, target) already
     /// exists, it is silently overwritten (upsert semantics).
-    pub fn add_edge(
+    pub(super) fn add_edge(
         &self,
         source: MemoryId,
         target: MemoryId,
@@ -315,7 +315,7 @@ impl EdgeStore {
     /// Remove all edges where `memory_id` appears as source or target.
     ///
     /// Returns the total number of edges removed.
-    pub fn remove_all_edges(&self, memory_id: MemoryId) -> Result<usize, StorageError> {
+    pub(super) fn remove_all_edges(&self, memory_id: MemoryId) -> Result<usize, StorageError> {
         let outgoing = self.get_outgoing_full(memory_id)?;
         let incoming = self.get_incoming_full(memory_id)?;
 
@@ -364,7 +364,7 @@ impl EdgeStore {
     }
 
     /// Persist multiple edges atomically in a single transaction.
-    pub fn batch_add_edges(&self, edges: &[PersistedEdge]) -> Result<(), StorageError> {
+    pub(super) fn batch_add_edges(&self, edges: &[PersistedEdge]) -> Result<(), StorageError> {
         if edges.is_empty() {
             return Ok(());
         }
@@ -391,7 +391,7 @@ impl EdgeStore {
     }
 
     /// Remove multiple edges atomically in a single transaction.
-    pub fn batch_remove_edges(&self, edges: &[PersistedEdge]) -> Result<(), StorageError> {
+    pub(super) fn batch_remove_edges(&self, edges: &[PersistedEdge]) -> Result<(), StorageError> {
         if edges.is_empty() {
             return Ok(());
         }

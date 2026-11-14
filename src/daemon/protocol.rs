@@ -50,6 +50,12 @@ pub struct DaemonRpcError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FindSimilarParams {
+    /// False forbids retrieval-attributable writes; omission preserves v1 behavior.
+    #[serde(
+        rename = "recordAccess",
+        default = "crate::search::default_record_access"
+    )]
+    pub record_access: bool,
     /// Source memory ID.
     pub id: String,
     /// Maximum number of results.
@@ -63,6 +69,12 @@ pub struct FindSimilarParams {
 /// Parameters for the `get_memory` RPC method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetMemoryParams {
+    /// False forbids retrieval-attributable writes; omission preserves v1 behavior.
+    #[serde(
+        rename = "recordAccess",
+        default = "crate::search::default_record_access"
+    )]
+    pub record_access: bool,
     /// Memory ID to retrieve.
     pub id: String,
 }
@@ -129,11 +141,18 @@ pub const ERR_PARTIALLY_APPLIED: i32 = -32006;
 /// RPC error code: required provider/service is unavailable.
 pub const ERR_UNAVAILABLE: i32 = -32008;
 
+/// RPC error code: an explicit namespace assertion failed.
+pub const ERR_NAMESPACE_MISMATCH: i32 = -32007;
+
 // ── BridgeError conversion ───────────────────────────────────────────
 
 impl From<&BridgeError> for DaemonRpcError {
     fn from(e: &BridgeError) -> Self {
         match e {
+            BridgeError::NamespaceMismatch(msg) => DaemonRpcError {
+                code: ERR_NAMESPACE_MISMATCH,
+                message: msg.clone(),
+            },
             BridgeError::NotFound(msg) => DaemonRpcError {
                 code: ERR_NOT_FOUND,
                 message: msg.clone(),
@@ -174,6 +193,7 @@ impl DaemonRpcError {
     /// Converts this RPC error into the corresponding `BridgeError` variant.
     pub fn into_bridge_error(self) -> BridgeError {
         match self.code {
+            ERR_NAMESPACE_MISMATCH => BridgeError::NamespaceMismatch(self.message),
             ERR_NOT_FOUND => BridgeError::NotFound(self.message),
             ERR_INVALID_INPUT => BridgeError::InvalidInput(self.message),
             ERR_STORAGE => BridgeError::Storage(self.message),

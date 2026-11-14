@@ -432,6 +432,8 @@ fn access_kind_from_u8(val: u8) -> Result<AccessKind, DecodeError> {
 /// Estimated size per entry: ~634 bytes (see Spec 01 section 3.4).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedRecord {
+    /// Exact canonical lifecycle provenance; None for legacy physical records.
+    pub lifecycle: Option<crate::model::schema::LifecycleFields>,
     /// Unique identifier.
     pub id: MemoryId,
     /// Namespace this memory belongs to.
@@ -460,7 +462,7 @@ pub struct CachedRecord {
     pub edge_count: u16,
     /// Index into the namespace's vectors.dat.
     pub vector_slot: u32,
-    /// Named entities extracted from the summary (derived at load time).
+    /// Exact canonical entities, or entities parsed from retained legacy tags.
     pub entities: Vec<String>,
 }
 
@@ -533,10 +535,15 @@ impl From<&Memory> for DiskRecord {
 impl From<&DiskRecord> for CachedRecord {
     /// Convert a DiskRecord to a CachedRecord for insertion into the
     /// moka cache. Drops full_text pointer and access_history (not
-    /// cached). Parses entities from stored tags (entity/ prefix).
+    /// cached). Preserves schema entities verbatim; schema-less records use
+    /// the existing retained-tag parser (entity/ prefix).
     fn from(d: &DiskRecord) -> Self {
-        let entities = crate::model::parse_structured_tags(&d.tags).entities;
+        let entities = d.schema.as_ref().map_or_else(
+            || crate::model::parse_structured_tags(&d.tags).entities,
+            |schema| schema.labels.entities.clone(),
+        );
         CachedRecord {
+            lifecycle: d.schema.as_ref().map(|s| s.lifecycle.clone()),
             id: MemoryId::from_bytes(d.id),
             namespace_id: NamespaceId::new(d.namespace_id),
             created_at: d.created_at,

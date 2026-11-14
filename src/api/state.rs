@@ -42,6 +42,52 @@ pub trait SearchPipeline: Send + Sync {
 
     /// Execute a search query, returning scored results.
     async fn search(&self, query: SearchQuery) -> Result<Vec<ResolvedSearchResult>, SearchError>;
+    async fn prepare_search(
+        &self,
+        _query: SearchQuery,
+    ) -> Result<Vec<ResolvedSearchResult>, SearchError> {
+        Err(SearchError::Unavailable(
+            "prepared search unavailable".into(),
+        ))
+    }
+
+    async fn find_similar(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, SearchError>;
+
+    /// Select without exposure while preserving the caller's observation intent
+    /// for policy admission. Implementations must not rewrite it to false.
+    async fn prepare_similar_filtered(
+        &self,
+        _id: MemoryId,
+        _limit: usize,
+        _min_score: Option<f32>,
+        _requested_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, SearchError> {
+        Err(SearchError::Unavailable(
+            "prepared similarity unavailable".into(),
+        ))
+    }
+
+    /// Record the final, fully hydrated similarity result IDs exactly once.
+    async fn record_similar_accesses(
+        &self,
+        _ids: &[MemoryId],
+        _scope: crate::storage::control::ExposureScope,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, SearchError> {
+        Err(SearchError::Internal(
+            "similarity exposure unavailable".into(),
+        ))
+    }
+    async fn record_exposures(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+        scope: crate::storage::control::ExposureScope,
+    ) -> Result<Vec<crate::storage::control::WriteReceipt>, SearchError>;
 
     /// Find existing memories at or above `threshold` similarity to a
     /// pre-computed embedding, closest first, at most `limit` of them.
@@ -139,7 +185,18 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<CachedRecord, StorageError>;
 
     /// Delete a memory by ID. Returns `true` if it existed.
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, StorageError>;
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, StorageError>;
+
+    /// Verify a by-ID namespace assertion against canonical metadata before effects.
+    async fn assert_memory_namespace(
+        &self,
+        id: MemoryId,
+        namespace: &str,
+    ) -> Result<(), StorageError>;
 
     /// Retrieve a single memory's DiskRecord by ID.
     ///
@@ -299,13 +356,30 @@ pub trait RelationshipGraph: Send + Sync {
 #[async_trait::async_trait]
 pub trait FsrsEngine: Send + Sync {
     /// Record an access event for decay tracking.
-    async fn record_access(&self, id: MemoryId, kind: AccessKind);
+    async fn record_access(
+        &self,
+        id: MemoryId,
+        kind: AccessKind,
+    ) -> Result<
+        Vec<crate::storage::control::WriteReceipt>,
+        crate::decay::observation::ObservationError,
+    > {
+        self.record_access_batch(&[(id, kind)]).await
+    }
+    async fn record_access_batch(
+        &self,
+        accesses: &[(MemoryId, AccessKind)],
+    ) -> Result<
+        Vec<crate::storage::control::WriteReceipt>,
+        crate::decay::observation::ObservationError,
+    >;
 
     /// Apply manual reinforcement with the given FSRS quality rating.
     async fn reinforce(
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<ReinforceResult, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Whether the decay sweep thread is still alive.
@@ -368,7 +442,8 @@ pub trait MetricsCollector: Send + Sync {
 /// Internal search query representation for the API layer.
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
-    /// The query input (text or pre-computed vector).
+    pub record_access: bool,
+    /// The query input (text, precomputed vector, or both).
     pub query: QueryInput,
     /// Target namespace for the search.
     pub namespace_id: NamespaceId,
@@ -396,19 +471,21 @@ pub struct SearchQuery {
     pub entities: Vec<String>,
 }
 
-/// Search query input: either natural-language text or a pre-computed
-/// embedding vector.
+/// Search query input: natural-language text, a precomputed vector, or both.
 #[derive(Debug, Clone)]
 pub enum QueryInput {
     /// Natural-language text to be embedded by the server.
     Text(String),
     /// Pre-computed embedding vector.
     Vector(Vec<f32>),
+    /// Precomputed semantic vector plus text for the FTS channel only.
+    TextAndVector { text: String, embedding: Vec<f32> },
 }
 
 /// A single resolved search result with its similarity score.
 #[derive(Debug, Clone)]
 pub struct ResolvedSearchResult {
+    pub access_kind: AccessKind,
     /// The cached memory record.
     pub memory: CachedRecord,
     /// Cosine similarity score.

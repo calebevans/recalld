@@ -106,8 +106,8 @@ impl From<Tag> for String {
 /// prefix out of the `entities`/`topics`/`emotions` limits, so no
 /// request that validates can produce an over-long tag here. What
 /// remains reachable is the alphabet: `Tag::new` accepts only
-/// `[a-z0-9/_.:-]`, which the request validator deliberately does not
-/// duplicate (an entity named `José` is a legitimate thing to send).
+/// `[a-z0-9/_.:-]`, which legacy structured-label writer admission now rejects before this
+/// helper. Retained canonical UTF-8 labels use their separate schema carrier.
 pub fn parse_tags_lossy(context: &str, raw: &[String]) -> Vec<Tag> {
     raw.iter()
         .filter_map(|t| match Tag::new(t) {
