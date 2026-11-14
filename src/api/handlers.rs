@@ -292,7 +292,7 @@ pub async fn create_memory(
     // --- Entity index (Issue 10) ---
     state
         .search
-        .entity_index_add(memory.id, &req.entities)
+        .entity_index_add(ns.id, memory.id, &req.entities)
         .await;
 
     // --- Graph node (Issue 11: must happen before edges) ---
@@ -442,10 +442,9 @@ pub async fn delete_memory(
 
         // Issue 14: Clean up entity index
         if let Some(ref record) = existing_record {
-            let metadata = crate::model::parse_structured_tags(&record.tags);
             state
                 .search
-                .entity_index_remove(memory_id, &metadata.entities)
+                .entity_index_remove(NamespaceId::new(record.namespace_id), memory_id)
                 .await;
         }
 
@@ -1633,7 +1632,7 @@ pub async fn batch_store(
         // Entity index
         state
             .search
-            .entity_index_add(memory.id, &mem_req.entities)
+            .entity_index_add(ns.id, memory.id, &mem_req.entities)
             .await;
 
         // Graph node
