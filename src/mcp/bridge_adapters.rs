@@ -128,6 +128,7 @@ impl bridge::SearchPipeline for McpSearchAdapter {
         };
 
         let pipeline_query = crate::search::SearchQuery {
+            query_embedding: None,
             text: Some(query.query),
             fts_query: None,
             namespace: query.namespace.clone(),

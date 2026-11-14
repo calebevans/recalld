@@ -221,11 +221,12 @@ fn default_namespace() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
     /// Natural-language query text. The server generates an
-    /// embedding from this for similarity search.
+    /// embedding from this for similarity search unless `embedding` is supplied.
     #[serde(default)]
     pub query: Option<String>,
 
-    /// Pre-computed query embedding. Mutually exclusive with `query`.
+    /// Pre-computed semantic query embedding. When present, `query` is used
+    /// only for FTS; the embedding provider is not invoked.
     #[serde(default)]
     pub embedding: Option<Vec<f32>>,
 

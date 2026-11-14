@@ -346,7 +346,7 @@ pub trait MetricsCollector: Send + Sync {
 /// Internal search query representation for the API layer.
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
-    /// The query input (text or pre-computed vector).
+    /// The query input (text, precomputed vector, or both).
     pub query: QueryInput,
     /// Target namespace for the search.
     pub namespace_id: NamespaceId,
@@ -374,14 +374,15 @@ pub struct SearchQuery {
     pub entities: Vec<String>,
 }
 
-/// Search query input: either natural-language text or a pre-computed
-/// embedding vector.
+/// Search query input: natural-language text, a precomputed vector, or both.
 #[derive(Debug, Clone)]
 pub enum QueryInput {
     /// Natural-language text to be embedded by the server.
     Text(String),
     /// Pre-computed embedding vector.
     Vector(Vec<f32>),
+    /// Precomputed semantic vector plus text for the FTS channel only.
+    TextAndVector { text: String, embedding: Vec<f32> },
 }
 
 /// A single resolved search result with its similarity score.

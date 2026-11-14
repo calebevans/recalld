@@ -99,9 +99,10 @@ impl state::SearchPipeline for SearchPipelineAdapter {
         query: state::SearchQuery,
     ) -> Result<Vec<state::ResolvedSearchResult>, crate::search::SearchError> {
         // Convert API-layer SearchQuery to the pipeline's SearchQuery.
-        let text = match query.query {
-            state::QueryInput::Text(t) => Some(t),
-            state::QueryInput::Vector(_) => None,
+        let (text, query_embedding) = match query.query {
+            state::QueryInput::Text(t) => (Some(t), None),
+            state::QueryInput::Vector(vector) => (None, Some(vector)),
+            state::QueryInput::TextAndVector { text, embedding } => (Some(text), Some(embedding)),
         };
 
         // A label that cannot become a tag is an error, not a dropped
@@ -141,6 +142,7 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             .unwrap_or_default();
 
         let pipeline_query = crate::search::SearchQuery {
+            query_embedding,
             text,
             fts_query: None,
             namespace: query.namespace_name.clone(), // Issue 1: pass actual namespace name
