@@ -104,6 +104,11 @@ pub trait SearchPipeline: Send + Sync {
 /// Persistent storage engine (meta.db, fulltext.dat, vectors.dat, edges.db).
 #[async_trait::async_trait]
 pub trait StorageEngine: Send + Sync {
+    /// Internal graph-effects admission, not public canonical generation/CAS.
+    async fn effects_stamp(&self) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
     /// Create a new memory record and persist it.
     async fn create_memory(
         &self,

@@ -54,6 +54,14 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
     if super::control::validate_existing(&read)?.is_some() {
         read.open_table(super::metadata::NAMESPACE_COUNTER)?;
     }
+    if super::metadata::effects::validate_existing(&read)?
+        .iter()
+        .any(|e| !e.canonical_applied)
+    {
+        return Err(StorageError::RecoveryRequired(
+            "pending canonical effects; reopen before backup".into(),
+        ));
+    }
     let namespaces = read.open_table(NAMESPACE_TABLE)?;
     let mut inventory: HashSet<String> = ["meta.db", "edges.db", "fulltext.dat"]
         .into_iter()

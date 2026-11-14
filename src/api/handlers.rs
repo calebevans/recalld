@@ -351,6 +351,20 @@ pub async fn get_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = get_memory_admitted(State(state.clone()), Path(id)).await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    result
+}
+
+async fn get_memory_admitted(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<MemoryResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
@@ -731,6 +745,20 @@ pub async fn search_memories(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = search_memories_admitted(State(state.clone()), Json(req)).await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    result
+}
+
+async fn search_memories_admitted(
+    State(state): State<AppState>,
+    Json(req): Json<SearchRequest>,
+) -> Result<Json<SearchResponse>, AppError> {
     let start = Instant::now();
 
     // Validate: need at least one search signal
@@ -866,6 +894,21 @@ pub async fn search_memories(
 /// 4. Exclude the source memory from results.
 /// 5. Return scored results.
 pub async fn find_similar(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<FindSimilarRequest>,
+) -> Result<Json<SearchResponse>, AppError> {
+    let stamp = state.storage.effects_stamp().await?;
+    let result = find_similar_admitted(State(state.clone()), Path(id), Json(req)).await;
+    if state.storage.effects_stamp().await? != stamp {
+        return Err(AppError::ServiceUnavailable {
+            message: "graph effects changed during query; retry".into(),
+        });
+    }
+    result
+}
+
+async fn find_similar_admitted(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<FindSimilarRequest>,

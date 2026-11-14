@@ -171,6 +171,11 @@ impl From<StorageError> for AppError {
                 resource: "namespace",
                 id: id.to_string(),
             },
+            StorageError::RecoveryRequired(_) | StorageError::CommittedEffectsPending { .. } => {
+                AppError::ServiceUnavailable {
+                    message: err.to_string(),
+                }
+            }
             StorageError::DatabaseLocked => AppError::ServiceUnavailable {
                 message: "database is locked by another process".to_string(),
             },
