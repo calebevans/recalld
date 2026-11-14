@@ -4,8 +4,9 @@
 //! Vectors are read via zero-copy mmap and written via the file descriptor.
 //! See CS-06 for the full specification.
 
+use super::ownership::OwnedFileLock;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -283,8 +284,8 @@ pub struct VectorStore {
     mmap: Mmap,
 
     /// Open file handle for writes and file extension.
-    /// Held for the process lifetime; locked exclusively via `fs2`.
-    file: File,
+    /// Locked exclusively via `fs2`; released after the mapping is dropped.
+    file: OwnedFileLock,
 
     /// Absolute path to the vectors.dat file (for error messages).
     path: PathBuf,
@@ -307,6 +308,10 @@ impl VectorStore {
     /// * `dir` -- directory that will contain the file (created if absent).
     /// * `dim` -- embedding dimensionality for this namespace.
     ///
+    pub(crate) fn relocate_path(&mut self, dir: &Path) {
+        self.path = dir.join("vectors.dat");
+    }
+
     /// On create: writes a 64-byte header and zero vector slots.
     /// On open: validates the header, acquires an exclusive file lock.
     pub fn open(dir: &Path, dim: usize) -> Result<Self> {
@@ -333,15 +338,14 @@ impl VectorStore {
             })?;
 
         // Acquire exclusive lock (advisory, prevents concurrent processes).
-        use fs2::FileExt;
-        file.try_lock_exclusive()
+        let file = OwnedFileLock::acquire(file)
             .map_err(|_| VectorError::FileLocked { path: path.clone() })?;
 
         if !exists {
             // New file -- write header.
             let header = VectorFileHeader::new(dim_u16);
             let header_bytes = zerocopy::IntoBytes::as_bytes(&header);
-            (&file)
+            (&*file)
                 .write_all(header_bytes)
                 .map_err(|e| VectorError::Io {
                     path: path.clone(),
@@ -356,7 +360,7 @@ impl VectorStore {
         // Memory-map the file (read-only).
         // SAFETY: file is exclusively locked; no external writer.
         let mmap = unsafe {
-            Mmap::map(&file).map_err(|e| VectorError::Io {
+            Mmap::map(&*file).map_err(|e| VectorError::Io {
                 path: path.clone(),
                 source: e,
             })?
@@ -727,7 +731,7 @@ impl VectorStore {
     pub fn remap(&mut self) -> Result<()> {
         // SAFETY: file is exclusively locked, no external writer.
         let new_mmap = unsafe {
-            Mmap::map(&self.file).map_err(|e| VectorError::Io {
+            Mmap::map(&*self.file).map_err(|e| VectorError::Io {
                 path: self.path.clone(),
                 source: e,
             })?
@@ -837,6 +841,10 @@ impl VectorManager {
             self.stores.insert(namespace_id, store);
         }
         Ok(self.stores.get_mut(&namespace_id).unwrap())
+    }
+
+    pub(crate) fn install_prepared(&mut self, id: NamespaceId, store: VectorStore) {
+        self.stores.insert(id, store);
     }
 
     /// Get a shared reference to an already-opened store.

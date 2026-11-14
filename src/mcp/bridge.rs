@@ -675,6 +675,10 @@ pub enum BridgeError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// A provider or required service cannot satisfy the operation.
+    #[error("Unavailable: {0}")]
+    Unavailable(String),
+
     /// A storage subsystem error occurred.
     #[error("Storage error: {0}")]
     Storage(String),

@@ -24,11 +24,18 @@ use crate::model::constants::{
 };
 use crate::model::id::{MemoryId, NamespaceId};
 use crate::model::memory::AccessKind;
-use crate::model::validation::{MemoryInputRef, validate_memory_input, validate_namespace_name};
+use crate::model::validation::{MemoryInputRef, validate_memory_input};
 use crate::serialization::{
-    ApiResponse, MemoryResponse, NamespaceRequest, NamespaceResponse, SearchHit, SearchRequest,
-    SearchResponse,
+    ApiResponse, MemoryResponse, NamespaceResponse, SearchHit, SearchRequest, SearchResponse,
 };
+
+/// Keep shared parser field names in HTTP validation errors.
+fn argument_error(error: crate::mcp::args::ArgError) -> AppError {
+    AppError::BadRequest {
+        message: error.message,
+        field: (!error.field.is_empty()).then_some(error.field),
+    }
+}
 
 /// Duration for which a cached health report is considered fresh.
 const HEALTH_REPORT_CACHE_TTL_SECS: u64 = 60;
@@ -152,7 +159,6 @@ pub async fn create_memory(
     State(state): State<AppState>,
     Json(req): Json<CreateMemoryApiRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<MemoryResponse>>), AppError> {
-    let _publication = state.storage.publication_lease().await?;
     state.storage.effects_stamp().await?;
 
     let start = Instant::now();
@@ -218,7 +224,7 @@ pub async fn create_memory(
     }
 
     // --- Embedding (Issue 9: embed summary + full_text + tags) ---
-    let embedding = match req.embedding {
+    let raw_embedding = match req.embedding {
         Some(ref vec) => {
             if vec.len() != ns.embedding_dim as usize {
                 return Err(AppError::UnprocessableEntity {
@@ -246,87 +252,54 @@ pub async fn create_memory(
         }
     };
 
+    let mut embedding = raw_embedding.clone();
+    crate::storage::insertion::normalize_embedding(
+        &mut embedding,
+        ns.embedding_dim,
+        req.embedding.is_some(),
+    )?;
+
     // --- Near-duplicate advisory ---
     // Before the write, so the new memory is not yet in the vector index
     // and cannot match itself. See `near_duplicate_report`.
     let near_duplicates =
         near_duplicate_report(&state, &embedding, ns.id, req.check_duplicates).await?;
 
-    // --- Persist ---
-    // Resolve initial stability: use caller-provided value, or fall back
-    // to the namespace's configured initial_stability (matching the MCP
-    // reference implementation).
-    let resolved_stability = req.initial_stability.unwrap_or(ns.initial_stability);
-    let memory = state
+    // Canonical record + explicit links share one receipt/effects transaction.
+    // Completion publishes all indexes before this returns.
+    let inserted = state
         .storage
-        .create_memory(
+        .insert_memory(
             ns.id,
-            &req.summary,
-            req.full_text.as_deref(),
-            &merged_tags,
-            &embedding,
-            Some(resolved_stability),
-            req.created_at,
+            crate::storage::insertion::InsertMemory {
+                id: None,
+                summary: req.summary.clone(),
+                full_text: req.full_text.clone(),
+                tags: crate::model::parse_tags_lossy("create_memory.tags", &merged_tags),
+                embedding: req.embedding.clone(),
+                initial_stability: req.initial_stability,
+                created_at: req.created_at,
+                parent_id: req.parent_id,
+                supersedes: req.supersedes,
+            },
+            raw_embedding,
         )
         .await?;
-
-    // --- Cache + vector index ---
-    state.cache.insert(&memory).await;
-    state
-        .search
-        .index_memory(memory.id, &embedding, ns.id)
-        .await;
-
-    // --- FTS5 indexing (Issue 10) ---
-    state
-        .search
-        .fts_add(
-            ns.id,
-            memory.id,
-            &req.summary,
-            req.full_text.as_deref(),
-            &merged_tags,
-        )
-        .await;
-
-    // --- Entity index (Issue 10) ---
-    state
-        .search
-        .entity_index_add(memory.id, &req.entities)
-        .await;
-
-    // --- Graph node (Issue 11: must happen before edges) ---
-    let _ = state
-        .graph
-        .add_node(
-            memory.id,
-            ns.id,
-            crate::model::DecayPhase::Full,
-            1.0,
-            memory.vector_slot,
-        )
-        .await;
-
-    // --- Parent edge ---
-    // Both explicit edges were validated before the record was written, so
-    // neither can fail the request from here — which is the point. A `?` at
-    // this line would return a 4xx with the memory already created. Both go
-    // through the shared `explicit_links` helpers, so an HTTP-created parent
-    // edge counts toward `edge_count` exactly as an MCP-created one does.
-    if let Some(parent_id) = req.parent_id {
-        state.graph.apply_parent_edge(parent_id, memory.id).await;
-    }
-
-    // --- Supersedes edge (Issue 8) ---
-    let supersedes_outcome = match req.supersedes {
-        Some(old_id) => Some(state.graph.apply_supersedes_edge(memory.id, old_id).await),
-        None => None,
-    };
+    let receipt = inserted.receipt;
+    let memory = inserted.record.ok_or_else(|| {
+        AppError::from(crate::storage::StorageError::CommittedMutation {
+            receipt: Box::new(receipt.clone()),
+            source: Box::new(crate::storage::StorageError::RecoveryRequired(
+                "inserted record unavailable".into(),
+            )),
+        })
+    })?;
+    let supersedes_outcome = req.supersedes.map(|id| {
+        crate::model::SupersedesOutcome::new(id, crate::model::SupersedesStatus::Applied)
+    });
 
     // --- Autolink, entity-link, temporal-link (Issue 12) ---
-    let created_at = req
-        .created_at
-        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let created_at = memory.created_at;
     state
         .graph
         .perform_post_creation_links(
@@ -338,6 +311,9 @@ pub async fn create_memory(
             created_at,
         )
         .await;
+
+    state.storage.complete_insertion(&receipt).await?;
+    state.cache.insert(&memory).await;
 
     let mut response = MemoryResponse::from_cached(&memory, ns.name.clone());
     response.full_text = req.full_text;
@@ -481,23 +457,17 @@ pub async fn delete_memory(
 pub async fn reinforce_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<ReinforceRequest>,
+    Json(req): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<ReinforceResponse>>, AppError> {
     let start = Instant::now();
 
     let memory_id = parse_memory_id(&id)?;
 
-    // Validate quality rating
-    if !(1..=4).contains(&req.quality) {
-        return Err(AppError::BadRequest {
-            message: "quality must be 1-4 (again/hard/good/easy)".into(),
-            field: Some("quality".into()),
-        });
-    }
+    let quality = crate::mcp::args::parse_quality(&req).map_err(argument_error)?;
 
     let updated = state
         .decay
-        .reinforce(memory_id, req.quality)
+        .reinforce(memory_id, quality)
         .await
         .map_err(|e| feedback_error(e, &id))?;
 
@@ -1093,49 +1063,26 @@ pub async fn list_namespaces(
 /// 4. Return 201 with namespace details.
 pub async fn create_namespace(
     State(state): State<AppState>,
-    Json(req): Json<NamespaceRequest>,
+    Json(req): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<ApiResponse<NamespaceResponse>>), AppError> {
     let start = Instant::now();
 
-    // Validate name format
-    validate_namespace_name(&req.name)?;
-
-    // Validate embedding dimensions if provided
-    if let Some(dim) = req.embedding_dim {
-        if dim == 0 || dim > 8192 {
-            return Err(AppError::BadRequest {
-                message: "embedding_dim must be between 1 and 8192".into(),
-                field: Some("embeddingDim".into()),
-            });
-        }
-    }
+    let req = crate::mcp::args::parse_create_namespace(&req).map_err(argument_error)?;
 
     // Create namespace (registry checks for duplicates)
     let ns = state
         .namespaces
         .create(
             &req.name,
-            req.embedding_dim,
-            req.initial_stability,
-            req.desired_retention,
+            req.embedding_dim.map(u32::from),
+            req.initial_stability
+                .unwrap_or(crate::model::constants::DEFAULT_INITIAL_STABILITY),
+            req.desired_retention
+                .unwrap_or(crate::model::constants::DEFAULT_DESIRED_RETENTION),
             req.decay_rate_multiplier,
         )
         .await
-        .map_err(|e| {
-            if matches!(
-                e.downcast_ref::<crate::decay::lifecycle::LifecycleError>(),
-                Some(crate::decay::lifecycle::LifecycleError::InvalidInput(_))
-            ) {
-                AppError::BadRequest {
-                    message: e.to_string(),
-                    field: None,
-                }
-            } else {
-                AppError::Conflict {
-                    message: format!("namespace '{}' already exists", req.name),
-                }
-            }
-        })?;
+        .map_err(namespace_create_error)?;
 
     let response = NamespaceResponse {
         id: ns.id.get(),
@@ -1158,6 +1105,36 @@ pub async fn create_namespace(
             took_us: Some(took),
         }),
     ))
+}
+
+fn namespace_create_error(error: Box<dyn std::error::Error + Send + Sync>) -> AppError {
+    use crate::decay::lifecycle::LifecycleError;
+    use crate::storage::StorageError;
+    if matches!(
+        error.downcast_ref::<LifecycleError>(),
+        Some(LifecycleError::InvalidInput(_))
+    ) {
+        return AppError::BadRequest {
+            message: error.to_string(),
+            field: None,
+        };
+    }
+    match error.downcast::<StorageError>() {
+        Ok(error) => match *error {
+            StorageError::InvalidMutation(message)
+            | StorageError::InvalidNamespaceName {
+                reason: message, ..
+            } => AppError::BadRequest {
+                message,
+                field: None,
+            },
+            error @ StorageError::CommitOutcomeUnknown { .. } => AppError::ServiceUnavailable {
+                message: error.to_string(),
+            },
+            error => error.into(),
+        },
+        Err(source) => AppError::Internal { source },
+    }
 }
 
 /// GET /namespaces/:id/stats -- namespace statistics.
@@ -1435,7 +1412,6 @@ pub async fn batch_store(
     State(state): State<AppState>,
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<BatchStoreResponse>>), AppError> {
-    let _publication = state.storage.publication_lease().await?;
     state.storage.effects_stamp().await?;
 
     let start = Instant::now();
@@ -1539,7 +1515,7 @@ pub async fn batch_store(
         }
 
         // Embedding
-        let embedding = match mem_req.embedding {
+        let raw_embedding = match mem_req.embedding {
             Some(ref vec) => {
                 if vec.len() != ns.embedding_dim as usize {
                     failed.push(BatchStoreFailure {
@@ -1578,6 +1554,20 @@ pub async fn batch_store(
             }
         };
 
+        let mut embedding = raw_embedding.clone();
+        if let Err(error) = crate::storage::insertion::normalize_embedding(
+            &mut embedding,
+            ns.embedding_dim,
+            mem_req.embedding.is_some(),
+        ) {
+            failed.push(BatchStoreFailure {
+                index,
+                error: error.to_string(),
+                field: mem_req.embedding.as_ref().map(|_| "embedding".into()),
+            });
+            continue;
+        }
+
         // Near-duplicate advisory, before this item is indexed. Items are
         // created in order and each is indexed before the next is checked,
         // so an intra-batch duplicate is reported too — same property the
@@ -1585,86 +1575,56 @@ pub async fn batch_store(
         let near_duplicates =
             near_duplicate_report(&state, &embedding, ns.id, mem_req.check_duplicates).await?;
 
-        // Persist — resolve initial stability from namespace config (matching MCP)
-        let resolved_stability = mem_req.initial_stability.unwrap_or(ns.initial_stability);
-        let memory = match state
+        let inserted = match state
             .storage
-            .create_memory(
+            .insert_memory(
                 ns.id,
-                &mem_req.summary,
-                mem_req.full_text.as_deref(),
-                &merged_tags,
-                &embedding,
-                Some(resolved_stability),
-                mem_req.created_at,
+                crate::storage::insertion::InsertMemory {
+                    id: None,
+                    summary: mem_req.summary.clone(),
+                    full_text: mem_req.full_text.clone(),
+                    tags: crate::model::parse_tags_lossy("batch_store.tags", &merged_tags),
+                    embedding: mem_req.embedding.clone(),
+                    initial_stability: mem_req.initial_stability,
+                    created_at: mem_req.created_at,
+                    parent_id: mem_req.parent_id,
+                    supersedes: mem_req.supersedes,
+                },
+                raw_embedding,
             )
             .await
         {
-            Ok(m) => m,
-            Err(e) => {
+            Ok(value) => value,
+            Err(error @ crate::storage::StorageError::CommittedMutation { .. }) => {
+                return Err(error.into());
+            }
+            Err(error @ crate::storage::StorageError::CommitOutcomeUnknown { .. }) => {
+                return Err(error.into());
+            }
+            Err(error) => {
                 failed.push(BatchStoreFailure {
                     index,
-                    error: e.to_string(),
+                    error: error.to_string(),
                     field: None,
                 });
                 continue;
             }
         };
-
-        // Cache + index
-        state.cache.insert(&memory).await;
-        state
-            .search
-            .index_memory(memory.id, &embedding, ns.id)
-            .await;
-
-        // FTS
-        state
-            .search
-            .fts_add(
-                ns.id,
-                memory.id,
-                &mem_req.summary,
-                mem_req.full_text.as_deref(),
-                &merged_tags,
-            )
-            .await;
-
-        // Entity index
-        state
-            .search
-            .entity_index_add(memory.id, &mem_req.entities)
-            .await;
-
-        // Graph node
-        let _ = state
-            .graph
-            .add_node(
-                memory.id,
-                ns.id,
-                crate::model::DecayPhase::Full,
-                1.0,
-                memory.vector_slot,
-            )
-            .await;
-
-        // Explicit links. Both targets were validated before this item was
-        // created, so failures here are durability details, not rejections.
-        // Both use the shared `explicit_links` helpers, so `edge_count` moves
-        // the same way it does on the single-store and MCP paths.
-        if let Some(parent_id) = mem_req.parent_id {
-            state.graph.apply_parent_edge(parent_id, memory.id).await;
-        }
-
-        let supersedes_outcome = match mem_req.supersedes {
-            Some(old_id) => Some(state.graph.apply_supersedes_edge(memory.id, old_id).await),
-            None => None,
-        };
+        let receipt = inserted.receipt;
+        let memory = inserted.record.ok_or_else(|| {
+            AppError::from(crate::storage::StorageError::CommittedMutation {
+                receipt: Box::new(receipt.clone()),
+                source: Box::new(crate::storage::StorageError::RecoveryRequired(
+                    "inserted record unavailable".into(),
+                )),
+            })
+        })?;
+        let supersedes_outcome = mem_req.supersedes.map(|id| {
+            crate::model::SupersedesOutcome::new(id, crate::model::SupersedesStatus::Applied)
+        });
 
         // Post-creation links
-        let created_at = mem_req
-            .created_at
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let created_at = memory.created_at;
         state
             .graph
             .perform_post_creation_links(
@@ -1677,6 +1637,8 @@ pub async fn batch_store(
             )
             .await;
 
+        state.storage.complete_insertion(&receipt).await?;
+        state.cache.insert(&memory).await;
         created.push(BatchStoreResult {
             id: memory.id,
             namespace: ns.name.clone(),
@@ -1722,8 +1684,20 @@ pub async fn scan_duplicates(
                 id: name.clone(),
             })?;
 
-        let threshold = req.threshold.clamp(0.0, 1.0);
-        let max_memories = req.max_memories.min(10_000);
+        if !req.threshold.is_finite() || !(0.0..=1.0).contains(&req.threshold) {
+            return Err(AppError::BadRequest {
+                message: "threshold must be finite and between 0 and 1".into(),
+                field: Some("threshold".into()),
+            });
+        }
+        if !(1..=10_000).contains(&req.max_memories) {
+            return Err(AppError::BadRequest {
+                message: "maxMemories must be between 1 and 10000".into(),
+                field: Some("maxMemories".into()),
+            });
+        }
+        let threshold = req.threshold;
+        let max_memories = req.max_memories;
 
         // Get memory IDs in this namespace
         let filter = ListFilter {
@@ -1736,34 +1710,25 @@ pub async fn scan_duplicates(
         let records = state.storage.list_memories(&filter).await?;
         let memory_ids: Vec<MemoryId> = records.iter().take(max_memories).map(|r| r.id).collect();
 
-        if memory_ids.len() < 2 {
-            let took = start.elapsed().as_micros() as u64;
-            return Ok(Json(ApiResponse {
-                data: ScanDuplicatesResponse {
-                    clusters: vec![],
-                    total: 0,
-                },
-                took_us: Some(took),
-            }));
-        }
-
         // Load embeddings
         let embeddings = state.search.get_embeddings_batch(&memory_ids);
+        let sampled_count = memory_ids.len();
         let id_embeddings: Vec<(MemoryId, Vec<f32>)> = memory_ids
             .into_iter()
             .filter_map(|mid| embeddings.get(&mid).map(|emb| (mid, emb.clone())))
             .collect();
 
-        if id_embeddings.len() < 2 {
-            let took = start.elapsed().as_micros() as u64;
-            return Ok(Json(ApiResponse {
-                data: ScanDuplicatesResponse {
-                    clusters: vec![],
-                    total: 0,
-                },
-                took_us: Some(took),
-            }));
-        }
+        let coverage = DuplicateScanCoverage {
+            algorithm: "sampledPairs",
+            eligible_count: records.len(),
+            sampled_count,
+            skipped_vector_count: sampled_count - id_embeddings.len(),
+            sample_cap: max_memories,
+            neighbor_cap: None,
+            truncated: sampled_count < records.len(),
+            // This legacy scan has no generation-consistent read view.
+            complete: false,
+        };
 
         // Union-Find based clustering
         let n = id_embeddings.len();
@@ -1854,7 +1819,11 @@ pub async fn scan_duplicates(
         let took = start.elapsed().as_micros() as u64;
 
         Ok(Json(ApiResponse {
-            data: ScanDuplicatesResponse { clusters, total },
+            data: ScanDuplicatesResponse {
+                clusters,
+                total,
+                coverage,
+            },
             took_us: Some(took),
         }))
     }
@@ -1992,3 +1961,7 @@ mod lifecycle_error_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "validation_tests.rs"]
+mod validation_tests;

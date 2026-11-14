@@ -7,11 +7,16 @@
 //!
 //! See CS-07 for the full specification.
 
+mod catalog;
 pub(crate) mod effects;
+mod insertion;
 mod lifecycle_updates;
+pub(crate) mod namespace_state;
+pub(crate) mod purge;
 pub(crate) mod removal_ledger;
 pub(crate) mod restoration;
 pub(crate) mod text_generation;
+mod tombstone;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -74,12 +79,15 @@ const NAMESPACE_INDEX: MultimapTableDefinition<u32, &[u8]> =
 pub struct MetadataStore {
     db: Database,
     unavailable: std::sync::atomic::AtomicBool,
+    purge_pending: std::sync::atomic::AtomicBool,
     pub(crate) canonical_pending: std::sync::atomic::AtomicBool,
     derived_dirty: std::sync::atomic::AtomicBool,
     effects_epoch: std::sync::atomic::AtomicU64,
     pub(crate) derived_publication: std::sync::Arc<tokio::sync::RwLock<()>>,
     #[cfg(test)]
     pub(crate) fail_effect_application: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_purge_child_commit: std::sync::atomic::AtomicBool,
     // Lock order: engine gate -> publication -> redb -> phase_index.
     // Hold across commit and bitmap publication, including direct callers.
     publication: std::sync::RwLock<()>,
@@ -163,16 +171,32 @@ impl MetadataStore {
         let store = Self {
             db,
             unavailable: std::sync::atomic::AtomicBool::new(false),
+            purge_pending: std::sync::atomic::AtomicBool::new(false),
             canonical_pending: std::sync::atomic::AtomicBool::new(false),
             derived_dirty: std::sync::atomic::AtomicBool::new(false),
             effects_epoch: std::sync::atomic::AtomicU64::new(0),
             derived_publication: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             fail_effect_application: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_purge_child_commit: std::sync::atomic::AtomicBool::new(false),
             publication: std::sync::RwLock::new(()),
             phase_index: std::sync::RwLock::new(PhaseIndex::new()),
         };
-        store.rebuild_phase_index()?;
+        store.purge_pending.store(
+            store
+                .purge_progress()?
+                .iter()
+                .any(|p| p.stage != crate::storage::purge::PurgeStage::Complete),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let records = store.scan_all_for_recovery()?;
+        let phases: Vec<_> = records
+            .iter()
+            .map(|(_, r)| (r.namespace_id, r.vector_slot, r.phase))
+            .collect();
+        *store.phase_index.write().unwrap_or_else(|e| e.into_inner()) =
+            PhaseIndex::rebuild_from_records(&phases);
         let pending = store.pending_effects()?;
         store.canonical_pending.store(
             pending.iter().any(|e| !e.canonical_applied),
@@ -194,6 +218,11 @@ impl MetadataStore {
     }
 
     pub(crate) fn ensure_available(&self) -> Result<(), StorageError> {
+        self.ensure_handle_available()?;
+        self.require_no_active_purge()
+    }
+
+    pub(crate) fn ensure_handle_available(&self) -> Result<(), StorageError> {
         if self.unavailable.load(std::sync::atomic::Ordering::Acquire)
             || self
                 .canonical_pending
@@ -485,7 +514,7 @@ impl MetadataStore {
         scope: MutationScope,
         operation_id: uuid::Uuid,
     ) -> Result<Option<WriteReceipt>, StorageError> {
-        self.ensure_available()?;
+        self.ensure_handle_available()?;
         let tx = self.db.begin_read()?;
         let table = tx.open_table(control::CONTROL)?;
         let value = table
@@ -1247,64 +1276,17 @@ impl MetadataStore {
     /// - `StorageError::DuplicateName` if a namespace with this name
     ///   already exists.
     pub fn create_namespace(&self, config: &NamespaceConfig) -> Result<NamespaceId, StorageError> {
-        self.ensure_available()?;
-        let _publication = self.mutation_guard()?;
-        let write_txn = self.db.begin_write()?;
-        let new_id;
-        {
-            // Check name uniqueness by scanning existing namespaces.
-            //
-            // Case-INSENSITIVELY, because the name becomes a directory
-            // name and macOS APFS, Windows NTFS and a case-insensitive
-            // ext4 volume all give "notes" and "Notes" the SAME
-            // directory. Two rows sharing one directory is not a
-            // cosmetic collision:
-            //
-            // - delete "notes" (row gone, remove_dir_all fails, warn
-            //   only), create "Notes", and the new namespace adopts the
-            //   old one's `vectors.dat` — somebody else's embeddings.
-            // - `create_namespace("Default")` used to pass the
-            //   uniqueness check, commit its row, no-op `create_dir_all`
-            //   onto `default/` and only then fail on the exclusive
-            //   flock. The row survived, and `delete_namespace("Default")`
-            //   walked past the `!= "default"` guard and unlinked the
-            //   real default's vectors.
-            //
-            // `validate_namespace_name` restricts names to ASCII, so
-            // ASCII case folding is total here.
-            let ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
-            for result in ns_table.iter()? {
-                let (_, value) = result?;
-                let existing: NamespaceConfig = serde_json::from_slice(value.value())
-                    .map_err(|e| StorageError::Deserialize(e.to_string()))?;
-                if existing.name.eq_ignore_ascii_case(&config.name) {
-                    return Err(StorageError::DuplicateName(config.name.clone()));
-                }
-            }
-            drop(ns_table);
-
-            // Assign next ID.
-            let mut counter_table = write_txn.open_table(NAMESPACE_COUNTER)?;
-            let current_max = counter_table.get("max_id")?.map(|v| v.value()).unwrap_or(0);
-            new_id = current_max
-                .checked_add(1)
-                .ok_or_else(|| StorageError::InvalidControl("namespace ID exhausted".into()))?;
-            counter_table.insert("max_id", new_id)?;
-            drop(counter_table);
-
-            // Write the namespace config with the assigned ID.
-            let mut stored_config = config.clone();
-            stored_config.id = NamespaceId::new(new_id);
-            let bytes = serde_json::to_vec(&stored_config)
-                .map_err(|e| StorageError::Serialize(e.to_string()))?;
-
-            let mut ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
-            ns_table.insert(new_id, bytes.as_slice())?;
+        let ctx = MutationContext {
+            scope: MutationScope::Catalog,
+            ..MutationContext::unkeyed(NamespaceId::new(1))
+        };
+        let receipt = self.create_catalog(&ctx, config, |_| Ok(()))?;
+        match receipt.outcome {
+            MutationOutcome::NamespaceCreated { namespace_id, .. } => Ok(namespace_id),
+            _ => Err(StorageError::InvalidControl(
+                "create receipt outcome mismatch".into(),
+            )),
         }
-        control::advance_generation(&write_txn)?;
-        self.commit(write_txn)?;
-
-        Ok(NamespaceId::new(new_id))
     }
 
     /// List all namespace configurations.

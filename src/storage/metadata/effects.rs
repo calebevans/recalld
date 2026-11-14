@@ -6,6 +6,22 @@ use crate::storage::edges::PersistedEdge;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_AFTER_RECORD_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Ephemeral inputs only; receipts and effects never retain stripped content.
+pub(super) enum RecordMutation<'a> {
+    GraphOnly,
+    PurgeChunk(&'a crate::storage::purge::PurgeProgress),
+    Inserted(&'a DiskRecord, u32),
+    Tombstoned {
+        record: &'a DiskRecord,
+        old_phase: DecayPhase,
+    },
+}
+
 pub(crate) const SCHEMA: TableDefinition<&str, u32> = TableDefinition::new("effects_schema");
 pub(crate) const EFFECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mutation_effects");
 
@@ -71,6 +87,10 @@ pub(crate) fn validate_existing(
                 if matches!(
                     control::validate_receipt(value.value())?.receipt.outcome,
                     MutationOutcome::GraphChanged { .. }
+                        | MutationOutcome::MemoryInserted { .. }
+                        | MutationOutcome::MemoryTombstoned { .. }
+                        | MutationOutcome::NamespacePurgeStarted { .. }
+                        | MutationOutcome::NamespacePurgeAdvanced { .. }
                 ) {
                     return Err(StorageError::InvalidControl(
                         "effects schema missing from adopted store".into(),
@@ -127,6 +147,49 @@ pub(crate) fn validate_existing(
             ));
         }
         match effect.receipt.outcome {
+            MutationOutcome::MemoryTombstoned { memory_id, status }
+                if matches!(effect.scope, MutationScope::Namespace(_))
+                    && effect.puts.is_empty()
+                    && effect.deletes.is_empty()
+                    && effect.removed_ids.is_empty()
+                    && effect.peer_counts.is_empty()
+                    && effect.invalidated_ids == [memory_id]
+                    && match status {
+                        crate::storage::tombstone::TombstoneStatus::Tombstoned => {
+                            effect.releases.len() == 1
+                                && effect.releases.iter().all(|r| {
+                                    r.memory_id == memory_id
+                                        && effect.scope == MutationScope::Namespace(r.namespace_id)
+                                })
+                        }
+                        crate::storage::tombstone::TombstoneStatus::AlreadyTombstoned => {
+                            effect.releases.is_empty()
+                        }
+                    } => {}
+            MutationOutcome::MemoryInserted {
+                memory_id,
+                edges_put,
+                ..
+            } if matches!(effect.scope, MutationScope::Namespace(_))
+                && edges_put == effect.puts.len()
+                && effect.deletes.is_empty()
+                && effect.removed_ids.is_empty()
+                && effect.releases.is_empty()
+                && effect.invalidated_ids.contains(&memory_id) => {}
+            MutationOutcome::NamespacePurgeAdvanced {
+                stage,
+                removed,
+                edges_removed,
+                ..
+            } if effect.puts.is_empty()
+                && effect.releases.is_empty()
+                && removed == effect.removed_ids.len() as u64
+                && edges_removed == effect.deletes.len() as u64
+                && (stage == crate::storage::purge::PurgeStage::Deleting
+                    || (removed == 0
+                        && edges_removed == 0
+                        && effect.invalidated_ids.is_empty()
+                        && effect.peer_counts.is_empty())) => {}
             MutationOutcome::GraphChanged {
                 edges_put,
                 edges_removed,
@@ -143,7 +206,7 @@ pub(crate) fn validate_existing(
         if effect
             .releases
             .iter()
-            .any(|r| !effect.removed_ids.contains(&r.memory_id))
+            .any(|r| !effect.removed_ids.contains(&r.memory_id) && !matches!(effect.receipt.outcome, MutationOutcome::MemoryTombstoned { memory_id, .. } if memory_id == r.memory_id))
         {
             return Err(StorageError::InvalidControl(
                 "release without removed owner".into(),
@@ -217,6 +280,43 @@ impl MetadataStore {
     ) -> Result<EffectResult, StorageError> {
         self.ensure_available()?;
         let tx = self.db.begin_write()?;
+        let ctx = MutationContext::unkeyed(namespace);
+        let request = control::encode(&(puts, incident_ids, delete_records, release_vectors))?;
+        let hash = control::request_hash(&ctx, "graph_effects", &[&request]);
+        self.finish_record_effects(
+            _guard,
+            tx,
+            &ctx,
+            hash,
+            existing_edges,
+            puts,
+            incident_ids,
+            delete_records,
+            release_vectors,
+            RecordMutation::GraphOnly,
+        )
+    }
+
+    /// Shared transaction tail for graph mutations and canonical insertion.
+    /// Insertion has already staged its new row/indexes in this transaction.
+    pub(super) fn finish_record_effects(
+        &self,
+        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
+        tx: redb::WriteTransaction,
+        ctx: &MutationContext,
+        hash: [u8; 32],
+        existing_edges: &[PersistedEdge],
+        puts: &[PersistedEdge],
+        incident_ids: &[MemoryId],
+        delete_records: bool,
+        release_vectors: bool,
+        mutation: RecordMutation<'_>,
+    ) -> Result<EffectResult, StorageError> {
+        let MutationScope::Namespace(namespace) = ctx.scope else {
+            return Err(StorageError::InvalidMutationContext(
+                "record effects require namespace scope".into(),
+            ));
+        };
         if tx
             .open_table(NAMESPACE_TABLE)?
             .get(namespace.get())?
@@ -228,6 +328,21 @@ impl MetadataStore {
         let mut removed = Vec::new();
         let mut releases = Vec::new();
         let mut invalidated: std::collections::HashSet<_> = incident_ids.iter().copied().collect();
+        match &mutation {
+            RecordMutation::Inserted(record, _) | RecordMutation::Tombstoned { record, .. } => {
+                invalidated.insert(MemoryId::from_bytes(record.id));
+            }
+            RecordMutation::GraphOnly | RecordMutation::PurgeChunk(_) => {}
+        }
+        if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
+            if *old_phase != DecayPhase::Tombstone {
+                releases.push(VectorRelease {
+                    namespace_id: namespace,
+                    slot: record.vector_slot,
+                    memory_id: MemoryId::from_bytes(record.id),
+                });
+            }
+        }
         let mut final_edges: Vec<_> = existing_edges
             .iter()
             .filter(|e| !incident_ids.contains(&e.source) && !incident_ids.contains(&e.target))
@@ -267,7 +382,8 @@ impl MetadataStore {
                         EdgeType::ParentChild => id == edge.source || delete_records,
                         _ => false,
                     };
-                    if record.namespace_id != namespace.get()
+                    if record.id != *id.as_bytes()
+                        || record.namespace_id != namespace.get()
                         || (matches!(record.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
                             && !retained_structural)
                         || (delete_records && incident_ids.contains(&id))
@@ -283,13 +399,13 @@ impl MetadataStore {
                             && old.target == edge.target
                             && old.source != edge.source
                     }) {
-                        return Err(StorageError::InvalidMutation("supersedes branch".into()));
+                        return Err(StorageError::EdgeConflict("supersedes branch".into()));
                     }
                     let mut seen = std::collections::HashSet::new();
                     let mut visit = vec![edge.target];
                     while let Some(id) = visit.pop() {
                         if id == edge.source {
-                            return Err(StorageError::InvalidMutation("supersedes cycle".into()));
+                            return Err(StorageError::EdgeConflict("supersedes cycle".into()));
                         }
                         if seen.insert(id) {
                             visit.extend(
@@ -363,18 +479,57 @@ impl MetadataStore {
         peer_counts.sort_by_key(|(id, _)| *id);
         let mut invalidated_ids: Vec<_> = invalidated.into_iter().collect();
         invalidated_ids.sort();
-        let ctx = MutationContext::unkeyed(namespace);
-        let request = control::encode(&(puts, incident_ids, delete_records, release_vectors))?;
-        let receipt = control::record_receipt(
-            &tx,
-            &ctx,
-            control::request_hash(&ctx, "graph_effects", &[&request]),
-            MutationOutcome::GraphChanged {
+        let outcome = match &mutation {
+            RecordMutation::Inserted(record, embedding_dim) => MutationOutcome::MemoryInserted {
+                memory_id: MemoryId::from_bytes(record.id),
+                created_at: record.created_at,
+                initial_stability_bits: record.stability.to_bits(),
+                embedding_dim: *embedding_dim,
                 edges_put: actual_puts.len(),
-                edges_removed: deletes.len(),
-                memories_removed: removed.len(),
             },
-        )?;
+            RecordMutation::Tombstoned { record, old_phase } => MutationOutcome::MemoryTombstoned {
+                memory_id: MemoryId::from_bytes(record.id),
+                status: if *old_phase == DecayPhase::Tombstone {
+                    crate::storage::tombstone::TombstoneStatus::AlreadyTombstoned
+                } else {
+                    crate::storage::tombstone::TombstoneStatus::Tombstoned
+                },
+            },
+            RecordMutation::GraphOnly | RecordMutation::PurgeChunk(_) => {
+                MutationOutcome::GraphChanged {
+                    edges_put: actual_puts.len(),
+                    edges_removed: deletes.len(),
+                    memories_removed: removed.len(),
+                }
+            }
+        };
+        let receipt = if let RecordMutation::PurgeChunk(progress) = &mutation {
+            super::purge::record_next(
+                &tx,
+                progress,
+                crate::storage::purge::PurgeStage::Deleting,
+                &removed,
+                deletes.len(),
+            )?
+        } else {
+            control::record_receipt(&tx, ctx, hash, outcome)?
+        };
+        if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
+            if *old_phase != DecayPhase::Tombstone {
+                super::removal_ledger::record_removal(
+                    &tx,
+                    crate::storage::control::GenerationRef {
+                        store_id: receipt.store_id,
+                        generation: receipt.committed_generation,
+                    },
+                    record.namespace_id,
+                    MemoryId::from_bytes(record.id),
+                    Some(super::removal_ledger::TerminalKind::Tombstone),
+                    super::removal_ledger::ALL,
+                    receipt.operation_id,
+                )?;
+            }
+        }
         // Removal evidence and effect receipt share this canonical transaction.
         for (id, record) in &removed {
             super::removal_ledger::record_removal(
@@ -417,7 +572,20 @@ impl MetadataStore {
         self.derived_dirty.store(true, Ordering::SeqCst);
         self.canonical_pending.store(true, Ordering::SeqCst);
         self.effects_epoch.store(next, Ordering::SeqCst);
-        tx.commit().map_err(|source| {
+        let committed = tx.commit();
+        // Synthetic I/O ambiguity: the commit succeeded, but the caller must
+        // not assume failure means its staged bytes can be reclaimed.
+        #[cfg(test)]
+        let committed = committed.and_then(|()| {
+            if FAIL_AFTER_RECORD_COMMIT.with(|flag| flag.replace(false)) {
+                Err(redb::CommitError::Storage(redb::StorageError::Io(
+                    std::io::Error::other("injected unknown record commit"),
+                )))
+            } else {
+                Ok(())
+            }
+        });
+        committed.map_err(|source| {
             self.mark_unavailable();
             StorageError::CommitOutcomeUnknown {
                 operation_id: receipt.operation_id,
@@ -426,6 +594,19 @@ impl MetadataStore {
         })?;
         crash_point("after_metadata_commit");
         let mut phases = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+        if let RecordMutation::Inserted(record, _) = &mutation {
+            phases.transition(
+                record.namespace_id,
+                record.vector_slot,
+                DecayPhase::Full,
+                record.phase,
+            );
+        }
+        if let RecordMutation::Tombstoned { record, old_phase } = &mutation {
+            if *old_phase != DecayPhase::Tombstone {
+                phases.remove(record.namespace_id, record.vector_slot, *old_phase);
+            }
+        }
         for (_, record) in &removed {
             if record.phase != DecayPhase::Tombstone {
                 phases.remove(record.namespace_id, record.vector_slot, record.phase);
@@ -504,9 +685,52 @@ pub(crate) fn validate_plan(
             "removed effect ID still exists".into(),
         ));
     }
+    if let MutationOutcome::MemoryInserted {
+        memory_id,
+        created_at,
+        ..
+    } = effect.receipt.outcome
+    {
+        if records
+            .iter()
+            .find(|(id, _)| *id == memory_id)
+            .is_none_or(|(_, record)| {
+                record.phase != DecayPhase::Full
+                    || record.created_at != created_at
+                    || effect.scope
+                        != MutationScope::Namespace(NamespaceId::new(record.namespace_id))
+            })
+        {
+            return Err(StorageError::InvalidControl(
+                "pending insertion disagrees with canonical record".into(),
+            ));
+        }
+    }
+    if let MutationOutcome::MemoryTombstoned { memory_id, .. } = effect.receipt.outcome {
+        if records
+            .iter()
+            .find(|(id, _)| *id == memory_id)
+            .is_none_or(|(_, record)| {
+                record.phase != DecayPhase::Tombstone
+                    || !record.summary.is_empty()
+                    || !record.tags.is_empty()
+                    || record.text_offset != 0
+                    || record.text_length != 0
+                    || effect.scope
+                        != MutationScope::Namespace(NamespaceId::new(record.namespace_id))
+                    || effect.releases.iter().any(|r| r.slot != record.vector_slot)
+            })
+        {
+            return Err(StorageError::InvalidControl(
+                "pending tombstone disagrees with canonical record".into(),
+            ));
+        }
+    }
     for release in &effect.releases {
         if records.iter().any(|(id, r)| {
-            *id == release.memory_id
+            (*id == release.memory_id
+                && !matches!(effect.receipt.outcome,
+                MutationOutcome::MemoryTombstoned { memory_id, .. } if memory_id == *id))
                 || (r.phase != DecayPhase::Tombstone
                     && r.namespace_id == release.namespace_id.get()
                     && r.vector_slot == release.slot)

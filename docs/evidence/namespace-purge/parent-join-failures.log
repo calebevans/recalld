@@ -1,0 +1,23 @@
+failures:
+
+---- storage::engine::catalog::tests::catalog_receipt_scope_forgery_fails_startup_without_changing_source stdout ----
+
+thread 'storage::engine::catalog::tests::catalog_receipt_scope_forgery_fails_startup_without_changing_source' (1589) panicked at src/storage/engine/catalog.rs:289:25:
+assertion `left == right` failed
+  left: "receipt outcome disagrees with key scope"
+ right: "catalog receipt outcome disagrees with key scope"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- storage::engine::insertion::tests::insertion_rejects_schema_policy_and_invalid_receipt_numerics stdout ----
+
+thread 'storage::engine::insertion::tests::insertion_rejects_schema_policy_and_invalid_receipt_numerics' (1602) panicked at src/storage/engine/insertion_tests.rs:582:47:
+called `Result::unwrap()` on an `Err` value: InvalidMutation("invalid namespace dimension, creation time or unsupported schema")
+
+
+failures:
+    storage::engine::catalog::tests::catalog_receipt_scope_forgery_fails_startup_without_changing_source
+    storage::engine::insertion::tests::insertion_rejects_schema_policy_and_invalid_receipt_numerics
+
+test result: FAILED. 684 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 86.88s
+
+error: test failed, to rerun pass `--lib`

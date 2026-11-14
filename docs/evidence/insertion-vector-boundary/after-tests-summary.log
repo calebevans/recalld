@@ -1,0 +1,26 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.34s
+test api::adapters::tests::actual_http_insertion_adapter_reports_durable_receipt_if_publication_fails ... ok
+test api::adapters::tests::insertion_http_boundary_distinguishes_provider_unavailable_from_caller_invalid ... ok
+test daemon::server::tests::actual_daemon_insertion_dispatch_keeps_committed_failure_distinct_from_success ... ok
+test derived_completion::tests::insertion_completion_returns_receipt_on_failure_then_retries_all_views ... ok
+test mcp::bridge_adapters::tests::insertion_adapter_rejects_bad_provider_and_caller_vectors_and_normalizes_advisory ... ok
+test storage::engine::insertion::tests::caller_identity_bits_conflicts_and_preallocation_rejections ... ok
+test storage::engine::insertion::tests::explicit_links_are_one_transaction_and_final_target_checks_precede_allocation ... ok
+test storage::engine::insertion::tests::insertion_concurrent_same_key_commits_one_uuid_and_generation ... ok
+test storage::engine::insertion::tests::insertion_canonical_effect_failure_retains_receipt_and_reopens_without_slot_reuse ... ok
+test storage::engine::insertion::tests::insertion_process_child ... ok
+test storage::engine::insertion::tests::insertion_pending_plan_preflight_rejects_before_original_store_changes ... ok
+test storage::engine::insertion::tests::insertion_rejects_schema_policy_and_invalid_receipt_numerics ... ok
+test storage::engine::insertion::tests::insertion_rejects_zero_generated_without_mutation ... ok
+test storage::engine::insertion::tests::insertion_rejects_zero_supplied_without_mutation ... ok
+test storage::engine::insertion::tests::insertion_replay_precedes_clock_provider_allocation_and_mutable_defaults ... ok
+test storage::engine::insertion::tests::insertion_unknown_commit_preserves_payload_until_receipt_reconciliation ... ok
+test storage::engine::insertion::tests::insertion_uses_canonical_target_after_preflight_and_retains_structural_tombstones ... ok
+test storage::engine::insertion::tests::insertion_vector_boundary_normalizes_both_origins_and_preserves_request_identity ... ok
+test storage::engine::insertion::tests::insertion_process_crashes_replay_or_reclaim_without_double_allocation ... ok
+test result: ok. 645 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 69.80s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
