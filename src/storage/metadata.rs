@@ -19,6 +19,9 @@ use crate::model::constants::ACCESS_HISTORY_MAX;
 use crate::model::{
     AccessEvent, AccessKind, DecayPhase, DiskRecord, MemoryId, NamespaceConfig, NamespaceId,
 };
+use crate::storage::control::{
+    self, ControlState, MutationContext, MutationOutcome, MutationScope, WriteReceipt,
+};
 use crate::storage::error::StorageError;
 use crate::storage::indexes::PhaseIndex;
 
@@ -87,6 +90,7 @@ impl MetadataStore {
         // Force-create all tables by opening them in a write transaction.
         {
             let write_txn = db.begin_write()?;
+            control::initialize(&write_txn)?;
             let _ = write_txn.open_table(META_TABLE)?;
             let _ = write_txn.open_table(NAMESPACE_TABLE)?;
             let _ = write_txn.open_table(NAMESPACE_COUNTER)?;
@@ -122,7 +126,7 @@ impl MetadataStore {
     /// - `StorageError::NotFound` if no record exists for this ID.
     fn update_record<F>(&self, id: &MemoryId, f: F) -> Result<DiskRecord, StorageError>
     where
-        F: FnOnce(&mut DiskRecord),
+        F: FnOnce(&mut DiskRecord) -> Result<(), StorageError>,
     {
         let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         let old_phase;
@@ -139,11 +143,12 @@ impl MetadataStore {
             };
 
             old_phase = record.phase;
-            f(&mut record);
+            f(&mut record)?;
 
             table.insert(key, record.to_bytes().as_slice())?;
             record
         };
+        control::advance_generation(&write_txn)?;
         write_txn.commit()?;
 
         if old_phase != record.phase {
@@ -195,6 +200,7 @@ impl MetadataStore {
                 ns_idx.insert(record.namespace_id, key)?;
             }
         }
+        control::advance_generation(&write_txn)?;
         write_txn.commit()?;
 
         // 4. Publish the actual committed phase; tombstones own no slot.
@@ -257,28 +263,17 @@ impl MetadataStore {
         stability: f32,
         is_permastore: bool,
     ) -> Result<(), StorageError> {
-        let mut old_phase = None;
-
         self.update_record(&id, |record| {
-            old_phase = Some(record.phase);
             if record.phase == DecayPhase::Tombstone {
-                return;
+                return Err(StorageError::NotFound(id.into_inner()));
             }
             record.phase = phase;
             record.strength = strength;
             record.decay_strength = decay_strength;
             record.stability = stability;
             record.is_permastore = if is_permastore { 1 } else { 0 };
+            Ok(())
         })?;
-
-        let old_phase = old_phase.expect("update_record closure always runs");
-
-        // Reported the way a hard-deleted record already is, so callers
-        // treat "forgotten since I read it" the same in both cases. The
-        // phase bitmap is left alone: a tombstone is not tracked in it.
-        if old_phase == DecayPhase::Tombstone {
-            return Err(StorageError::NotFound(id.into_inner()));
-        }
 
         Ok(())
     }
@@ -292,6 +287,7 @@ impl MetadataStore {
         self.update_record(&id, |record| {
             record.text_offset = 0;
             record.text_length = 0;
+            Ok(())
         })?;
         Ok(())
     }
@@ -303,6 +299,7 @@ impl MetadataStore {
     pub fn strip_summary(&self, id: MemoryId) -> Result<(), StorageError> {
         self.update_record(&id, |record| {
             record.summary = String::new();
+            Ok(())
         })?;
         Ok(())
     }
@@ -317,17 +314,123 @@ impl MetadataStore {
         timestamp: i64,
         kind: AccessKind,
     ) -> Result<(), StorageError> {
-        self.update_record(&id, |record| {
-            record.last_accessed_at = timestamp;
+        let record = self
+            .get(id)?
+            .ok_or(StorageError::NotFound(id.into_inner()))?;
+        self.update_access_with_receipt(
+            &MutationContext::unkeyed(NamespaceId::new(record.namespace_id)),
+            id,
+            timestamp,
+            kind,
+        )?;
+        Ok(())
+    }
 
-            let event = AccessEvent { timestamp, kind };
+    /// The current metadata control state. This is not a coherent cross-file
+    /// read view or a derived readiness watermark (see `storage::control`).
+    pub fn control_state(&self) -> Result<ControlState, StorageError> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(control::CONTROL)?;
+        let value = table
+            .get("state")?
+            .ok_or_else(|| StorageError::InvalidControl("missing control state".into()))?;
+        ControlState::decode(value.value())
+    }
+
+    /// Historical receipt lookup uses immutable scope, even after namespace
+    /// purge. It never looks up or returns the record's removed content.
+    pub fn lookup_operation(
+        &self,
+        store_id: uuid::Uuid,
+        scope: MutationScope,
+        operation_id: uuid::Uuid,
+    ) -> Result<Option<WriteReceipt>, StorageError> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(control::CONTROL)?;
+        let value = table
+            .get("state")?
+            .ok_or_else(|| StorageError::InvalidControl("missing control state".into()))?;
+        if ControlState::decode(value.value())?.store_id != store_id {
+            return Err(StorageError::StoreLineageMismatch);
+        }
+        let table = tx.open_table(control::RECEIPTS)?;
+        table
+            .get(control::scoped_key(store_id, scope, operation_id.as_bytes()).as_slice())?
+            .map(|v| control::validate_receipt(v.value()).map(|r| r.receipt))
+            .transpose()
+    }
+
+    /// Atomic access patch + generation + receipt. `timestamp` is the sampled
+    /// server clock and deliberately excluded from retry identity; replay uses
+    /// the original committed timestamp. Callers with client-supplied timestamps
+    /// need a distinct operation/hash contract, not this method.
+    ///
+    /// Success certifies ONLY the canonical metadata commit. Search/cache
+    /// publication is not tracked here and must not be reported ready by callers.
+    pub fn update_access_with_receipt(
+        &self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        timestamp: i64,
+        kind: AccessKind,
+    ) -> Result<WriteReceipt, StorageError> {
+        let (tx, receipt) = self.prepare_access(ctx, id, timestamp, kind)?;
+        if !receipt.replayed {
+            tx.commit()
+                .map_err(|source| StorageError::CommitOutcomeUnknown {
+                    operation_id: receipt.operation_id,
+                    source,
+                })?;
+        }
+        Ok(receipt)
+    }
+
+    // Keep preparation and commit separate so tests can abandon the actual
+    // transaction at the last pre-commit boundary, without a fake backend.
+    fn prepare_access(
+        &self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        timestamp: i64,
+        kind: AccessKind,
+    ) -> Result<(redb::WriteTransaction, WriteReceipt), StorageError> {
+        let kind_bytes = control::encode(&kind)?;
+        let hash = control::request_hash(ctx, "record_access", &[id.as_bytes(), &kind_bytes]);
+        let tx = self.db.begin_write()?;
+        if let Some(receipt) = control::replay_or_check(&tx, ctx, hash)? {
+            return Ok((tx, receipt));
+        }
+        {
+            let mut table = tx.open_table(META_TABLE)?;
+            let mut record = {
+                let value = table
+                    .get(id.as_bytes().as_slice())?
+                    .ok_or(StorageError::NotFound(id.into_inner()))?;
+                DiskRecord::from_bytes(value.value())?
+            };
+            if ctx.scope != MutationScope::Namespace(NamespaceId::new(record.namespace_id)) {
+                return Err(StorageError::MutationNamespaceMismatch);
+            }
+            if record.phase == DecayPhase::Tombstone {
+                return Err(StorageError::NotFound(id.into_inner()));
+            }
+            record.last_accessed_at = timestamp;
             if record.access_history.len() >= ACCESS_HISTORY_MAX {
                 record.access_history.remove(0);
             }
-            record.access_history.push(event);
-        })?;
-
-        Ok(())
+            record.access_history.push(AccessEvent { timestamp, kind });
+            table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
+        }
+        let receipt = control::record_receipt(
+            &tx,
+            ctx,
+            hash,
+            MutationOutcome::AccessRecorded {
+                memory_id: id,
+                accessed_at: timestamp,
+            },
+        )?;
+        Ok((tx, receipt))
     }
 
     /// Delete a memory record and all its secondary index entries.
@@ -366,6 +469,7 @@ impl MetadataStore {
             let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             ns_idx.remove(deleted_record.namespace_id, key)?;
         }
+        control::advance_generation(&write_txn)?;
         write_txn.commit()?;
 
         // 4. Remove from in-memory phase bitmap.
@@ -436,6 +540,7 @@ impl MetadataStore {
             let mut ns_idx = write_txn.open_multimap_table(NAMESPACE_INDEX)?;
             ns_idx.remove(record.namespace_id, key)?;
         }
+        control::advance_generation(&write_txn)?;
         write_txn.commit()?;
 
         // Update phase bitmap: remove from old phase.
@@ -555,6 +660,7 @@ impl MetadataStore {
     pub fn update_edge_count(&self, id: MemoryId, edge_count: u16) -> Result<(), StorageError> {
         self.update_record(&id, |record| {
             record.edge_count = edge_count;
+            Ok(())
         })?;
 
         Ok(())
@@ -883,6 +989,7 @@ impl MetadataStore {
                 ));
             }
         }
+        control::advance_generation(&write_txn)?;
         write_txn.commit()?;
         let mut pi = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
         for (ns, slot, from, to) in transitions {
@@ -991,7 +1098,9 @@ impl MetadataStore {
             // Assign next ID.
             let mut counter_table = write_txn.open_table(NAMESPACE_COUNTER)?;
             let current_max = counter_table.get("max_id")?.map(|v| v.value()).unwrap_or(0);
-            new_id = current_max + 1;
+            new_id = current_max
+                .checked_add(1)
+                .ok_or_else(|| StorageError::InvalidControl("namespace ID exhausted".into()))?;
             counter_table.insert("max_id", new_id)?;
             drop(counter_table);
 
@@ -1004,6 +1113,7 @@ impl MetadataStore {
             let mut ns_table = write_txn.open_table(NAMESPACE_TABLE)?;
             ns_table.insert(new_id, bytes.as_slice())?;
         }
+        control::advance_generation(&write_txn)?;
         write_txn.commit()?;
 
         Ok(NamespaceId::new(new_id))
@@ -1093,6 +1203,7 @@ impl MetadataStore {
             config = serde_json::from_slice(value.value())
                 .map_err(|e| StorageError::Deserialize(e.to_string()))?;
         }
+        control::advance_generation(&write_txn)?;
         write_txn.commit()?;
         Ok(config)
     }
@@ -1265,6 +1376,7 @@ impl MetadataStore {
                 ns_idx.remove(ns, key)?;
             }
         }
+        control::advance_generation(&write_txn)?;
         write_txn.commit()?;
         Ok(())
     }
@@ -1388,6 +1500,7 @@ impl MetadataStore {
                 outcomes.push(TombstoneOutcome::Tombstoned(existing));
             }
         }
+        control::advance_generation(&write_txn)?;
         write_txn.commit()?;
 
         // Phase bitmaps only after the commit: a bitmap update rolled
@@ -1494,6 +1607,7 @@ mod tests {
                 .update_record(&id, |r| {
                     entered_tx.send(()).unwrap();
                     r.phase = DecayPhase::Ghost;
+                    Ok(())
                 })
                 .unwrap()
         });
@@ -1586,6 +1700,312 @@ mod tests {
         record.id = *id.as_bytes();
         store.insert(id, &record).expect("insert");
         id
+    }
+
+    fn keyed_context(store: &MetadataStore, namespace_id: u32, key: &str) -> MutationContext {
+        let state = store.control_state().unwrap();
+        MutationContext {
+            store_id: Some(state.store_id),
+            scope: MutationScope::Namespace(NamespaceId::new(namespace_id)),
+            idempotency_key: Some(key.into()),
+            expected_generation: Some(state.committed_generation),
+            contract_version: 1,
+        }
+    }
+
+    #[test]
+    fn access_receipt_aborted_transaction_and_overflow_leave_no_mutation() {
+        let (dir, store) = open_store();
+        let id = insert(&store, 1, 0, &[]);
+        let ctx = keyed_context(&store, 1, "abort");
+        let before = store.control_state().unwrap();
+        // All three writes have been staged in the real redb transaction.
+        let (tx, abandoned) = store
+            .prepare_access(&ctx, id, 123, AccessKind::DirectRetrieval)
+            .unwrap();
+        drop(tx);
+        drop(store);
+        let store = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
+        assert_eq!(store.control_state().unwrap(), before);
+        assert!(store.get(id).unwrap().unwrap().access_history.is_empty());
+        assert!(
+            store
+                .lookup_operation(before.store_id, ctx.scope, abandoned.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        let receipt = store
+            .update_access_with_receipt(&ctx, id, 456, AccessKind::DirectRetrieval)
+            .unwrap();
+        assert!(!receipt.replayed);
+        assert_eq!(
+            receipt.committed_generation.get(),
+            before.committed_generation.get() + 1
+        );
+
+        let mut exhausted = store.control_state().unwrap();
+        exhausted.committed_generation = control::Generation::MAX;
+        let tx = store.db.begin_write().unwrap();
+        tx.open_table(control::CONTROL)
+            .unwrap()
+            .insert("state", control::encode(&exhausted).unwrap().as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+        let ctx = keyed_context(&store, 1, "overflow");
+        let before_record = store.get(id).unwrap().unwrap().to_bytes();
+        assert!(matches!(
+            store.update_access_with_receipt(&ctx, id, 789, AccessKind::DirectRetrieval),
+            Err(StorageError::GenerationExhausted)
+        ));
+        assert_eq!(store.get(id).unwrap().unwrap().to_bytes(), before_record);
+        assert_eq!(store.control_state().unwrap(), exhausted);
+        assert_eq!(
+            store
+                .db
+                .begin_read()
+                .unwrap()
+                .open_table(control::RECEIPTS)
+                .unwrap()
+                .len()
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn access_receipt_replay_precedes_cas_but_never_lineage_check() {
+        let (_dir, store) = open_store();
+        let id = insert(&store, 1, 0, &[]);
+        let ctx = keyed_context(&store, 1, "access");
+        let original = store
+            .update_access_with_receipt(&ctx, id, 123, AccessKind::DirectRetrieval)
+            .unwrap();
+        let unrelated = insert(&store, 2, 0, &[]);
+        let before = store.control_state().unwrap();
+        let replay = store
+            .update_access_with_receipt(&ctx, id, 999, AccessKind::DirectRetrieval)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation_id, original.operation_id);
+        assert_eq!(replay.outcome, original.outcome);
+        assert_eq!(replay.committed_generation, original.committed_generation);
+        assert_eq!(store.control_state().unwrap(), before);
+        assert_eq!(store.get(id).unwrap().unwrap().access_history.len(), 1);
+        assert_eq!(store.get(id).unwrap().unwrap().last_accessed_at, 123);
+
+        let mut stale = ctx.clone();
+        stale.idempotency_key = Some("new-key".into());
+        assert!(matches!(
+            store.update_access_with_receipt(&stale, id, 999, AccessKind::DirectRetrieval),
+            Err(StorageError::GenerationConflict { .. })
+        ));
+        let mut foreign = ctx.clone();
+        foreign.store_id = Some(uuid::Uuid::new_v4());
+        assert!(matches!(
+            store.update_access_with_receipt(&foreign, id, 999, AccessKind::DirectRetrieval),
+            Err(StorageError::StoreLineageMismatch)
+        ));
+        assert!(matches!(
+            store.update_access_with_receipt(&ctx, unrelated, 999, AccessKind::DirectRetrieval),
+            Err(StorageError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            store.update_access_with_receipt(&ctx, id, 999, AccessKind::ManualReinforcement),
+            Err(StorageError::IdempotencyConflict)
+        ));
+        let tx = store.db.begin_write().unwrap();
+        assert!(matches!(
+            control::replay_or_check(
+                &tx,
+                &ctx,
+                control::request_hash(&ctx, "another_operation", &[id.as_bytes()])
+            ),
+            Err(StorageError::IdempotencyConflict)
+        ));
+        drop(tx);
+        assert_eq!(store.control_state().unwrap(), before);
+    }
+
+    #[test]
+    fn access_receipts_serialize_concurrent_retries_and_scope_keys_by_namespace() {
+        let (_dir, store) = open_store();
+        let store = std::sync::Arc::new(store);
+        let id = insert(&store, 1, 0, &[]);
+        let other = insert(&store, 2, 0, &[]);
+        let ctx = keyed_context(&store, 1, "same-key");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                let ctx = ctx.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    store
+                        .update_access_with_receipt(&ctx, id, i, AccessKind::DirectRetrieval)
+                        .unwrap()
+                })
+            })
+            .collect();
+        let receipts: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(receipts.iter().filter(|r| !r.replayed).count(), 1);
+        assert!(
+            receipts
+                .iter()
+                .all(|r| r.operation_id == receipts[0].operation_id)
+        );
+        assert_eq!(store.get(id).unwrap().unwrap().access_history.len(), 1);
+        let other_ctx = keyed_context(&store, 2, "same-key");
+        let other_receipt = store
+            .update_access_with_receipt(&other_ctx, other, 456, AccessKind::DirectRetrieval)
+            .unwrap();
+        assert!(!other_receipt.replayed);
+        assert_ne!(other_receipt.operation_id, receipts[0].operation_id);
+        let wrong_scope = keyed_context(&store, 2, "wrong-scope");
+        let before = store.control_state().unwrap();
+        assert!(matches!(
+            store.update_access_with_receipt(&wrong_scope, id, 0, AccessKind::DirectRetrieval),
+            Err(StorageError::MutationNamespaceMismatch)
+        ));
+        assert_eq!(store.control_state().unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_metadata_mutations_advance_generation_but_reads_and_checkpoints_do_not() {
+        let (_dir, store) = open_store();
+        let mut generation = 0;
+        let mut advanced = || {
+            generation += 1;
+            assert_eq!(
+                store.control_state().unwrap().committed_generation.get(),
+                generation
+            );
+        };
+        let ns = store
+            .create_namespace(&NamespaceConfig::default_namespace(0))
+            .unwrap();
+        advanced();
+        let id = insert(&store, ns.get(), 0, &[]);
+        advanced();
+        store
+            .update_access(id, 123, AccessKind::DirectRetrieval)
+            .unwrap();
+        advanced();
+        store.update_edge_count(id, 3).unwrap();
+        advanced();
+        store
+            .update_decay_state(id, DecayPhase::Summary, 0.5, 0.5, 1.0, false)
+            .unwrap();
+        advanced();
+        store.strip_full_text(id).unwrap();
+        advanced();
+        store.strip_summary(id).unwrap();
+        advanced();
+        store
+            .batch_update_records(&[(id, store.get(id).unwrap().unwrap())])
+            .unwrap();
+        advanced();
+        store
+            .decay_sweep(|r| {
+                let mut r = r.clone();
+                r.strength = 0.4;
+                Some(r)
+            })
+            .unwrap();
+        advanced();
+        store.tombstone(id).unwrap();
+        advanced();
+        let terminal = store.control_state().unwrap();
+        assert!(
+            store
+                .update_access(id, 456, AccessKind::DirectRetrieval)
+                .is_err()
+        );
+        assert!(
+            store
+                .update_decay_state(id, DecayPhase::Full, 1.0, 1.0, 1.0, false)
+                .is_err()
+        );
+        assert_eq!(store.control_state().unwrap(), terminal);
+        store.delete(id).unwrap();
+        advanced();
+        let id = insert(&store, ns.get(), 0, &[]);
+        advanced();
+        store.batch_tombstone(&[id]).unwrap();
+        advanced();
+        store.purge_namespace_records(ns, 1).unwrap();
+        advanced();
+        store.delete_namespace(ns).unwrap();
+        advanced();
+        let before = store.control_state().unwrap();
+        store.get(id).unwrap();
+        store.list_namespaces().unwrap();
+        store.scan_all().unwrap();
+        store.persist_phase_index().unwrap();
+        store.rebuild_phase_index().unwrap();
+        store.batch_update_records(&[]).unwrap();
+        assert_eq!(store.control_state().unwrap(), before);
+    }
+
+    #[test]
+    fn control_adopts_legacy_records_without_reencoding_and_fails_closed_on_unknown_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.db");
+        let id = MemoryId::new();
+        let mut record = record_in(1, 0, &[]);
+        record.id = *id.as_bytes();
+        let bytes = record.to_bytes();
+        {
+            let db = Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            tx.open_table(META_TABLE)
+                .unwrap()
+                .insert(id.as_bytes().as_slice(), bytes.as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let store = MetadataStore::open(&path).unwrap();
+        assert_eq!(store.get(id).unwrap().unwrap().to_bytes(), bytes);
+        let original = store.control_state().unwrap();
+        assert_eq!(original.committed_generation.get(), 0);
+        drop(store);
+        let store = MetadataStore::open(&path).unwrap();
+        assert_eq!(store.control_state().unwrap(), original);
+        let mut future = original;
+        future.control_schema_version = 2;
+        let tx = store.db.begin_write().unwrap();
+        tx.open_table(control::CONTROL)
+            .unwrap()
+            .insert("state", control::encode(&future).unwrap().as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+        drop(store);
+        assert!(matches!(
+            MetadataStore::open(&path),
+            Err(StorageError::InvalidControl(_))
+        ));
+    }
+
+    #[test]
+    fn control_missing_row_or_receipt_table_never_mints_a_new_lineage() {
+        for remove_row in [true, false] {
+            let (dir, store) = open_store();
+            let tx = store.db.begin_write().unwrap();
+            if remove_row {
+                tx.open_table(control::CONTROL)
+                    .unwrap()
+                    .remove("state")
+                    .unwrap();
+            } else {
+                tx.delete_table(control::RECEIPTS).unwrap();
+            }
+            tx.commit().unwrap();
+            drop(store);
+            assert!(matches!(
+                MetadataStore::open(&dir.path().join("meta.db")),
+                Err(StorageError::InvalidControl(_))
+            ));
+        }
     }
 
     // ── the non-force emptiness guard ────────────────────────────────

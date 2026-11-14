@@ -15,6 +15,7 @@ use crate::model::validation::validate_namespace_name;
 use crate::model::{
     AccessKind, DecayPhase, DiskRecord, EdgeType, MemoryId, NamespaceConfig, NamespaceId,
 };
+use crate::storage::control::{ControlState, MutationContext, MutationScope, WriteReceipt};
 use crate::storage::edges::{EdgeStore, PersistedEdge, cleanup_orphaned_edges};
 use crate::storage::error::StorageError;
 use crate::storage::metadata::MetadataStore;
@@ -282,6 +283,35 @@ pub struct RedbStorageEngine {
 }
 
 impl RedbStorageEngine {
+    /// Metadata lineage/generation foundation; not a whole-store read snapshot.
+    pub fn control_state(&self) -> Result<ControlState, StorageError> {
+        self.meta_store.control_state()
+    }
+
+    /// Commit an access event and its receipt in one metadata transaction.
+    /// This acknowledges canonical commit only. Derived readiness is untracked;
+    /// adapters must not advertise v2 ready-write semantics from this receipt.
+    pub fn update_access_with_receipt(
+        &self,
+        ctx: &MutationContext,
+        id: MemoryId,
+        timestamp: i64,
+        kind: AccessKind,
+    ) -> Result<WriteReceipt, StorageError> {
+        self.meta_store
+            .update_access_with_receipt(ctx, id, timestamp, kind)
+    }
+
+    pub fn lookup_operation(
+        &self,
+        store_id: uuid::Uuid,
+        scope: MutationScope,
+        operation_id: uuid::Uuid,
+    ) -> Result<Option<WriteReceipt>, StorageError> {
+        self.meta_store
+            .lookup_operation(store_id, scope, operation_id)
+    }
+
     /// Open or create a storage engine at the given directory path.
     ///
     /// Performs the full initialization sequence:
@@ -1693,6 +1723,74 @@ mod tests {
             .insert_memory(id, namespace_id, &mut record, &[0.0; DIM], None)
             .expect("insert memory");
         id
+    }
+
+    #[test]
+    fn canonical_access_receipt_restarts_and_survives_namespace_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_engine(dir.path());
+        let namespace = make_namespace(&mut engine, "receipts");
+        let id = add_memory(&mut engine, namespace);
+        let state = engine.control_state().unwrap();
+        let ctx = MutationContext {
+            store_id: Some(state.store_id),
+            scope: MutationScope::Namespace(namespace),
+            idempotency_key: Some("request-1".into()),
+            expected_generation: Some(state.committed_generation),
+            contract_version: 1,
+        };
+        let receipt = engine
+            .update_access_with_receipt(&ctx, id, 123, AccessKind::DirectRetrieval)
+            .unwrap();
+        // Lost-response boundary: close immediately after the real commit,
+        // without an explicit sync/checkpoint acknowledgement to the caller.
+        drop(engine);
+        let mut engine = open_engine(dir.path());
+        assert_eq!(engine.control_state().unwrap().store_id, state.store_id);
+        assert_eq!(
+            engine
+                .lookup_operation(state.store_id, ctx.scope, receipt.operation_id)
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        let replay = engine
+            .update_access_with_receipt(&ctx, id, 999, AccessKind::DirectRetrieval)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation_id, receipt.operation_id);
+        assert_eq!(replay.outcome, receipt.outcome);
+        assert_eq!(
+            engine.get_record(id).unwrap().unwrap().access_history.len(),
+            1
+        );
+        engine.purge_namespace(namespace).unwrap();
+        let replacement = make_namespace(&mut engine, "receipts");
+        assert_ne!(replacement, namespace);
+        drop(engine);
+        let engine = open_engine(dir.path());
+        let before = engine.control_state().unwrap();
+        let replay = engine
+            .update_access_with_receipt(&ctx, id, 1000, AccessKind::DirectRetrieval)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation_id, receipt.operation_id);
+        assert_eq!(engine.control_state().unwrap(), before);
+        assert!(engine.get_record(id).unwrap().is_none());
+        assert!(
+            engine
+                .lookup_operation(
+                    state.store_id,
+                    MutationScope::Namespace(replacement),
+                    receipt.operation_id
+                )
+                .unwrap()
+                .is_none()
+        );
+        let encoded = serde_json::to_value(&replay).unwrap();
+        assert!(encoded["committedGeneration"].is_string());
+        assert_eq!(encoded["receiptVersion"], 1);
+        assert!(encoded.get("ready").is_none()); // Receipt is not a readiness claim.
+        assert!(!encoded.to_string().contains("fixture"));
     }
 
     /// The directory shape the boot sweep recognizes, planted by hand.

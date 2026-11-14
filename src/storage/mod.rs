@@ -14,6 +14,7 @@
 //! - `error` — Unified `StorageError` type
 //! - `fsync` — Filesystem sync helpers for crash safety
 
+pub mod control;
 pub mod edges;
 pub mod engine;
 pub mod error;
