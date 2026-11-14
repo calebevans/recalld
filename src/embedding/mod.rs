@@ -10,6 +10,7 @@ mod ollama;
 mod openai;
 mod passthrough;
 mod prefix;
+pub mod profile;
 mod provider;
 
 mod bedrock;

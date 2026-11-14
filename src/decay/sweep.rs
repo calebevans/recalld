@@ -1425,6 +1425,7 @@ mod tests {
 
         let id = MemoryId::new();
         let mut record = DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *id.as_bytes(),
             namespace_id: namespace_id.get(),

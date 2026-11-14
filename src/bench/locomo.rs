@@ -1273,6 +1273,7 @@ pub(super) async fn store_single_memory(
     let memory_id = MemoryId::new();
 
     let mut record = DiskRecord {
+        schema: None,
         version: DiskRecord::CURRENT_VERSION,
         id: *memory_id.as_bytes(),
         namespace_id: ns_config.id.get(),

@@ -185,7 +185,7 @@ impl MetadataStore {
                 }
                 record.text_offset = reference.file_offset;
                 record.text_length = reference.length;
-                records.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
+                records.insert(id.as_bytes().as_slice(), record.encode()?.as_slice())?;
             }
         }
         {

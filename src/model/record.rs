@@ -26,6 +26,7 @@ pub struct DiskRecord {
     // ── Header ───────────────────────────────────────────────────────
     /// Schema version. Current: 1.
     pub version: u8,
+    pub schema: Option<crate::model::schema::RecordSchemaV2>,
 
     // ── Fixed-size fields ────────────────────────────────────────────
     /// UUID bytes, big-endian.
@@ -105,6 +106,20 @@ impl DiskRecord {
     /// [access_count: u16 LE] ( [timestamp: i64 LE] [kind: u8] ) *
     /// ```
     pub fn to_bytes(&self) -> Vec<u8> {
+        if self.version == 2 {
+            let mut legacy = self.clone();
+            legacy.version = 1;
+            legacy.schema = None;
+            let base = legacy.to_bytes();
+            let extra =
+                serde_json::to_vec(&self.schema).expect("schema contains only serializable values");
+            let mut bytes = vec![2];
+            bytes.extend_from_slice(&(base.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&base);
+            bytes.extend_from_slice(&(extra.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&extra);
+            return bytes;
+        }
         let mut buf = Vec::with_capacity(512);
 
         // Fixed fields
@@ -159,8 +174,67 @@ impl DiskRecord {
         let version = data[0];
         match version {
             1 => Self::decode_v1(data),
+            2 => Self::decode_v2(data),
             v => Err(DecodeError::UnknownVersion(v)),
         }
+    }
+
+    /// Checked canonical encoder. All persistence/migration callers use this.
+    pub fn encode(&self) -> Result<Vec<u8>, DecodeError> {
+        if self.summary.len() > u16::MAX as usize
+            || self.tags.len() > u16::MAX as usize
+            || self.access_history.len() > u16::MAX as usize
+        {
+            return Err(DecodeError::InvalidSchema(
+                "record field exceeds codec bounds".into(),
+            ));
+        }
+        match (self.version, &self.schema) {
+            (1, None) => {}
+            (2, Some(schema)) => schema.validate(self).map_err(DecodeError::InvalidSchema)?,
+            _ => {
+                return Err(DecodeError::InvalidSchema(
+                    "version/schema disagreement".into(),
+                ));
+            }
+        }
+        Ok(self.to_bytes())
+    }
+
+    fn decode_v2(data: &[u8]) -> Result<Self, DecodeError> {
+        fn part<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8], DecodeError> {
+            let end = pos
+                .checked_add(4)
+                .filter(|e| *e <= data.len())
+                .ok_or_else(|| DecodeError::InvalidSchema("truncated v2 length".into()))?;
+            let len = u32::from_le_bytes(data[*pos..end].try_into().unwrap()) as usize;
+            *pos = end;
+            let end = pos
+                .checked_add(len)
+                .filter(|e| *e <= data.len())
+                .ok_or_else(|| DecodeError::InvalidSchema("truncated v2 field".into()))?;
+            let value = &data[*pos..end];
+            *pos = end;
+            Ok(value)
+        }
+        let mut pos = 1;
+        let base = part(data, &mut pos)?;
+        if base.first() != Some(&1) {
+            return Err(DecodeError::InvalidSchema("v2 base is not v1".into()));
+        }
+        let mut record = Self::decode_v1(base)?;
+        let schema: crate::model::schema::RecordSchemaV2 =
+            serde_json::from_slice(part(data, &mut pos)?)
+                .map_err(|e| DecodeError::InvalidSchema(e.to_string()))?;
+        if pos != data.len() {
+            return Err(DecodeError::InvalidSchema("trailing v2 bytes".into()));
+        }
+        schema
+            .validate(&record)
+            .map_err(DecodeError::InvalidSchema)?;
+        record.version = 2;
+        record.schema = Some(schema);
+        Ok(record)
     }
 
     /// Decode a version-1 record from raw bytes.
@@ -231,14 +305,14 @@ impl DiskRecord {
             let tag_str = read_length_prefixed_string(data, &mut pos, "tag")?;
             // Use Tag::new for validation; corrupt tags are a fatal
             // decode error (invalid UTF-8 is caught by the string read).
-            match Tag::new(tag_str) {
-                Ok(tag) => tags.push(tag),
-                Err(_) => {
-                    // Tag validation failed but UTF-8 was valid.
-                    // Skip this tag silently rather than failing the
-                    // entire record — this is a recoverable corruption.
-                }
+            let tag = Tag::new(tag_str.clone())
+                .map_err(|_| DecodeError::InvalidSchema("invalid retained tag".into()))?;
+            if tag.as_str() != tag_str {
+                return Err(DecodeError::InvalidSchema(
+                    "noncanonical retained tag would be changed".into(),
+                ));
             }
+            tags.push(tag);
         }
 
         // Variable: access history
@@ -253,13 +327,17 @@ impl DiskRecord {
             }
             let timestamp = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let kind = access_kind_from_u8(data[pos]);
+            let kind = access_kind_from_u8(data[pos])?;
             pos += 1;
             access_history.push(AccessEvent { timestamp, kind });
         }
 
+        if pos != data.len() {
+            return Err(DecodeError::InvalidSchema("trailing record bytes".into()));
+        }
         Ok(DiskRecord {
             version,
+            schema: None,
             id,
             namespace_id,
             created_at,
@@ -326,17 +404,16 @@ fn access_kind_to_u8(kind: AccessKind) -> u8 {
     }
 }
 
-/// Convert a u8 discriminant to an `AccessKind`, defaulting to
-/// `DirectRetrieval` for unknown values (recoverable).
-fn access_kind_from_u8(val: u8) -> AccessKind {
-    match val {
+/// Unknown events fail closed; migration must never invent retrieval evidence.
+fn access_kind_from_u8(val: u8) -> Result<AccessKind, DecodeError> {
+    Ok(match val {
         1 => AccessKind::DirectRetrieval,
         2 => AccessKind::AssociativeRetrieval,
         3 => AccessKind::DecaySweep,
         4 => AccessKind::ManualReinforcement,
         // Default to DirectRetrieval for unknown values (recoverable).
-        _ => AccessKind::DirectRetrieval,
-    }
+        _ => return Err(DecodeError::InvalidSchema("unknown access kind".into())),
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -383,7 +460,7 @@ pub struct CachedRecord {
     pub edge_count: u16,
     /// Index into the namespace's vectors.dat.
     pub vector_slot: u32,
-    /// Named entities extracted from the summary (derived at load time).
+    /// Exact canonical entities, or entities parsed from retained legacy tags.
     pub entities: Vec<String>,
 }
 
@@ -430,6 +507,7 @@ impl From<&Memory> for DiskRecord {
     /// registry.
     fn from(m: &Memory) -> Self {
         DiskRecord {
+            schema: None,
             version: DiskRecord::CURRENT_VERSION,
             id: *m.id.as_bytes(),
             namespace_id: 0, // Must be set by caller from namespace registry
@@ -455,9 +533,13 @@ impl From<&Memory> for DiskRecord {
 impl From<&DiskRecord> for CachedRecord {
     /// Convert a DiskRecord to a CachedRecord for insertion into the
     /// moka cache. Drops full_text pointer and access_history (not
-    /// cached). Parses entities from stored tags (entity/ prefix).
+    /// cached). Preserves schema entities verbatim; schema-less records use
+    /// the existing retained-tag parser (entity/ prefix).
     fn from(d: &DiskRecord) -> Self {
-        let entities = crate::model::parse_structured_tags(&d.tags).entities;
+        let entities = d.schema.as_ref().map_or_else(
+            || crate::model::parse_structured_tags(&d.tags).entities,
+            |schema| schema.labels.entities.clone(),
+        );
         CachedRecord {
             id: MemoryId::from_bytes(d.id),
             namespace_id: NamespaceId::new(d.namespace_id),
