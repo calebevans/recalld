@@ -1,0 +1,828 @@
+{
+  "manifest": {
+    "candidate_source": "dec5b23199bff767cef1e3ce2c91701f0f730f98",
+    "probe_sha256": "d7c1ca01f28ce3c91cd7411596f5085a83b9ca5e0b3dd75930e4994608503079",
+    "anchor_source": "1ceec0b9134456f902de7487d024801f0e5e85cc",
+    "runtime_parent": "3b590fb28c84bb2aa2d8afaac66e34556d7da6a6",
+    "anchor_binary_sha256": "da1bb69833b40cdb1b28c69dc69692d6fc6e2bd3844e5bc422591635e0aac3bf",
+    "candidate_binary_sha256": "8e878b091971113de622d6c3913d8e710a30ef99e4cfeee74f8043d6c7f55830",
+    "deadline_utc": "2026-11-14T13:58:27Z",
+    "mode": "quiet",
+    "orders": {
+      "7": "ADE",
+      "19": "DEA",
+      "41": "EAD",
+      "73": "AED",
+      "101": "DAE"
+    },
+    "seeds": [
+      7,
+      19,
+      41,
+      73,
+      101
+    ],
+    "runtime": {
+      "image": "sha256:daefdc9cbe9b0f39b1fc29d975148b3b10adc1bd4309f9ca1be8abd36ed811ef",
+      "network": "none",
+      "cpus": 2,
+      "memory": "4g"
+    },
+    "warmup": 200,
+    "samples": 1000,
+    "throughput_seconds": 60,
+    "sink": "full JSON file, synchronous per-request flush",
+    "sampling": 1,
+    "host_before": {
+      "time_ns": 1794663542394145000,
+      "loadavg": [
+        1.6259765625,
+        2.56005859375,
+        3.27490234375
+      ],
+      "container_count": 14,
+      "images": {
+        "public.ecr.aws/docker/library/postgres:16": {
+          "count": 14,
+          "cpu_percent_sum": 0.05,
+          "memory_usage_samples": [
+            "14.88MiB / 15.66GiB",
+            "17.34MiB / 15.66GiB",
+            "17.72MiB / 15.66GiB",
+            "17.92MiB / 15.66GiB",
+            "13.28MiB / 15.66GiB",
+            "8.918MiB / 15.66GiB",
+            "11.55MiB / 15.66GiB",
+            "16.21MiB / 15.66GiB",
+            "13.93MiB / 15.66GiB",
+            "17.22MiB / 15.66GiB",
+            "16.83MiB / 15.66GiB",
+            "17.25MiB / 15.66GiB",
+            "13.55MiB / 15.66GiB",
+            "14.41MiB / 15.66GiB"
+          ],
+          "missing_stats": 0
+        }
+      },
+      "host_cpu_percent": {
+        "user": 4.72,
+        "system": 1.25,
+        "idle": 94.2
+      }
+    }
+  },
+  "preflight": [
+    {
+      "time_ns": 1794663546159686000,
+      "loadavg": [
+        1.73583984375,
+        2.56689453125,
+        3.27294921875
+      ],
+      "container_count": 14,
+      "images": {
+        "public.ecr.aws/docker/library/postgres:16": {
+          "count": 14,
+          "cpu_percent_sum": 0.04,
+          "memory_usage_samples": [
+            "14.8MiB / 15.66GiB",
+            "17.76MiB / 15.66GiB",
+            "18.32MiB / 15.66GiB",
+            "18.46MiB / 15.66GiB",
+            "13.83MiB / 15.66GiB",
+            "9.098MiB / 15.66GiB",
+            "11.67MiB / 15.66GiB",
+            "16.33MiB / 15.66GiB",
+            "14.31MiB / 15.66GiB",
+            "17.29MiB / 15.66GiB",
+            "17.47MiB / 15.66GiB",
+            "17.44MiB / 15.66GiB",
+            "13.25MiB / 15.66GiB",
+            "13.34MiB / 15.66GiB"
+          ],
+          "missing_stats": 0
+        }
+      },
+      "host_cpu_percent": {
+        "user": 2.0,
+        "system": 1.4,
+        "idle": 96.58
+      }
+    },
+    {
+      "time_ns": 1794663549893244000,
+      "loadavg": [
+        1.73583984375,
+        2.56689453125,
+        3.27294921875
+      ],
+      "container_count": 14,
+      "images": {
+        "public.ecr.aws/docker/library/postgres:16": {
+          "count": 14,
+          "cpu_percent_sum": 0.03,
+          "memory_usage_samples": [
+            "14.82MiB / 15.66GiB",
+            "17.76MiB / 15.66GiB",
+            "18.32MiB / 15.66GiB",
+            "18.2MiB / 15.66GiB",
+            "13.82MiB / 15.66GiB",
+            "9.098MiB / 15.66GiB",
+            "11.67MiB / 15.66GiB",
+            "16.33MiB / 15.66GiB",
+            "14.31MiB / 15.66GiB",
+            "17.29MiB / 15.66GiB",
+            "17.47MiB / 15.66GiB",
+            "17.44MiB / 15.66GiB",
+            "13.25MiB / 15.66GiB",
+            "13.34MiB / 15.66GiB"
+          ],
+          "missing_stats": 0
+        }
+      },
+      "host_cpu_percent": {
+        "user": 2.37,
+        "system": 1.48,
+        "idle": 96.13
+      }
+    },
+    {
+      "time_ns": 1794663553661948000,
+      "loadavg": [
+        1.8369140625,
+        2.57373046875,
+        3.27099609375
+      ],
+      "container_count": 14,
+      "images": {
+        "public.ecr.aws/docker/library/postgres:16": {
+          "count": 14,
+          "cpu_percent_sum": 0.0,
+          "memory_usage_samples": [
+            "14.82MiB / 15.66GiB",
+            "17.23MiB / 15.66GiB",
+            "17.72MiB / 15.66GiB",
+            "18.61MiB / 15.66GiB",
+            "13.79MiB / 15.66GiB",
+            "9.297MiB / 15.66GiB",
+            "11.81MiB / 15.66GiB",
+            "16.72MiB / 15.66GiB",
+            "14.12MiB / 15.66GiB",
+            "17.54MiB / 15.66GiB",
+            "17.47MiB / 15.66GiB",
+            "17.44MiB / 15.66GiB",
+            "13.59MiB / 15.66GiB",
+            "13.55MiB / 15.66GiB"
+          ],
+          "missing_stats": 0
+        }
+      },
+      "host_cpu_percent": {
+        "user": 2.4,
+        "system": 1.29,
+        "idle": 96.66
+      }
+    }
+  ],
+  "cleanup": {
+    "time_utc": "2026-11-14T13:57:34.903168+00:00",
+    "own_probe_containers_remaining": 0,
+    "measurement_finished": true
+  },
+  "host_summary": {
+    "captures": 77,
+    "capture_errors": 0,
+    "container_counts": [
+      14,
+      15
+    ],
+    "host_idle_percent_range": [
+      82.67,
+      96.13
+    ],
+    "images": [
+      "daefdc9cbe9b",
+      "public.ecr.aws/docker/library/postgres:16"
+    ],
+    "postgres_cpu_percent_sum_range": [
+      0.0,
+      31.870000000000005
+    ],
+    "build_exclusive_coordinated": true,
+    "whole_host_exclusive": false
+  },
+  "ratios": {
+    "D": {
+      "p95": {
+        "geometric_mean": 1.002475219316928,
+        "ci95": [
+          0.9718932674952225,
+          1.0412313672005096
+        ],
+        "pairs": [
+          0.9826957284632287,
+          0.9596918835095894,
+          1.0677250634592168,
+          1.0271948272591567,
+          0.9788250567893487
+        ]
+      },
+      "throughput": {
+        "geometric_mean": 0.9889439386448555,
+        "ci95": [
+          0.9834444070223799,
+          0.994599316853319
+        ],
+        "pairs": [
+          0.9791688228338117,
+          0.9871599228344884,
+          0.9873670798754975,
+          0.9926332712713859,
+          0.9984947863146838
+        ]
+      }
+    },
+    "E": {
+      "p95": {
+        "geometric_mean": 1.106281019658185,
+        "ci95": [
+          1.0412940949658582,
+          1.1891812278156377
+        ],
+        "pairs": [
+          1.0601001279770768,
+          1.0095102994945155,
+          1.122503951234255,
+          1.0816232443443765,
+          1.2752806650476967
+        ]
+      },
+      "throughput": {
+        "geometric_mean": 0.9333024564085601,
+        "ci95": [
+          0.9260841490729683,
+          0.939137067033302
+        ],
+        "pairs": [
+          0.9192162454269799,
+          0.9351285948583307,
+          0.9393422033307048,
+          0.940942211366953,
+          0.9320436012153217
+        ]
+      }
+    }
+  },
+  "arms": [
+    {
+      "seed": 7,
+      "arm": "A",
+      "p95_ms": 1.24241,
+      "requests_per_second": 859.9104313128108,
+      "peak_rss_bytes": 76247040,
+      "queries": 52795,
+      "canonical_state_sha256": "2fd466c90fccefd922960dbe74021cf69327963ebf1a390166c9ba9975bb0426",
+      "result_sha256": "7e904dcc10929099a52b1877d463ea8bcea2fb8c069191c66499d8060d473b43",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 7,
+      "arm": "D",
+      "p95_ms": 1.220911,
+      "requests_per_second": 841.9974847710803,
+      "peak_rss_bytes": 75423744,
+      "queries": 51720,
+      "canonical_state_sha256": "2fd466c90fccefd922960dbe74021cf69327963ebf1a390166c9ba9975bb0426",
+      "result_sha256": "7e904dcc10929099a52b1877d463ea8bcea2fb8c069191c66499d8060d473b43",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 7,
+      "arm": "E",
+      "p95_ms": 1.317079,
+      "requests_per_second": 790.4436380748568,
+      "peak_rss_bytes": 76673024,
+      "queries": 48627,
+      "canonical_state_sha256": "2fd466c90fccefd922960dbe74021cf69327963ebf1a390166c9ba9975bb0426",
+      "result_sha256": "7e904dcc10929099a52b1877d463ea8bcea2fb8c069191c66499d8060d473b43",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 19,
+      "arm": "A",
+      "p95_ms": 1.301326,
+      "requests_per_second": 844.3161042536377,
+      "peak_rss_bytes": 76279808,
+      "queries": 51859,
+      "canonical_state_sha256": "9353034ecf60a099381fc2d5d257d5d339fe55694fc9d1c4e7bc89c8d6affcaa",
+      "result_sha256": "50da8f43be0bb1b8966a52f3baf3aad41afb50e52569462de188fe9ac76ec989",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 19,
+      "arm": "D",
+      "p95_ms": 1.248872,
+      "requests_per_second": 833.4750203229369,
+      "peak_rss_bytes": 75730944,
+      "queries": 51209,
+      "canonical_state_sha256": "9353034ecf60a099381fc2d5d257d5d339fe55694fc9d1c4e7bc89c8d6affcaa",
+      "result_sha256": "50da8f43be0bb1b8966a52f3baf3aad41afb50e52569462de188fe9ac76ec989",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 19,
+      "arm": "E",
+      "p95_ms": 1.313702,
+      "requests_per_second": 789.544132186964,
+      "peak_rss_bytes": 75792384,
+      "queries": 48573,
+      "canonical_state_sha256": "9353034ecf60a099381fc2d5d257d5d339fe55694fc9d1c4e7bc89c8d6affcaa",
+      "result_sha256": "50da8f43be0bb1b8966a52f3baf3aad41afb50e52569462de188fe9ac76ec989",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 41,
+      "arm": "A",
+      "p95_ms": 1.211014,
+      "requests_per_second": 851.0326745063883,
+      "peak_rss_bytes": 75595776,
+      "queries": 52262,
+      "canonical_state_sha256": "0d07a9d21881f5f048a9ee9bc10bc3cdf4e5fc762d5e100f7e492afe189df0fc",
+      "result_sha256": "b5d8eba27cd3c909815f68539b3c6991aa714f559657b7ce85a3ae1bb5f64634",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 41,
+      "arm": "D",
+      "p95_ms": 1.29303,
+      "requests_per_second": 840.2816467060073,
+      "peak_rss_bytes": 76550144,
+      "queries": 51617,
+      "canonical_state_sha256": "0d07a9d21881f5f048a9ee9bc10bc3cdf4e5fc762d5e100f7e492afe189df0fc",
+      "result_sha256": "b5d8eba27cd3c909815f68539b3c6991aa714f559657b7ce85a3ae1bb5f64634",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 41,
+      "arm": "E",
+      "p95_ms": 1.359368,
+      "requests_per_second": 799.4109075772533,
+      "peak_rss_bytes": 75235328,
+      "queries": 49165,
+      "canonical_state_sha256": "0d07a9d21881f5f048a9ee9bc10bc3cdf4e5fc762d5e100f7e492afe189df0fc",
+      "result_sha256": "b5d8eba27cd3c909815f68539b3c6991aa714f559657b7ce85a3ae1bb5f64634",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 73,
+      "arm": "A",
+      "p95_ms": 1.21251,
+      "requests_per_second": 850.1678376642234,
+      "peak_rss_bytes": 75612160,
+      "queries": 52211,
+      "canonical_state_sha256": "0c24da41f9dc5462bba9d2cf994c232092cc226bf3ecd097e932d83f801c0e4b",
+      "result_sha256": "f3c00f457b723f9f3698646a77893c9697f3ef1b0b6a48bb1b24a0b256c97625",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 73,
+      "arm": "D",
+      "p95_ms": 1.245484,
+      "requests_per_second": 843.9048818303586,
+      "peak_rss_bytes": 75603968,
+      "queries": 51835,
+      "canonical_state_sha256": "0c24da41f9dc5462bba9d2cf994c232092cc226bf3ecd097e932d83f801c0e4b",
+      "result_sha256": "f3c00f457b723f9f3698646a77893c9697f3ef1b0b6a48bb1b24a0b256c97625",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 73,
+      "arm": "E",
+      "p95_ms": 1.311479,
+      "requests_per_second": 799.958805204835,
+      "peak_rss_bytes": 75706368,
+      "queries": 49198,
+      "canonical_state_sha256": "0c24da41f9dc5462bba9d2cf994c232092cc226bf3ecd097e932d83f801c0e4b",
+      "result_sha256": "f3c00f457b723f9f3698646a77893c9697f3ef1b0b6a48bb1b24a0b256c97625",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 101,
+      "arm": "A",
+      "p95_ms": 1.249354,
+      "requests_per_second": 847.1575509125558,
+      "peak_rss_bytes": 76623872,
+      "queries": 52030,
+      "canonical_state_sha256": "a1b8c0364483ceef600ffc7e1532bf11b0f1419186b5807cb2fa0cc8b8e8ce9a",
+      "result_sha256": "c846ead79f2181d4b9c402cf06c8c40b2824a49dd8152c8e21e698535f4c3c1a",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 101,
+      "arm": "D",
+      "p95_ms": 1.222899,
+      "requests_per_second": 845.8823977733033,
+      "peak_rss_bytes": 75993088,
+      "queries": 51953,
+      "canonical_state_sha256": "a1b8c0364483ceef600ffc7e1532bf11b0f1419186b5807cb2fa0cc8b8e8ce9a",
+      "result_sha256": "c846ead79f2181d4b9c402cf06c8c40b2824a49dd8152c8e21e698535f4c3c1a",
+      "within_absolute_budgets": true
+    },
+    {
+      "seed": 101,
+      "arm": "E",
+      "p95_ms": 1.593277,
+      "requests_per_second": 789.5877745492908,
+      "peak_rss_bytes": 76013568,
+      "queries": 48576,
+      "canonical_state_sha256": "a1b8c0364483ceef600ffc7e1532bf11b0f1419186b5807cb2fa0cc8b8e8ce9a",
+      "result_sha256": "c846ead79f2181d4b9c402cf06c8c40b2824a49dd8152c8e21e698535f4c3c1a",
+      "within_absolute_budgets": true
+    }
+  ],
+  "trace_qa": {
+    "source": "dec5b23199bff767cef1e3ce2c91701f0f730f98",
+    "anchor": "1ceec0b9134456f902de7487d024801f0e5e85cc",
+    "arms": {
+      "7-A": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "7-D": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "7-E": {
+        "valid": true,
+        "expected_requests": 48627,
+        "observed_requests": 48627,
+        "events": 1847826,
+        "events_per_request": 38,
+        "sha256": "181e88707801a1935e9b3df70159bc55f99c44648c70fdc8539351a23c165bf8",
+        "bytes": 709156726,
+        "counter_ranges": {
+          "union_candidates": [
+            282,
+            303
+          ],
+          "pre_limit": [
+            282,
+            303
+          ]
+        },
+        "sample_stage_mean_ns": {
+          "parse_namespace": 22060.214,
+          "embedding": 1880.096,
+          "canonical_read": 259091.221,
+          "strength_projection": 4357.201,
+          "hard_filter": 58081.988,
+          "vector": 136172.507,
+          "fts": 585405.554,
+          "fusion": 4396.377,
+          "entity": 8809.837,
+          "candidate_assembly": 36634.296,
+          "graph": 1561.683,
+          "candidate_filter": 1832.845,
+          "effective_strength": 1524.147,
+          "rif": 30139.059,
+          "rank": 1988.593,
+          "graph_filter_rank_supersession": 20500.028,
+          "response": 6148.08,
+          "exposure": 1334.67,
+          "residual": 11088.785,
+          "pipeline_total": 1193007.181,
+          "root_total": 1228097.456,
+          "caller_total": 1243053.739
+        },
+        "sample_nested_duration_mean_ns": {
+          "storage.read.queue": 20502.642,
+          "storage.read.wait": 19.883,
+          "canonical.namespace_read": 212002.895,
+          "storage.read.hold": 240682.286,
+          "vector.lock_wait": 114.463,
+          "vector.lock_hold": 132333.591,
+          "fts.lock_wait": 104.023,
+          "fts.lock_hold": 581490.406,
+          "engine.search": 1228097.456
+        },
+        "checks": [
+          "exact_nonzero_request_and_event_counts",
+          "single_engine_parent_worker_continuity",
+          "exclusive_partition_and_nested_bounds",
+          "root_bounded_by_caller_time",
+          "exact_fixture_counters",
+          "strict_payload_allowlist_no_content_or_memory_ids"
+        ]
+      },
+      "19-A": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "19-D": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "19-E": {
+        "valid": true,
+        "expected_requests": 48573,
+        "observed_requests": 48573,
+        "events": 1845774,
+        "events_per_request": 38,
+        "sha256": "f79f0df48fa3205aa57f8287ae81af8b7299a799dcbc6e9b9ccc32a7fbd25f76",
+        "bytes": 708360200,
+        "counter_ranges": {
+          "union_candidates": [
+            284,
+            302
+          ],
+          "pre_limit": [
+            284,
+            302
+          ]
+        },
+        "sample_stage_mean_ns": {
+          "parse_namespace": 22453.633,
+          "embedding": 1913.49,
+          "canonical_read": 260282.236,
+          "strength_projection": 4566.16,
+          "hard_filter": 58967.301,
+          "vector": 136350.834,
+          "fts": 587655.708,
+          "fusion": 4457.581,
+          "entity": 8918.811,
+          "candidate_assembly": 36530.098,
+          "graph": 1560.859,
+          "candidate_filter": 1819.825,
+          "effective_strength": 1605.814,
+          "rif": 30000.271,
+          "rank": 2111.951,
+          "graph_filter_rank_supersession": 20681.912,
+          "response": 6177.758,
+          "exposure": 1432.154,
+          "residual": 11077.238,
+          "pipeline_total": 1198563.634,
+          "root_total": 1235128.972,
+          "caller_total": 1250090.539
+        },
+        "sample_nested_duration_mean_ns": {
+          "storage.read.queue": 21061.462,
+          "storage.read.wait": 20.663,
+          "canonical.namespace_read": 212350.854,
+          "storage.read.hold": 241422.015,
+          "vector.lock_wait": 98.468,
+          "vector.lock_hold": 132365.039,
+          "fts.lock_wait": 83.916,
+          "fts.lock_hold": 583622.151,
+          "engine.search": 1235128.972
+        },
+        "checks": [
+          "exact_nonzero_request_and_event_counts",
+          "single_engine_parent_worker_continuity",
+          "exclusive_partition_and_nested_bounds",
+          "root_bounded_by_caller_time",
+          "exact_fixture_counters",
+          "strict_payload_allowlist_no_content_or_memory_ids"
+        ]
+      },
+      "41-A": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "41-D": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "41-E": {
+        "valid": true,
+        "expected_requests": 49165,
+        "observed_requests": 49165,
+        "events": 1868270,
+        "events_per_request": 38,
+        "sha256": "4119c9d62279687d69b818e61e02872c03c6329d1f33b05b014542ac77bd850b",
+        "bytes": 717017130,
+        "counter_ranges": {
+          "union_candidates": [
+            283,
+            302
+          ],
+          "pre_limit": [
+            283,
+            302
+          ]
+        },
+        "sample_stage_mean_ns": {
+          "parse_namespace": 18234.095,
+          "embedding": 1963.455,
+          "canonical_read": 268541.147,
+          "strength_projection": 4469.797,
+          "hard_filter": 58885.194,
+          "vector": 137137.413,
+          "fts": 580193.428,
+          "fusion": 4337.87,
+          "entity": 8810.222,
+          "candidate_assembly": 36876.23,
+          "graph": 1518.645,
+          "candidate_filter": 1759.452,
+          "effective_strength": 1532.357,
+          "rif": 30367.382,
+          "rank": 2085.031,
+          "graph_filter_rank_supersession": 20315.741,
+          "response": 6014.774,
+          "exposure": 1347.999,
+          "residual": 11186.646,
+          "pipeline_total": 1195576.878,
+          "root_total": 1237823.353,
+          "caller_total": 1253013.553
+        },
+        "sample_nested_duration_mean_ns": {
+          "storage.read.queue": 25593.832,
+          "storage.read.wait": 25.772,
+          "canonical.namespace_read": 218538.575,
+          "storage.read.hold": 247235.566,
+          "vector.lock_wait": 109.533,
+          "vector.lock_hold": 133281.813,
+          "fts.lock_wait": 110.763,
+          "fts.lock_hold": 576292.758,
+          "engine.search": 1237823.353
+        },
+        "checks": [
+          "exact_nonzero_request_and_event_counts",
+          "single_engine_parent_worker_continuity",
+          "exclusive_partition_and_nested_bounds",
+          "root_bounded_by_caller_time",
+          "exact_fixture_counters",
+          "strict_payload_allowlist_no_content_or_memory_ids"
+        ]
+      },
+      "73-A": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "73-D": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "73-E": {
+        "valid": true,
+        "expected_requests": 49198,
+        "observed_requests": 49198,
+        "events": 1869524,
+        "events_per_request": 38,
+        "sha256": "ad3a0321dc9a8da92af54c58a9f085c51b6d1bb7c8238fc7c57f345e4c516704",
+        "bytes": 717480356,
+        "counter_ranges": {
+          "union_candidates": [
+            284,
+            307
+          ],
+          "pre_limit": [
+            284,
+            307
+          ]
+        },
+        "sample_stage_mean_ns": {
+          "parse_namespace": 20348.835,
+          "embedding": 2015.84,
+          "canonical_read": 262840.213,
+          "strength_projection": 4567.747,
+          "hard_filter": 58553.768,
+          "vector": 135642.147,
+          "fts": 580963.954,
+          "fusion": 4346.0,
+          "entity": 8817.848,
+          "candidate_assembly": 36645.932,
+          "graph": 1554.013,
+          "candidate_filter": 1779.835,
+          "effective_strength": 1589.499,
+          "rif": 30103.238,
+          "rank": 2174.591,
+          "graph_filter_rank_supersession": 20594.682,
+          "response": 6176.532,
+          "exposure": 1353.063,
+          "residual": 11162.088,
+          "pipeline_total": 1191229.825,
+          "root_total": 1229773.481,
+          "caller_total": 1244429.413
+        },
+        "sample_nested_duration_mean_ns": {
+          "storage.read.queue": 23346.204,
+          "storage.read.wait": 26.891,
+          "canonical.namespace_read": 213482.101,
+          "storage.read.hold": 242228.471,
+          "vector.lock_wait": 118.804,
+          "vector.lock_hold": 131754.846,
+          "fts.lock_wait": 95.014,
+          "fts.lock_hold": 576990.986,
+          "engine.search": 1229773.481
+        },
+        "checks": [
+          "exact_nonzero_request_and_event_counts",
+          "single_engine_parent_worker_continuity",
+          "exclusive_partition_and_nested_bounds",
+          "root_bounded_by_caller_time",
+          "exact_fixture_counters",
+          "strict_payload_allowlist_no_content_or_memory_ids"
+        ]
+      },
+      "101-A": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "101-D": {
+        "valid": true,
+        "events": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "101-E": {
+        "valid": true,
+        "expected_requests": 48576,
+        "observed_requests": 48576,
+        "events": 1845888,
+        "events_per_request": 38,
+        "sha256": "2da1e8bd5f9e638d5fc63628fb6bf3da61ce6fbcaf68a5ff82936d86e8828996",
+        "bytes": 708410585,
+        "counter_ranges": {
+          "union_candidates": [
+            281,
+            302
+          ],
+          "pre_limit": [
+            281,
+            302
+          ]
+        },
+        "sample_stage_mean_ns": {
+          "parse_namespace": 24719.158,
+          "embedding": 2019.29,
+          "canonical_read": 275618.144,
+          "strength_projection": 4574.784,
+          "hard_filter": 62808.225,
+          "vector": 148703.667,
+          "fts": 618274.47,
+          "fusion": 4644.285,
+          "entity": 9267.461,
+          "candidate_assembly": 39740.897,
+          "graph": 2132.91,
+          "candidate_filter": 1859.768,
+          "effective_strength": 1676.661,
+          "rif": 34420.872,
+          "rank": 2198.383,
+          "graph_filter_rank_supersession": 21720.968,
+          "response": 7230.5,
+          "exposure": 1463.425,
+          "residual": 13112.527,
+          "pipeline_total": 1276186.395,
+          "root_total": 1315124.296,
+          "caller_total": 1330779.327
+        },
+        "sample_nested_duration_mean_ns": {
+          "storage.read.queue": 22508.752,
+          "storage.read.wait": 25.07,
+          "canonical.namespace_read": 224790.004,
+          "storage.read.hold": 255456.83,
+          "vector.lock_wait": 119.57,
+          "vector.lock_hold": 144575.716,
+          "fts.lock_wait": 110.199,
+          "fts.lock_hold": 614160.824,
+          "engine.search": 1315124.296
+        },
+        "checks": [
+          "exact_nonzero_request_and_event_counts",
+          "single_engine_parent_worker_continuity",
+          "exclusive_partition_and_nested_bounds",
+          "root_bounded_by_caller_time",
+          "exact_fixture_counters",
+          "strict_payload_allowlist_no_content_or_memory_ids"
+        ]
+      }
+    },
+    "valid": true
+  },
+  "failed_attempts": [],
+  "absolute_budgets": {
+    "p95_ms": 25,
+    "requests_per_second_min": 40,
+    "peak_rss_bytes_max": 1073741824,
+    "all_passed": true
+  },
+  "conclusion": "Enabled emission does not pass the 5% overhead gate. Disabled-arm intervals numerically meet this cell gate. Shared-host characterization, no production or latest-integration promotion."
+}

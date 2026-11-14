@@ -234,8 +234,11 @@ impl FtsIndex {
             },
         )?;
 
+        let instrumented = crate::performance::enabled();
+        let mut examined = 0usize;
         let mut out = Vec::with_capacity(k);
         for result in results {
+            examined += usize::from(instrumented);
             let (uuid_bytes, score) = result?;
             if uuid_bytes.len() == 16 {
                 let bytes: [u8; 16] = uuid_bytes.try_into().unwrap();
@@ -244,6 +247,7 @@ impl FtsIndex {
             }
         }
 
+        tracing::trace!(target: "recalld::performance", kind = "fts_legacy_rows", examined, returned = out.len(), sqlite_internal_work_known = false);
         Ok(out)
     }
 
@@ -312,6 +316,11 @@ impl FtsIndex {
         out.coverage.budget_exhausted =
             !out.coverage.exhausted && out.coverage.examined == MAX_FTS_EXAMINED;
         out.coverage.candidate_limited |= out.coverage.budget_exhausted;
+        tracing::trace!(target: "recalld::performance", kind = "fts_rows",
+            examined = out.coverage.examined, eligible = out.coverage.eligible,
+            admitted = out.coverage.admitted, pages = out.coverage.pages,
+            exhausted = out.coverage.exhausted, budget_exhausted = out.coverage.budget_exhausted,
+            sqlite_internal_work_known = false);
         Ok(out)
     }
 

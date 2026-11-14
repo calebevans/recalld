@@ -982,16 +982,24 @@ impl MetadataStore {
         &self,
         namespace_id: NamespaceId,
     ) -> Result<Vec<DiskRecord>, StorageError> {
+        let timer = crate::performance::Timer::new("canonical.namespace_read");
+        let instrumented = crate::performance::enabled();
+        let mut encoded_bytes = 0usize;
+        let mut examined = 0usize;
         let read = self.db.begin_read()?;
         let namespaces = read.open_multimap_table(NAMESPACE_INDEX)?;
         let records = read.open_table(META_TABLE)?;
         let mut result = Vec::new();
         for entry in namespaces.get(namespace_id.get())? {
             let key = entry?;
+            examined += usize::from(instrumented);
             let bytes: [u8; 16] = key.value().try_into().map_err(|_| {
                 StorageError::CorruptIndex("invalid UUID length in namespace index".into())
             })?;
             if let Some(value) = records.get(bytes.as_slice())? {
+                if instrumented {
+                    encoded_bytes += value.value().len();
+                }
                 let record = DiskRecord::from_bytes(value.value())?;
                 if record.id != bytes || record.namespace_id != namespace_id.get() {
                     return Err(StorageError::CorruptIndex(
@@ -1001,6 +1009,9 @@ impl MetadataStore {
                 result.push(record);
             }
         }
+        tracing::trace!(target: "recalld::performance", kind = "canonical_read",
+            examined, records = result.len(), encoded_record_bytes = encoded_bytes);
+        timer.complete();
         Ok(result)
     }
 
