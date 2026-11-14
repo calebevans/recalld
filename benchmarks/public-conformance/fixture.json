@@ -1,0 +1,74 @@
+{
+  "fixtureVersion": 1,
+  "license": "CC0-1.0; synthetic fixture authored for this harness; no external data",
+  "seed": 7,
+  "profile": {
+    "model": "public-fixture-v1",
+    "dimensions": 4,
+    "documentPrefix": "",
+    "queryPrefix": ""
+  },
+  "sources": [
+    {
+      "sourceId": "turn-001",
+      "summary": "amber",
+      "namespace": "default",
+      "vector": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "embeddingInput": "amber"
+    },
+    {
+      "sourceId": "turn-002",
+      "summary": "birch",
+      "namespace": "default",
+      "vector": [
+        0,
+        1,
+        0,
+        0
+      ],
+      "embeddingInput": "birch\n\nbirch payload",
+      "fullText": "birch payload"
+    },
+    {
+      "sourceId": "turn-003",
+      "summary": "foreign",
+      "namespace": "foreign",
+      "vector": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "embeddingInput": "foreign"
+    },
+    {
+      "sourceId": "turn-004",
+      "summary": "olive",
+      "namespace": "default",
+      "vector": [
+        0,
+        0,
+        1,
+        0
+      ],
+      "embeddingInput": "olive"
+    }
+  ],
+  "query": "amber",
+  "evidenceSources": [
+    "turn-001"
+  ],
+  "extraEmbeddingInputs": {
+    "health check": [
+      0,
+      0,
+      0,
+      1
+    ]
+  }
+}

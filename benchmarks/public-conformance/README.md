@@ -1,0 +1,142 @@
+# Real public v1 transport characterization
+
+This standalone harness is based on read-only runtime `03d9b4d`, without merging
+independent evaluation/study branches. It drives the real `recalld` binary over
+MCP stdio, HTTP MCP `/mcp`, and REST. All stores and mutations traverse production
+parsing, validation and adapters. It does not use private ingestion or replace
+the access recorder. This is a limited v1 diagnostic, not public-v2 certification.
+
+## Run
+
+Prepare the image separately (may require network for Rust components):
+
+```sh
+docker build -t recalld-ci:1.94 - < scripts/public-conformance.Dockerfile
+```
+
+Then run with already cached dependencies and a previous isolated build cache:
+
+```sh
+python3 scripts/public-conformance.py \
+  --cache /tmp/recalld-unit-tests-l__ja1yo/cargo \
+  --build-cache /path/to/isolated/target
+```
+
+The supervisor copies tracked Rust files under Cargo source/test/example/bench
+roots, declared custom targets and build scripts, the three fixed Cargo inputs,
+and this checkout's five fixed harness inputs. `--source-root` selects a separate
+runtime checkout and requires `--source-commit`; the harness/fixture/recipe/tests
+still come from this checkout. Each manifest records both commits and every
+file's origin and hash. Existing evidence remains pinned to its original source.
+
+```sh
+python3 scripts/public-conformance.py \
+  --source-root /tmp/recalld-implementation/integration \
+  --source-commit FULL_STABLE_COMMIT \
+  --source-input tests/fixtures/required-asset.json \
+  --cache /path/to/isolated/cargo --build-cache /path/to/isolated/target
+```
+
+The asset flag is optional and repeatable; list only files the selected runtime
+actually needs. Inputs must be exact tracked repository-relative regular files.
+Unknown untracked files, secrets, local Cargo config and build scratch are not
+enumerated into the snapshot. Symlink paths, missing declared targets and dirty
+or moving frozen runtime inputs fail. Non-Rust files under selected target roots
+require explicit `--source-input` entries. Five named legacy LoCoMo JSON inputs
+are excluded with recorded reasons; that external-data track is not invoked.
+Literal Rust includes must resolve to declared inputs. Cargo metadata, fmt,
+tests and all-target Clippy run against the snapshot; computed includes,
+build-script reads and arbitrary runtime I/O cannot be statically inferred, so
+supply their assets explicitly and retain resulting build/test failures.
+Workspaces/local path dependencies currently fail with an explicit unsupported
+error. The runner never copies an entire checkout as fallback.
+
+Every copied
+file is hashed, including new harness files absent from the Git diff. Cargo and
+target are copied into separate scratch directories. Builds/tests/episodes run
+with `--network none`, 2 CPUs, 4 GiB, two build jobs, Rust 1.94.1, read-only root,
+tmpfs `/tmp`, dropped capabilities and only the scratch mount. No host home,
+credentials or daemon sockets are mounted. Results and source manifests remain
+in the printed scratch output directory. Bulky caches never enter Git.
+
+A stdlib loopback HTTP server implements the actual OpenAI embeddings request
+shape. Its complete input/profile lookup is fixed by `fixture.json`; misses
+return HTTP400 with no live fallback. The child gets an explicit environment
+allowlist and a synthetic placeholder API key, never host credentials. Artificial
+vectors test contracts, not semantic relevance. Labels/mappings stay evaluator-side.
+
+MCP pins protocol `2025-06-18`, performs initialize/initialized/tools discovery,
+and sends normal JSON-RPC tool calls. HTTP MCP uses its real legacy session.
+For stdio, an explicit temporary daemon socket has a regular file as its parent:
+the existing CLI fails daemon setup before spawn and enters its real direct
+fallback. The harness checks the fallback log. This is not a daemon-client test.
+
+## Scope and interpretation
+
+Each transport has three fresh stores/process replays, each including a restart.
+The fixed four-source fixture has three default-namespace records and a foreign
+namespace distractor with an identical query embedding. It checks omitted versus
+explicit default scope, successful store/recall/get with false mode, repeated
+read-only windows, valid grade-4 feedback (unchanged stability under multiplier zero), grade-1
+feedback (lower stability with content retained), tombstone content absence, rejection of
+seven malformed requests and one deliberate embedding-fixture miss, and persisted public fields/ranks across restart.
+Generated UUIDs are retained and mapped bijectively to source IDs. Raw timestamps
+are retained; equality is asserted within an episode across reads/restart. Across
+fresh replays, only declared outcome flags and mapped source ranks are compared.
+There is no claim of equal full logical state or timestamps across replays.
+
+Present string-valued reinforcement quality is probed separately. A v1 acceptance
+or state change is retained as a conformance violation in the summary, not hidden
+as a successful rejection. A completed characterization can have
+`conformancePassed: false`. No unkeyed write is retried on transport errors.
+
+Public record comparisons omit fields that the API does not expose. Physical
+file hashes across a bounded 200ms quiet read window supplement those checks.
+The comparison excludes only `fts.db-shm`, SQLite WAL-index coordination state;
+its before/after hashes are still retained. Durable SQLite DB/WAL, metadata,
+edges, vectors and text stay in the comparison. These observations
+are not a canonical snapshot, transitive readiness barrier, in-memory cache
+inspection, event/receipt proof or concurrent-writer guarantee. Background sweeps,
+autolinking, RIF and warm-file persistence are disabled. The actual system clock
+remains active; there is no public manual-clock control. Restart is a normal
+process restart of the same synthetic directory, not snapshot reset or fault
+injection. HTTP shutdown follows the current CLI's two-stage signal sequence.
+
+Source retention and unique-source retrieval recall are scored separately;
+unknown evidence is unscored. No extraction model, answerer, judge, paid provider
+or RL is used. Timings in traces include the Python client and debug binary;
+they are diagnostic, not production performance measurements.
+
+Still outside scope: A1 generations/receipts/barrier/snapshot/reset, full canonical
+state/hash replay, controlled chronological lifecycle, concurrent races, graph
+and batch reads, supersession fixtures, strict-validation repair, real semantic
+datasets and grouped statistical evaluation. The parent retains the known HTTP
+vector-only/similarity EmptyQuery limitation; successful HTTP similarity needs a
+subsequent combined parent with the independent vector fix. No full A6 completion.
+
+See [handoff and frozen-state controls plan](HANDOFF.md) for the combined-runtime
+rerun sequence and the boundary between this diagnostic and future A6 controls.
+
+## Combined runtime and fixture revision 2
+
+The [combined-runtime report](combined-aeab9e6/REPORT.md) retains the unchanged
+fixture-v1 replay on frozen `aeab9e6` separately from the declared fixture-v2
+extension. Both use legacy API contract v1 and MCP protocol2025-06-18.
+
+Select the extension with `--fixture-version 2` and the same explicit runtime
+root/commit. `fixture-v2.json` adds a fifth synthetic source, copper, with vector
+[0.8,0.6,0,0], while preserving the original four embedding inputs. It tests
+by-ID similarity on stdio MCP, HTTP MCP and REST, plus embedding-only REST
+search. MCP recall still requires text; no MCP embedding-only path is claimed.
+Three read repetitions before mutation and one after restart check the expected
+neighbor, source/foreign exclusion, ranks and no embedding-provider calls.
+Wrong namespace assertions, wrong vector dimensions and zero vectors must reject
+without public/durable changes. Fixture revision2 additionally requires strict
+wrong-type quality rejection. Actual clock and file-hash limitations still apply.
+
+The supervisor now executes `cargo test --offline --locked --all-features --lib
+--bins --tests --examples -j 1`, including declared migration CLI and example
+unit tests. Serial test linking avoids overlapping large linker jobs within the
+4GiB cap; other build commands retain the two-job ceiling. Doctests remain
+outside this command. No core source, private ingestion or performance workload
+is introduced by this extension.

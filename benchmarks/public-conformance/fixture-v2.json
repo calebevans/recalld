@@ -1,0 +1,107 @@
+{
+  "fixtureVersion": 2,
+  "license": "CC0-1.0; synthetic fixture authored for this harness; no external data",
+  "seed": 7,
+  "profile": {
+    "model": "public-fixture-v1",
+    "dimensions": 4,
+    "documentPrefix": "",
+    "queryPrefix": ""
+  },
+  "sources": [
+    {
+      "sourceId": "turn-001",
+      "summary": "amber",
+      "namespace": "default",
+      "vector": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "embeddingInput": "amber"
+    },
+    {
+      "sourceId": "turn-002",
+      "summary": "birch",
+      "namespace": "default",
+      "vector": [
+        0,
+        1,
+        0,
+        0
+      ],
+      "embeddingInput": "birch\n\nbirch payload",
+      "fullText": "birch payload"
+    },
+    {
+      "sourceId": "turn-003",
+      "summary": "foreign",
+      "namespace": "foreign",
+      "vector": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "embeddingInput": "foreign"
+    },
+    {
+      "sourceId": "turn-004",
+      "summary": "olive",
+      "namespace": "default",
+      "vector": [
+        0,
+        0,
+        1,
+        0
+      ],
+      "embeddingInput": "olive"
+    },
+    {
+      "sourceId": "turn-005",
+      "summary": "copper",
+      "namespace": "default",
+      "vector": [
+        0.8,
+        0.6,
+        0,
+        0
+      ],
+      "embeddingInput": "copper"
+    }
+  ],
+  "query": "amber",
+  "evidenceSources": [
+    "turn-001"
+  ],
+  "extraEmbeddingInputs": {
+    "health check": [
+      0,
+      0,
+      0,
+      1
+    ]
+  },
+  "extension": {
+    "similaritySource": "amber",
+    "expectedNeighbor": "copper",
+    "vectorQuery": [
+      1,
+      0,
+      0,
+      0
+    ],
+    "initialRepeats": 3,
+    "restartRepeats": 1,
+    "vectorOnlyTransports": [
+      "rest"
+    ],
+    "similarityTransports": [
+      "stdio",
+      "http-mcp",
+      "rest"
+    ],
+    "apiContractVersion": "legacy-v1"
+  }
+}
