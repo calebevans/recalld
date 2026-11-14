@@ -101,6 +101,9 @@ pub struct ScanDuplicatesParams {
     pub threshold: f32,
     /// Maximum number of memories to sample.
     pub max_memories: usize,
+    /// Opt into a report object; omission preserves the legacy cluster array.
+    #[serde(default)]
+    pub include_coverage: bool,
 }
 
 /// Parameters for the `namespace_stats` RPC method.

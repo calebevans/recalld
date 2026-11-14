@@ -298,15 +298,11 @@ async fn http_duplicate_coverage_reports_caps_missing_vectors_and_empty_samples(
     assert_eq!(coverage["complete"], false);
     assert_eq!(coverage["sampleCap"], 200);
     assert_eq!(coverage["neighborCap"], 11);
-    assert_eq!(coverage["countsAvailable"], false);
-    for key in [
-        "sampledCount",
-        "eligibleCount",
-        "skippedVectorCount",
-        "truncated",
-    ] {
-        assert!(coverage[key].is_null(), "{key}");
+    assert_eq!(coverage["countsAvailable"], true);
+    for key in ["sampledCount", "eligibleCount", "skippedVectorCount"] {
+        assert_eq!(coverage[key], 0, "{key}");
     }
+    assert_eq!(coverage["truncated"], false);
     for count in 0..=2 {
         if count > 0 {
             f.insert_memory().await;

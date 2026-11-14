@@ -66,6 +66,12 @@ namespace = "my-project"
 
 When recalld starts in MCP mode, it walks up from the current working directory to find the nearest `.recalld.toml`. The `namespace` field sets the default namespace for scoped MCP operations (store, recall, lists, stats, and duplicate scans) in that directory tree. If no `.recalld.toml` is found, the default namespace is `"default"`.
 
+### Connection context
+
+Read the MCP resource `recalld://session` to inspect the connection's frozen default namespace, its canonical name/ID and configured dimension when it exists, current v1 limits, and bounded duplicate-scan semantics. A missing namespace is reported with `exists: false` and `resolved: null`; the read does not create it. `source: "bridge"` identifies the stored connection default, not whether it originally came from a configuration file or a fallback.
+
+Session resource reads carry `cacheScope: "private"` and `ttlMs: 0`; the public resource catalog contains only a static description. The resource advertises only application contract v1. It does not claim active embedding-profile compatibility, generations, receipts, idempotency, exact scans, or future read-only flags. The dimension is namespace configuration, not an active provider identity. HTTP REST `GET /capabilities` remains unimplemented.
+
 ### Other MCP-compatible tools
 
 Any MCP client can use recalld via either transport.
@@ -841,19 +847,23 @@ Response:
   "clusterCount": 1,
   "coverage": {
     "algorithm": "sampledNearestNeighbors",
-    "sampledCount": null,
-    "eligibleCount": null,
-    "skippedVectorCount": null,
+    "sampledCount": 200,
+    "eligibleCount": 203,
+    "skippedVectorCount": 1,
     "sampleCap": 200,
     "neighborCap": 11,
     "complete": false,
-    "truncated": null,
-    "countsAvailable": false
+    "truncated": true,
+    "countsAvailable": true
   }
 }
 ```
 
-MCP coverage counts and `truncated` are unknown (`null`) because the legacy bridge returns only clusters; cluster membership cannot reconstruct those counts. `complete` is always false, including for empty results. HTTP duplicate scans instead compare pairs within a capped sample (default 500, maximum 10,000), return observed live-record, sampled-record, and missing-vector counts, and report whether sampling was truncated. HTTP `neighborCap` is null because it has no neighbor cap. Its `complete` also remains false because reads are not pinned to a generation. Neither endpoint proves there are no other duplicates. Exact paginated scans and bridge/daemon count reporting remain future work.
+MCP scan coverage comes from the scan itself, including when used through the daemon. `eligibleCount` counts live records before sampling (including ghosts and records with missing vectors); `sampledCount` counts selected live records; `skippedVectorCount` counts sampled records whose vectors were missing when loaded. Tombstones are excluded before sampling. `truncated` reports record sampling only: a false value does not remove the separate neighbor cap or establish that every qualifying pair was found. `neighborCap: 11` includes the extra candidate requested to allow for self-removal.
+
+Older daemons return only clusters. New clients preserve those clusters and report `countsAvailable: false` with null counts and `truncated`, rather than guessing. New daemons still return the legacy array to clients that omit the private `includeCoverage` flag. This flag does not select a public contract version.
+
+`complete` is always false, even for empty scans: the algorithm is bounded and has no generation-consistent read view. HTTP duplicate scans instead compare pairs within a capped sample (default 500, maximum 10,000), report observed counts and truncation, and use a null `neighborCap`. Neither endpoint proves there are no other duplicates. Exact paginated scans and coherent generations remain future work.
 
 ---
 

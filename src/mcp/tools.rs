@@ -8,7 +8,7 @@
 use serde_json::json;
 
 use crate::mcp::args;
-use crate::mcp::bridge::{McpBridge, StoredMemory};
+use crate::mcp::bridge::{DUPLICATE_NEIGHBOR_CAP, DUPLICATE_SAMPLE_CAP, McpBridge, StoredMemory};
 use crate::mcp::protocol::{ToolAnnotations, ToolCallResult, ToolInfo};
 use crate::model::constants::{
     DEFAULT_LIST_LIMIT, DEFAULT_TAG_LIMIT, DUPLICATE_SIMILARITY_THRESHOLD, EMOTION_MAX_BYTES,
@@ -1141,34 +1141,35 @@ async fn handle_find_similar_scan(
         }
     };
 
-    // Max memories to sample from the namespace (bounded to 200).
-    const MAX_SCAN_MEMORIES: usize = 200;
-
     match bridge
         .search
-        .scan_duplicates(&namespace, threshold, MAX_SCAN_MEMORIES)
+        .scan_duplicates_with_coverage(&namespace, threshold, DUPLICATE_SAMPLE_CAP)
         .await
     {
-        Ok(clusters) => {
-            let response = json!({
-                "namespace": namespace,
-                "threshold": threshold,
-                "clusters": clusters,
-                "clusterCount": clusters.len(),
-                // The legacy bridge returns clusters only. Do not manufacture scan
-                // counts from cluster membership or from a separate racy catalog read.
-                "coverage": {
+        Ok(report) => {
+            let coverage = match report.coverage {
+                Some(coverage) => match serde_json::to_value(coverage) {
+                    Ok(value) => value,
+                    Err(e) => return ToolCallResult::error(format!("Serialization error: {e}")),
+                },
+                None => json!({
                     "algorithm": "sampledNearestNeighbors",
                     "sampledCount": null,
                     "eligibleCount": null,
                     "skippedVectorCount": null,
-                    "sampleCap": MAX_SCAN_MEMORIES,
-                    // Ten neighbors plus one candidate to allow for self-removal.
-                    "neighborCap": 11,
+                    "sampleCap": DUPLICATE_SAMPLE_CAP,
+                    "neighborCap": DUPLICATE_NEIGHBOR_CAP,
                     "complete": false,
                     "truncated": null,
                     "countsAvailable": false
-                },
+                }),
+            };
+            let response = json!({
+                "namespace": namespace,
+                "threshold": threshold,
+                "clusters": report.clusters,
+                "clusterCount": report.clusters.len(),
+                "coverage": coverage,
             });
             match ToolCallResult::json(&response) {
                 Ok(r) => r,
