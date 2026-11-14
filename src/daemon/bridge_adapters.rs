@@ -43,6 +43,7 @@ impl SearchPipeline for RemoteSearchAdapter {
         limit: usize,
         min_score: Option<f32>,
         same_namespace: bool,
+        namespace: Option<&str>,
     ) -> Result<Vec<SearchHit>, BridgeError> {
         let params = serde_json::to_value(protocol::FindSimilarParams {
             id: id.to_string(),
@@ -51,7 +52,7 @@ impl SearchPipeline for RemoteSearchAdapter {
             same_namespace,
         })
         .map_err(|e| BridgeError::Internal(e.to_string()))?;
-        let result = self.client.call("find_similar", params).await?;
+        let result = call_scoped(&self.client, "find_similar", params, namespace).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
@@ -100,18 +101,26 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
 
-    async fn get_memory(&self, id: MemoryId) -> Result<Option<MemoryRecord>, BridgeError> {
+    async fn get_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<Option<MemoryRecord>, BridgeError> {
         let params = serde_json::to_value(protocol::GetMemoryParams { id: id.to_string() })
             .map_err(|e| BridgeError::Internal(e.to_string()))?;
-        let result = self.client.call("get_memory", params).await?;
+        let result = call_scoped(&self.client, "get_memory", params, namespace).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
 
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, BridgeError> {
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, BridgeError> {
         let params = serde_json::to_value(protocol::DeleteMemoryParams { id: id.to_string() })
             .map_err(|e| BridgeError::Internal(e.to_string()))?;
-        let result = self.client.call("delete_memory", params).await?;
+        let result = call_scoped(&self.client, "delete_memory", params, namespace).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
@@ -130,13 +139,14 @@ impl bridge::StorageEngine for RemoteStorageAdapter {
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<ReinforceResult, BridgeError> {
         let params = serde_json::to_value(protocol::ReinforceParams {
             id: id.to_string(),
             quality,
         })
         .map_err(|e| BridgeError::Internal(e.to_string()))?;
-        let result = self.client.call("reinforce_memory", params).await?;
+        let result = call_scoped(&self.client, "reinforce_memory", params, namespace).await?;
         serde_json::from_value(result)
             .map_err(|e| BridgeError::Internal(format!("response decode: {e}")))
     }
@@ -264,5 +274,20 @@ impl bridge::HealthChecker for RemoteHealthAdapter {
                 }],
             },
         }
+    }
+}
+
+// A separate method makes old daemons reject assertions instead of ignoring fields.
+async fn call_scoped(
+    client: &DaemonClient,
+    method: &str,
+    mut params: serde_json::Value,
+    namespace: Option<&str>,
+) -> Result<serde_json::Value, BridgeError> {
+    if let Some(namespace) = namespace {
+        params["namespace"] = serde_json::Value::String(namespace.to_owned());
+        client.call(&format!("{method}_scoped"), params).await
+    } else {
+        client.call(method, params).await
     }
 }

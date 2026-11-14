@@ -28,12 +28,14 @@ pub trait SearchPipeline: Send + Sync {
     async fn search(&self, query: SearchInput) -> Result<SearchResponse, BridgeError>;
 
     /// Find memories similar to an existing memory by its ID.
+    /// `namespace`, when supplied, asserts canonical source scope before effects.
     async fn find_similar(
         &self,
         id: MemoryId,
         limit: usize,
         min_score: Option<f32>,
         same_namespace: bool,
+        namespace: Option<&str>,
     ) -> Result<Vec<SearchHit>, BridgeError>;
 
     /// Scan a namespace for clusters of near-duplicate memories.
@@ -56,10 +58,20 @@ pub trait StorageEngine: Send + Sync {
     async fn store_memory(&self, input: StoreInput) -> Result<StoredMemory, BridgeError>;
 
     /// Retrieve a full memory record by ID, or `None` if not found.
-    async fn get_memory(&self, id: MemoryId) -> Result<Option<MemoryRecord>, BridgeError>;
+    /// `namespace`, when supplied, asserts canonical scope; unknown IDs are errors.
+    async fn get_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<Option<MemoryRecord>, BridgeError>;
 
     /// Delete a memory by ID. Returns `true` if the memory existed and was deleted.
-    async fn delete_memory(&self, id: MemoryId) -> Result<bool, BridgeError>;
+    /// `namespace`, when supplied, must match canonical scope before mutation.
+    async fn delete_memory(
+        &self,
+        id: MemoryId,
+        namespace: Option<&str>,
+    ) -> Result<bool, BridgeError>;
 
     /// Delete many memories in one pass.
     ///
@@ -71,10 +83,12 @@ pub trait StorageEngine: Send + Sync {
     async fn delete_memories(&self, ids: &[MemoryId]) -> Result<Vec<bool>, BridgeError>;
 
     /// Reinforce a memory with the given FSRS quality rating (1-4).
+    /// `namespace`, when supplied, must match canonical scope before mutation.
     async fn reinforce_memory(
         &self,
         id: MemoryId,
         quality: u8,
+        namespace: Option<&str>,
     ) -> Result<ReinforceResult, BridgeError>;
 
     /// List memories in a namespace with pagination and optional filters.
@@ -675,6 +689,10 @@ pub enum BridgeError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// An explicit by-ID namespace assertion failed.
+    #[error("{0}")]
+    NamespaceMismatch(String),
+
     /// A storage subsystem error occurred.
     #[error("Storage error: {0}")]
     Storage(String),
@@ -702,6 +720,18 @@ pub enum BridgeError {
     /// destroyed records are still there.
     #[error("Partially applied: {0}")]
     PartiallyApplied(String),
+}
+
+impl From<crate::storage::StorageError> for BridgeError {
+    fn from(error: crate::storage::StorageError) -> Self {
+        use crate::storage::StorageError;
+        match error {
+            StorageError::NamespaceMismatch { .. } => Self::NamespaceMismatch(error.to_string()),
+            StorageError::NotFound(_) => Self::NotFound(error.to_string()),
+            StorageError::InvalidNamespaceName { .. } => Self::InvalidInput(error.to_string()),
+            _ => Self::Storage(error.to_string()),
+        }
+    }
 }
 
 impl BridgeError {
