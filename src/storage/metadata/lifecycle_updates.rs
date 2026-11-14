@@ -120,6 +120,7 @@ impl MetadataStore {
                 return Ok(None);
             }
         }
+        let before = record.clone();
         match patch {
             LegacyPatch::Feedback(plan) => {
                 if !matches!(record.phase, DecayPhase::Full | DecayPhase::Summary)
@@ -189,7 +190,14 @@ impl MetadataStore {
             let mut table = tx.open_table(META_TABLE)?;
             table.insert(id.as_bytes().as_slice(), record.to_bytes().as_slice())?;
         }
-        control::advance_generation(&tx)?;
+        let state = control::advance_generation(&tx)?;
+        removal_ledger::record_change(
+            &tx,
+            state.generation_ref(),
+            &before,
+            &record,
+            uuid::Uuid::new_v4(),
+        )?;
         Ok(Some((tx, record)))
     }
 }
@@ -393,6 +401,7 @@ mod tests {
             }
             let before = store.get(id).unwrap().unwrap();
             let g = generation(&store);
+            let ledger_before = store.removal_ledger_export().unwrap();
             let plan = feedback(&before, &ns);
             let patch = match kind {
                 0 => LegacyPatch::Feedback(&plan),
@@ -423,9 +432,11 @@ mod tests {
             drop(tx);
             drop(guard);
             assert_unchanged(&store, id, &before, g);
+            assert_eq!(store.removal_ledger_export().unwrap(), ledger_before);
             drop(store);
             let reopened = MetadataStore::open(&dir.path().join("meta.db")).unwrap();
             assert_unchanged(&reopened, id, &before, g);
+            assert_eq!(reopened.removal_ledger_export().unwrap(), ledger_before);
         }
     }
 

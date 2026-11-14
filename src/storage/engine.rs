@@ -1206,6 +1206,7 @@ impl StorageEngine for RedbStorageEngine {
         self.meta_store
             .get_namespace(namespace_id)?
             .ok_or(StorageError::NamespaceNotFound(namespace_id.get()))?;
+        self.meta_store.ensure_uuid_not_terminal(id)?;
         // 1. Allocate vector slot and write embedding.
         let vector_store = self
             .vector_manager

@@ -1672,15 +1672,15 @@ mod independent_review_regressions {
                         storage
                             .update_access(id, DAY, AccessKind::DirectRetrieval)
                             .unwrap();
+                    } else if field == "phase" {
+                        // Reach terminal state through the actual removal writer,
+                        // so its content and removal evidence agree.
+                        storage.tombstone_memory(id).unwrap();
                     } else {
                         storage
                             .update_decay_state(
                                 id,
-                                if field == "phase" {
-                                    DecayPhase::Tombstone
-                                } else {
-                                    phase
-                                },
+                                phase,
                                 1.0,
                                 1.0,
                                 if field == "stability" { 2.0 } else { 1.0 },

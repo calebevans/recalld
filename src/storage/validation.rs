@@ -51,7 +51,9 @@ pub(crate) fn validate_existing(path: &Path) -> Result<HashSet<String>, StorageE
     }
     let (_meta_copy, meta) = inspect_database(&path.join("meta.db"))?;
     let read = meta.begin_read()?;
-    if super::control::validate_existing(&read)?.is_some() {
+    let control = super::control::validate_existing(&read)?;
+    super::metadata::removal_ledger::read_export(&read, control.as_ref())?;
+    if control.is_some() {
         read.open_table(super::metadata::NAMESPACE_COUNTER)?;
     }
     let namespaces = read.open_table(NAMESPACE_TABLE)?;
