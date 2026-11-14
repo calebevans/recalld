@@ -22,6 +22,7 @@ pub mod error;
 pub mod fsync;
 pub mod indexes;
 pub mod metadata;
+pub mod offline_snapshot;
 pub(crate) mod ownership;
 pub mod schema_migration;
 pub mod text;
