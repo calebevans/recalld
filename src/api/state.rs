@@ -43,6 +43,17 @@ pub trait SearchPipeline: Send + Sync {
     /// Execute a search query, returning scored results.
     async fn search(&self, query: SearchQuery) -> Result<Vec<ResolvedSearchResult>, SearchError>;
 
+    /// Shared by-ID similarity selection, including threshold before exposure.
+    async fn find_similar(
+        &self,
+        _id: MemoryId,
+        _limit: usize,
+        _min_score: Option<f32>,
+        _record_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, SearchError> {
+        Err(SearchError::Internal("similarity unavailable".into()))
+    }
+
     /// Find existing memories at or above `threshold` similarity to a
     /// pre-computed embedding, closest first, at most `limit` of them.
     ///

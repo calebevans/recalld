@@ -26,6 +26,10 @@ use crate::model::{AccessKind, CachedRecord, DecayPhase, MemoryId, NamespaceConf
 pub trait NamespaceResolver: Send + Sync {
     /// Look up a namespace by name, returning its configuration.
     async fn resolve(&self, name: &str) -> Result<NamespaceConfig>;
+    /// Resolve canonical by-ID scope without guessing a session default.
+    async fn resolve_id(&self, id: NamespaceId) -> Result<NamespaceConfig> {
+        Err(SearchError::NamespaceNotFound(format!("id {}", id.get())))
+    }
 }
 
 /// Per-namespace embedding provider registry.
@@ -976,8 +980,22 @@ impl QueryEngine {
         k: usize,
         record_access: bool,
     ) -> Result<Vec<SearchResult>> {
+        self.similar_filtered_with_access(id, k, None, record_access)
+            .await
+    }
+
+    /// Select the final similarity response before recording any exposure.
+    pub async fn similar_filtered_with_access(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<SearchResult>> {
         let stamp = self.meta_store.effects_stamp().await?;
-        let result = self.similar_with_access_admitted(id, k, record_access).await;
+        let result = self
+            .similar_with_access_admitted(id, k, min_score, record_access)
+            .await;
         if self.meta_store.effects_stamp().await? != stamp {
             return Err(SearchError::Unavailable(
                 "graph effects changed during query".into(),
@@ -986,8 +1004,14 @@ impl QueryEngine {
         result
     }
 
-    async fn similar_with_access_admitted(&self, id: MemoryId, k: usize, record_access: bool) -> Result<Vec<SearchResult>> {
-        let k = k.clamp(1, SearchQuery::MAX_USER_LIMIT);
+    async fn similar_with_access_admitted(
+        &self,
+        id: MemoryId,
+        k: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let k = k.min(SearchQuery::MAX_USER_LIMIT);
 
         // By-ID scope comes from the canonical record, even if its cache entry is stale.
         let record = self
@@ -996,10 +1020,20 @@ impl QueryEngine {
             .await?
             .ok_or(SearchError::MemoryNotFound(id))?;
 
+        let namespace = self
+            .namespace_resolver
+            .resolve_id(record.namespace_id)
+            .await?;
+
         // Load the source memory's embedding from the vector index.
-        let source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
+        let mut source_embedding = self.vector_indexes.get_vector(id).ok_or_else(|| {
             SearchError::Internal(format!("no embedding found for memory {id:?}"))
         })?;
+
+        super::query::normalize_query_embedding(
+            &mut source_embedding,
+            namespace.embedding_dim as usize,
+        )?;
 
         // Over-fetch by 1 to account for self-match removal.
         let scored = self
@@ -1009,12 +1043,12 @@ impl QueryEngine {
         // Remove the source memory from results.
         let filtered: Vec<ScoredResult> = scored
             .into_iter()
-            .filter(|s| s.memory_id != id)
+            .filter(|s| s.memory_id != id && min_score.is_none_or(|minimum| s.score >= minimum))
             .take(k)
             .collect();
 
         let result_ids: Vec<MemoryId> = filtered.iter().map(|s| s.memory_id).collect();
-        let records = self.load_records(&result_ids, record_access).await?;
+        let records = self.meta_store.get_batch(&result_ids).await?;
 
         // Build a lookup map so we can iterate `filtered` (which preserves
         // descending similarity order from the vector search) instead of
@@ -1026,6 +1060,11 @@ impl QueryEngine {
             .iter()
             .filter_map(|scored| {
                 let rec = record_map.get(&scored.memory_id)?;
+                if rec.namespace_id != record.namespace_id
+                    || matches!(rec.phase, DecayPhase::Ghost | DecayPhase::Tombstone)
+                {
+                    return None;
+                }
                 let score = Some(scored.score);
                 Some(SearchResult {
                     memory_id: rec.id,
@@ -1049,7 +1088,7 @@ impl QueryEngine {
                     activation_score: None,
                     is_permastore: rec.is_permastore,
                     stability: rec.stability,
-                    namespace: String::new(),
+                    namespace: namespace.name.clone(),
                 })
             })
             .collect();

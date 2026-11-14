@@ -899,3 +899,161 @@ async fn scoped_read_only_aliases_fail_closed_on_older_single_control_daemons() 
         server.await.unwrap();
     }
 }
+
+// Real adapters and production handlers: threshold is cosine, not strength;
+// only final returned IDs may receive legacy associative exposure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn similarity_threshold_namespace_and_returned_only_exposure() {
+    for rest in [false, true] {
+        let mut h = Harness::new().await;
+        let namespace = h.f.create_namespace("similarity-scope");
+        let mut members = Vec::new();
+        for (vector, strength) in [
+            ([1.0, 0.0, 0.0, 0.0], 1.0),
+            ([0.8, 0.6, 0.0, 0.0], 0.01),
+            ([0.0, 1.0, 0.0, 0.0], 1.0),
+            ([0.6, 0.8, 0.0, 0.0], 1.0),
+        ] {
+            let id =
+                h.f.insert_memory_with(MemorySpec {
+                    embedding: Some(&vector),
+                    decay_strength: strength,
+                    ..MemorySpec::new(namespace)
+                })
+                .await;
+            h.f.vector_index
+                .write()
+                .await
+                .add(
+                    id,
+                    &vector,
+                    VectorMetadata {
+                        namespace_id: namespace,
+                        decay_phase: 1,
+                        tags: vec![],
+                    },
+                )
+                .unwrap();
+            members.push(id);
+            h.ids.push(id);
+        }
+        let bridge = h.bridge(); // default differs from canonical source scope
+        let before = h.snapshot().await;
+        // /search must still filter strength: the low-strength closest neighbor
+        // is excluded even though its cosine is .8.
+        let (status, search) = http_call(
+            h.http(),
+            "POST",
+            "/search",
+            json!({
+                "embedding": VECTOR, "namespace":"similarity-scope",
+                "recordAccess":false, "minStrength":0.5, "limit":20,
+            }),
+        )
+        .await;
+        assert!(status.is_success(), "{search}");
+        let hits = search["hits"].as_array().unwrap();
+        assert!(
+            hits.iter()
+                .any(|v| v["memory"]["id"] == members[2].to_string())
+        );
+        assert!(
+            !hits
+                .iter()
+                .any(|v| v["memory"]["id"] == members[1].to_string())
+        );
+        // Default/explicit scope, no score threshold, threshold, and empty results.
+        for (minimum, expected) in [(None, 3), (Some(0.1), 2), (Some(0.9), 0)] {
+            for explicit_scope in [false, true] {
+                let mut args =
+                    json!({"id":members[0].to_string(), "recordAccess":false, "limit":20});
+                if let Some(minimum) = minimum {
+                    args["minScore"] = json!(minimum);
+                }
+                if explicit_scope {
+                    args["namespace"] = json!("similarity-scope");
+                }
+                let hits = similarity_call(&h, &bridge, rest, args).await;
+                assert_eq!(hits.len(), expected);
+                for hit in &hits {
+                    let memory = if rest { &hit["memory"] } else { hit };
+                    assert_eq!(memory["namespace"], "similarity-scope");
+                    assert_ne!(memory["id"], members[0].to_string());
+                    if let Some(minimum) = minimum {
+                        assert!(hit["score"].as_f64().unwrap() >= minimum);
+                    }
+                }
+            }
+        }
+        h.assert_quiet(&before).await;
+        // No hits in true mode means no event, not exposure of discarded candidates.
+        let empty = similarity_call(
+            &h,
+            &bridge,
+            rest,
+            json!({
+                "id":members[0].to_string(), "minScore":0.9, "recordAccess":true,
+            }),
+        )
+        .await;
+        assert!(empty.is_empty());
+        h.assert_quiet(&before).await;
+        // Both implicit true and explicit true: source, below-threshold, foreign,
+        // and above-threshold but beyond-limit candidates remain unchanged.
+        for explicit_true in [false, true] {
+            let mut args = json!({"id":members[0].to_string(), "minScore":0.1, "limit":1});
+            if explicit_true {
+                args["recordAccess"] = json!(true);
+            }
+            let records: Vec<_> = h.ids.iter().map(|id| h.f.record(*id).unwrap()).collect();
+            let hits = similarity_call(&h, &bridge, rest, args).await;
+            assert_eq!(hits.len(), 1);
+            let returned = if rest {
+                &hits[0]["memory"]["id"]
+            } else {
+                &hits[0]["id"]
+            };
+            assert_eq!(returned, &json!(members[1].to_string()));
+            h.observed().await;
+            for (id, old) in h.ids.iter().zip(records) {
+                let new = h.f.record(*id).unwrap();
+                if *id == members[1] {
+                    assert_eq!(new.access_history.len(), old.access_history.len() + 1);
+                    assert_eq!(new.last_accessed_at, NOW);
+                    assert_eq!(new.stability, old.stability);
+                    assert_eq!(
+                        new.access_history.last().unwrap().kind,
+                        AccessKind::AssociativeRetrieval
+                    );
+                } else {
+                    assert_eq!(
+                        new.to_bytes(),
+                        old.to_bytes(),
+                        "excluded candidate {id} changed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn similarity_call(h: &Harness, bridge: &McpBridge, rest: bool, args: Value) -> Vec<Value> {
+    if rest {
+        let (status, body) = http_call(
+            h.http(),
+            "POST",
+            &format!("/similar/{}", args["id"].as_str().unwrap()),
+            args,
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+        body["hits"].as_array().unwrap().clone()
+    } else {
+        let result = crate::mcp::tools::dispatch_tool(bridge, "find_similar_memories", args).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let wire = serde_json::to_value(result).unwrap();
+        let body: Value =
+            serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap();
+        body["memories"].as_array().unwrap().clone()
+    }
+}

@@ -42,6 +42,20 @@ impl StorageNamespaceResolver {
 
 #[async_trait]
 impl NamespaceResolver for StorageNamespaceResolver {
+    async fn resolve_id(&self, id: NamespaceId) -> Result<NamespaceConfig> {
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            storage
+                .read()
+                .map_err(|e| SearchError::Internal(format!("storage lock poisoned: {e}")))?
+                .get_namespace(id)
+                .map_err(|e| SearchError::Internal(e.to_string()))?
+                .ok_or_else(|| SearchError::NamespaceNotFound(format!("id {}", id.get())))
+        })
+        .await
+        .map_err(|e| SearchError::Internal(format!("blocking task join error: {e}")))?
+    }
+
     async fn resolve(&self, name: &str) -> Result<NamespaceConfig> {
         let storage = self.storage.clone();
         let name = name.to_string();

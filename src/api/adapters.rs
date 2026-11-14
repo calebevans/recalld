@@ -194,6 +194,18 @@ impl state::SearchPipeline for SearchPipelineAdapter {
             .collect())
     }
 
+    async fn find_similar(
+        &self,
+        id: MemoryId,
+        limit: usize,
+        min_score: Option<f32>,
+        record_access: bool,
+    ) -> Result<Vec<crate::search::PipelineSearchResult>, crate::search::SearchError> {
+        self.query_engine
+            .similar_filtered_with_access(id, limit, min_score, record_access)
+            .await
+    }
+
     async fn near_duplicates(
         &self,
         embedding: &[f32],

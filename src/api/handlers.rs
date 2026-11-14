@@ -989,85 +989,56 @@ async fn find_similar_admitted(
             .await?;
     }
 
-    // The source scope is canonical, never a session default or cached namespace.
-    let source = state
-        .storage
-        .get_record(memory_id)
-        .await
-        .ok_or_else(|| AppError::NotFound {
-            resource: "memory",
-            id: id.clone(),
-        })?;
-    let source_namespace = NamespaceId::new(source.namespace_id);
-
-    let source_embedding =
-        state
-            .search
-            .get_embedding(memory_id)
-            .ok_or_else(|| AppError::Internal {
-                source: "source memory has no indexed embedding".into(),
-            })?;
-
-    let limit = req.limit.min(100) as usize;
-
-    let ns_name = state
-        .namespaces
-        .name_for(source_namespace)
-        .unwrap_or_else(|| "default".to_string());
-
-    // Search using source embedding, requesting limit+1 to account
-    // for the source memory appearing in its own results.
-    let search_query = SearchQuery {
-        record_access: req.record_access,
-        query: QueryInput::Vector(source_embedding),
-        namespace_id: source_namespace,
-        namespace_name: ns_name,
-        k: limit + 1,
-        include_tags: vec![],
-        exclude_tags: vec![],
-        decay_phases: None,
-        min_score: req.min_score,
-        graph_depth: 0,
-        apply_rif: false,
-        time_range_start: None,
-        time_range_end: None,
-        entities: vec![],
-    };
-
-    let results = state.search.search(search_query).await?;
-
-    // Batch-load embeddings with a single lock acquisition if requested.
+    // The shared path resolves canonical scope, removes the source and applies
+    // similarity minScore before exposure. /search minStrength is independent.
+    let results = state
+        .search
+        .find_similar(
+            memory_id,
+            req.limit.min(100) as usize,
+            req.min_score,
+            req.record_access,
+        )
+        .await?;
     let embeddings = if req.include_embeddings {
-        let ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id).collect();
+        let ids: Vec<_> = results.iter().map(|r| r.memory_id).collect();
         state.search.get_embeddings_batch(&ids)
     } else {
         std::collections::HashMap::new()
     };
-
-    // Exclude source memory from results, loading full_text from storage
-    let filtered: Vec<_> = results
-        .into_iter()
-        .filter(|r| r.memory.id != memory_id)
-        .take(limit)
-        .collect();
-    let mut hits: Vec<SearchHit> = Vec::with_capacity(filtered.len());
-    for r in filtered {
-        let ns_name = state
-            .namespaces
-            .name_for(r.memory.namespace_id)
-            .unwrap_or_else(|| "unknown".to_string());
-        let mut mem = MemoryResponse::from_cached(&r.memory, ns_name);
-        mem.full_text = state
-            .storage
-            .get_full_text(r.memory.id)
-            .await
-            .unwrap_or(None);
-        if req.include_embeddings {
-            mem.embedding = embeddings.get(&r.memory.id).cloned();
-        }
+    let mut hits = Vec::with_capacity(results.len());
+    for r in results {
+        let metadata = crate::model::parse_structured_tags(&r.tags);
+        let memory = MemoryResponse {
+            id: r.memory_id,
+            namespace: r.namespace,
+            created_at: r.created_at,
+            last_accessed_at: r.last_accessed_at,
+            summary: r.summary.unwrap_or_default(),
+            full_text: state
+                .storage
+                .get_full_text(r.memory_id)
+                .await
+                .unwrap_or(None),
+            tags: r.tags,
+            entities: metadata.entities,
+            topics: metadata.topics,
+            emotions: metadata.emotions,
+            phase: r.phase,
+            strength: r.retrievability,
+            decay_strength: r.effective_r,
+            stability: r.stability,
+            difficulty: 5.0,
+            is_permastore: r.is_permastore,
+            edge_count: r.edge_count,
+            embedding: embeddings.get(&r.memory_id).cloned(),
+            access_history: None,
+            supersedes: None,
+            near_duplicates: None,
+        };
         hits.push(SearchHit {
-            memory: mem,
-            score: r.score,
+            memory,
+            score: r.score.unwrap_or(0.0),
         });
     }
 

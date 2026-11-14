@@ -396,15 +396,14 @@ impl bridge::SearchPipeline for McpSearchAdapter {
         }
         let results = self
             .query_engine
-            .similar_with_access(id, limit, record_access)
+            .similar_filtered_with_access(id, limit, min_score, record_access)
             .await
             .map_err(|e| bridge::BridgeError::Search(e.to_string()))?;
 
-            Ok(results
-                .into_iter()
-                .filter(|r| min_score.map_or(true, |ms| r.score.unwrap_or(0.0) >= ms))
-                .map(|r| {
-                    let metadata = crate::model::parse_structured_tags(&r.tags);
+        Ok(results
+            .into_iter()
+            .map(|r| {
+                let metadata = crate::model::parse_structured_tags(&r.tags);
 
                     let tz = self.timezone;
                     bridge::SearchHit {
