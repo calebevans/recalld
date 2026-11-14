@@ -118,3 +118,11 @@ passed; `cargo clippy --offline --locked --all-features --all-targets` completed
 with warnings, including the repository's large `StorageError` pattern in added
 helpers. Scratch caches/logs are excluded from commits. No macOS or warning-free
 validation claim.
+
+Urgent graph P1 follow-up: the baseline reproducer also failed on PR #22. Parent
+fix `745ca69` passed 515 tests; atomic forward merge `e0187fc` passed 558 tests.
+Merge `931994b` brings that corrected atomic parent into this ledger branch.
+Combined validation passed **565 tests**, four existing doctests ignored,
+formatting and Clippy (with warnings), using the same offline Docker constraints.
+The ledger remains in the actual canonical metadata mutation transaction after
+final graph revalidation. No restore/ancestry guarantee is added by this fix.
