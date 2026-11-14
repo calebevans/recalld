@@ -1,6 +1,7 @@
 //! Explicit offline canonical schema migration and attestation. No daemon/provider calls.
 use clap::{Parser, Subcommand};
 use recalld::storage::control::{Generation, GenerationRef};
+use recalld::storage::logical_export::{export_store, import_store};
 use recalld::storage::schema_migration::{
     MigrationOptions, ProfileAttestationInput, inspect_schema, migrate_schema,
 };
@@ -10,7 +11,7 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(
     name = "recalld-schema",
-    about = "Inspect or migrate a stopped store; schema-v2 destinations remain offline"
+    about = "Inspect, migrate, export or import a stopped store; schema-v2 destinations remain offline"
 )]
 struct Args {
     #[command(subcommand)]
@@ -21,6 +22,10 @@ struct Args {
 enum Command {
     /// Validate a stopped store and inspect its migration identity/bindings without changing it.
     Inspect { source: PathBuf },
+    /// Export retained schema-v2 data to a fresh logical file without changing the source.
+    Export { source: PathBuf, file: PathBuf },
+    /// Import a logical file to a fresh offline destination; retry the same file to resume.
+    Import { file: PathBuf, destination: PathBuf },
     /// Migrate to a fresh offline destination. Never replaces or activates the source.
     Migrate {
         source: PathBuf,
@@ -63,6 +68,14 @@ fn parse_timestamp(value: &str) -> Result<i64, &'static str> {
 fn run(args: Args) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     match args.command {
         Command::Inspect { source } => Ok(serde_json::to_value(inspect_schema(&source)?)?),
+        Command::Export { source, file } => {
+            Ok(serde_json::to_value(export_store(&source, &file)?)?)
+        }
+        Command::Import { file, destination } => {
+            let summary = import_store(&file, &destination)?;
+            eprintln!("Destination remains offline; import does not enable ordinary serving.");
+            Ok(serde_json::to_value(summary)?)
+        }
         Command::Migrate {
             source,
             destination,
