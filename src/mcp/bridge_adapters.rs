@@ -1327,15 +1327,17 @@ impl bridge::StorageEngine for McpStorageAdapter {
         id: MemoryId,
         quality: u8,
     ) -> Result<bridge::ReinforceResult, bridge::BridgeError> {
-        let plan = crate::decay::storage_adapter::reinforce(
+        let outcome = crate::decay::storage_adapter::reinforce(
             self.storage.clone(),
             id,
             quality,
             self.config.decay.decay_rate_multiplier,
             self.clock.now_millis(),
         )
-        .await
-        .map_err(|e| {
+        .await;
+        // The first storage write may have committed even if the second failed.
+        self.cache.invalidate(id).await;
+        let plan = outcome.map_err(|e| {
             use crate::decay::lifecycle::LifecycleError;
             match e {
                 LifecycleError::NotFound | LifecycleError::ContentUnavailable => {
@@ -1345,8 +1347,6 @@ impl bridge::StorageEngine for McpStorageAdapter {
                 LifecycleError::Storage(_) => bridge::BridgeError::Storage(e.to_string()),
             }
         })?;
-        // Invalidate instead of copying potentially discarded content from cache.
-        self.cache.invalidate(id).await;
         Ok(bridge::ReinforceResult {
             id: id.to_string(),
             strength: plan.strength,
@@ -1756,6 +1756,13 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
                 decay_rate_multiplier,
             };
 
+            crate::decay::lifecycle::resolve_policy(
+                &ns_config,
+                &crate::decay::DecayConfig::default(),
+                1.0,
+            )
+            .map_err(|e| bridge::BridgeError::InvalidInput(e.to_string()))?;
+
             let mut storage_w = storage.write().map_err(|e| {
                 bridge::BridgeError::Internal(format!("storage lock poisoned: {e}"))
             })?;
@@ -1999,6 +2006,8 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
             .map_err(|e| bridge::BridgeError::Internal(format!("blocking task join error: {e}")))?
         };
 
+        // The blocking closure has released storage before graph/index cleanup.
+        // Keep this order: sweep publication acquires graph before storage.
         let purged = match outcome {
             Ok(purged) => purged,
             Err(failure) => {

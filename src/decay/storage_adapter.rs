@@ -12,6 +12,8 @@ use crate::storage::StorageEngine;
 /// Serialize current-layout feedback with other users of the storage lock.
 /// A1 must replace the two writes with a receipt-backed canonical transaction;
 /// this compatibility adapter does not provide crash atomicity or retry safety.
+/// Lock order: storage only here. Do not acquire/await graph while holding this
+/// guard: sweep publication holds graph first, then acquires storage.
 pub async fn reinforce(
     storage: std::sync::Arc<std::sync::RwLock<crate::storage::RedbStorageEngine>>,
     id: MemoryId,
@@ -78,6 +80,8 @@ pub fn get_decay_metadata(
                 .ok_or_else(|| SweepError::Storage("namespace policy not found".to_string()))?;
 
             Ok(Some(DecayMetadata {
+                phase: record.phase,
+                created_at: record.created_at,
                 stability: record.stability,
                 last_accessed_at: record.last_accessed_at,
                 is_permastore: record.is_permastore != 0,

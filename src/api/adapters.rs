@@ -1130,8 +1130,13 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         let now = self.clock.now_millis();
         let storage = self.storage.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(storage_r) = storage.read() {
-                let _ = storage_r.update_access(id, now, kind);
+            if let Ok(storage_w) = storage.write() {
+                if let Ok(Some(record)) = storage_w.get_record(id) {
+                    if record.phase != DecayPhase::Tombstone {
+                        let timestamp = now.max(record.created_at).max(record.last_accessed_at);
+                        let _ = storage_w.update_access(id, timestamp, kind);
+                    }
+                }
             }
         })
         .await;
@@ -1142,16 +1147,17 @@ impl state::FsrsEngine for FsrsEngineAdapter {
         id: MemoryId,
         quality: u8,
     ) -> Result<state::ReinforceResult, Box<dyn std::error::Error + Send + Sync>> {
-        let plan = crate::decay::storage_adapter::reinforce(
+        let outcome = crate::decay::storage_adapter::reinforce(
             self.storage.clone(),
             id,
             quality,
             self.config.decay.decay_rate_multiplier,
             self.clock.now_millis(),
         )
-        .await?;
-        // Invalidate instead of copying potentially discarded content from cache.
+        .await;
+        // The first storage write may have committed even if the second failed.
         self.cache.invalidate(id).await;
+        let plan = outcome?;
         Ok(state::ReinforceResult {
             strength: plan.strength,
             stability: plan.stability,
@@ -1321,6 +1327,12 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
                 decay_rate_multiplier,
             };
 
+            crate::decay::lifecycle::resolve_policy(
+                &ns_config,
+                &crate::decay::DecayConfig::default(),
+                1.0,
+            )?;
+
             let mut storage_w = storage.write().map_err(|e| {
                 Box::new(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -1487,5 +1499,76 @@ mod tests {
             !fx.fts_index.lock().await.is_empty().expect("fts"),
             "the second delete ran the index cleanup anyway"
         );
+    }
+    #[tokio::test]
+    async fn creation_adapters_reject_unusable_lifecycle_policy_before_persistence() {
+        use crate::api::state::NamespaceRegistry as _;
+        use crate::mcp::bridge::{BridgeError, CreateNamespaceInput, NamespaceRegistry as _};
+        let f = Fixture::new();
+        let http = NamespaceRegistryAdapter::new(f.storage.clone());
+        let mcp = f.namespace_adapter();
+        for (stability, multiplier) in [
+            (0.0, None),
+            (-1.0, None),
+            (f32::NAN, None),
+            (f32::INFINITY, None),
+            (1.0, Some(-1.0)),
+            (1.0, Some(f32::NAN)),
+            (1.0, Some(f32::INFINITY)),
+        ] {
+            let error = http
+                .create("invalid-http", Some(DIM as u32), stability, 0.9, multiplier)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<crate::decay::lifecycle::LifecycleError>(),
+                Some(crate::decay::lifecycle::LifecycleError::InvalidInput(_))
+            ));
+            let error = mcp
+                .create_namespace(CreateNamespaceInput {
+                    name: "invalid-mcp".into(),
+                    embedding_dim: Some(DIM as u16),
+                    initial_stability: Some(stability),
+                    desired_retention: None,
+                    decay_rate_multiplier: multiplier,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, BridgeError::InvalidInput(_)));
+        }
+        assert!(
+            f.storage
+                .read()
+                .unwrap()
+                .get_namespace_by_name("invalid-http")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            f.storage
+                .read()
+                .unwrap()
+                .get_namespace_by_name("invalid-mcp")
+                .unwrap()
+                .is_none()
+        );
+        // Zero decay is valid, zero stability is not; inherited settings stay valid.
+        for multiplier in [None, Some(0.0)] {
+            let name = if multiplier.is_none() {
+                "inherited"
+            } else {
+                "disabled"
+            };
+            let ns = http
+                .create(name, Some(DIM as u32), 1.0, 0.9, multiplier)
+                .await
+                .unwrap();
+            crate::decay::lifecycle::resolve_policy(
+                &ns,
+                &crate::decay::DecayConfig::default(),
+                1.0,
+            )
+            .unwrap();
+        }
     }
 }
