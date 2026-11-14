@@ -11,6 +11,11 @@ import tempfile
 
 IMAGE = "recalld-ci:1.94"
 ROOT = Path(__file__).resolve().parents[1]
+FIXED_INPUTS = (
+    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "examples/offline_eval.rs",
+    "scripts/offline-evaluation.py", "scripts/offline-evaluation.Dockerfile",
+    "scripts/test_offline_evaluation.py",
+)
 
 
 def command(args, **kwargs):
@@ -23,6 +28,29 @@ def sha(path):
 
 def save(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def snapshot_source(root, destination):
+    # Only tracked production Rust plus these exact harness/build inputs. Never
+    # enumerate untracked files, checkout-local Cargo config, data or artifacts.
+    tracked = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--", "src"], cwd=root)
+    names = set(FIXED_INPUTS)
+    names.update(os.fsdecode(p) for p in tracked.split(b"\0") if p and p.endswith(b".rs"))
+    hashes = {}
+    for name in sorted(names):
+        source = root / name
+        if source.is_symlink() or not source.is_file() or not source.resolve().is_relative_to(root.resolve()):
+            raise RuntimeError(f"missing, nonregular or escaping source input: {name}")
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        hashes[name] = sha(target)
+    return hashes
+
+
+def source_patch(root, names):
+    # Unrelated tracked changes can also contain credentials or bulky output.
+    return subprocess.check_output(["git", "diff", "HEAD", "--binary", "--", *sorted(names)], cwd=root)
 
 
 def main():
@@ -52,24 +80,7 @@ def main():
     output = scratch / "output"
     output.mkdir()
     print(f"Artifacts: {output}", flush=True)
-    paths = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=ROOT).split(b"\0")
-    hashes = {}
-    for raw in sorted(set(paths)):
-        if not raw:
-            continue
-        rel = os.fsdecode(raw)
-        # Prior results are evidence, not compiler inputs. Avoid recursive copying.
-        if rel.startswith("benchmarks/offline-evaluation/runs/"):
-            continue
-        path = ROOT / rel
-        if not path.exists():
-            continue
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeError(f"unexpected source type: {rel}")
-        dest = source / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, dest)
-        hashes[rel] = sha(dest)
+    hashes = snapshot_source(ROOT, source)
     shutil.copytree(cache / "registry", scratch / "cargo" / "registry")
     if args.build_cache:
         build_cache = args.build_cache.resolve()
@@ -78,7 +89,7 @@ def main():
         shutil.copytree(build_cache, scratch / "target")
     else:
         (scratch / "target").mkdir()
-    patch = subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=ROOT)
+    patch = source_patch(ROOT, hashes)
     (output / "source.patch").write_bytes(patch)
     image = json.loads(command(["docker", "image", "inspect", args.image]))[0]
     manifest = {
@@ -88,6 +99,8 @@ def main():
         "sourceCommit": command(["git", "rev-parse", "HEAD"], cwd=ROOT),
         "dirtyPatchSha256": hashlib.sha256(patch).hexdigest(),
         "sourceFilesSha256": hashes,
+        "sourceInputPolicy": "tracked src/**/*.rs plus FIXED_INPUTS; no other tracked or untracked paths",
+        "dirtyPatchScope": "allowlisted source inputs only; per-file hashes are authoritative",
         "sourceTreeSha256": hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(),
         "lockfileSha256": hashes["Cargo.lock"],
         "containerImageId": image["Id"], "containerRepoDigests": image.get("RepoDigests", []),
@@ -125,6 +138,7 @@ df -T /work > /work/output/filesystem.txt
 df -T /tmp > /work/output/storage-filesystem.txt
 cat /sys/fs/cgroup/memory.max > /work/output/cgroup-memory.txt
 cat /sys/fs/cgroup/cpu.max > /work/output/cgroup-cpu.txt
+python3 scripts/test_offline_evaluation.py > /work/output/runner-tests.log 2>&1
 rustfmt --check --edition 2024 examples/offline_eval.rs > /work/output/format.log 2>&1
 cargo test --locked --offline --lib > /work/output/library-tests.log 2>&1
 cargo test --locked --offline --example offline_eval > /work/output/harness-tests.log 2>&1

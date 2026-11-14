@@ -9,13 +9,20 @@ results remain a separate legacy evaluation track.
 Run from this checkout with the locally prepared Rust 1.94 image:
 
 ```sh
+# One-time preparation, separate from offline tests. No checkout context is sent.
+docker build -t recalld-ci:1.94 - < scripts/offline-evaluation.Dockerfile
 python3 scripts/offline-evaluation.py \
   --cache /tmp/recalld-unit-tests-l__ja1yo/cargo
 ```
 
-The runner copies source and the scratch Cargo registry into a new temporary
+The pinned Dockerfile adds rustfmt and Clippy to Rust 1.94.1. Image preparation
+may download those components; test and benchmark containers always have no
+network. An existing image is resolved to its immutable ID and recorded per run.
+
+The runner copies allowlisted source and the scratch Cargo registry into a new temporary
 directory, with independent cargo/target directories. It runs formatting checks,
-library tests, harness tests, Clippy, and a release build, then three separate processes
+runner boundary tests, library tests, harness tests, Clippy, and a release build,
+then three separate processes
 with seed 7, 1,000 records, d384, k20, 20 warmups and 100 measured queries per cell.
 Every Docker execution uses `--network none`, 2 CPUs, 4 GiB, a read-only container
 root, a fresh temporary home, and one scratch mount. No home, credentials, socket,
@@ -27,9 +34,16 @@ execution; `RUSTUP_TOOLCHAIN=1.94.1` avoids the repository's `stable` override.
 The printed scratch output directory retains failures as well as successes. Do
 not commit its Cargo cache, target, fixture vectors, full record dumps or CPU
 inventory. Keep compact result summaries and selected raw traces with their
-manifest when publishing measurements. The source-tree manifest includes
-untracked source files, because a Git commit plus an empty patch alone cannot
-identify an uncommitted harness. SHA-256s also cover fixtures, ranks, stored-record
+manifest when publishing measurements. Source inputs are only tracked `src/**/*.rs`,
+`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, and the four explicitly named
+harness/runner/recipe/test files in the runner's `FIXED_INPUTS`. Those exact harness
+files may be untracked during implementation; other untracked files are never
+enumerated or copied. `.validation`, `.test-scratch`, `target`, `.env`, local
+`.cargo/config`, other examples, notes and benchmark artifacts are excluded even
+when tracked. Missing, symlinked or escaping inputs fail closed. Future required
+build inputs must be explicitly added to the allowlist. Dirty patches are scoped
+to the same inputs; hashes describe the copied files, not the whole checkout.
+SHA-256s also cover fixtures, ranks, stored-record
 bytes and output artifacts. Container compiler, CPU, memory/cgroup limits, kernel
 and mount filesystem are recorded. Filesystem data does not establish host-device
 or power-loss durability. There is no provider or external dataset license to

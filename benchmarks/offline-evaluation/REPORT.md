@@ -1,5 +1,44 @@
 # Internal offline foundation: measured validation
 
+## Runner hardening follow-up
+
+The current runner uses the explicit source allowlist described in README and
+scopes dirty-patch provenance to the same files. No broad enumeration of untracked
+files or copying of unrelated tracked files remains. Three isolated Python
+regressions passed: scratch/secrets canaries excluded from both snapshot and
+patch with exact source hashes, missing inputs rejected, and symlinks rejected.
+
+The checked-in `scripts/offline-evaluation.Dockerfile` was built using an empty
+stdin context and the pinned Rust base. A network-disabled preparation attempt
+failed closed on the missing rustfmt layer; the separate normal preparation
+build succeeded using its component cache. All subsequent tests/measurements
+still ran with `--network none`. The recipe image resolved to
+`sha256:b5de9590d0d460e34c1657ca68d6d56bdcf95c4ab23471b76bf08daa2b236efd`.
+
+Final validation repeated **496 library + 2 Rust harness + 3 Python runner tests**,
+formatting, Clippy (207 existing library warnings, none in the example), release
+build, and three fresh processes with 1,200 measured completions. All passed;
+fixture/ledger/state/rank hashes matched. The Rust harness is unchanged from the
+original run below. Run-specific p95 microseconds, keeping each process separate:
+
+| Cell | Run 0 | Run 1 | Run 2 |
+| --- | ---: | ---: | ---: |
+| Exact index, 100% eligible | 28.708 | 29.875 | 29.000 |
+| Exact index, 10% eligible | 9.375 | 11.417 | 5.792 |
+| Internal engine, vector | 171.958 | 144.542 | 142.333 |
+| Internal engine, hybrid | 161.125 | 127.292 | 114.291 |
+
+[Final raw evidence](runs/2026-11-14-allowlist/evidence.tgz), 130,709 bytes,
+SHA-256 `d5f7a84030a4b1aa621dcd56753092367d8fe590e2d2ea2cdfd82c3a4540c1d0`.
+The 124 allowed inputs have source-tree hash
+`5be06c14699e41d078747a3545790230ed6f508e858166afd5aba379f43681ed`;
+runner SHA-256 `7c01b3217d06b94695e672282645e7953b43d6b9c198c74592caeff5b2332d02`.
+The archive includes the runner tests and scoped patch as well as all prior log
+types, raw traces and summaries. It supersedes the earlier runner validation,
+while preserving the earlier measured evidence below. No release gate is claimed.
+
+## Initial foundation measurement
+
 2026-11-14. This is an A5/A6 foundation slice, not full A6 implementation or a
 performance/quality promotion result. See [scope and follow-up stack](README.md).
 
