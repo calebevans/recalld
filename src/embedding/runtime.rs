@@ -20,6 +20,47 @@ impl From<Vec<f32>> for GeneratedEmbedding {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum NamespaceProfileError {
+    #[error("embeddingDim must be an integer in 1..8192")]
+    InvalidDimension,
+    #[error("embeddingDim {requested} differs from the active provider dimension {active}")]
+    InactiveDimension { requested: u32, active: u32 },
+    #[error("active embedding provider configuration is unavailable: {0}")]
+    Unavailable(&'static str),
+}
+
+/// Resolve creation against the actual single provider, never a default
+/// namespace row. This permits the staged unverified v1 lane, not attestation.
+pub fn creation_dimension(
+    provider: &dyn EmbeddingProvider,
+    requested: Option<u32>,
+) -> Result<u32, NamespaceProfileError> {
+    if requested.is_some_and(|dim| !(1..=8192).contains(&dim)) {
+        return Err(NamespaceProfileError::InvalidDimension);
+    }
+    let active = u32::try_from(provider.dimensions())
+        .ok()
+        .filter(|dim| (1..=8192).contains(dim))
+        .ok_or(NamespaceProfileError::Unavailable("invalid dimensions"))?;
+    if let Some(profile) = provider.profile() {
+        profile
+            .validate()
+            .map_err(|_| NamespaceProfileError::Unavailable("invalid profile"))?;
+        if profile.dimension != active {
+            return Err(NamespaceProfileError::Unavailable(
+                "profile dimension differs from provider",
+            ));
+        }
+    }
+    if let Some(requested) = requested {
+        if requested != active {
+            return Err(NamespaceProfileError::InactiveDimension { requested, active });
+        }
+    }
+    Ok(active)
+}
+
 pub(crate) fn native_profile(
     kind: ProviderKind,
     model: &str,

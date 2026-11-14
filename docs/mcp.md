@@ -861,12 +861,16 @@ MCP coverage counts and `truncated` are unknown (`null`) because the legacy brid
 
 Create a new memory namespace. Namespaces organize data; they are not access controls. Each namespace has its own embedding space and decay configuration. Embedding dimensions are fixed after creation.
 
+Creation uses the single active provider's dimension. Existing v1 namespaces remain
+legacy-unverified: checking the active configuration does not attest stored vectors
+or persist a profile binding. Schema-v2 serving remains gated.
+
 #### Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `name` | string | yes | -- | Alphanumeric, hyphens, underscores; 1-64 chars |
-| `embeddingDim` | integer | no | *inherited* | Integer 1–8192; null is invalid. Inherits the `default` namespace dimension (fallback 1536), fixed after creation. |
+| `embeddingDim` | integer | no | active provider | Integer 1–8192; null is invalid. Must equal the active provider dimension; omission selects it. Fixed after creation. |
 | `initialStability` | number | no | `3.7145` | Positive finite starting stability in days for new memories |
 | `desiredRetention` | number | no | `0.9` | Target retention rate (0.0-1.0) |
 | `decayRateMultiplier` | number | no | *inherited* | Finite and nonnegative: 1.0 = normal, 2.0 = 2x slower decay, 0.5 = 2x faster, 0.0 = disabled |

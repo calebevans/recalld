@@ -1149,7 +1149,10 @@ mod tests {
                     system.config.clone(),
                     false,
                 )),
-                Arc::new(NamespaceRegistryAdapter::new(system.storage.clone())),
+                Arc::new(NamespaceRegistryAdapter::new(
+                    system.storage.clone(),
+                    system.embedding.clone(),
+                )),
                 Arc::new(NoopMetricsCollector),
             );
             use tower::ServiceExt;

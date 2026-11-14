@@ -1279,12 +1279,16 @@ impl state::FsrsEngine for FsrsEngineAdapter {
 /// Adapts `RedbStorageEngine` to the API `NamespaceRegistry` trait.
 pub struct NamespaceRegistryAdapter {
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+    embedding: Arc<dyn EmbeddingProvider>,
 }
 
 impl NamespaceRegistryAdapter {
     /// Creates a new adapter wrapping the storage engine for namespace operations.
-    pub fn new(storage: Arc<std::sync::RwLock<RedbStorageEngine>>) -> Self {
-        Self { storage }
+    pub fn new(
+        storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+        embedding: Arc<dyn EmbeddingProvider>,
+    ) -> Self {
+        Self { storage, embedding }
     }
 }
 
@@ -1368,22 +1372,13 @@ impl state::NamespaceRegistry for NamespaceRegistryAdapter {
         desired_retention: f32,
         decay_rate_multiplier: Option<f32>,
     ) -> Result<NamespaceConfig, Box<dyn std::error::Error + Send + Sync>> {
+        let dim =
+            crate::embedding::runtime::creation_dimension(self.embedding.as_ref(), embedding_dim)?;
         let now = chrono::Utc::now().timestamp_millis();
         let storage = self.storage.clone();
         let name_owned = name.to_string();
 
         tokio::task::spawn_blocking(move || {
-            // Resolve embedding_dim: use provided value, or inherit from
-            // the 'default' namespace, or fall back to 1536.
-            let dim = embedding_dim.unwrap_or_else(|| {
-                storage
-                    .read()
-                    .ok()
-                    .and_then(|s| s.get_namespace_by_name("default").ok().flatten())
-                    .map(|ns| ns.embedding_dim)
-                    .unwrap_or(1536)
-            });
-
             let ns_config = NamespaceConfig {
                 schema: None,
                 id: NamespaceId::UNSET,
@@ -1691,7 +1686,10 @@ mod tests {
         use crate::api::state::NamespaceRegistry as _;
         use crate::mcp::bridge::{BridgeError, CreateNamespaceInput, NamespaceRegistry as _};
         let f = Fixture::new();
-        let http = NamespaceRegistryAdapter::new(f.storage.clone());
+        let http = NamespaceRegistryAdapter::new(
+            f.storage.clone(),
+            Arc::new(crate::embedding::PassthroughProvider::new(DIM)),
+        );
         let mcp = f.namespace_adapter();
         for (stability, multiplier) in [
             (0.0, None),

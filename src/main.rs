@@ -469,8 +469,9 @@ async fn run_serve(
             )
             .with_clock(system.clock().clone()),
         );
-        let namespaces: Arc<dyn recalld::api::NamespaceRegistry> =
-            Arc::new(NamespaceRegistryAdapter::new(system.storage().clone()));
+        let namespaces: Arc<dyn recalld::api::NamespaceRegistry> = Arc::new(
+            NamespaceRegistryAdapter::new(system.storage().clone(), system.embedding().clone()),
+        );
         let metrics: Arc<dyn recalld::api::MetricsCollector> = Arc::new(NoopMetricsCollector);
 
         recalld::api::AppState::new(search, storage, cache, graph, decay, namespaces, metrics)
@@ -583,6 +584,7 @@ fn create_direct_mcp_bridge(
     let namespaces: Arc<dyn recalld::mcp::bridge::NamespaceRegistry> =
         Arc::new(McpNamespaceAdapter::new(
             system.storage().clone(),
+            system.embedding().clone(),
             system.cache().clone(),
             system.vector_index().clone(),
             system.fts_index().clone(),

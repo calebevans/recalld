@@ -281,6 +281,7 @@ impl Fixture {
     pub(crate) fn namespace_adapter(&self) -> crate::mcp::bridge_adapters::McpNamespaceAdapter {
         crate::mcp::bridge_adapters::McpNamespaceAdapter::new(
             self.storage.clone(),
+            Arc::new(crate::embedding::PassthroughProvider::new(DIM)),
             self.cache.clone(),
             self.vector_index.clone(),
             self.fts_index.clone(),

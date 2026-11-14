@@ -56,10 +56,10 @@ even a match still rejects ordinary semantic serving/writes until the all-writer
 barrier is complete. The existing disk/open and final writer gates remain closed.
 Metadata reads and offline export do not acquire a provider requirement.
 
-Remaining work includes actual namespace-create validation against the single
-active provider (parser range 1..8192 is not end-to-end support for arbitrary
-inactive widths). That consumer needs catalog PR50 in its own minimal child;
-this change does not introduce that parent. Canonical UTF-8 label hydration and
+The dependent [namespace-create consumer](namespace-profile-boundary.md) now
+checks the actual single provider using catalog PR50; parser range 1..8192 is not
+end-to-end support for arbitrary inactive widths. The original profile slice
+above does not introduce that parent. Canonical UTF-8 label hydration and
 filter predicates, participating schema-v2 writers, public precomputed-vector
 profile selectors, versioned envelopes and capabilities/discovery remain separate
 work. This child advertises no new public capability or readiness.

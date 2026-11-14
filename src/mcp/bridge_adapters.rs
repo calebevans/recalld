@@ -1617,6 +1617,7 @@ fn build_list_tags_response(
 /// handles happen to be.
 pub struct McpNamespaceAdapter {
     storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+    embedding: Arc<dyn EmbeddingProvider>,
     cache: Arc<CacheManager>,
     vector_index: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
     fts_index: Arc<tokio::sync::Mutex<FtsIndex>>,
@@ -1630,6 +1631,7 @@ impl McpNamespaceAdapter {
     /// the indexes a namespace deletion has to clean.
     pub fn new(
         storage: Arc<std::sync::RwLock<RedbStorageEngine>>,
+        embedding: Arc<dyn EmbeddingProvider>,
         cache: Arc<CacheManager>,
         vector_index: Arc<tokio::sync::RwLock<FlatVectorIndex>>,
         fts_index: Arc<tokio::sync::Mutex<FtsIndex>>,
@@ -1640,6 +1642,7 @@ impl McpNamespaceAdapter {
         cache.bind_storage(&storage);
         Self {
             storage,
+            embedding,
             cache,
             vector_index,
             fts_index,
@@ -1794,29 +1797,26 @@ impl bridge::NamespaceRegistry for McpNamespaceAdapter {
         crate::model::validation::validate_namespace_name(&input.name)
             .map_err(|e| bridge::BridgeError::InvalidInput(e.to_string()))?;
 
+        let dim = crate::embedding::runtime::creation_dimension(
+            self.embedding.as_ref(),
+            input.embedding_dim.map(u32::from),
+        )
+        .map_err(|error| match error {
+            crate::embedding::runtime::NamespaceProfileError::Unavailable(_) => {
+                bridge::BridgeError::Unavailable(error.to_string())
+            }
+            _ => bridge::BridgeError::InvalidInput(error.to_string()),
+        })?;
+
         let now = chrono::Utc::now().timestamp_millis();
         let storage = self.storage.clone();
         let tz = self.timezone;
         let input_name = input.name.clone();
-        let embedding_dim = input.embedding_dim;
         let initial_stability = input.initial_stability;
         let desired_retention = input.desired_retention;
         let decay_rate_multiplier = input.decay_rate_multiplier;
 
         tokio::task::spawn_blocking(move || {
-            let dim = embedding_dim.map(|d| d as u32).unwrap_or_else(|| {
-                storage
-                    .read()
-                    .ok()
-                    .and_then(|s| {
-                        s.get_namespace_by_name(crate::model::constants::DEFAULT_NAMESPACE_NAME)
-                            .ok()
-                            .flatten()
-                    })
-                    .map(|ns| ns.embedding_dim)
-                    .unwrap_or(1536)
-            });
-
             let ns_config = NamespaceConfig {
                 schema: None,
                 id: NamespaceId::UNSET,

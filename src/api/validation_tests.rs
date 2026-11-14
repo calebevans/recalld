@@ -15,10 +15,19 @@ use crate::storage::StorageEngine as _;
 use crate::test_support::Fixture;
 
 fn fixture_clients(f: &Fixture) -> (Router, crate::mcp::bridge::McpBridge) {
+    fixture_clients_with_provider(
+        f,
+        Arc::new(crate::embedding::PassthroughProvider::new(
+            crate::test_support::DIM,
+        )),
+    )
+}
+
+fn fixture_clients_with_provider(
+    f: &Fixture,
+    embedding: Arc<dyn crate::embedding::EmbeddingProvider>,
+) -> (Router, crate::mcp::bridge::McpBridge) {
     use crate::search::adapters::*;
-    let embedding = Arc::new(crate::embedding::PassthroughProvider::new(
-        crate::test_support::DIM,
-    ));
     let engine = Arc::new(crate::search::QueryEngine::new(
         Arc::new(StorageNamespaceResolver::new(f.storage.clone())),
         Arc::new(SingleEmbeddingRegistry::new(embedding.clone())),
@@ -42,11 +51,21 @@ fn fixture_clients(f: &Fixture) -> (Router, crate::mcp::bridge::McpBridge) {
         f.graph.clone(),
         chrono_tz::UTC,
     ));
+    bridge.namespaces = Arc::new(crate::mcp::bridge_adapters::McpNamespaceAdapter::new(
+        f.storage.clone(),
+        embedding.clone(),
+        f.cache.clone(),
+        f.vector_index.clone(),
+        f.fts_index.clone(),
+        f.entity_index.clone(),
+        f.graph.clone(),
+        chrono_tz::UTC,
+    ));
     let config = Arc::new(crate::config::RecalldConfig::default());
     let state = AppState::new(
         Arc::new(SearchPipelineAdapter::new(
             engine,
-            embedding,
+            embedding.clone(),
             f.vector_index.clone(),
             f.fts_index.clone(),
             f.entity_index.clone(),
@@ -75,7 +94,10 @@ fn fixture_clients(f: &Fixture) -> (Router, crate::mcp::bridge::McpBridge) {
             config,
             false,
         )),
-        Arc::new(NamespaceRegistryAdapter::new(f.storage.clone())),
+        Arc::new(NamespaceRegistryAdapter::new(
+            f.storage.clone(),
+            embedding.clone(),
+        )),
         Arc::new(NoopMetricsCollector),
     );
     (
@@ -98,6 +120,201 @@ async fn post(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+fn namespace_tree(
+    path: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn walk(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = if path.is_dir() {
+                walk(root, &path, files);
+                vec![]
+            } else {
+                std::fs::read(&path).unwrap()
+            };
+            files.insert(path.strip_prefix(root).unwrap().into(), bytes);
+        }
+    }
+    let mut files = Default::default();
+    walk(path, path, &mut files);
+    files
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespace_profile_http_mcp_use_active_width_before_catalog_allocation() {
+    let f = Fixture::new();
+    // Existing default is 4; actual provider is 8. Omission must not inherit 4.
+    let provider = Arc::new(crate::embedding::OllamaProvider::new(
+        "fixture-model".into(),
+        8,
+    ));
+    let (app, bridge) = fixture_clients_with_provider(&f, provider);
+    let before = namespace_tree(f.path());
+    let generation = f
+        .storage
+        .read()
+        .unwrap()
+        .control_state()
+        .unwrap()
+        .committed_generation;
+    for width in [1, 4, 8192] {
+        let input = json!({"name":"rejected", "embeddingDim":width});
+        let (status, body) = post(&app, "/namespaces", input.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["field"], "embeddingDim");
+        let result = crate::mcp::tools::dispatch_tool(&bridge, "create_namespace", input).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            serde_json::to_string(&result)
+                .unwrap()
+                .contains("active provider dimension 8")
+        );
+        assert_eq!(namespace_tree(f.path()), before);
+        assert_eq!(
+            f.storage
+                .read()
+                .unwrap()
+                .control_state()
+                .unwrap()
+                .committed_generation,
+            generation
+        );
+    }
+    for (index, input) in [
+        json!({"name":"http-omitted"}),
+        json!({"name":"mcp-omitted"}),
+        json!({"name":"http-explicit", "embeddingDim":8}),
+        json!({"name":"mcp-explicit", "embeddingDim":8}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index % 2 == 0 {
+            let (status, body) = post(&app, "/namespaces", input.clone()).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        } else {
+            let result =
+                crate::mcp::tools::dispatch_tool(&bridge, "create_namespace", input.clone()).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+        }
+        let storage = f.storage.read().unwrap();
+        let ns = storage
+            .get_namespace_by_name(input["name"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ns.embedding_dim, 8);
+        assert_eq!(
+            ns.id.get(),
+            index as u32 + 2,
+            "rejections must not reserve namespace IDs"
+        );
+        assert!(
+            ns.schema.is_none(),
+            "known config must not auto-attest legacy namespace"
+        );
+        assert_eq!(
+            storage.control_state().unwrap().committed_generation.get(),
+            generation.get() + index as u64 + 1
+        );
+    }
+    assert_eq!(
+        f.storage
+            .read()
+            .unwrap()
+            .get_namespace_by_name("default")
+            .unwrap()
+            .unwrap()
+            .embedding_dim,
+        4
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespace_profile_invalid_runtime_is_unavailable_without_catalog_mutation() {
+    struct Provider {
+        dim: usize,
+        profile: Option<crate::model::schema::EmbeddingProfile>,
+    }
+    #[async_trait::async_trait]
+    impl crate::embedding::EmbeddingProvider for Provider {
+        async fn embed(&self, _: &str) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
+            panic!("namespace creation must not embed")
+        }
+        fn dimensions(&self) -> usize {
+            self.dim
+        }
+        fn model_name(&self) -> &str {
+            "not provenance"
+        }
+        fn profile(&self) -> Option<crate::model::schema::EmbeddingProfile> {
+            self.profile.clone()
+        }
+    }
+    let f = Fixture::new();
+    let before = namespace_tree(f.path());
+    let mut bad_profile = crate::embedding::runtime::tests::profile();
+    bad_profile.identity_version = 99;
+    for provider in [
+        Provider {
+            dim: 0,
+            profile: None,
+        },
+        Provider {
+            dim: 8193,
+            profile: None,
+        },
+        Provider {
+            dim: 4,
+            profile: Some(bad_profile),
+        },
+        Provider {
+            dim: 8,
+            profile: Some(crate::embedding::runtime::tests::profile()),
+        },
+    ] {
+        let (app, bridge) = fixture_clients_with_provider(&f, Arc::new(provider));
+        let input = json!({"name":"bad-runtime"});
+        let (status, body) = post(&app, "/namespaces", input.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let result = crate::mcp::tools::dispatch_tool(&bridge, "create_namespace", input).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            serde_json::to_string(&result)
+                .unwrap()
+                .contains("unavailable")
+        );
+        assert_eq!(namespace_tree(f.path()), before);
+    }
+    // No descriptor remains allowed only as explicitly unverified v1 compatibility.
+    let (app, _) = fixture_clients_with_provider(
+        &f,
+        Arc::new(Provider {
+            dim: 4,
+            profile: None,
+        }),
+    );
+    assert_eq!(
+        post(&app, "/namespaces", json!({"name":"custom-legacy"}))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        f.storage
+            .read()
+            .unwrap()
+            .get_namespace_by_name("custom-legacy")
+            .unwrap()
+            .unwrap()
+            .schema
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -179,6 +396,10 @@ async fn http_namespace_rejects_exported_probe_values_without_creation() {
         );
     }
     for (name, dim) in [("one", 1), ("maximum", 8192)] {
+        let (app, _) = fixture_clients_with_provider(
+            &f,
+            Arc::new(crate::embedding::PassthroughProvider::new(dim as usize)),
+        );
         let (status, body) = post(
             &app,
             "/namespaces",
@@ -322,7 +543,7 @@ async fn namespace_option_parity_and_no_creation_on_invalid_input() {
             );
         }
     }
-    // Null floats retain v1 omission semantics; dimension omission inherits 4.
+    // Null floats retain v1 omission semantics; dimension omission selects active provider width 4.
     for (index, options) in [
         json!({"initialStability": null, "desiredRetention": null, "decayRateMultiplier": null}),
         json!({"initialStability": 1, "desiredRetention": 0, "decayRateMultiplier": 0}),

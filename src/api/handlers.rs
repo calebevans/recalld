@@ -1111,7 +1111,23 @@ pub async fn create_namespace(
 
 fn namespace_create_error(error: Box<dyn std::error::Error + Send + Sync>) -> AppError {
     use crate::decay::lifecycle::LifecycleError;
+    use crate::embedding::runtime::NamespaceProfileError;
     use crate::storage::StorageError;
+    if let Some(error) = error.downcast_ref::<NamespaceProfileError>() {
+        return match error {
+            NamespaceProfileError::InvalidDimension => AppError::BadRequest {
+                message: error.to_string(),
+                field: Some("embeddingDim".into()),
+            },
+            NamespaceProfileError::InactiveDimension { .. } => AppError::UnprocessableEntity {
+                message: error.to_string(),
+                field: Some("embeddingDim".into()),
+            },
+            NamespaceProfileError::Unavailable(_) => AppError::ServiceUnavailable {
+                message: error.to_string(),
+            },
+        };
+    }
     if matches!(
         error.downcast_ref::<LifecycleError>(),
         Some(LifecycleError::InvalidInput(_))
