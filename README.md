@@ -183,7 +183,7 @@ recalld mcp
 recalld serve
 ```
 
-**Daemon** -- Runs in the background with a Unix socket at `~/.recalld/socket`, using JSON-RPC 2.0. Auto-shuts down after 30 minutes of idle time.
+**Daemon** -- Runs in the background with a Unix socket at `$XDG_RUNTIME_DIR/recalld/recalld.sock` on Linux, or `~/.recalld/recalld.sock` where there is no runtime directory (macOS), using JSON-RPC 2.0. Auto-shuts down after 30 minutes of idle time.
 
 ```sh
 recalld daemon

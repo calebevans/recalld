@@ -346,7 +346,7 @@ The `namespace` field is required. All other sections are optional and replace t
 
 recalld has four run modes: MCP server (stdio), HTTP API server, daemon, and Docker container.
 
-### As MCP server (for Claude Code / Cursor)
+### As MCP server (for Claude Code / Cursor / Codex)
 
 This is the most common setup. recalld runs as an MCP server over stdio, launched by your AI tool.
 
@@ -360,7 +360,7 @@ claude mcp add --scope user recalld -- recalld mcp
 claude mcp add --scope project recalld -- recalld mcp
 ```
 
-**Cursor** -- add to `.cursor/mcp.json`:
+**Cursor** -- add to `.cursor/mcp.json` in a project, or to `~/.cursor/mcp.json` for every project:
 
 ```json
 {
@@ -383,6 +383,21 @@ When running recalld in Docker or on a remote server, use the URL transport inst
     }
   }
 }
+```
+
+**Codex** -- add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.recalld]
+command = "recalld"
+args = ["mcp"]
+```
+
+Codex starts MCP servers with a short fixed list of environment variables, and `XDG_RUNTIME_DIR` is not on it. recalld finds a daemon that is already running under `/run/user/<uid>` regardless. On recalld 1.0.0 and earlier it does not, and on Linux the server then fails to start whenever a daemon was started from a terminal or a systemd unit; set the variable for the server to avoid that:
+
+```toml
+[mcp_servers.recalld.env]
+XDG_RUNTIME_DIR = "/run/user/1000"   # use the output of `id -u`
 ```
 
 When launched in MCP mode, recalld automatically connects to a running daemon. If no daemon is running, it auto-starts one. If the daemon cannot be started, it falls back to direct mode (in-process storage).
@@ -446,7 +461,9 @@ This is the recommended transport when running recalld in a Docker container, on
 
 ### As daemon
 
-The daemon runs in the background, listening on a Unix socket (`~/.recalld/socket`). MCP clients connect to it via JSON-RPC 2.0. The daemon auto-shuts down after 30 minutes of inactivity by default.
+The daemon runs in the background, listening on a Unix socket. MCP clients connect to it via JSON-RPC 2.0. The daemon auto-shuts down after 30 minutes of inactivity by default.
+
+The socket is at `$XDG_RUNTIME_DIR/recalld/recalld.sock` on Linux, and at `~/.recalld/recalld.sock` where `XDG_RUNTIME_DIR` is not set (macOS). Set `RECALLD_DAEMON_SOCKET` to put it somewhere else. A client that does not have the same environment as the daemon still finds it: before settling on a path, recalld checks each of these locations, and `/run/user/<uid>` on Linux, for a daemon that is already listening. `recalld daemon status` prints the path in use.
 
 ```bash
 # Start in background (default)
@@ -1243,10 +1260,11 @@ recalld daemon stop
 recalld daemon start
 ```
 
-If `daemon stop` fails, remove the stale socket manually:
+If `daemon stop` fails, remove the stale socket manually. `recalld daemon status` prints its path as `stale socket: ...`; it is one of:
 
 ```bash
-rm ~/.recalld/socket
+rm "$XDG_RUNTIME_DIR/recalld/recalld.sock"   # Linux
+rm ~/.recalld/recalld.sock                   # macOS, or Linux without XDG_RUNTIME_DIR
 recalld daemon start
 ```
 
