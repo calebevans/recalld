@@ -1,0 +1,142 @@
+{
+  "fixtureVersion": 3,
+  "license": "CC0-1.0; synthetic fixture authored for this harness; no external data",
+  "seed": 7,
+  "profile": {
+    "model": "public-fixture-v1",
+    "dimensions": 4,
+    "documentPrefix": "",
+    "queryPrefix": ""
+  },
+  "sources": [
+    {
+      "sourceId": "turn-001",
+      "summary": "amber",
+      "namespace": "default",
+      "vector": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "embeddingInput": "amber"
+    },
+    {
+      "sourceId": "turn-002",
+      "summary": "birch",
+      "namespace": "default",
+      "vector": [
+        0,
+        1,
+        0,
+        0
+      ],
+      "embeddingInput": "birch\n\nbirch payload",
+      "fullText": "birch payload"
+    },
+    {
+      "sourceId": "turn-003",
+      "summary": "foreign",
+      "namespace": "foreign",
+      "vector": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "embeddingInput": "foreign"
+    },
+    {
+      "sourceId": "turn-004",
+      "summary": "olive",
+      "namespace": "default",
+      "vector": [
+        0,
+        0,
+        1,
+        0
+      ],
+      "embeddingInput": "olive"
+    },
+    {
+      "sourceId": "turn-005",
+      "summary": "copper",
+      "namespace": "default",
+      "vector": [
+        0.8,
+        0.6,
+        0,
+        0
+      ],
+      "embeddingInput": "copper"
+    },
+    {
+      "sourceId": "turn-006",
+      "summary": "foreign-peer",
+      "namespace": "foreign",
+      "vector": [
+        0.8,
+        0.6,
+        0,
+        0
+      ],
+      "embeddingInput": "foreign-peer"
+    }
+  ],
+  "query": "amber",
+  "evidenceSources": [
+    "turn-001"
+  ],
+  "extraEmbeddingInputs": {
+    "health check": [
+      0,
+      0,
+      0,
+      1
+    ]
+  },
+  "extension": {
+    "similaritySource": "amber",
+    "expectedNeighbor": "copper",
+    "vectorQuery": [
+      1,
+      0,
+      0,
+      0
+    ],
+    "initialRepeats": 3,
+    "restartRepeats": 1,
+    "vectorOnlyTransports": [
+      "rest"
+    ],
+    "similarityTransports": [
+      "stdio",
+      "http-mcp",
+      "rest"
+    ],
+    "apiContractVersion": "legacy-v1"
+  },
+  "exposureChecks": {
+    "cases": [
+      "threshold",
+      "limit",
+      "empty"
+    ],
+    "scopePairs": [
+      [
+        "amber",
+        "copper",
+        "default"
+      ],
+      [
+        "foreign",
+        "foreign-peer",
+        "foreign"
+      ]
+    ],
+    "quietMs": 200,
+    "preActionWaitMs": 1100,
+    "pollDeadlineMs": 5000,
+    "assertion": "returned IDs only; public anchor changes, exact canonical event counts checked separately in Rust"
+  }
+}
