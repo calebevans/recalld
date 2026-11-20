@@ -1261,7 +1261,8 @@ A concise version that covers the essential behaviors. Shorter prompts tend to g
 # Memory
 
 Start with `get_session` (fallback: `recalld://session`) to check the connection's
-namespace and access defaults. Reuse existing namespaces: `default` for shared
+namespace and access defaults, then `list_namespaces` to see what exists; never
+assume the list. Reuse existing namespaces: `default` for shared
 preferences and cross-project facts, `project-<name>` for project-specific
 knowledge, and optionally `topic-<name>` for useful general topics. A project
 default does not make every fact project-local. Namespaces are not access controls.
@@ -1292,7 +1293,8 @@ If you want more detailed guidance (at the cost of longer prompt length), use th
 # Memory
 
 Start with `get_session` (fallback: `recalld://session`) to check the connection's
-namespace and access defaults. Reuse existing namespaces: `default` for shared
+namespace and access defaults, then `list_namespaces` to see what exists; never
+assume the list. Reuse existing namespaces: `default` for shared
 preferences and cross-project facts, `project-<name>` for project-specific
 knowledge, and optionally `topic-<name>` for useful general topics. A project
 default does not make every fact project-local. Namespaces are not access controls.
@@ -1338,8 +1340,9 @@ on the new contract; old reads working does not establish write compatibility.
 
 Prompt instructions tell the model *how* to use memory, but models don't always follow instructions consistently -- especially long ones competing with other system prompt content. Hooks can offer a contextual reminder without requiring a memory operation on every turn.
 
-Claude Code [hooks](https://code.claude.com/docs/en/hooks) can run shell commands in response to lifecycle events. For the `UserPromptSubmit` hook below, successful plain-text stdout is added to the conversation context. Other events have different output rules. One hook works well for memory:
+Claude Code [hooks](https://code.claude.com/docs/en/hooks) can run shell commands in response to lifecycle events. For the `UserPromptSubmit` hook below, successful plain-text stdout is added to the conversation context. `SessionStart` stdout is added the same way. Two hooks work well for memory:
 
+- **`SessionStart`** -- runs when a session starts or resumes. A good place to have the model look up the existing namespaces with `list_namespaces` instead of assuming them.
 - **`UserPromptSubmit`** -- runs before the model responds to each user message. A good place to remind the model that memory tools are available.
 
 Add to your `~/.claude/settings.json` (or project `.claude/settings.json`):
@@ -1347,12 +1350,23 @@ Add to your `~/.claude/settings.json` (or project `.claude/settings.json`):
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Start with get_session, then list_namespaces. Use default for shared facts and the existing project namespace that matches this repository for project knowledge; create one only when none fits.'"
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Would shared or current-project memory help this task? Recall only relevant context; store durable learning and give feedback only when warranted.'"
+            "command": "echo 'Would shared or current-project memory help this task? Recall only relevant context; store durable learning and give feedback only when warranted. Select the appropriate namespace explicitly.'"
           }
         ]
       }
@@ -1363,7 +1377,9 @@ Add to your `~/.claude/settings.json` (or project `.claude/settings.json`):
 
 This hook is deliberately suggestive rather than commanding -- the model decides whether memories are relevant on each turn. This avoids unnecessary memory operations on simple tasks while ensuring the model doesn't forget that memory tools exist.
 
-Keep hook output static and trusted: do not interpolate user messages or recalled text into shell commands or injected instructions. Hooks should nudge relevance checks, not execute stores, reinforcement, or destructive writes themselves. Omit the hook if it adds noise.
+Keep hook output static and trusted: do not interpolate user messages or recalled text into shell commands or injected instructions. Hooks should nudge relevance checks, not execute stores, reinforcement, or destructive writes themselves. Omit a hook if it adds noise.
+
+Codex supports the same events in `~/.codex/hooks.json`. Its hooks print JSON instead of plain text, for example `printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Start with get_session, then list_namespaces. ..."}}'`. Codex asks you to trust a hook again whenever its command changes.
 
 ### Adapting the prompt
 

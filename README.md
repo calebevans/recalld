@@ -104,7 +104,8 @@ Add the following to your `CLAUDE.md` (or equivalent prompt file) so your AI ass
 # Memory
 
 Start with `get_session` (fallback: `recalld://session`) to check the connection's
-namespace and access defaults. Reuse existing namespaces: `default` for shared
+namespace and access defaults, then `list_namespaces` to see what exists; never
+assume the list. Reuse existing namespaces: `default` for shared
 preferences and cross-project facts, `project-<name>` for project-specific
 knowledge, and optionally `topic-<name>` for useful general topics. A project
 default does not make every fact project-local. Namespaces are not access controls.
@@ -129,19 +130,30 @@ durable batch with its documented receipt/key and unchanged full payload.
 
 ### 5. Improve memory usage with hooks (optional)
 
-Prompt instructions alone may not be enough to get consistent memory usage. Claude Code [hooks](https://code.claude.com/docs/en/hooks) can inject gentle reminders on every turn so your assistant doesn't forget that memory tools are available.
+Prompt instructions alone may not be enough to get consistent memory usage. Claude Code [hooks](https://code.claude.com/docs/en/hooks) can inject gentle reminders so your assistant checks which namespaces exist when a session starts and doesn't forget that memory tools are available on each turn.
 
 Add to your `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Start with get_session, then list_namespaces. Use default for shared facts and the existing project namespace that matches this repository for project knowledge; create one only when none fits.'"
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Would shared or current-project memory help this task? Recall only relevant context; store durable learning and give feedback only when warranted.'"
+            "command": "echo 'Would shared or current-project memory help this task? Recall only relevant context; store durable learning and give feedback only when warranted. Select the appropriate namespace explicitly.'"
           }
         ]
       }
