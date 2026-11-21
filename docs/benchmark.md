@@ -422,10 +422,7 @@ cargo run --features bench --release -- bench locomo
 ## 5. Results
 
 Results are stored in `benchmarks/<run-name>/bench_results.json` (per-question
-answers, judgments and timings). Earlier runs from the v1.x harness
-(Claude Sonnet 4.6 and Gemini 2.5 Flash, top-k 15/20, plus shared-store stress
-tests) remain in `benchmarks/` for reference; they are not comparable with the
-run below because the ingestion path, prompts, judge and top-k all changed.
+answers, judgments and timings).
 
 ### Run: Qwen3 235B, embeddinggemma, top-k 30 (all categories)
 
