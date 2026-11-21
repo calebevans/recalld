@@ -196,10 +196,19 @@ Recalld 2.0 creates new databases in the native schema and automatically upgrade
 
 recalld is evaluated on the [LoCoMo](https://aclanthology.org/2024.acl-long.747/) benchmark (1,986 questions across 5 categories including adversarial). All results use a single prompt for all categories, with no category routing or per-category prompt selection.
 
-| Model | Accuracy | Categories |
-|-------|----------|-----------|
-| Claude Sonnet 4.6 | 84.5% | All 5 (including adversarial) |
-| Gemini 2.5 Flash | 78.3% | All 5 (including adversarial) |
+| Answer model | Accuracy (all 5 categories) | Excluding adversarial | Retrieved memories |
+|--------------|------------------------------|-----------------------|--------------------|
+| Qwen3 235B (judge: DeepSeek V3.2, Mem0 2025 judge prompt) | 83.9% | 84.7% | 30 |
+
+```mermaid
+xychart-beta
+    title "LoCoMo accuracy, categories 1-4 (%)"
+    x-axis ["Mem0 top-200", "recalld top-30", "Mem0 top-50", "Supermemory", "Zep", "Letta", "MemOS"]
+    y-axis "Accuracy (%)" 0 --> 100
+    bar [91.6, 84.7, 82.7, 77.1, 75.1, 74.0, 73.3]
+```
+
+Competitor numbers are each vendor's own published results with different models, judges and context sizes, so they are not directly comparable.
 
 See [docs/benchmark.md](docs/benchmark.md) for full methodology, per-category breakdowns, and reproducibility instructions.
 

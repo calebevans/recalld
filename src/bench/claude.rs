@@ -612,6 +612,32 @@ impl LlmClient {
         system: &str,
         question_date: Option<&str>,
     ) -> Result<String, String> {
+        let memory_context = Self::render_memory_context(memories, graph_context);
+
+        let reasoning_hint = "Think step by step. First identify which memories are relevant. Then extract the key facts. If the question involves dates, write out the dates and compute. If it involves counting, list each instance. Finally, state your answer.";
+
+        let date_context = match question_date {
+            Some(d) if !d.is_empty() => format!("Today's date: {d}\n\n"),
+            _ => String::new(),
+        };
+
+        let user = format!(
+            "{date_context}Retrieved memories:\n{memory_context}\n\n\
+             Question: {question}\n\n\
+             {reasoning_hint}\n\n\
+             Answer:"
+        );
+
+        self.call(system, &user, 4096).await
+    }
+
+    /// The retrieved-memory block exactly as the answer model sees it
+    /// (numbered memories, then graph neighbors). Logged per question so the
+    /// benchmark can report memory-context token use.
+    pub fn render_memory_context(
+        memories: &[MemoryContext],
+        graph_context: &GraphContext,
+    ) -> String {
         let mut sorted_memories = memories.to_vec();
         sorted_memories.sort_by_key(|m| m.created_at);
 
@@ -717,21 +743,7 @@ impl LlmClient {
             )
         };
 
-        let reasoning_hint = "Think step by step. First identify which memories are relevant. Then extract the key facts. If the question involves dates, write out the dates and compute. If it involves counting, list each instance. Finally, state your answer.";
-
-        let date_context = match question_date {
-            Some(d) if !d.is_empty() => format!("Today's date: {d}\n\n"),
-            _ => String::new(),
-        };
-
-        let user = format!(
-            "{date_context}Retrieved memories:\n{context}{neighbor_context}\n\n\
-             Question: {question}\n\n\
-             {reasoning_hint}\n\n\
-             Answer:"
-        );
-
-        self.call(system, &user, 4096).await
+        format!("{context}{neighbor_context}")
     }
 
     pub async fn judge_answer(
@@ -741,6 +753,36 @@ impl LlmClient {
         generated_answer: &str,
         is_adversarial: bool,
     ) -> Result<JudgeResult, String> {
+        // BENCH_JUDGE_STYLE=mem0 grades non-adversarial questions with Mem0's
+        // published LoCoMo judge prompt (the de-facto shared protocol) for a
+        // comparable number. Adversarial questions keep recalld's rule.
+        // BENCH_JUDGE_STYLE=mem0-v3 uses Mem0's current, looser judge instead.
+        let style = std::env::var("BENCH_JUDGE_STYLE").unwrap_or_default();
+        let mem0_prompt = match style.as_str() {
+            "mem0" => Some(("Output ONLY the JSON object.", MEM0_ACCURACY_PROMPT)),
+            "mem0-v3" => Some((MEM0_V3_JUDGE_SYSTEM, MEM0_V3_JUDGE_PROMPT)),
+            _ => None,
+        };
+        if let (false, Some((system, template))) = (is_adversarial, mem0_prompt) {
+            let user = template
+                .replace("{question}", question)
+                .replace("{gold_answer}", gold_answer)
+                .replace("{generated_answer}", generated_answer);
+            let response = self.call(system, &user, 1024).await?;
+            // Like Mem0's extract_json: read "label" from the last JSON object.
+            let label = response
+                .rfind('{')
+                .and_then(|start| {
+                    let end = response[start..].find('}')? + start;
+                    serde_json::from_str::<serde_json::Value>(&response[start..=end]).ok()
+                })
+                .and_then(|v| v.get("label").and_then(|l| l.as_str()).map(str::to_owned))
+                .unwrap_or_default();
+            return Ok(JudgeResult {
+                correct: label.eq_ignore_ascii_case("CORRECT"),
+                reason: response.chars().take(200).collect(),
+            });
+        }
         let system = "You are evaluating conversational AI memory recall.\n\
             You must respond with exactly one JSON object containing two keys:\n\
             - \"label\": either \"CORRECT\" or \"WRONG\" (uppercase, no other values)\n\
@@ -965,13 +1007,12 @@ impl LlmClient {
     const SYSTEM_PROMPT_LOCOMO: &str = "You are an AI assistant listening to a conversation between two people. \
             You have a memory tool called store_memory that saves information for later recall.\n\n\
             You will see recent conversation context followed by the LATEST turn. \
-            Store new factual information revealed in the latest turn, but be highly selective — \
-            only store facts that would be useful to answer future questions about these people.\n\n\
+            Store each new fact revealed in the latest turn that could help answer future \
+            questions about these people.\n\n\
             <task>\n\
-            Your job: extract ONLY genuinely new, specific, useful facts from the latest turn.\n\
-            Quality over quantity. A typical conversation turn contains 0-2 memories worth storing. \
-            Most turns with casual chat, reactions, or continuation of an already-stored topic \
-            should produce zero new memories.\n\
+            Your job: extract every distinct new fact from the latest turn as its own memory. \
+            Skip only greetings, small talk, and facts already stored in the recent memories \
+            shown. When unsure whether a fact will matter later, store it.\n\
             </task>\n\n\
             <what_to_store>\n\
             Store facts that someone might ask about later:\n\
@@ -1017,12 +1058,12 @@ impl LlmClient {
             independently without surrounding context, so it must be completely \
             self-contained and unambiguous.\n\
             BAD: \"She mentioned she's been taking calligraphy lessons.\"\n\
-            GOOD: \"Melanie mentioned she has been taking calligraphy lessons since \
+            GOOD: \"Ingrid mentioned she has been taking calligraphy lessons since \
             approximately March 2023.\"\n\
             BAD: \"He got a new job at the hospital.\"\n\
             GOOD: \"Carlos Rivera started a new job at Memorial Hospital in May 2023.\"\n\
             When person A talks about person B, name BOTH speakers explicitly: \
-            \"Melanie said that Carlos would make a great teacher.\"\n\
+            \"Ingrid said that Carlos would make a great teacher.\"\n\
             When storing a cross-speaker opinion or reaction, always include both names as \
             entities so the memory links to both people.\n\
             </attribution>\n\n\
@@ -1607,3 +1648,63 @@ impl LlmClient {
         Err(format!("failed after 3 attempts: {last_err}"))
     }
 }
+
+/// Mem0's LoCoMo judge prompt, verbatim from mem0ai/mem0@aae5989e78
+/// evaluation/metrics/llm_judge.py (ACCURACY_PROMPT), used by Mem0, Zep and MemOS.
+const MEM0_ACCURACY_PROMPT: &str = r#"
+Your task is to label an answer to a question as ’CORRECT’ or ’WRONG’. You will be given the following data:
+    (1) a question (posed by one user to another user), 
+    (2) a ’gold’ (ground truth) answer, 
+    (3) a generated answer
+which you will score as CORRECT/WRONG.
+
+The point of the question is to ask about something one user should know about the other user based on their prior conversations.
+The gold answer will usually be a concise and short answer that includes the referenced topic, for example:
+Question: Do you remember what I got the last time I went to Hawaii?
+Gold answer: A shell necklace
+The generated answer might be much longer, but you should be generous with your grading - as long as it touches on the same topic as the gold answer, it should be counted as CORRECT. 
+
+For time related questions, the gold answer will be a specific date, month, year, etc. The generated answer might be much longer or use relative time references (like "last Tuesday" or "next month"), but you should be generous with your grading - as long as it refers to the same date or time period as the gold answer, it should be counted as CORRECT. Even if the format differs (e.g., "May 7th" vs "7 May"), consider it CORRECT if it's the same date.
+
+Now it's time for the real question:
+Question: {question}
+Gold answer: {gold_answer}
+Generated answer: {generated_answer}
+
+First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG. 
+Do NOT include both CORRECT and WRONG in your response, or it will break the evaluation script.
+
+Just return the label CORRECT or WRONG in a json format with the key as "label".
+"#;
+
+/// Mem0's current LoCoMo judge (mem0ai/memory-benchmarks@edcd6f1d42,
+/// benchmarks/locomo/prompts.py, JUDGE_PROMPT without evidence), verbatim.
+const MEM0_V3_JUDGE_SYSTEM: &str = r#"You are evaluating conversational AI memory recall. Return JSON only with the format requested."#;
+const MEM0_V3_JUDGE_PROMPT: &str = r#"Label the generated answer as CORRECT or WRONG.
+
+## Rules
+
+1. **PARTIAL CREDIT**: If the generated answer includes AT LEAST ONE correct item from the gold answer's list, mark CORRECT. Getting 1 out of 2, 2 out of 4, etc. is always acceptable. Only mark WRONG if NONE of the gold answer items appear.
+
+2. **PARAPHRASES COUNT**: Same concept in different words is CORRECT. "Chocolate raspberry tart" = "chocolate cake with raspberries". "Shelter meal service" = "volunteering at a homeless shelter". Emotions and sentiments in the same positive/negative family count as paraphrases: "proud" = "fulfilled" = "accomplished"; "huge success" = "relieved" = "thrilled" (all express positive achievement). Judge semantic meaning, not exact wording.
+
+3. **EXTRA DETAIL IS FINE**: A longer answer that includes the gold answer's key facts plus additional information is CORRECT. Never penalize for being more detailed or specific. If the generated answer adds extra descriptive details beyond the gold answer while still referencing the same core entity or concept, mark CORRECT.
+
+4. **DATE TOLERANCE**: Dates within 14 days of each other are CORRECT. Durations within 50% are CORRECT (e.g., "5 months" matches "six months"; "19 days" matches "two weeks"). Relative dates ("few days before November") match specific dates in the same window. A specific date (e.g., "February 2020") that is consistent with a vague reference (e.g., "a few years ago" relative to 2023) is CORRECT. Converting "last year" to the actual year (e.g., "2022" when conversations are in 2023) is CORRECT.
+
+5. **SEMANTIC OVERLAP**: Judge whether the generated answer addresses the same topic and captures the core idea of the gold answer. Different wording, phrasing, or level of detail should not result in WRONG if the underlying concept matches. For EMOTIONS and FEELINGS questions, answers expressing sentiments in the same valence (positive/negative) about the same event are CORRECT — do not require the exact same emotion word.
+
+6. **SAME REFERENT**: If the generated answer mentions or references the same named entity, character, person, or concept as the gold answer, mark CORRECT — even if the generated answer provides a different physical description or includes additional details. The key question is: does the generated answer identify the same core entity? If yes, it is CORRECT.
+
+7. **FOCUS ON KNOWLEDGE, NOT WORDING**: The goal is to assess whether the system recalled the right fact. Minor differences in specificity, phrasing, or scope should not result in WRONG. Only mark WRONG when the generated answer demonstrates a genuinely different or incorrect understanding.
+
+## ONLY mark WRONG if:
+- The generated answer contains ZERO correct items from the gold answer
+- The answer addresses a completely different topic
+
+## Question
+Question: {question}
+Gold answer: {gold_answer}
+Generated answer: {generated_answer}
+
+Return JSON with "reasoning" (one sentence) and "label" (CORRECT or WRONG). Do NOT include both labels."#;
