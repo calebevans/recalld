@@ -126,6 +126,7 @@ Shared client code:
   ≥ 1,500 d. Must match `src/decay/fsrs.rs`; unit-test against values computed from it.
 - `lib/labels.ts`: greedy collision-free label placement (DESIGN §6).
 - `lib/scope.svelte.ts`: the global namespace scope (persisted to localStorage).
+- `lib/prefs.svelte.ts`: per-viewer conveniences (collapsed sidebar, theme), persisted to localStorage.
 - `lib/events.ts`: an SSE client with reconnect and backoff, feeding the light layer and activity lists.
 
 ## 4. Phases
@@ -180,7 +181,7 @@ report `AGENTS.md` requires.
   (README section + `docs/ui.md`).
 
 ## 5. Out of scope for v1
-Dark theme, editing memory text, multi-user/remote access, a Tauri/desktop wrapper (possible later:
+Editing memory text, multi-user/remote access, a Tauri/desktop wrapper (possible later:
 it would wrap the same SPA), and 3D graphs.
 
 ## 6. Performance budgets

@@ -2,7 +2,7 @@
 <script module lang="ts">
   export type IconName =
     | 'map' | 'explore' | 'timeline' | 'health' | 'collapse' | 'expand' | 'layers'
-    | 'chevron' | 'close' | 'more' | 'plus' | 'minus' | 'fit' | 'search';
+    | 'chevron' | 'close' | 'more' | 'plus' | 'minus' | 'fit' | 'search' | 'moon';
 </script>
 
 <script lang="ts">
@@ -51,5 +51,7 @@
     <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
   {:else if name === 'search'}
     <circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" />
+  {:else if name === 'moon'}
+    <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z" />
   {/if}
 </svg>

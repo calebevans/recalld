@@ -33,8 +33,9 @@ new one.
 - **Sidebar** (`--sidebar-width`, collapses to `--sidebar-rail`): wordmark "recalld" (serif 25,
   weight 500) with a collapse button; views (Memory map, Explore, Timeline, Health); Namespaces list
   ("All namespaces" first, then each namespace with its count); and a status line at the bottom
-  (`read-only · daemon connected`, mono 10.5). Collapsed it becomes a rail of 40×40 icon links with
-  tooltips plus an "r" expand button. The collapsed state persists across sessions.
+  (`read-only · daemon connected`, mono 10.5) with the theme button (§4) beside it. Collapsed it
+  becomes a rail of 40×40 icon links with tooltips plus an "r" expand button, with the theme button
+  at its foot. The collapsed state persists across sessions.
 - **Detail panel** (`--panel-width`, min 300): opens when a memory is selected. Memory map: it
   collapses to a 56px rail (green dot plus the vertical short title). Explore: it closes entirely.
   Esc closes it.
@@ -78,6 +79,17 @@ Tie-breakers:
 - Phases are never told apart by hue alone — see §6.
 - Destructive actions (Forget) live behind the "More actions" (⋯) menu and confirm in a dialog.
   There is no red in the base palette.
+- **Two themes, one set of names.** `tokens.css` defines every color twice: the light theme on
+  `:root` and the dark theme on `:root[data-theme='dark']`. Nothing but color differs, and components
+  never name a theme. In the dark theme each role keeps its meaning with the lightness reversed:
+  near-black grounds, eggshell text, a pale sage accent (so the primary button carries dark text),
+  and a memory that is lightest while Full and strong and dims toward the canvas as it fades.
+- **The theme follows the system** (`prefers-color-scheme`) until the viewer picks the other one with
+  the theme button: an icon button with a moon, `aria-label="Dark theme"` and `aria-pressed`, beside
+  the sidebar's status line and at the foot of the rail. The choice persists across sessions; picking
+  the system's own theme again clears it, so the UI goes back to following the system. `app.html`
+  sets `data-theme` on `<html>` before first paint, so a page never flashes the other theme, and the
+  Memory map reads the tokens again when the theme changes.
 
 ## 5. Components
 
@@ -213,7 +225,8 @@ per-subsystem status dots; connected agents; next decay sweep.
 - **Mark:** a simple lightbulb: a slightly hand-drawn outline in `--color-accent-strong` (1.8 stroke)
   over cream glass `#F3EEDC`, one `--color-accent` dot inside (a memory), and a single base line.
   Nothing else. Files: `ui/static/logo.svg` (light) and `ui/static/favicon.svg` (switches to
-  light-on-dark in dark mode).
+  light-on-dark in dark mode). In the dark theme the sidebar mark takes the favicon's dark variant
+  through the same three tokens.
 - **Sidebar:** the 26px mark + 8px gap + "recalld" wordmark (serif 25/500). Collapsed rail: the 24px
   mark is the expand button (`aria-label="Expand sidebar"`).
 - **Browser tab:** `favicon.svg` with fallbacks `favicon.ico` (16+32), `favicon-32.png` and
@@ -226,8 +239,9 @@ per-subsystem status dots; connected agents; next decay sweep.
 Real `<button>` / `<a>` / `<input>` + `<label>` elements; icon-only buttons have `aria-label`;
 toggles use `aria-pressed`; the palette is `role="dialog"` with a `listbox`; the map canvas has an
 `aria-label` and an off-screen list of the visible nodes, so keyboard users can Tab through results.
-Focus rings: 2px `--color-accent` outline, 2px offset. Text contrast ≥ 4.5:1 (verified for all
-tokens). Hit targets ≥ 34px in toolbars and 44px for primary actions.
+Focus rings: 2px `--color-accent` outline, 2px offset. Text contrast ≥ 4.5:1 in both themes
+(`ui/tests/unit/themes.test.ts` checks every text color on every ground). Hit targets ≥ 34px in
+toolbars and 44px for primary actions.
 
 ## 11. Reference files
 

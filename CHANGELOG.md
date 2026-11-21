@@ -4,6 +4,7 @@
 
 ### Local web UI
 
+- The UI has a dark theme. It follows the system's light or dark setting, and a moon button at the bottom of the sidebar switches to the other theme and remembers the choice; picking the system's own theme again goes back to following the system. The Memory map, charts and search recolor with it, and the sidebar mark matches the browser tab icon's dark variant.
 - The memory map always lays memories out 3× further apart, as the old Spacing slider's top setting did, and the slider is gone. Nodes are drawn slightly larger, and the lightest Summary and Ghost shades are darker so they stand out from the background.
 
 ## 2.2.0 — 2026-11-20

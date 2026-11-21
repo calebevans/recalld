@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { open } from '../support/ui';
+import { centrePixel } from '../support/pixel';
 
 test('signs in with the launch token and lists namespaces from the daemon', async ({ page }) => {
   await open(page, '/explore');
@@ -43,4 +44,44 @@ test('the sidebar collapses to a rail and remembers it', async ({ page }) => {
   await page.reload();
   await expect(page.getByRole('button', { name: 'Expand sidebar' })).toBeVisible();
   await page.getByRole('button', { name: 'Expand sidebar' }).click();
+});
+
+test('the theme follows the system, and the sidebar button switches and remembers it', async ({ page }) => {
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await open(page, '/map');
+  const html = page.locator('html');
+  const button = page.getByRole('button', { name: 'Dark theme' });
+  await expect(html).toHaveAttribute('data-theme', 'dark');
+  await expect(button).toHaveAttribute('aria-pressed', 'true');
+
+  // The map draws with the theme's colors: a memory is lighter than the dark
+  // canvas and darker than the light one. Sample both as a user sees them.
+  await page.waitForFunction(() => (window as unknown as { __recalldSettled?: boolean }).__recalldSettled === true, null, { timeout: 60_000 });
+  await page.mouse.move(0, 0);
+  const brightness = async (x: number, y: number) =>
+    centrePixel(await page.screenshot({ clip: { x: x - 1, y: y - 1, width: 3, height: 3 } })).reduce((a, c) => a + c, 0);
+  const memoryMinusCanvas = async () => {
+    await page.waitForTimeout(500);
+    const at = await page.evaluate(() => {
+      const node = (window as unknown as { __recalldNodeAt: () => { x: number; y: number } | null }).__recalldNodeAt()!;
+      const box = document.querySelector('canvas.sigma-stage')!.getBoundingClientRect();
+      return { node: { x: Math.round(node.x), y: Math.round(node.y) }, corner: { x: Math.round(box.right - 6), y: Math.round(box.top + 6) } };
+    });
+    return (await brightness(at.node.x, at.node.y)) - (await brightness(at.corner.x, at.corner.y));
+  };
+  expect(await memoryMinusCanvas()).toBeGreaterThan(60);
+
+  // Choosing light on a dark system recolors the map at once and is remembered.
+  await button.click();
+  await expect(html).toHaveAttribute('data-theme', 'light');
+  await expect(button).toHaveAttribute('aria-pressed', 'false');
+  expect(await memoryMinusCanvas()).toBeLessThan(-60);
+  await page.reload();
+  await expect(html).toHaveAttribute('data-theme', 'light');
+  await expect(button).toHaveAttribute('aria-pressed', 'false');
+
+  // Going back to the system's own theme forgets the choice.
+  await button.click();
+  await expect(html).toHaveAttribute('data-theme', 'dark');
+  expect(await page.evaluate(() => localStorage.getItem('recalld.theme'))).toBeNull();
 });

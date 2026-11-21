@@ -2,7 +2,7 @@
      d3-force in a worker, rings and collision-free labels on a 2D overlay
      redrawn only when sigma renders. Nothing animates while idle. -->
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import Graph from 'graphology';
   import Sigma from 'sigma';
   import { layerDashed, layerPlain, pathLine, sdfCircle } from 'sigma/rendering';
@@ -21,6 +21,7 @@
   import { choreograph, type Choreo } from './choreo';
   import { rgb, alpha, solid } from './theme';
   import { live, type Received } from '$lib/live.svelte';
+  import { prefs } from '$lib/prefs.svelte';
 
   let {
     snapshot,
@@ -182,6 +183,18 @@
     focus;
     reencode();
     sigma?.refresh();
+  });
+
+  $effect(() => {
+    // A theme switch changes the tokens: read them again and recolor.
+    prefs.theme;
+    untrack(() => {
+      if (!graph) return;
+      theme = readTheme();
+      reencode();
+      graph.forEachEdge((id, a) => graph!.mergeEdgeAttributes(id, edgeAttributes(theme, a.type as number, a.weight as number)));
+      sigma?.refresh();
+    });
   });
 
   $effect(() => {

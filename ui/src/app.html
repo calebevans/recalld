@@ -8,6 +8,18 @@
     <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <title>recalld</title>
+    <script>
+      // The theme before first paint: the viewer's choice, else the system's
+      // (kept in step afterwards by src/lib/prefs.svelte.ts).
+      (function () {
+        var theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        try {
+          var chosen = localStorage.getItem('recalld.theme');
+          if (chosen === 'light' || chosen === 'dark') theme = chosen;
+        } catch (e) {}
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">

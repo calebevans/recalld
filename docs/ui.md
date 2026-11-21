@@ -40,6 +40,8 @@ Press Ctrl-C to stop the UI. The daemon keeps running for your agents.
 
 The namespace scope (sidebar or the first toolbar chip) applies to every view and is remembered. It starts on `default`, which is lighter than the whole store once your memories are split into project namespaces; choose **All namespaces** to see everything.
 
+The UI has a light and a dark theme. It follows your system's setting; the moon button at the bottom of the sidebar switches to the other theme and remembers it.
+
 ## Looking never changes memory
 
 Every read the UI makes uses recalld's read-only paths (`recordAccess:false` and the daemon's `*_read_only` methods), so browsing, searching or opening a memory never reinforces it, never resets its decay clock and never triggers retrieval-induced forgetting. An integration test checks this on every change. Only **Reinforce** (with a rating) and **Forget** (after a confirmation) write, through the same tool path your agents use.

@@ -4,10 +4,12 @@
  * Components reference these variables only; no raw hex values in components.
  * Warm "eggshell" grounds (requested after review, 2026-11-19); contrast
  * re-checked: every text color stays >= 4.5:1 on bg, surface, canvas and sunken.
- * Light theme only for v1. A dark theme is out of scope until the light one ships.
+ * Two themes: light (below) and dark (the second block). Only colors differ.
  */
 
 :root {
+  color-scheme: light;
+
   /* ── Surfaces ─────────────────────────────────────────────── */
   --color-bg: #F1EDE2;            /* page ground (warm eggshell) */
   --color-surface: #F7F3E9;       /* cards, panels, tables, popovers */
@@ -147,6 +149,74 @@
   --dur-fast: 120ms;       /* hover, press, tooltip show delay */
   --dur-panel: 180ms;      /* sidebar / detail panel collapse */
   --dur-palette: 140ms;    /* ⌘K open (fade + 4px rise) */
+}
+
+/*
+ * Dark theme: <html data-theme="dark">. The app sets the attribute before first
+ * paint: the system's preference, unless the viewer chose the other theme
+ * (DESIGN §4). It starts from the favicon's dark variant (ink, glass, dot), so
+ * the sidebar mark matches the browser tab icon. Same rules as the light theme:
+ * every text color stays >= 4.5:1 on bg, surface, canvas and sunken
+ * (ui/tests/unit/themes.test.ts checks both themes).
+ */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  /* ── Surfaces ─────────────────────────────────────────────── */
+  --color-bg: #1A1C19;            /* page ground (the light theme's ink) */
+  --color-surface: #20231F;       /* cards, panels, tables, popovers */
+  --color-canvas: #1D1F1C;        /* Memory map canvas */
+  --color-canvas-dot: #2B2E29;    /* 1px dot grid on the map canvas, 24px pitch */
+  --color-sunken: #1A1C19;        /* stat tiles, palette footer */
+  --color-scrim: rgba(0, 0, 0, 0.5); /* behind the ⌘K palette */
+
+  /* ── Lines ────────────────────────────────────────────────── */
+  --color-border: #2F332D;        /* card, panel and table outlines */
+  --color-border-strong: #3B4039; /* secondary buttons, kbd */
+  --color-divider: #292C27;       /* row separators inside cards/tables */
+  --color-grid: #393E37;          /* chart gridlines (dashed 2 3) */
+
+  /* ── Text ─────────────────────────────────────────────────── */
+  --color-text: #ECE8DD;          /* 13.0:1 on surface */
+  --color-text-2: #C9C6BB;        /* secondary text, unselected nav */
+  --color-text-muted: #A0A396;    /* captions, meta, labels (6.2:1) */
+  --color-text-axis: #979A8E;     /* chart axis labels only (5.5:1) */
+
+  /* ── Accent: pale sage ────────────────────────────────────── */
+  --color-accent: #A9C2B1;        /* primary button, recall light, curves, dots (8.3:1) */
+  --color-accent-text: #B4CBBC;   /* small green text: status lines, links (9.2:1) */
+  --color-accent-strong: #E9ECE6; /* text on accent-soft, link hover */
+  --color-accent-soft: #2A302B;   /* selected chip / nav / row background */
+  --color-accent-soft-border: #3A423B;
+  --color-on-accent: #1A1C19;     /* text on --color-accent */
+
+  /* ── Graph ────────────────────────────────────────────────── */
+  --color-node: #C9D9CE;          /* Full memory at full strength: the lightest sage */
+  --color-node-fading: #7C9A86;   /* Full memory nearing Summary: moss */
+  --color-node-summary: #55695C;  /* Summary memory nearing Ghost: dim sage */
+  --color-node-ghost: #5E7566;    /* Ghost memory outline */
+  --color-node-lit: #5BE08F;      /* node reached by a recall: fresh green, more vivid than any stage */
+  --color-edge: #646B62;          /* base edge, opacity 0.32 × (0.3 + 0.7 × weight), solid */
+  --color-suppressed: #4B555E;    /* RIF-suppressed competitor */
+  --color-suppressed-text: #A7B4C1;
+  --color-contradicts: #8FA1B5;   /* dashed 3 3 */
+  --color-permastore: #A8965A;    /* 1px halo ring, r + 3.2 */
+  --color-mark-glass: #33413A;    /* dark glass of the bulb mark (DESIGN §9a) */
+  --color-label-halo: #1D1F1C;    /* 4px text stroke behind map labels */
+
+  /* ── Agents (pulse + activity dot colors, assigned in order) ─ */
+  --color-agent-1: #5BE08F;
+  --color-agent-2: #8E9578;       /* moss */
+  --color-agent-3: #8C9DB5;       /* slate */
+  --color-agent-4: #B9A66A;       /* brass */
+
+  /* ── Decay curve bands ────────────────────────────────────── */
+  --band-full: rgba(169, 194, 177, 0.08);    /* R > 0.70 */
+  --band-summary: rgba(142, 149, 120, 0.07); /* 0.30 < R ≤ 0.70 */
+
+  /* ── Elevation ────────────────────────────────────────────── */
+  --shadow-popover: 0 24px 64px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-tooltip: 0 3px 0 rgba(0, 0, 0, 0.35);
 }
 
 @media (prefers-reduced-motion: reduce) {

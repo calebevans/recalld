@@ -8,6 +8,8 @@ and don't copy their structure.
 Hard rules:
 - **Values come from tokens.** No raw hex, font names or magic pixel sizes in components; use
   `var(--…)` from `tokens.css`. To add a value, add a token first.
+- **Colors have two values.** A color token needs a light value (`:root`) and a dark one
+  (`:root[data-theme='dark']`), each readable on its grounds; components never name a theme.
 - **Type roles are fixed:** Newsreader = titles and display numbers (≥ 18px); Instrument Sans =
   interface (lists, controls, inputs, body); IBM Plex Mono = values (numbers, IDs, timestamps,
   shortcuts, uppercase micro-labels). Never use mono for sentences or serif for controls.

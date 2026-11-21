@@ -43,6 +43,9 @@
         </a>
       {/each}
     </nav>
+    <button type="button" class="rail-btn theme" aria-label="Dark theme" title="Dark theme" aria-pressed={prefs.theme === 'dark'} onclick={() => prefs.toggleTheme()}>
+      <Icon name="moon" />
+    </button>
   </aside>
 {:else}
   <aside class="sidebar" aria-label="Sidebar">
@@ -74,7 +77,12 @@
       {/each}
     </div>
 
-    <span class="status mono" title="The UI never records access, so browsing does not change decay">read-only · {status}</span>
+    <div class="foot">
+      <span class="status mono" title="The UI never records access, so browsing does not change decay">read-only · {status}</span>
+      <button type="button" class="icon-btn theme" aria-label="Dark theme" title="Dark theme" aria-pressed={prefs.theme === 'dark'} onclick={() => prefs.toggleTheme()}>
+        <Icon name="moon" />
+      </button>
+    </div>
   </aside>
 {/if}
 
@@ -169,10 +177,24 @@
     height: var(--space-4);
     margin: var(--space-2) 0;
   }
-  .status {
+  .foot {
     margin-top: auto;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+  .status {
     font-size: var(--text-label);
     color: var(--color-text-muted);
+  }
+  .foot .theme {
+    flex: none;
+    margin: 0 calc(var(--space-2) * -1) calc(var(--space-2) * -1) 0;
+  }
+  .theme[aria-pressed='true'] {
+    background: var(--color-accent-soft);
+    color: var(--color-accent-strong);
   }
   .rail {
     flex: 0 0 var(--sidebar-rail);
@@ -207,6 +229,9 @@
     background: var(--color-accent-soft);
     color: var(--color-accent-strong);
   }
+  .rail .theme {
+    margin-top: auto;
+  }
   @media (max-width: 600px) {
     .sidebar,
     .rail {
@@ -225,8 +250,12 @@
     .rail-nav {
       flex-direction: row;
     }
-    .status {
+    .foot,
+    .rail .theme {
       margin-top: 0;
+    }
+    .foot .theme {
+      margin: 0;
     }
   }
 </style>

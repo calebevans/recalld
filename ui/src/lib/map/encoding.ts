@@ -52,5 +52,6 @@ export function edgeAttributes(theme: MapTheme, type: number, weight: number) {
     dashSize: dashed ? dashed[0] : 0,
     gapSize: dashed ? dashed[1] : 0,
     baseColor: color,
+    weight,
   };
 }
