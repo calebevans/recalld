@@ -130,7 +130,7 @@ The harness reacts to tool errors the way an agent would:
 | Model   | Same as answer generation model (configurable via `--model`) |
 | Temperature     | 0.0 |
 | max_tokens      | 1024 |
-| Default top_k   | 15 (configurable via `--top-k`) |
+| Default top_k   | 15 (configurable via `--top-k`; the published run uses 30) |
 | Default graph depth | 2 (LLM can set 0--3 per query) |
 | Access recording | Off (searches don't update memory access history) |
 
@@ -215,6 +215,12 @@ from domains absent from the LoCoMo dataset.
 refuses to answer or says "I don't know." WRONG if it provides any specific
 answer as if true. The gold answer field contains the *wrong* answer a tricked
 system would give; it is shown to the judge as "Expected wrong answer."
+
+**Mem0-compatible judging** (`BENCH_JUDGE_STYLE`): set `mem0` to judge with
+Mem0's 2025 `ACCURACY_PROMPT` (the prompt most published LoCoMo scores use), or
+`mem0-v3` for the more lenient judge in Mem0's 2026 memory-benchmarks repo
+(which also trims open-domain gold answers at `;`). Unset keeps the prompts
+above. The published run uses `mem0`.
 
 **Fallback parsing**: If the judge's JSON output fails to parse, the system
 checks whether the cleaned, uppercased response (with markdown code fences
@@ -415,177 +421,73 @@ cargo run --features bench --release -- bench locomo
 
 ## 5. Results
 
-Results are stored in `benchmarks/<run-name>/` with full JSON output
-(`bench_results.json`) and per-question debug logs (`bench_debug.log`),
-tracked in the repository for reproducibility verification.
+Results are stored in `benchmarks/<run-name>/bench_results.json` (per-question
+answers, judgments and timings). Earlier runs from the v1.x harness
+(Claude Sonnet 4.6 and Gemini 2.5 Flash, top-k 15/20, plus shared-store stress
+tests) remain in `benchmarks/` for reference; they are not comparable with the
+run below because the ingestion path, prompts, judge and top-k all changed.
 
-All results include adversarial questions (all 5 categories, 1,986 total
-questions).
-
-### Run: Claude Sonnet 4.6 (top-k=15, all categories)
+### Run: Qwen3 235B, embeddinggemma, top-k 30 (all categories)
 
 **Configuration:**
-- Model (ingestion + answer gen): `claude-sonnet-4-6`
-- Judge: `claude-haiku-4-5`
-- Top-k: 15
-- Prompt: unified (no category routing or per-category selection)
+- recalld: v2.x native storage; memories written through the real
+  `store_memory` MCP tool
+- Model (ingestion + answer gen): Qwen3 235B A22B 2507 (Amazon Bedrock)
+- Judge: DeepSeek V3.2 (Amazon Bedrock) with Mem0's 2025 `ACCURACY_PROMPT`
+  (`BENCH_JUDGE_STYLE=mem0`)
+- Embeddings: `embeddinggemma:300m` (768d, via Ollama)
+- Top-k: 30
 - Categories: all 5 (including adversarial)
-- Results: `benchmarks/claude-sonnet-4-6-top15/`
+- Results: `benchmarks/qwen3-235b-embeddinggemma-top30/`
 
-**Overall accuracy: 84.5%** (1,678/1,986)
+**Overall accuracy: 83.9%** (1,667/1,986), Wilson 95% CI [82.3%, 85.5%]
 
-Wilson 95% CI: [82.8%, 86.0%]
+**Excluding adversarial: 84.7%** (1,305/1,540), Wilson 95% CI [82.9%, 86.4%]
 
 | Category    | Correct | Total | Accuracy |
 |-------------|---------|-------|----------|
-| Multi-hop   | 230     | 282   | 81.6%    |
-| Temporal    | 286     | 321   | 89.1%    |
-| Open-domain | 69      | 96    | 71.9%    |
-| Single-hop  | 711     | 841   | 84.5%    |
-| Adversarial | 382     | 446   | 85.7%    |
-| **Overall (1--5)** | **1,678** | **1,986** | **84.5%** |
+| Single-hop  | 738     | 841   | 87.8%    |
+| Multi-hop   | 244     | 282   | 86.5%    |
+| Temporal    | 257     | 321   | 80.1%    |
+| Open-domain | 66      | 96    | 68.8%    |
+| Adversarial | 362     | 446   | 81.2%    |
+| **Overall (1--5)** | **1,667** | **1,986** | **83.9%** |
 
-### Run: Claude Sonnet 4.6 (top-k=20, all categories)
+2,438 memories were stored across the 10 conversations. Mean latency per
+question: retrieval 5.7 s (dominated by the LLM query-construction call),
+answer 3.9 s, judge 3.1 s.
 
-**Configuration:**
-- Model (ingestion + answer gen): `claude-sonnet-4-6`
-- Judge: `claude-haiku-4-5`
-- Top-k: 20
-- Prompt: unified (no category routing or per-category selection)
-- Categories: all 5 (including adversarial)
-- Results: `benchmarks/claude-sonnet-4-6-top20/`
-
-**Overall accuracy: 84.2%** (1,672/1,986)
-
-Wilson 95% CI: [82.5%, 85.7%]
-
-| Category    | Correct | Total | Accuracy |
-|-------------|---------|-------|----------|
-| Multi-hop   | 229     | 282   | 81.2%    |
-| Temporal    | 283     | 321   | 88.2%    |
-| Open-domain | 67      | 96    | 69.8%    |
-| Single-hop  | 716     | 841   | 85.1%    |
-| Adversarial | 377     | 446   | 84.5%    |
-| **Overall (1--5)** | **1,672** | **1,986** | **84.2%** |
-
-### Run: Gemini 2.5 Flash (top-k=15, all categories)
-
-**Configuration:**
-- Model (ingestion + answer gen): `gemini-2.5-flash`
-- Judge: `gemini-2.5-flash`
-- Top-k: 15
-- Prompt: unified (no category routing or per-category selection)
-- Categories: all 5 (including adversarial)
-- Results: `benchmarks/gemini-2.5-flash-top15/`
-
-**Overall accuracy: 77.4%** (1,537/1,986)
-
-Wilson 95% CI: [75.5%, 79.2%]
-
-| Category    | Correct | Total | Accuracy |
-|-------------|---------|-------|----------|
-| Multi-hop   | 201     | 282   | 71.3%    |
-| Temporal    | 274     | 321   | 85.4%    |
-| Open-domain | 51      | 96    | 53.1%    |
-| Single-hop  | 644     | 841   | 76.6%    |
-| Adversarial | 367     | 446   | 82.3%    |
-| **Overall (1--5)** | **1,537** | **1,986** | **77.4%** |
-
-### Run: Gemini 2.5 Flash (top-k=20, all categories)
-
-**Configuration:**
-- Model (ingestion + answer gen): `gemini-2.5-flash`
-- Judge: `gemini-2.5-flash`
-- Top-k: 20
-- Prompt: unified (no category routing or per-category selection)
-- Categories: all 5 (including adversarial)
-- Results: `benchmarks/gemini-2.5-flash-top20/`
-
-**Overall accuracy: 78.3%** (1,556/1,986)
-
-Wilson 95% CI: [76.5%, 80.1%]
-
-| Category    | Correct | Total | Accuracy |
-|-------------|---------|-------|----------|
-| Multi-hop   | 210     | 282   | 74.5%    |
-| Temporal    | 266     | 321   | 82.9%    |
-| Open-domain | 52      | 96    | 54.2%    |
-| Single-hop  | 655     | 841   | 77.9%    |
-| Adversarial | 373     | 446   | 83.6%    |
-| **Overall (1--5)** | **1,556** | **1,986** | **78.3%** |
-
-## 6. Stress Test
-
-The standard LoCoMo evaluation creates an isolated memory store per
-conversation. The stress test evaluates retrieval accuracy with a larger memory
-store by ingesting all 10 conversations into a **single shared memory store**,
-then running all 1,986 questions against it.
-
-### Run: Gemini 2.5 Flash stress test (top-k=15, all categories)
-
-**Configuration:**
-- Model (ingestion + answer gen): `gemini-2.5-flash`
-- Judge: `gemini-2.5-flash`
-- Top-k: 15
-- Total memories in store: all 10 conversations combined
-- Categories: all 5 (including adversarial)
-- Results: `benchmarks/gemini-2.5-flash-top15-stress-test/`
-
-**Overall accuracy: 76.8%** (1,525/1,986)
-
-| Category    | Correct | Total | Accuracy |
-|-------------|---------|-------|----------|
-| Multi-hop   | 190     | 282   | 67.4%    |
-| Temporal    | 261     | 321   | 81.3%    |
-| Open-domain | 44      | 96    | 45.8%    |
-| Single-hop  | 652     | 841   | 77.5%    |
-| Adversarial | 378     | 446   | 84.8%    |
-| **Overall (1--5)** | **1,525** | **1,986** | **76.8%** |
-
-### Run: Gemini 2.5 Flash stress test (top-k=20, all categories)
-
-**Configuration:**
-- Model (ingestion + answer gen): `gemini-2.5-flash`
-- Judge: `gemini-2.5-flash`
-- Top-k: 20
-- Total memories in store: all 10 conversations combined
-- Categories: all 5 (including adversarial)
-- Results: `benchmarks/gemini-2.5-flash-top20-stress-test/`
-
-**Overall accuracy: 78.3%** (1,555/1,986)
-
-| Category    | Correct | Total | Accuracy |
-|-------------|---------|-------|----------|
-| Multi-hop   | 202     | 282   | 71.6%    |
-| Temporal    | 277     | 321   | 86.3%    |
-| Open-domain | 51      | 96    | 53.1%    |
-| Single-hop  | 656     | 841   | 78.0%    |
-| Adversarial | 369     | 446   | 82.7%    |
-| **Overall (1--5)** | **1,555** | **1,986** | **78.3%** |
-
-### Accuracy retention
-
-| Mode | top-k | Accuracy | Delta |
-|------|-------|----------|-------|
-| Isolated (per-conversation) | 15 | 77.4% | -- |
-| Stress test (shared store) | 15 | 76.8% | -0.6 pts |
-| Isolated (per-conversation) | 20 | 78.3% | -- |
-| Stress test (shared store) | 20 | 78.3% | 0.0 pts |
-
-With all 10 conversations in a single store, accuracy dropped by less than
-1 percentage point at top-k=15, and showed no drop at top-k=20.
+**Context size.** The answer model saw on average 9,820 tokens of memory
+context per question (median 9,752, p95 11,611; `o200k_base` tokenizer):
+30 retrieved memories plus about 10 graph neighbors, about 245 tokens each.
 
 ## 7. Comparison
 
 Due to the methodological differences described in Section 3.1, these numbers
-are **not directly comparable**. Different models, prompts, judge
-configurations, and scoring criteria were used by each system.
+are **not directly comparable**: systems used different answer models, judges,
+judge prompts and amounts of retrieved context. Scores below exclude
+adversarial questions (categories 1--4), which is how most vendors report.
 
-| System              | Reported accuracy | Categories | Scoring method | Notes |
-|---------------------|-------------------|-----------|----------------|-------|
-| recalld             | 84.5%             | 1--5 (all) | LLM-as-judge, binary | Claude Sonnet 4.6; top-k=15 |
-| Mem0 (April 2026)   | 92.5%             | 1--4 only | LLM-as-judge   | Adversarial excluded |
-| ByteRover 2.0       | 92.2%             | 1--4 only | LLM-as-judge   | Adversarial excluded |
-| Human (original paper) | 87.9% F1       | 1--5 (all) | Token-level F1 | Different metric |
-| Accuracy ceiling     | ~95%             | -- | --              | Limited by ground truth errors (Penfield Labs) |
+```mermaid
+xychart-beta
+    title "LoCoMo accuracy, categories 1-4 (%)"
+    x-axis ["Mem0 top-200", "recalld top-30", "Mem0 top-50", "Supermemory", "Zep", "Letta", "MemOS", "Full context"]
+    y-axis "Accuracy (%)" 0 --> 100
+    bar [91.6, 84.7, 82.7, 77.1, 75.1, 74.0, 73.3, 72.9]
+```
 
+| System | Accuracy (cat. 1--4) | Retrieved context | Answer model | Judge |
+|--------|----------------------|-------------------|--------------|-------|
+| Mem0 (memory-benchmarks, 2026) | 91.6% | top 200 | GPT-5 | Mem0 v3 judge (more lenient) |
+| **recalld** | **84.7%** | top 30 | Qwen3 235B | Mem0 2025 judge, DeepSeek V3.2 |
+| Mem0 (memory-benchmarks, 2026) | 82.7% | top 50 | GPT-5 | Mem0 v3 judge (more lenient) |
+| Supermemory | 77.1% | -- | -- | Not published; stated in a GitHub issue |
+| Zep (2025, corrected) | 75.1% | -- | gpt-4o-mini | Mem0 2025 judge |
+| Letta | 74.0% | raw transcripts | gpt-4o-mini | Strict judge |
+| MemOS | 73.3% | top 20 | gpt-4o-mini | Mem0 2025 judge |
+| Full conversation in context (Mem0 paper) | 72.9% | everything | gpt-4o-mini | Mem0 2025 judge |
+| Human (original paper) | 87.9% F1 | -- | -- | Token-level F1, different metric |
+| Accuracy ceiling | ~95% | -- | -- | Limited by ground-truth errors (Penfield Labs) |
+
+Mem0's README headline of 92.5% and Zep's later 94.7% claim are omitted: no
+public configuration reproduces them.

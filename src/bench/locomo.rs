@@ -796,12 +796,30 @@ async fn run_stress_test(
                 .generate_answer(&question, &mem_contexts, "unknown", &graph_context)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            // Exact memory block the answer model saw, for context-token reporting.
+            let memory_context = LlmClient::render_memory_context(&mem_contexts, &graph_context);
+            let _ = writeln!(
+                debug_buf,
+                "  MemCtx: {}",
+                serde_json::json!({
+                    "question": question,
+                    "category": cat_name,
+                    "memories": mem_contexts.len(),
+                    "neighbors": graph_context.neighbors.len(),
+                    "context": memory_context,
+                })
+            );
             let answer_ms = answer_start.elapsed().as_secs_f64() * 1000.0;
 
             // Judge.
             let judge_start = Instant::now();
             let result = judge_llm
-                .judge_answer(&question, &gold_answer, &generated, is_adversarial)
+                .judge_answer(
+                    &question,
+                    judge_gold(&cat_name, &gold_answer),
+                    &generated,
+                    is_adversarial,
+                )
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let judge_ms = judge_start.elapsed().as_secs_f64() * 1000.0;
@@ -809,11 +827,7 @@ async fn run_stress_test(
             let verdict = if result.correct { "CORRECT" } else { "WRONG" };
             let _ = writeln!(debug_buf, "  [{}] Q: {}", conv_id, question);
             let _ = writeln!(debug_buf, "  Gold: {}", gold_answer);
-            let _ = writeln!(
-                debug_buf,
-                "  Gen:  {}",
-                generated.chars().take(300).collect::<String>()
-            );
+            let _ = writeln!(debug_buf, "  Gen:  {}", generated);
             let _ = writeln!(debug_buf, "  -> {} ({})", verdict, cat_name);
             let _ = writeln!(debug_buf);
 
@@ -1136,12 +1150,30 @@ async fn run_conversation(
                 .generate_answer(&question, &mem_contexts, "unknown", &graph_context)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            // Exact memory block the answer model saw, for context-token reporting.
+            let memory_context = LlmClient::render_memory_context(&mem_contexts, &graph_context);
+            let _ = writeln!(
+                debug_buf,
+                "  MemCtx: {}",
+                serde_json::json!({
+                    "question": question,
+                    "category": cat_name,
+                    "memories": mem_contexts.len(),
+                    "neighbors": graph_context.neighbors.len(),
+                    "context": memory_context,
+                })
+            );
             let answer_ms = answer_start.elapsed().as_secs_f64() * 1000.0;
 
             // Judge (separate model to avoid self-grading bias).
             let judge_start = Instant::now();
             let result = judge_llm
-                .judge_answer(&question, &gold_answer, &generated, is_adversarial)
+                .judge_answer(
+                    &question,
+                    judge_gold(&cat_name, &gold_answer),
+                    &generated,
+                    is_adversarial,
+                )
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let judge_ms = judge_start.elapsed().as_secs_f64() * 1000.0;
@@ -1149,11 +1181,7 @@ async fn run_conversation(
             let verdict = if result.correct { "CORRECT" } else { "WRONG" };
             let _ = writeln!(debug_buf, "  Q: {}", question);
             let _ = writeln!(debug_buf, "  Gold: {}", gold_answer);
-            let _ = writeln!(
-                debug_buf,
-                "  Gen:  {}",
-                generated.chars().take(300).collect::<String>()
-            );
+            let _ = writeln!(debug_buf, "  Gen:  {}", generated);
             let _ = writeln!(debug_buf, "  -> {} ({})", verdict, cat_name);
             let _ = writeln!(debug_buf);
 
@@ -1669,7 +1697,20 @@ pub(super) async fn search_memories(
             entities: search_entities.clone(),
         };
 
-        let response = harness.system.query_engine().search(query).await?;
+        // Transient provider errors (e.g. a Bedrock embedding "service error")
+        // must not fail the whole conversation: retry with backoff.
+        let mut attempt = 0u32;
+        let response = loop {
+            match harness.system.query_engine().search(query.clone()).await {
+                Ok(response) => break response,
+                Err(error) if attempt < 4 => {
+                    attempt += 1;
+                    eprintln!("      search retry {attempt}/4 after error: {error}");
+                    tokio::time::sleep(std::time::Duration::from_secs(2u64 << attempt)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         let results = load_full_texts(harness, response.results)?;
 
         for r in results {
@@ -2428,4 +2469,14 @@ fn format_report(report: &LocomoReport) -> String {
     ));
 
     out
+}
+
+/// Mem0's current protocol judges open-domain questions against only the part
+/// of the gold answer before the first semicolon.
+fn judge_gold<'a>(category: &str, gold: &'a str) -> &'a str {
+    if category == "open-domain" && std::env::var("BENCH_JUDGE_STYLE").as_deref() == Ok("mem0-v3") {
+        gold.split(';').next().unwrap_or(gold).trim()
+    } else {
+        gold
+    }
 }
